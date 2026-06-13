@@ -4,6 +4,7 @@ use crate::channel::outcome::{ChannelSummary, SubscribeOutcome, UnsubscribeOutco
 use crate::channel::registry::Registry;
 use crate::connection::handle::ConnectionHandle;
 use crate::presence::member::PresenceMember;
+use crate::protocol::error::PusherError;
 use crate::protocol::event::ServerEvent;
 use crate::protocol::socket_id::SocketId;
 use crate::user::registry::UserRegistry;
@@ -116,6 +117,29 @@ impl Adapter for LocalAdapter {
 
     async fn is_user_online(&self, app: &str, user_id: &str) -> bool {
         self.users.is_online(app, user_id)
+    }
+
+    async fn send_to_user(&self, app: &str, user_id: &str, event: ServerEvent) {
+        for h in self.users.handles(app, user_id) {
+            let _ = h.mailbox.send(event.clone());
+        }
+    }
+
+    async fn terminate_user(&self, app: &str, user_id: &str) -> Vec<SocketId> {
+        let handles = self.users.handles(app, user_id);
+        let ids = handles.iter().map(|h| h.socket_id.clone()).collect();
+        for h in handles {
+            // Mirror soketi namespace.ts:179-188 — error frame then close, both 4009.
+            let _ = h.mailbox.send(ServerEvent::Error(PusherError::new(
+                4009,
+                "You got disconnected by the app.",
+            )));
+            let _ = h.mailbox.send(ServerEvent::Close {
+                code: 4009,
+                reason: "You got disconnected by the app.".to_string(),
+            });
+        }
+        ids
     }
 }
 
@@ -240,5 +264,61 @@ mod tests {
             )
             .await;
         assert_eq!(adapter.cache_get("app", "cache-x").await, None);
+    }
+
+    #[tokio::test]
+    async fn send_to_user_fans_out_to_all_connections() {
+        let adapter = LocalAdapter::new(Arc::new(Registry::new()));
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let s1 = SocketId::generate();
+        let s2 = SocketId::generate();
+        adapter
+            .signin_user(
+                "app",
+                "u",
+                ConnectionHandle {
+                    socket_id: s1,
+                    mailbox: tx1,
+                },
+            )
+            .await;
+        adapter
+            .signin_user(
+                "app",
+                "u",
+                ConnectionHandle {
+                    socket_id: s2,
+                    mailbox: tx2,
+                },
+            )
+            .await;
+        adapter.send_to_user("app", "u", ServerEvent::Pong).await;
+        assert!(matches!(rx1.try_recv(), Ok(ServerEvent::Pong)));
+        assert!(matches!(rx2.try_recv(), Ok(ServerEvent::Pong)));
+    }
+
+    #[tokio::test]
+    async fn terminate_user_pushes_error_then_close_and_returns_ids() {
+        let adapter = LocalAdapter::new(Arc::new(Registry::new()));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let s = SocketId::generate();
+        adapter
+            .signin_user(
+                "app",
+                "u",
+                ConnectionHandle {
+                    socket_id: s.clone(),
+                    mailbox: tx,
+                },
+            )
+            .await;
+        let ids = adapter.terminate_user("app", "u").await;
+        assert_eq!(ids, vec![s]);
+        assert!(matches!(rx.try_recv(), Ok(ServerEvent::Error(e)) if e.code == 4009));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::Close { code: 4009, .. })
+        ));
     }
 }

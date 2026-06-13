@@ -72,4 +72,11 @@ pub trait Adapter: Send + Sync {
 
     /// True while `user_id` has at least one live signed-in connection.
     async fn is_user_online(&self, app: &str, user_id: &str) -> bool;
+
+    /// Deliver an event to every live connection of `user_id` (server-to-user).
+    async fn send_to_user(&self, app: &str, user_id: &str, event: ServerEvent);
+
+    /// Close every connection of `user_id` (terminate). Returns the closed
+    /// socket ids. Connections clean themselves up via their task's on_close.
+    async fn terminate_user(&self, app: &str, user_id: &str) -> Vec<SocketId>;
 }
