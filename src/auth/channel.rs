@@ -3,11 +3,17 @@
 
 use crate::auth::signature::{channel_signature, constant_time_eq};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ChannelAuthError {
-    Malformed,    // token not in "key:signature" form
-    KeyMismatch,  // token's key is not this app's key
-    BadSignature, // signature does not match
+    /// Token not in "key:signature" form.
+    #[error("Bad auth token")]
+    Malformed,
+    /// Token's key is not this app's key.
+    #[error("Auth key mismatch")]
+    KeyMismatch,
+    /// Signature does not match.
+    #[error("Invalid signature")]
+    BadSignature,
 }
 
 impl ChannelAuthError {

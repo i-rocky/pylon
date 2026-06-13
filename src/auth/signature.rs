@@ -35,6 +35,8 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
 
 /// Channel auth signature. Private channels sign "<socket_id>:<channel>";
 /// presence channels append ":<channel_data>" (the exact JSON string the client sent).
+/// An empty `channel_data` (`Some("")`) is treated as no channel data — it signs
+/// the private-channel string `"<socket_id>:<channel>"`.
 pub fn channel_signature(
     secret: &str,
     socket_id: &str,
@@ -68,7 +70,7 @@ mod tests {
 
     #[test]
     fn private_channel_signature_matches_signing_string() {
-        // signs "123.456:private-foo"
+        // via: printf '%s' "123.456:private-foo" | openssl dgst -sha256 -hmac secret
         assert_eq!(
             channel_signature("secret", "123.456", "private-foo", None),
             "70492d107085f5eed6c826e9deabe88bd9466b7349d812f7579b263318287644"
@@ -77,7 +79,7 @@ mod tests {
 
     #[test]
     fn presence_channel_signature_includes_channel_data() {
-        // signs "123.456:presence-foo:{\"user_id\":\"42\"}"
+        // via: printf '%s' '123.456:presence-foo:{"user_id":"42"}' | openssl dgst -sha256 -hmac secret
         assert_eq!(
             channel_signature(
                 "secret",
@@ -86,6 +88,14 @@ mod tests {
                 Some(r#"{"user_id":"42"}"#)
             ),
             "78d7eba8791f1c6a06c3d98b0a5cf37c94f440e8132173320996d824a8c1e433"
+        );
+    }
+
+    #[test]
+    fn empty_channel_data_signs_as_private() {
+        assert_eq!(
+            channel_signature("secret", "123.456", "private-foo", Some("")),
+            channel_signature("secret", "123.456", "private-foo", None)
         );
     }
 
