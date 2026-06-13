@@ -18,6 +18,25 @@ impl ConnectionContext {
         if self.subscribed.contains(&channel) {
             return;
         }
+
+        // Reserved `#` channels are server-managed, never normal subscriptions.
+        if let Some(uid) = channel.strip_prefix("#server-to-user-") {
+            let ok = self.user.as_ref().is_some_and(|u| u.id == uid);
+            if ok {
+                // Delivery is via the user registry (set up at signin), NOT the
+                // channel registry — just acknowledge so the client's User
+                // channel settles. Do not register or broadcast a count.
+                return self.send_self(ServerEvent::SubscriptionSucceeded {
+                    channel,
+                    presence: None,
+                });
+            }
+            return self.send_subscription_error(&channel, "AuthError", "Unauthorized", 401);
+        }
+        if channel.starts_with('#') {
+            return self.send_subscription_error(&channel, "AuthError", "Unknown channel", 401);
+        }
+
         let info = ChannelInfo::of(&channel);
         match info.auth {
             AuthKind::Public => {

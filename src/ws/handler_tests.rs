@@ -575,3 +575,89 @@ async fn on_close_signs_out_bound_user() {
         "user must be signed out after connection close"
     );
 }
+
+#[tokio::test]
+async fn server_to_user_subscribe_succeeds_when_signed_in_and_matches() {
+    use crate::auth::signature::user_signature;
+    let (mut c, mut rx) = ctx(app(false));
+    let sig = user_signature("s", c.socket_id.as_str(), r#"{"id":"9"}"#);
+    c.dispatch(ClientCommand::Signin {
+        auth: format!("k:{sig}"),
+        user_data: r#"{"id":"9"}"#.into(),
+    })
+    .await;
+    let _ = rx.try_recv(); // drain signin_success
+    c.dispatch(ClientCommand::Subscribe {
+        channel: "#server-to-user-9".into(),
+        auth: None,
+        channel_data: None,
+    })
+    .await;
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(ServerEvent::SubscriptionSucceeded { .. })
+    ));
+    // Reserved channels never enter the channel registry:
+    assert_eq!(
+        c.adapter
+            .channel("app", "#server-to-user-9")
+            .await
+            .subscription_count,
+        0
+    );
+}
+
+#[tokio::test]
+async fn server_to_user_subscribe_errors_on_mismatch() {
+    let (mut c, mut rx) = ctx(app(false)); // not signed in
+    c.dispatch(ClientCommand::Subscribe {
+        channel: "#server-to-user-9".into(),
+        auth: None,
+        channel_data: None,
+    })
+    .await;
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(ServerEvent::SubscriptionError { .. })
+    ));
+}
+
+#[tokio::test]
+async fn server_to_user_subscribe_errors_when_signed_in_as_different_user() {
+    use crate::auth::signature::user_signature;
+    let (mut c, mut rx) = ctx(app(false));
+    // Sign in as user "7" ...
+    let sig = user_signature("s", c.socket_id.as_str(), r#"{"id":"7"}"#);
+    c.dispatch(ClientCommand::Signin {
+        auth: format!("k:{sig}"),
+        user_data: r#"{"id":"7"}"#.into(),
+    })
+    .await;
+    let _ = rx.try_recv(); // drain signin_success
+                           // ... then try to subscribe to a DIFFERENT user's channel -> must be rejected.
+    c.dispatch(ClientCommand::Subscribe {
+        channel: "#server-to-user-9".into(),
+        auth: None,
+        channel_data: None,
+    })
+    .await;
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(ServerEvent::SubscriptionError { .. })
+    ));
+}
+
+#[tokio::test]
+async fn arbitrary_hash_channel_subscribe_errors() {
+    let (mut c, mut rx) = ctx(app(false));
+    c.dispatch(ClientCommand::Subscribe {
+        channel: "#some-reserved-channel".into(),
+        auth: None,
+        channel_data: None,
+    })
+    .await;
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(ServerEvent::SubscriptionError { .. })
+    ));
+}
