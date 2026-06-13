@@ -27,14 +27,21 @@ pub struct ChannelState {
 
 impl ChannelState {
     /// Add a subscriber. Returns `Some(PresenceJoin)` for presence channels.
-    pub fn add(&mut self, handle: ConnectionHandle, member: Option<PresenceMember>) -> Option<PresenceJoin> {
+    pub fn add(
+        &mut self,
+        handle: ConnectionHandle,
+        member: Option<PresenceMember>,
+    ) -> Option<PresenceJoin> {
         let socket_id = handle.socket_id.clone();
         let join = member.as_ref().map(|m| {
             let first_for_user = !self.users.contains_key(&m.user_id);
             let u = self
                 .users
                 .entry(m.user_id.clone())
-                .or_insert_with(|| PresenceUser { user_info: m.user_info.clone(), conn_count: 0 });
+                .or_insert_with(|| PresenceUser {
+                    user_info: m.user_info.clone(),
+                    conn_count: 0,
+                });
             u.conn_count += 1;
             PresenceJoin {
                 first_for_user,
@@ -42,7 +49,8 @@ impl ChannelState {
                 member: m.clone(),
             }
         });
-        self.subscribers.insert(socket_id, Subscriber { handle, member });
+        self.subscribers
+            .insert(socket_id, Subscriber { handle, member });
         join.map(|mut j| {
             j.roster = self.roster();
             j
@@ -66,7 +74,10 @@ impl ChannelState {
             }
             None => true,
         };
-        Some(PresenceLeave { last_for_user, user_id: member.user_id })
+        Some(PresenceLeave {
+            last_for_user,
+            user_id: member.user_id,
+        })
     }
 
     pub fn subscription_count(&self) -> usize {
@@ -75,10 +86,6 @@ impl ChannelState {
 
     pub fn is_empty(&self) -> bool {
         self.subscribers.is_empty()
-    }
-
-    pub fn is_presence(&self) -> bool {
-        !self.users.is_empty()
     }
 
     /// Distinct-user count (presence) — `None` for non-presence channels.
@@ -98,14 +105,21 @@ impl ChannelState {
         for id in &ids {
             hash.insert(id.clone(), self.users[id].user_info.clone());
         }
-        PresencePayload { count: ids.len(), ids, hash }
+        PresencePayload {
+            count: ids.len(),
+            ids,
+            hash,
+        }
     }
 
     pub fn members(&self) -> Vec<PresenceMember> {
         let mut ids: Vec<String> = self.users.keys().cloned().collect();
         ids.sort();
         ids.into_iter()
-            .map(|id| PresenceMember { user_info: self.users[&id].user_info.clone(), user_id: id })
+            .map(|id| PresenceMember {
+                user_info: self.users[&id].user_info.clone(),
+                user_id: id,
+            })
             .collect()
     }
 
@@ -127,11 +141,17 @@ mod tests {
 
     fn handle() -> ConnectionHandle {
         let (tx, _rx) = mpsc::unbounded_channel();
-        ConnectionHandle { socket_id: SocketId::generate(), mailbox: tx }
+        ConnectionHandle {
+            socket_id: SocketId::generate(),
+            mailbox: tx,
+        }
     }
 
     fn member(user_id: &str) -> PresenceMember {
-        PresenceMember { user_id: user_id.into(), user_info: serde_json::json!({"n": user_id}) }
+        PresenceMember {
+            user_id: user_id.into(),
+            user_info: serde_json::json!({"n": user_id}),
+        }
     }
 
     #[test]
@@ -157,7 +177,10 @@ mod tests {
         assert_eq!(j1.roster.count, 1);
 
         let j2 = s.add(h2, Some(member("u1"))).unwrap();
-        assert!(!j2.first_for_user, "second connection of same user is not first");
+        assert!(
+            !j2.first_for_user,
+            "second connection of same user is not first"
+        );
         assert_eq!(s.user_count(), Some(1));
         assert_eq!(s.subscription_count(), 2);
 
