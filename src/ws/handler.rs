@@ -163,6 +163,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_cache_channel_subscribes_as_public() {
+        // bare cache-foo must subscribe as public, not error 4009
+        let (mut c, mut rx) = ctx(app(false));
+        c.dispatch(ClientCommand::Subscribe {
+            channel: "cache-foo".into(),
+            auth: None,
+            channel_data: None,
+        })
+        .await;
+        assert!(
+            matches!(rx.try_recv(), Ok(ServerEvent::SubscriptionSucceeded { .. })),
+            "bare cache-foo must subscribe as public, not error 4009"
+        );
+    }
+
+    #[tokio::test]
     async fn subscription_count_emitted_when_enabled() {
         let (mut c, mut rx) = ctx(app(true));
         c.dispatch(ClientCommand::Subscribe {
