@@ -1,30 +1,16 @@
-//! Channel-name classification. SP1 only acts on `Public`; the auth-required and
-//! cache/encrypted kinds are recognized here but handled in SP2/SP3.
+//! Channel-name classification. Two orthogonal dimensions: the auth kind
+//! (public / private / presence / private-encrypted) and whether it is a cache
+//! channel (any auth kind plus a `cache-` segment after the auth prefix).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChannelKind {
+pub enum AuthKind {
     Public,
     Private,
     Presence,
     PrivateEncrypted,
-    Cache,
 }
 
-impl ChannelKind {
-    pub fn of(name: &str) -> ChannelKind {
-        if name.starts_with("private-encrypted-") {
-            ChannelKind::PrivateEncrypted
-        } else if name.starts_with("presence-") {
-            ChannelKind::Presence
-        } else if name.starts_with("private-") {
-            ChannelKind::Private
-        } else if name.starts_with("cache-") {
-            ChannelKind::Cache
-        } else {
-            ChannelKind::Public
-        }
-    }
-
+impl AuthKind {
     pub fn requires_auth(self) -> bool {
         matches!(
             self,
@@ -33,27 +19,62 @@ impl ChannelKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelInfo {
+    pub auth: AuthKind,
+    pub cache: bool,
+}
+
+impl ChannelInfo {
+    pub fn of(name: &str) -> ChannelInfo {
+        let (auth, rest) = if let Some(r) = name.strip_prefix("private-encrypted-") {
+            (AuthKind::PrivateEncrypted, r)
+        } else if let Some(r) = name.strip_prefix("presence-") {
+            (AuthKind::Presence, r)
+        } else if let Some(r) = name.strip_prefix("private-") {
+            (AuthKind::Private, r)
+        } else {
+            (AuthKind::Public, name)
+        };
+        ChannelInfo {
+            auth,
+            cache: rest.starts_with("cache-"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn classifies_by_prefix() {
-        assert_eq!(ChannelKind::of("my-channel"), ChannelKind::Public);
-        assert_eq!(ChannelKind::of("private-foo"), ChannelKind::Private);
-        assert_eq!(ChannelKind::of("presence-room"), ChannelKind::Presence);
-        assert_eq!(
-            ChannelKind::of("private-encrypted-x"),
-            ChannelKind::PrivateEncrypted
-        );
-        assert_eq!(ChannelKind::of("cache-feed"), ChannelKind::Cache);
+    fn classifies_all_eight_prefix_combinations() {
+        let cases = [
+            ("foo", AuthKind::Public, false),
+            ("cache-foo", AuthKind::Public, true),
+            ("private-foo", AuthKind::Private, false),
+            ("private-cache-foo", AuthKind::Private, true),
+            ("presence-foo", AuthKind::Presence, false),
+            ("presence-cache-foo", AuthKind::Presence, true),
+            ("private-encrypted-foo", AuthKind::PrivateEncrypted, false),
+            (
+                "private-encrypted-cache-foo",
+                AuthKind::PrivateEncrypted,
+                true,
+            ),
+        ];
+        for (name, auth, cache) in cases {
+            let info = ChannelInfo::of(name);
+            assert_eq!(info.auth, auth, "auth for {name}");
+            assert_eq!(info.cache, cache, "cache for {name}");
+        }
     }
 
     #[test]
     fn auth_requirement() {
-        assert!(!ChannelKind::Public.requires_auth());
-        assert!(ChannelKind::Private.requires_auth());
-        assert!(ChannelKind::Presence.requires_auth());
-        assert!(ChannelKind::PrivateEncrypted.requires_auth());
+        assert!(!AuthKind::Public.requires_auth());
+        assert!(AuthKind::Private.requires_auth());
+        assert!(AuthKind::Presence.requires_auth());
+        assert!(AuthKind::PrivateEncrypted.requires_auth());
     }
 }

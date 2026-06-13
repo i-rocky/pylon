@@ -1,7 +1,7 @@
 //! Subscribe/unsubscribe and client-event handling, split from `ws::handler`.
 
 use super::handler::ConnectionContext;
-use crate::channel::kind::ChannelKind;
+use crate::channel::kind::{AuthKind, ChannelInfo};
 use crate::protocol::error::PusherError;
 use crate::protocol::event::ServerEvent;
 use serde_json::Value;
@@ -18,8 +18,9 @@ impl ConnectionContext {
         if self.subscribed.contains(&channel) {
             return;
         }
-        match ChannelKind::of(&channel) {
-            ChannelKind::Public => {
+        let info = ChannelInfo::of(&channel);
+        match info.auth {
+            AuthKind::Public => {
                 let out = self
                     .adapter
                     .subscribe(&self.app.id, &channel, self.handle(), None)
@@ -32,7 +33,7 @@ impl ConnectionContext {
                 self.maybe_emit_count(&channel, out.subscription_count)
                     .await;
             }
-            ChannelKind::Private => {
+            AuthKind::Private => {
                 let token = match auth.as_deref() {
                     Some(t) => t,
                     None => {
@@ -66,7 +67,7 @@ impl ConnectionContext {
                 self.maybe_emit_count(&channel, out.subscription_count)
                     .await;
             }
-            ChannelKind::Presence => {
+            AuthKind::Presence => {
                 let token = match auth.as_deref() {
                     Some(t) => t,
                     None => {
@@ -159,8 +160,10 @@ impl ConnectionContext {
                 self.maybe_emit_count(&channel, out.subscription_count)
                     .await;
             }
-            // encrypted / cache require auth — SP3.
-            _ => self.send_self(ServerEvent::Error(PusherError::unauthorized())),
+            // Encrypted subscribe is added in Phase B; placeholder for now.
+            AuthKind::PrivateEncrypted => {
+                self.send_self(ServerEvent::Error(PusherError::unauthorized()))
+            }
         }
     }
 
@@ -188,10 +191,10 @@ impl ConnectionContext {
             return;
         }
         // Client events are valid only on private/presence channels the sender joined.
-        let kind = ChannelKind::of(&channel);
+        let auth = ChannelInfo::of(&channel).auth;
         let allowed = matches!(
-            kind,
-            ChannelKind::Private | ChannelKind::Presence | ChannelKind::PrivateEncrypted
+            auth,
+            AuthKind::Private | AuthKind::Presence | AuthKind::PrivateEncrypted
         );
         if !allowed || !self.subscribed.contains(&channel) {
             return; // silently dropped, matching Soketi/Pusher
