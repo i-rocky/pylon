@@ -8,6 +8,7 @@ use crate::protocol::command::ClientCommand;
 use crate::protocol::error::PusherError;
 use crate::protocol::event::ServerEvent;
 use crate::protocol::socket_id::SocketId;
+use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
@@ -42,13 +43,11 @@ impl ConnectionContext {
                 channel_data,
             } => self.subscribe(channel, auth, channel_data).await,
             ClientCommand::Unsubscribe { channel } => self.unsubscribe(channel).await,
-            ClientCommand::ClientEvent { .. } => {
-                // Client events are valid only on private/presence channels (SP2).
-                self.send_self(ServerEvent::Error(PusherError::new(
-                    4301,
-                    "Client events are only supported on private and presence channels",
-                )));
-            }
+            ClientCommand::ClientEvent {
+                event,
+                channel,
+                data,
+            } => self.client_event(event, channel, data).await,
             ClientCommand::Unknown(_) => {}
         }
     }
@@ -214,6 +213,42 @@ impl ConnectionContext {
         });
     }
 
+    async fn client_event(&self, event: String, channel: String, data: Value) {
+        if !self.app.client_messages_enabled {
+            self.send_self(ServerEvent::Error(PusherError::new(
+                4301,
+                "The app does not have client messaging enabled.",
+            )));
+            return;
+        }
+        // Client events are valid only on private/presence channels the sender joined.
+        let kind = ChannelKind::of(&channel);
+        let allowed = matches!(
+            kind,
+            ChannelKind::Private | ChannelKind::Presence | ChannelKind::PrivateEncrypted
+        );
+        if !allowed || !self.subscribed.contains(&channel) {
+            return; // silently dropped, matching Soketi/Pusher
+        }
+        // Oversize client-event payloads are silently dropped.
+        if serde_json::to_string(&data).map_or(0, |s| s.len()) > self.limits.max_event_payload_bytes
+        {
+            return;
+        }
+        self.adapter
+            .broadcast(
+                &self.app.id,
+                &channel,
+                ServerEvent::ChannelEvent {
+                    channel: channel.clone(),
+                    event,
+                    data,
+                },
+                Some(self.socket_id.clone()),
+            )
+            .await;
+    }
+
     async fn unsubscribe(&mut self, channel: String) {
         if self.subscribed.remove(&channel) {
             let out = self
@@ -270,7 +305,6 @@ mod tests {
     use super::*;
     use crate::adapter::local::LocalAdapter;
     use crate::channel::registry::Registry;
-    use serde_json::Value;
     use tokio::sync::mpsc;
 
     fn app(sub_count: bool) -> App {
@@ -278,6 +312,14 @@ mod tests {
             "name": "t", "id": "app", "key": "k", "secret": "s",
             "client_messages_enabled": true,
             "subscription_count_enabled": sub_count
+        }))
+        .unwrap()
+    }
+
+    fn app_with_client_messages(enabled: bool) -> App {
+        serde_json::from_value::<App>(serde_json::json!({
+            "name": "t", "id": "app", "key": "k", "secret": "s",
+            "client_messages_enabled": enabled, "subscription_count_enabled": false
         }))
         .unwrap()
     }
@@ -464,17 +506,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_event_rejected_in_sp1() {
-        let (mut c, mut rx) = ctx(app(true));
+    async fn client_event_rejected_when_messaging_disabled() {
+        let (mut c, mut rx) = ctx(app_with_client_messages(false));
         c.dispatch(ClientCommand::ClientEvent {
             event: "client-x".into(),
-            channel: "room".into(),
-            data: Value::Null,
+            channel: "private-x".into(),
+            data: serde_json::json!({}),
         })
         .await;
         match rx.try_recv() {
             Ok(ServerEvent::Error(e)) => assert_eq!(e.code, 4301),
-            other => panic!("expected Error 4301, got {other:?}"),
+            other => panic!("expected 4301, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn client_event_dropped_when_not_subscribed() {
+        let (mut c, mut rx) = ctx(app_with_client_messages(true));
+        c.dispatch(ClientCommand::ClientEvent {
+            event: "client-x".into(),
+            channel: "private-x".into(),
+            data: serde_json::json!({}),
+        })
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "unsubscribed client event is silently dropped"
+        );
     }
 }
