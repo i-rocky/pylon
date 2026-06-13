@@ -524,6 +524,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn presence_cache_subscribe_replays_after_join() {
+        let (mut c, mut rx) = ctx(app(false));
+        // Seed the cache for the presence-cache channel (app id "app" matches the harness).
+        c.adapter
+            .cache_set(
+                "app",
+                "presence-cache-room",
+                crate::channel::cache::CachedEvent {
+                    event: "my-event".into(),
+                    data: "{\"hi\":1}".into(),
+                },
+                std::time::Duration::from_secs(60),
+            )
+            .await;
+        let sid = c.socket_id.as_str().to_string();
+        let channel_data = serde_json::json!({"user_id":"u1","user_info":{"name":"U"}}).to_string();
+        let sig = crate::auth::signature::channel_signature(
+            "s",
+            &sid,
+            "presence-cache-room",
+            Some(&channel_data),
+        );
+        c.dispatch(ClientCommand::Subscribe {
+            channel: "presence-cache-room".into(),
+            auth: Some(format!("k:{sig}")),
+            channel_data: Some(channel_data),
+        })
+        .await;
+        // First the roster success frame, then the replayed cached event.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::SubscriptionSucceeded { .. })
+        ));
+        match rx.try_recv() {
+            Ok(ServerEvent::ChannelEvent { channel, event, .. }) => {
+                assert_eq!(channel, "presence-cache-room");
+                assert_eq!(event, "my-event");
+            }
+            other => panic!("expected replayed ChannelEvent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn presence_over_member_cap_errors() {
         let registry = Arc::new(Registry::new());
         let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));

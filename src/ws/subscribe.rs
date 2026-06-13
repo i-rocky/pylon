@@ -138,8 +138,8 @@ impl ConnectionContext {
                     .adapter
                     .subscribe(&self.app.id, &channel, self.handle(), Some(member))
                     .await;
-                self.subscribed.insert(channel.clone());
                 if let Some(join) = out.presence {
+                    self.subscribed.insert(channel.clone());
                     self.send_self(ServerEvent::SubscriptionSucceeded {
                         channel: channel.clone(),
                         presence: Some(join.roster),
@@ -168,16 +168,15 @@ impl ConnectionContext {
         // this new subscriber only — or signal a miss. `subscribed` contains the
         // channel iff the subscribe above succeeded (auth failures returned early).
         if info.cache && self.subscribed.contains(&channel) {
-            match self.adapter.cache_get(&self.app.id, &channel).await {
-                Some(cached) => self.send_self(ServerEvent::ChannelEvent {
-                    channel: channel.clone(),
+            let event = match self.adapter.cache_get(&self.app.id, &channel).await {
+                Some(cached) => ServerEvent::ChannelEvent {
+                    channel,
                     event: cached.event,
                     data: Value::String(cached.data),
-                }),
-                None => self.send_self(ServerEvent::CacheMiss {
-                    channel: channel.clone(),
-                }),
-            }
+                },
+                None => ServerEvent::CacheMiss { channel },
+            };
+            self.send_self(event);
         }
     }
 
