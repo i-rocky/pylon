@@ -12,6 +12,10 @@ use std::collections::HashMap;
 pub struct UserRegistry {
     // (app_id, user_id) -> { socket_id -> handle }
     users: DashMap<(String, String), HashMap<SocketId, ConnectionHandle>>,
+    // (app_id, watched_user_id) -> { socket_id -> watcher handle }
+    watchers: DashMap<(String, String), HashMap<SocketId, ConnectionHandle>>,
+    // (app_id, socket_id) -> watched user_ids (for O(1) disconnect cleanup)
+    watching: DashMap<(String, SocketId), Vec<String>>,
 }
 
 impl UserRegistry {
@@ -59,6 +63,52 @@ impl UserRegistry {
             .get(&(app.to_string(), user_id.to_string()))
             .is_some_and(|e| !e.is_empty())
     }
+
+    pub fn watch(&self, app: &str, handle: ConnectionHandle, watched: Vec<String>) -> Vec<String> {
+        let sock = handle.socket_id.clone();
+        // Idempotent: drop any prior watch state for this connection before
+        // recording the new one, so a re-watch can't leak stale `watchers` entries.
+        self.unwatch(app, &sock);
+        for w in &watched {
+            self.watchers
+                .entry((app.to_string(), w.clone()))
+                .or_default()
+                .insert(sock.clone(), handle.clone());
+        }
+        let online = watched
+            .iter()
+            .filter(|w| self.is_online(app, w))
+            .cloned()
+            .collect();
+        self.watching.insert((app.to_string(), sock), watched);
+        online
+    }
+
+    pub fn unwatch(&self, app: &str, socket_id: &SocketId) {
+        let Some((_, watched)) = self.watching.remove(&(app.to_string(), socket_id.clone())) else {
+            return;
+        };
+        for w in watched {
+            let key = (app.to_string(), w);
+            // Drop the get_mut guard before the conditional remove (deadlock avoidance),
+            // and use remove_if so a concurrent watch that repopulated the set is not
+            // clobbered — same pattern as signout / channel::Registry.
+            {
+                let Some(mut set) = self.watchers.get_mut(&key) else {
+                    continue;
+                };
+                set.remove(socket_id);
+            }
+            self.watchers.remove_if(&key, |_, set| set.is_empty());
+        }
+    }
+
+    pub fn watchers_of(&self, app: &str, user_id: &str) -> Vec<ConnectionHandle> {
+        self.watchers
+            .get(&(app.to_string(), user_id.to_string()))
+            .map(|e| e.values().cloned().collect())
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -101,5 +151,44 @@ mod tests {
         assert!(!r.signout("app", "u", &s1).last_for_user);
         assert!(r.signout("app", "u", &s2).last_for_user);
         assert!(!r.is_online("app", "u"));
+    }
+
+    #[test]
+    fn watch_returns_online_subset_and_watchers_resolve() {
+        let r = UserRegistry::new();
+        let (online_user, _o) = handle();
+        r.signin("app", "b", online_user); // b is online; c is not
+        let (watcher, _w) = handle();
+        let sock = watcher.socket_id.clone();
+        let online = r.watch("app", watcher, vec!["b".into(), "c".into()]);
+        assert_eq!(online, vec!["b".to_string()]); // only b currently online
+        assert_eq!(r.watchers_of("app", "b").len(), 1);
+        r.unwatch("app", &sock);
+        assert!(r.watchers_of("app", "b").is_empty());
+    }
+
+    #[test]
+    fn rewatch_replaces_prior_watchlist_without_leak() {
+        let r = UserRegistry::new();
+        let (watcher, _w) = handle();
+        let sock = watcher.socket_id.clone();
+        // First watch covers a and b.
+        r.watch("app", watcher.clone(), vec!["a".into(), "b".into()]);
+        assert_eq!(r.watchers_of("app", "a").len(), 1);
+        assert_eq!(r.watchers_of("app", "b").len(), 1);
+        // Re-watch with a different set must DROP the stale a/b entries (only c remains).
+        r.watch("app", watcher, vec!["c".into()]);
+        assert!(
+            r.watchers_of("app", "a").is_empty(),
+            "stale watcher for a leaked"
+        );
+        assert!(
+            r.watchers_of("app", "b").is_empty(),
+            "stale watcher for b leaked"
+        );
+        assert_eq!(r.watchers_of("app", "c").len(), 1);
+        // And a final unwatch clears everything.
+        r.unwatch("app", &sock);
+        assert!(r.watchers_of("app", "c").is_empty());
     }
 }

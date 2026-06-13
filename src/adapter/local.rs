@@ -125,6 +125,23 @@ impl Adapter for LocalAdapter {
         }
     }
 
+    async fn watch(
+        &self,
+        app: &str,
+        handle: ConnectionHandle,
+        watched: Vec<String>,
+    ) -> Vec<String> {
+        self.users.watch(app, handle, watched)
+    }
+
+    async fn unwatch(&self, app: &str, socket_id: &SocketId) {
+        self.users.unwatch(app, socket_id)
+    }
+
+    async fn watchers_of(&self, app: &str, user_id: &str) -> Vec<ConnectionHandle> {
+        self.users.watchers_of(app, user_id)
+    }
+
     async fn terminate_user(&self, app: &str, user_id: &str) -> Vec<SocketId> {
         let handles = self.users.handles(app, user_id);
         let ids = handles.iter().map(|h| h.socket_id.clone()).collect();

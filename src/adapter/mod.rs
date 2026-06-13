@@ -79,4 +79,14 @@ pub trait Adapter: Send + Sync {
     /// Close every connection of `user_id` (terminate). Returns the closed
     /// socket ids. Connections clean themselves up via their task's on_close.
     async fn terminate_user(&self, app: &str, user_id: &str) -> Vec<SocketId>;
+
+    /// Register `handle` as watching `watched`; returns the currently-online subset.
+    async fn watch(&self, app: &str, handle: ConnectionHandle, watched: Vec<String>)
+        -> Vec<String>;
+
+    /// Drop this connection from every watchlist (disconnect cleanup).
+    async fn unwatch(&self, app: &str, socket_id: &SocketId);
+
+    /// Connections watching `user_id` (to notify on its online/offline transition).
+    async fn watchers_of(&self, app: &str, user_id: &str) -> Vec<ConnectionHandle>;
 }
