@@ -53,6 +53,11 @@ pub enum ServerEvent {
         channel: String,
         user_id: String,
     },
+    /// `pusher:cache_miss` — sent to a new cache-channel subscriber when no event
+    /// is cached. Carries only the channel (no `data` field).
+    CacheMiss {
+        channel: String,
+    },
 }
 
 #[cfg(test)]

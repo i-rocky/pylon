@@ -68,6 +68,9 @@ pub fn encode(event: &ServerEvent) -> String {
             json!({ "event": "pusher_internal:member_removed", "channel": channel, "data": data })
                 .to_string()
         }
+        ServerEvent::CacheMiss { channel } => {
+            json!({ "event": "pusher:cache_miss", "channel": channel }).to_string()
+        }
     }
 }
 
@@ -292,6 +295,19 @@ mod tests {
         let data = parse(out["data"].as_str().unwrap());
         assert_eq!(data["user_id"], "u1");
         assert!(data.get("user_info").is_none());
+    }
+
+    #[test]
+    fn cache_miss_frame_has_no_data_field() {
+        let out = parse(&encode(&ServerEvent::CacheMiss {
+            channel: "cache-x".into(),
+        }));
+        assert_eq!(out["event"], "pusher:cache_miss");
+        assert_eq!(out["channel"], "cache-x");
+        assert!(
+            out.get("data").is_none(),
+            "cache_miss carries no data field"
+        );
     }
 
     #[test]
