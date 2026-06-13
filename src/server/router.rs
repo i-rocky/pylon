@@ -18,8 +18,8 @@ pub struct AppState {
 }
 
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/", get(crate::http::root))
-        .route("/app/{key}", get(crate::ws::upgrade::upgrade))
-        .with_state(state)
+        .route("/app/{key}", get(crate::ws::upgrade::upgrade));
+    crate::http::rest::merge(router).with_state(state)
 }
