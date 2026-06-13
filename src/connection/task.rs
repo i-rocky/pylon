@@ -50,6 +50,7 @@ pub async fn run(socket: WebSocket, codec: Box<dyn Codec>, params: ConnectionPar
         adapter: params.adapter.clone(),
         limits: params.limits,
         subscribed: HashSet::new(),
+        user: None,
     };
 
     let activity = Duration::from_secs(params.activity_timeout as u64);

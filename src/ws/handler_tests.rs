@@ -31,6 +31,7 @@ fn ctx(app: App) -> (ConnectionContext, mpsc::UnboundedReceiver<ServerEvent>) {
         adapter,
         limits: crate::server::config::ServerConfig::default().limits(),
         subscribed: HashSet::new(),
+        user: None,
     };
     (c, rx)
 }
@@ -233,6 +234,7 @@ async fn presence_unsubscribe_broadcasts_member_removed_to_others() {
             adapter,
             limits: crate::server::config::ServerConfig::default().limits(),
             subscribed: HashSet::new(),
+            user: None,
         };
         (c, rx)
     };
@@ -329,6 +331,7 @@ async fn client_event_on_encrypted_channel_is_dropped() {
             adapter,
             limits: crate::server::config::ServerConfig::default().limits(),
             subscribed: HashSet::new(),
+            user: None,
         };
         (c, rx)
     };
@@ -523,6 +526,7 @@ async fn presence_over_member_cap_errors() {
             adapter: adapter.clone(),
             limits,
             subscribed: HashSet::new(),
+            user: None,
         };
         (c, rx)
     };

@@ -17,6 +17,7 @@ pub struct ConnectionContext {
     pub adapter: Arc<dyn Adapter>,
     pub limits: crate::server::config::Limits,
     pub subscribed: HashSet<String>,
+    pub user: Option<crate::user::AuthenticatedUser>,
 }
 
 impl ConnectionContext {
@@ -45,9 +46,7 @@ impl ConnectionContext {
                 channel,
                 data,
             } => self.client_event(event, channel, data).await,
-            ClientCommand::Signin { .. } => {
-                // TODO(SP4): handle pusher:signin — validate auth and emit SigninSuccess
-            }
+            ClientCommand::Signin { auth, user_data } => self.signin(auth, user_data).await,
             ClientCommand::Unknown(_) => {}
         }
     }
