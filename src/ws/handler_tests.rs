@@ -556,3 +556,22 @@ async fn presence_over_member_cap_errors() {
         other => panic!("expected LimitReached SubscriptionError, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn on_close_signs_out_bound_user() {
+    use crate::auth::signature::user_signature;
+    // app(false): key "k" / secret "s" / id "app"
+    let (mut c, _rx) = ctx(app(false));
+    let sig = user_signature("s", c.socket_id.as_str(), r#"{"id":"9"}"#);
+    c.dispatch(ClientCommand::Signin {
+        auth: format!("k:{sig}"),
+        user_data: r#"{"id":"9"}"#.into(),
+    })
+    .await;
+    assert!(c.user.is_some(), "user must be bound after signin");
+    c.on_close().await;
+    assert!(
+        !c.adapter.is_user_online("app", "9").await,
+        "user must be signed out after connection close"
+    );
+}

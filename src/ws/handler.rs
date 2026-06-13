@@ -93,11 +93,16 @@ impl ConnectionContext {
         }
     }
 
-    /// On disconnect: leave every channel (emitting count updates).
+    /// On disconnect: leave every channel, then sign out any bound user.
     pub async fn on_close(&mut self) {
         let channels: Vec<String> = self.subscribed.iter().cloned().collect();
         for channel in channels {
             self.unsubscribe(channel).await;
+        }
+        if let Some(user) = self.user.take() {
+            self.adapter
+                .signout_user(&self.app.id, &user.id, &self.socket_id)
+                .await;
         }
     }
 }

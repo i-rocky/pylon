@@ -69,4 +69,7 @@ pub trait Adapter: Send + Sync {
         user_id: &str,
         socket_id: &SocketId,
     ) -> UserLeaveOutcome;
+
+    /// True while `user_id` has at least one live signed-in connection.
+    async fn is_user_online(&self, app: &str, user_id: &str) -> bool;
 }

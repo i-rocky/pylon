@@ -113,6 +113,10 @@ impl Adapter for LocalAdapter {
     ) -> UserLeaveOutcome {
         self.users.signout(app, user_id, socket_id)
     }
+
+    async fn is_user_online(&self, app: &str, user_id: &str) -> bool {
+        self.users.is_online(app, user_id)
+    }
 }
 
 #[cfg(test)]
