@@ -19,6 +19,9 @@ mio = { version = "1", features = ["os-poll", "net"] }
 httparse = "1"
 # O(1) connection table keyed by the mio Token value for the per-core worker (SP9).
 slab = "0.4"
+# Serve axum REST connections handed off from the per-core mio worker to the
+# tokio runtime (SP9 REST handoff): auto HTTP/1+2 server + tower→hyper glue.
+hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "service", "http1", "http2"] }
 # RFC 6455 Sec-WebSocket-Accept = base64(sha1(key + GUID)).
 sha1 = "0.10"
 base64 = "0.22"

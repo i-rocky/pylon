@@ -13,6 +13,7 @@
 pub mod conn;
 pub mod frame;
 pub mod handshake;
+pub mod rest;
 pub mod worker;
 
 use crate::adapter::Adapter;
@@ -22,7 +23,10 @@ use crate::webhook::WebhookHandle;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
+use tokio::sync::mpsc::UnboundedSender;
 use worker::{DispatchEnv, Mode, WorkerConfig};
+
+pub use rest::RestConn;
 
 /// Run the per-core (`PYLON_TRANSPORT=percore`) worker as the actual server.
 ///
@@ -32,15 +36,21 @@ use worker::{DispatchEnv, Mode, WorkerConfig};
 /// until `shutdown` is observed (or a fatal bind/poll error occurs).
 ///
 /// Single worker for now; multi-worker `SO_REUSEPORT` fan-out is a later task.
-/// REST handling in percore mode is deferred — the worker closes non-WS
-/// connections (`HeadResult::Rest`), so this enables WS connection + the full
-/// v7 protocol, which is what the benchmark exercises next.
+///
+/// REST handling (SP9 §3.4): the worker no longer closes non-WS connections. On
+/// a `HeadResult::Rest` head it transfers the accepted fd (plus the head bytes
+/// already read) over `rest_handoff` to the tokio/axum REST plane spawned by the
+/// caller via [`rest::serve`]. WS connections + the full v7 protocol run on this
+/// worker thread as before. `rest_handoff` is `None` only in tests that exercise
+/// the worker without a REST plane.
+#[allow(clippy::too_many_arguments)]
 pub fn run_percore(
     config: ServerConfig,
     apps: Arc<dyn AppManager>,
     adapter: Arc<dyn Adapter>,
     conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>>,
     webhooks: WebhookHandle,
+    rest_handoff: Option<UnboundedSender<RestConn>>,
     shutdown: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     let addr: std::net::SocketAddr = format!("{}:{}", config.bind, config.port)
@@ -69,6 +79,7 @@ pub fn run_percore(
         max_payload,
         high_water,
         mode: Mode::Dispatch(Arc::new(env)),
+        rest_handoff,
     };
 
     tracing::info!(

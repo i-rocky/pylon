@@ -1,4 +1,9 @@
-#![forbid(unsafe_code)]
+// `deny` (not `forbid`) so the single maintainer-approved unsafe site — the fd
+// transfer in `transport::rest` that moves an accepted connection from the mio
+// worker to the tokio/axum REST plane (SP9) — can opt in via a local
+// `#[allow(unsafe_code)]` with a `// SAFETY:` justification. `forbid` cannot be
+// overridden by a local `allow`; every other module remains unsafe-free.
+#![deny(unsafe_code)]
 //! pylon — a Pusher-compatible real-time WebSocket server.
 
 pub mod adapter;

@@ -84,6 +84,10 @@ pub struct WorkerConfig {
     pub high_water: usize,
     /// Behaviour applied to inbound frames.
     pub mode: Mode,
+    /// Sink for plain-HTTP (REST) connections accepted here but served on the
+    /// tokio/axum plane (SP9 §3.4). `None` ⇒ no REST plane (the worker's own
+    /// tests); a `Rest` head is then closed as before.
+    pub rest_handoff: Option<mpsc::UnboundedSender<crate::transport::rest::RestConn>>,
 }
 
 /// Worker behaviour for inbound frames.
@@ -168,11 +172,18 @@ pub fn run(cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<()> 
                         continue;
                     }
 
-                    if event.is_readable()
-                        && handle_readable(&poll, &mut conns, key, &cfg) == Action::Close
-                    {
-                        remove(&poll, &mut conns, key);
-                        continue;
+                    if event.is_readable() {
+                        match handle_readable(&poll, &mut conns, key, &cfg) {
+                            Action::Close => {
+                                remove(&poll, &mut conns, key);
+                                continue;
+                            }
+                            Action::Handoff(prefix) => {
+                                handoff_rest(&poll, &mut conns, key, &cfg, prefix);
+                                continue;
+                            }
+                            Action::Keep => {}
+                        }
                     }
 
                     if event.is_writable()
@@ -196,11 +207,16 @@ pub fn run(cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<()> 
     }
 }
 
-/// Outcome of handling a connection event: keep it or close it.
+/// Outcome of handling a connection event: keep it, close it, or hand it off to
+/// the tokio/axum REST plane.
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
     Keep,
     Close,
+    /// A plain-HTTP request head was detected: transfer the connection (and the
+    /// `Vec<u8>` of bytes already read off the socket, to be replayed) to the
+    /// REST handoff channel. Carries the bytes to replay.
+    Handoff(Vec<u8>),
 }
 
 /// Drain the listener's accept backlog, registering every accepted socket.
@@ -305,8 +321,18 @@ fn handle_handshake(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig) -> Actio
 
             flush_and_arm(poll, entry)
         }
-        // TODO(3.4): hand off to the tokio REST control plane (replay the head).
-        HeadResult::Rest { .. } => Action::Close,
+        // A plain-HTTP request (a Pusher REST publish): hand the connection off
+        // to the tokio/axum plane. We have read *all* currently-available bytes
+        // into `inbuf` (head + any body that arrived with it); the whole buffer
+        // is the prefix to replay to the HTTP parser. With no REST plane wired
+        // (`rest_handoff == None`, e.g. the worker's own echo tests) we close.
+        HeadResult::Rest { .. } => {
+            if cfg.rest_handoff.is_some() {
+                Action::Handoff(entry.inbuf.to_vec())
+            } else {
+                Action::Close
+            }
+        }
         HeadResult::Bad(_) => Action::Close,
     }
 }
@@ -637,6 +663,45 @@ fn drain_into(conn: &mut Connection, buf: &mut BytesMut) -> ReadOutcome {
     }
 }
 
+/// Transfer a plain-HTTP connection to the tokio/axum REST plane (SP9 §3.4).
+///
+/// Order matters: deregister the stream from this `Poll` and remove the slab
+/// entry BEFORE moving the fd out of mio, so mio's registry/slab no longer
+/// reference it. Then [`rest::mio_to_std`] transfers fd ownership into a
+/// `std::net::TcpStream` (the single audited `unsafe` site), and the connection
+/// plus its already-read `prefix` bytes are sent to the handoff channel. The
+/// stream stays non-blocking (inherited from mio), which is what tokio wants.
+///
+/// On a missing handoff sender, or a closed channel, the connection is simply
+/// dropped (closed). A pre-handshake REST connection never has a [`Session`], so
+/// no on-close hook / counter decrement is needed.
+fn handoff_rest(
+    poll: &Poll,
+    conns: &mut slab::Slab<Entry>,
+    key: usize,
+    cfg: &WorkerConfig,
+    prefix: Vec<u8>,
+) {
+    let Some(mut entry) = conns.try_remove(key) else {
+        return;
+    };
+    let _ = poll.registry().deregister(&mut entry.conn.stream);
+
+    let Some(tx) = cfg.rest_handoff.as_ref() else {
+        // No REST plane; dropping `entry` closes the socket.
+        return;
+    };
+
+    let std_stream = crate::transport::rest::mio_to_std(entry.conn.into_stream());
+    if let Err(e) = tx.send(crate::transport::rest::RestConn {
+        fd_stream: std_stream,
+        prefix,
+    }) {
+        // Receiver gone (REST task ended): dropping the RestConn closes the fd.
+        tracing::debug!(error = %e, "REST handoff channel closed; dropping connection");
+    }
+}
+
 /// Remove a connection: run the protocol on-close hook (dispatch only),
 /// decrement the app's connection counter, deregister its socket, and drop the
 /// slab entry.
@@ -677,6 +742,7 @@ mod tests {
                     max_payload: 1 << 20,
                     high_water: 1 << 20,
                     mode: Mode::Echo,
+                    rest_handoff: None,
                 },
                 sd,
             )

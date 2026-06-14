@@ -87,6 +87,7 @@ async fn spawn(config: ServerConfig) -> Harness {
                 max_payload: 1 << 20,
                 high_water: 1 << 20,
                 mode: Mode::Dispatch(env),
+                rest_handoff: None,
             },
             sd,
         )

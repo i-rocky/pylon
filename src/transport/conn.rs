@@ -97,6 +97,17 @@ impl Connection {
         }
     }
 
+    /// Consume the connection and return ownership of its underlying socket.
+    ///
+    /// Used by the per-core worker's REST handoff (SP9 §3.4): a plain-HTTP
+    /// connection is removed from the slab and its `mio` stream moved out, to be
+    /// converted to a `std::net::TcpStream` and handed to the tokio/axum plane.
+    /// Any queued outbound bytes are discarded (a REST connection has none — the
+    /// head was only ever read).
+    pub fn into_stream(self) -> mio::net::TcpStream {
+        self.stream
+    }
+
     /// Queue a pre-encoded frame for sending.
     ///
     /// If appending would push the total queued bytes past `high_water`, the

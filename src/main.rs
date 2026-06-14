@@ -101,6 +101,25 @@ async fn main() -> anyhow::Result<()> {
             // future resolves. Webhooks/adapter background tasks (e.g. the Redis
             // sweeper) were already spawned on this tokio runtime above and keep
             // running independently of the worker thread.
+            //
+            // REST handoff (SP9 §3.4): the worker accepts every connection but
+            // can only drive WS itself. It transfers plain-HTTP (Pusher REST
+            // publish) connections over `rest_tx` to a tokio task that serves
+            // them with the SAME axum `Router` the legacy transport uses. The
+            // task is spawned HERE, on the runtime, BEFORE the blocking worker
+            // call — so a runtime handle exists to serve the handed-off fds.
+            let (rest_tx, rest_rx) =
+                tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
+            let rest_state = AppState {
+                config: config.clone(),
+                apps: apps.clone(),
+                adapter: adapter.clone(),
+                conn_counts: conn_counts.clone(),
+                webhooks: webhooks.clone(),
+            };
+            let rest_router = build_router(rest_state);
+            tokio::spawn(pylon::transport::rest::serve(rest_rx, rest_router));
+
             let shutdown = Arc::new(AtomicBool::new(false));
             let worker_shutdown = shutdown.clone();
             let worker_config = config.clone();
@@ -111,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
                     adapter,
                     conn_counts,
                     webhooks,
+                    Some(rest_tx),
                     worker_shutdown,
                 )
             });
