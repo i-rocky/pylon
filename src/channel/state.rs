@@ -130,12 +130,22 @@ impl ChannelState {
     }
 
     /// Deliver `event` to every subscriber's mailbox except `except`.
+    ///
+    /// Encode the wire frame ONCE here and fan out cheap `Arc<str>` clones rather
+    /// than re-encoding in every connection task (was N encodes + N deep clones for
+    /// N local subscribers). If the event is already pre-encoded (`Raw`, e.g. a
+    /// broadcast relayed verbatim from another node), reuse its `Arc`. Control
+    /// events (`Close`) never reach `broadcast`.
     pub fn broadcast(&self, event: &ServerEvent, except: Option<&SocketId>) {
+        let frame: std::sync::Arc<str> = match event {
+            ServerEvent::Raw(f) => f.clone(),
+            other => std::sync::Arc::from(crate::protocol::v7::frames::encode(other).as_str()),
+        };
         for (sid, sub) in &self.subscribers {
             if Some(sid) == except {
                 continue;
             }
-            let _ = sub.handle.mailbox.send(event.clone());
+            let _ = sub.handle.mailbox.send(ServerEvent::Raw(frame.clone()));
         }
     }
 }
@@ -151,6 +161,17 @@ mod tests {
             socket_id: SocketId::generate(),
             mailbox: tx,
         }
+    }
+
+    fn handle_with_rx() -> (ConnectionHandle, mpsc::UnboundedReceiver<ServerEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            ConnectionHandle {
+                socket_id: SocketId::generate(),
+                mailbox: tx,
+            },
+            rx,
+        )
     }
 
     fn member(user_id: &str) -> PresenceMember {
@@ -196,6 +217,32 @@ mod tests {
         assert!(l2.last_for_user);
         assert_eq!(l2.user_id, "u1");
         assert_eq!(s.user_count(), None);
+    }
+
+    #[test]
+    fn broadcast_encodes_once_and_fans_out_raw() {
+        let mut s = ChannelState::default();
+        let (h1, mut rx1) = handle_with_rx();
+        let (h2, mut rx2) = handle_with_rx();
+        s.add(h1, None);
+        s.add(h2, None);
+
+        let original = ServerEvent::ChannelEvent {
+            channel: "my-channel".into(),
+            event: "my-event".into(),
+            data: serde_json::json!({"x": 1}),
+            user_id: None,
+        };
+        let expected = crate::protocol::v7::frames::encode(&original);
+
+        s.broadcast(&original, None);
+
+        for rx in [&mut rx1, &mut rx2] {
+            match rx.try_recv().expect("subscriber received a frame") {
+                ServerEvent::Raw(f) => assert_eq!(&*f, expected.as_str()),
+                other => panic!("expected Raw, got {other:?}"),
+            }
+        }
     }
 
     #[test]

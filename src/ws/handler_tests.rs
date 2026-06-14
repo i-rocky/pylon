@@ -77,6 +77,25 @@ fn ctx(app: App) -> (ConnectionContext, mpsc::UnboundedReceiver<ServerEvent>) {
     (c, rx)
 }
 
+/// Broadcasts are now encoded once upstream and delivered to subscriber mailboxes
+/// as `ServerEvent::Raw(frame)`. Decode such a frame back into its JSON `Value` so
+/// tests can assert on wire content. Panics if `ev` is not a `Raw` frame.
+fn raw_json(ev: &ServerEvent) -> serde_json::Value {
+    match ev {
+        ServerEvent::Raw(f) => serde_json::from_str(f).expect("Raw frame must be valid JSON"),
+        other => panic!("expected Raw broadcast frame, got {other:?}"),
+    }
+}
+
+/// True if `ev` is a `Raw` broadcast frame whose wire `event` field equals `name`.
+fn raw_event_is(ev: &ServerEvent, name: &str) -> bool {
+    matches!(ev, ServerEvent::Raw(f)
+        if serde_json::from_str::<serde_json::Value>(f)
+            .ok()
+            .and_then(|v| v.get("event").and_then(|e| e.as_str()).map(str::to_owned))
+            .as_deref() == Some(name))
+}
+
 #[tokio::test]
 async fn ping_enqueues_pong() {
     let (mut c, mut rx) = ctx(app(false));
@@ -130,7 +149,13 @@ async fn subscription_count_emitted_when_enabled() {
         Ok(ServerEvent::SubscriptionSucceeded { .. })
     ));
     match rx.try_recv() {
-        Ok(ServerEvent::SubscriptionCount { count, .. }) => assert_eq!(count, 1),
+        Ok(ev) => {
+            let j = raw_json(&ev);
+            assert_eq!(j["event"], "pusher_internal:subscription_count");
+            let data: serde_json::Value =
+                serde_json::from_str(j["data"].as_str().unwrap()).unwrap();
+            assert_eq!(data["subscription_count"], 1);
+        }
         other => panic!("expected SubscriptionCount, got {other:?}"),
     }
 }
@@ -303,8 +328,11 @@ async fn presence_unsubscribe_broadcasts_member_removed_to_others() {
     // a should now see member_removed for ub.
     let mut saw = false;
     while let Ok(ev) = rxa.try_recv() {
-        if let ServerEvent::MemberRemoved { user_id, .. } = ev {
-            assert_eq!(user_id, "ub");
+        if raw_event_is(&ev, "pusher_internal:member_removed") {
+            let j = raw_json(&ev);
+            let data: serde_json::Value =
+                serde_json::from_str(j["data"].as_str().unwrap()).unwrap();
+            assert_eq!(data["user_id"], "ub");
             saw = true;
         }
     }
@@ -1340,7 +1368,7 @@ async fn sub_count_emitted_after_subscribe(channel: &str, channel_data: Option<&
     .await;
     let mut saw_count = false;
     while let Ok(ev) = rx.try_recv() {
-        if matches!(ev, ServerEvent::SubscriptionCount { .. }) {
+        if raw_event_is(&ev, "pusher_internal:subscription_count") {
             saw_count = true;
         }
     }
@@ -1511,11 +1539,10 @@ async fn relayed_client_event_frame(
     })
     .await;
 
-    let frame = match rxb.try_recv() {
-        Ok(ev @ ServerEvent::ChannelEvent { .. }) => ev,
-        other => panic!("expected relayed ChannelEvent, got {other:?}"),
-    };
-    serde_json::from_str(&crate::protocol::v7::frames::encode(&frame)).unwrap()
+    match rxb.try_recv() {
+        Ok(ev) if raw_event_is(&ev, "client-foo") => raw_json(&ev),
+        other => panic!("expected relayed client-foo frame, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -1684,7 +1711,7 @@ async fn client_event_rate_limit_returns_4301_and_drops() {
     // Receiver must have received exactly 3 ChannelEvent broadcasts (not 4).
     let mut broadcast_count = 0;
     while let Ok(ev) = rx_recv.try_recv() {
-        if matches!(ev, ServerEvent::ChannelEvent { .. }) {
+        if raw_event_is(&ev, "client-foo") {
             broadcast_count += 1;
         }
     }

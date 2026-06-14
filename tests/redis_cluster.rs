@@ -292,23 +292,22 @@ async fn cross_node_broadcast_fans_out_with_dedup_and_exclusion() {
         )
         .await;
 
-    // other_a receives EXACTLY ONE typed event via local delivery.
+    // other_a receives EXACTLY ONE event via local delivery. `broadcast` now
+    // encodes once and fans out pre-encoded `Raw` frames, so assert the local
+    // delivery on its wire content (byte-identical to the cross-node frame).
     let got = tokio::time::timeout(Duration::from_secs(2), other_a_rx.recv())
         .await
         .expect("other_a must receive the local broadcast within 2s")
         .expect("other_a mailbox must yield an event");
     match got {
-        ServerEvent::ChannelEvent {
-            channel,
-            event,
-            data,
-            ..
-        } => {
-            assert_eq!(channel, "public-room");
-            assert_eq!(event, "my-event");
-            assert_eq!(data, serde_json::json!({ "hello": "world" }));
+        ServerEvent::Raw(s) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&s).expect("Raw frame must be valid JSON");
+            assert_eq!(parsed["channel"], "public-room");
+            assert_eq!(parsed["event"], "my-event");
+            assert_eq!(parsed["data"], serde_json::json!({ "hello": "world" }));
         }
-        other => panic!("other_a expected ChannelEvent, got {other:?}"),
+        other => panic!("other_a expected Raw frame from local broadcast, got {other:?}"),
     }
 
     // recv_b receives the event via Redis as a pre-encoded Raw frame.

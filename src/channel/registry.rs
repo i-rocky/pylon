@@ -160,7 +160,15 @@ mod tests {
         assert_eq!(reg.subscribe("app", "c", h2, None).subscription_count, 2);
         reg.broadcast("app", "c", &ServerEvent::Pong, Some(&sid1));
         assert!(rx1.try_recv().is_err());
-        assert!(matches!(rx2.try_recv(), Ok(ServerEvent::Pong)));
+        // `broadcast` encodes once and fans out `Raw` frames; the excluded sender
+        // (`sid1`) still gets nothing, and the other subscriber receives the
+        // verbatim wire frame for `Pong`.
+        match rx2.try_recv() {
+            Ok(ServerEvent::Raw(f)) => {
+                assert_eq!(&*f, crate::protocol::v7::frames::encode(&ServerEvent::Pong))
+            }
+            other => panic!("expected Raw(Pong), got {other:?}"),
+        }
     }
 
     #[test]

@@ -218,7 +218,14 @@ mod tests {
             .await;
         assert_eq!(out.subscription_count, 1);
         adapter.broadcast("app", "c", ServerEvent::Pong, None).await;
-        assert!(matches!(rx.try_recv(), Ok(ServerEvent::Pong)));
+        // `broadcast` now encodes once and fans out `Raw` frames; assert the wire
+        // bytes match a freshly-encoded `Pong` rather than the structured variant.
+        match rx.try_recv() {
+            Ok(ServerEvent::Raw(f)) => {
+                assert_eq!(&*f, crate::protocol::v7::frames::encode(&ServerEvent::Pong))
+            }
+            other => panic!("expected Raw(Pong), got {other:?}"),
+        }
     }
 
     #[tokio::test]
