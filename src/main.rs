@@ -5,11 +5,13 @@ use pylon::adapter::Adapter;
 use pylon::app::static_file::StaticFileAppManager;
 use pylon::app::AppManager;
 use pylon::channel::registry::Registry;
-use pylon::server::config::ServerConfig;
+use pylon::server::config::{ServerConfig, TransportMode};
 use pylon::server::router::{build_router, AppState};
 use pylon::server::shutdown::shutdown_signal;
 use pylon::webhook::dispatcher::SystemClock;
 use pylon::webhook::transport::{HttpTransport, WebhookTransport};
+use dashmap::DashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 #[global_allocator]
@@ -73,17 +75,51 @@ async fn main() -> anyhow::Result<()> {
         r.start_sweeper(webhooks.clone());
     }
 
-    let state = AppState {
-        config: config.clone(),
-        apps,
-        adapter,
-        conn_counts: Arc::new(Default::default()),
-        webhooks,
-    };
-    let listener = tokio::net::TcpListener::bind((config.bind.as_str(), config.port)).await?;
-    tracing::info!("pylon listening on {}:{}", config.bind, config.port);
-    axum::serve(listener, build_router(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // Shared connection counters, used by both transports (axum `AppState` and
+    // the percore `DispatchEnv` mirror this type exactly).
+    let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
+
+    match config.transport {
+        TransportMode::Legacy => {
+            let state = AppState {
+                config: config.clone(),
+                apps,
+                adapter,
+                conn_counts,
+                webhooks,
+            };
+            let listener =
+                tokio::net::TcpListener::bind((config.bind.as_str(), config.port)).await?;
+            tracing::info!("pylon listening on {}:{}", config.bind, config.port);
+            axum::serve(listener, build_router(state))
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+        }
+        TransportMode::Percore => {
+            // The percore worker is a blocking `mio` loop; run it on a dedicated
+            // blocking thread and flip the shared shutdown flag when the signal
+            // future resolves. Webhooks/adapter background tasks (e.g. the Redis
+            // sweeper) were already spawned on this tokio runtime above and keep
+            // running independently of the worker thread.
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let worker_shutdown = shutdown.clone();
+            let worker_config = config.clone();
+            let worker = tokio::task::spawn_blocking(move || {
+                pylon::transport::run_percore(
+                    worker_config,
+                    apps,
+                    adapter,
+                    conn_counts,
+                    webhooks,
+                    worker_shutdown,
+                )
+            });
+
+            // Wait for Ctrl-C / SIGTERM, then signal the worker to stop and join.
+            shutdown_signal().await;
+            shutdown.store(true, Ordering::SeqCst);
+            worker.await??;
+        }
+    }
     Ok(())
 }
