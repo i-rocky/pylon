@@ -2,6 +2,7 @@
 //! so that multi-key Lua scripts over one channel are Redis Cluster slot-safe.
 
 /// Builds Redis keys for all Pylon data structures under a given prefix.
+#[derive(Clone)]
 pub struct Keys {
     prefix: String,
 }

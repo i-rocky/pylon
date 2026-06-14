@@ -103,6 +103,9 @@ pub fn encode(event: &ServerEvent) -> String {
         // Control frame — the connection task intercepts `Close` before encoding,
         // so this arm is unreachable in practice; present only for exhaustiveness.
         ServerEvent::Close { .. } => String::new(),
+        // Already a finished v7 wire frame (produced on the originating node and
+        // relayed verbatim by the Redis adapter): emit it byte-for-byte.
+        ServerEvent::Raw(s) => s.clone(),
     }
 }
 

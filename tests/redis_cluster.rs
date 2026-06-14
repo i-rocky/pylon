@@ -13,6 +13,7 @@ use pylon::adapter::redis::keys::Keys;
 use pylon::adapter::redis::{client::RedisClients, RedisAdapter};
 use pylon::adapter::Adapter;
 use pylon::connection::handle::ConnectionHandle;
+use pylon::protocol::event::ServerEvent;
 use pylon::protocol::socket_id::SocketId;
 use pylon::server::config::ServerConfig;
 use std::time::Duration;
@@ -187,4 +188,128 @@ async fn redis_sub_lifecycle_tracks_channels() {
 /// Whether `adapter`'s SubscriberClient currently tracks `key` as a subscription.
 fn tracked_contains(adapter: &RedisAdapter, key: &str) -> bool {
     adapter.tracked_redis_channels().iter().any(|c| c == key)
+}
+
+/// Subscribe a fresh fake socket to `(TEST_APP, channel)` on `adapter`, returning
+/// its `SocketId` and the receiving half of its mailbox. The connection task would
+/// normally drain the mailbox; here the test owns the rx so it can assert delivery.
+async fn subscribe_socket(
+    adapter: &RedisAdapter,
+    channel: &str,
+) -> (SocketId, tokio::sync::mpsc::UnboundedReceiver<ServerEvent>) {
+    let socket_id = SocketId::generate();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let handle = ConnectionHandle {
+        socket_id: socket_id.clone(),
+        mailbox: tx,
+    };
+    adapter.subscribe(TEST_APP, channel, handle, None).await;
+    (socket_id, rx)
+}
+
+/// Poll `adapter.tracked_redis_channels()` until it contains `key` or the deadline
+/// elapses. Returns whether the channel showed up — lets the test wait for a Redis
+/// SUBSCRIBE to take effect without a blind fixed sleep.
+async fn await_tracked(adapter: &RedisAdapter, key: &str, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if tracked_contains(adapter, key) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// B2: a `broadcast` on node A must (1) deliver locally honouring `except`, (2) fan
+/// out across Redis to subscribers on node B as a pre-encoded v7 frame, and (3) NOT
+/// loop back to A's own local sockets a second time (self-dedup via `node_id`).
+#[tokio::test]
+async fn cross_node_broadcast_fans_out_with_dedup_and_exclusion() {
+    let prefix = random_prefix();
+    let adapter_a = connect_adapter_with_prefix(&prefix).await;
+    let adapter_b = connect_adapter_with_prefix(&prefix).await;
+
+    let keys = Keys::new(&prefix);
+    let msg_key = keys.msg(TEST_APP, "public-room");
+
+    // On A: the sender (excepted) and another local subscriber.
+    let (sender_a_id, mut sender_a_rx) = subscribe_socket(&adapter_a, "public-room").await;
+    let (_other_a_id, mut other_a_rx) = subscribe_socket(&adapter_a, "public-room").await;
+
+    // On B: one remote subscriber that should receive the event via Redis.
+    let (_recv_b_id, mut recv_b_rx) = subscribe_socket(&adapter_b, "public-room").await;
+
+    // Wait for B's Redis SUBSCRIBE to take effect so the published message isn't lost.
+    assert!(
+        await_tracked(&adapter_b, &msg_key, Duration::from_secs(2)).await,
+        "B must track {msg_key} before A publishes"
+    );
+
+    // A broadcasts, excepting the sender socket on A.
+    adapter_a
+        .broadcast(
+            TEST_APP,
+            "public-room",
+            ServerEvent::ChannelEvent {
+                channel: "public-room".into(),
+                event: "my-event".into(),
+                data: serde_json::json!({ "hello": "world" }),
+                user_id: None,
+            },
+            Some(sender_a_id.clone()),
+        )
+        .await;
+
+    // other_a receives EXACTLY ONE typed event via local delivery.
+    let got = tokio::time::timeout(Duration::from_secs(2), other_a_rx.recv())
+        .await
+        .expect("other_a must receive the local broadcast within 2s")
+        .expect("other_a mailbox must yield an event");
+    match got {
+        ServerEvent::ChannelEvent {
+            channel,
+            event,
+            data,
+            ..
+        } => {
+            assert_eq!(channel, "public-room");
+            assert_eq!(event, "my-event");
+            assert_eq!(data, serde_json::json!({ "hello": "world" }));
+        }
+        other => panic!("other_a expected ChannelEvent, got {other:?}"),
+    }
+
+    // recv_b receives the event via Redis as a pre-encoded Raw frame.
+    let got_b = tokio::time::timeout(Duration::from_secs(2), recv_b_rx.recv())
+        .await
+        .expect("recv_b must receive the cross-node broadcast within 2s")
+        .expect("recv_b mailbox must yield an event");
+    let frame = match got_b {
+        ServerEvent::Raw(s) => s,
+        other => panic!("recv_b expected Raw frame from Redis, got {other:?}"),
+    };
+    assert!(
+        frame.contains("my-event") && frame.contains("hello"),
+        "Raw frame must carry the event payload: {frame}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&frame).expect("Raw frame must be valid JSON");
+    assert_eq!(parsed["event"], "my-event");
+    assert_eq!(parsed["channel"], "public-room");
+    assert_eq!(parsed["data"]["hello"], "world");
+
+    // Drain window: confirm self-dedup (other_a gets NO second copy from A's own
+    // Redis echo) and exclusion (sender_a gets NOTHING at all).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        other_a_rx.try_recv().is_err(),
+        "other_a must NOT receive a duplicate from A's own Redis echo (self-dedup)"
+    );
+    assert!(
+        sender_a_rx.try_recv().is_err(),
+        "sender_a was excepted and must receive nothing"
+    );
 }

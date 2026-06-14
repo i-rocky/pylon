@@ -10,6 +10,7 @@
 pub mod client;
 pub mod envelope;
 pub mod keys;
+pub mod pubsub;
 
 use super::Adapter;
 use crate::adapter::local::LocalAdapter;
@@ -23,7 +24,7 @@ use crate::protocol::socket_id::SocketId;
 use crate::server::config::ServerConfig;
 use crate::user::{UserJoinOutcome, UserLeaveOutcome};
 use async_trait::async_trait;
-use fred::interfaces::PubsubInterface;
+use fred::interfaces::{EventInterface, PubsubInterface};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,16 +54,21 @@ impl RedisConfig {
     }
 }
 
-/// Cross-node adapter backed by Redis. A3: delegates everything to a local
-/// adapter; later phases add the Redis fan-out.
+/// Cross-node adapter backed by Redis. Broadcasts deliver locally and fan out over
+/// Redis pub/sub; a spawned receive loop re-delivers remote broadcasts to this
+/// node's local sockets. Everything else still delegates to the local adapter.
 pub struct RedisAdapter {
-    local: LocalAdapter,
+    /// Shared with the receive loop so it can deliver remote broadcasts locally.
+    local: Arc<LocalAdapter>,
     clients: client::RedisClients,
     keys: keys::Keys,
-    #[allow(dead_code)] // wired in B/C/D/E
     node_id: String,
-    #[allow(dead_code)] // wired in B/C/D/E
+    #[allow(dead_code)] // wired in C/D/E
     cfg: RedisConfig,
+    /// The pub/sub receive loop. Kept alive for the adapter's lifetime — dropping
+    /// it would abort cross-node delivery on this node.
+    #[allow(dead_code)]
+    recv_handle: tokio::task::JoinHandle<()>,
 }
 
 impl RedisAdapter {
@@ -72,13 +78,24 @@ impl RedisAdapter {
         let node_id = uuid::Uuid::new_v4().to_string();
         let keys = keys::Keys::new(&cfg.redis_prefix);
         let clients = client::RedisClients::connect(&cfg.redis_url, cfg.redis_pool_size).await?;
-        let local = LocalAdapter::new(Arc::new(Registry::new()));
+        let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
+
+        // Spawn the pub/sub receive loop. It shares the local adapter so remote
+        // broadcasts land on this node's sockets. The handle is stored on the
+        // struct so the task is not dropped (which would stop cross-node delivery).
+        let rx = clients.sub.message_rx();
+        let recv_local = local.clone();
+        let recv_node = node_id.clone();
+        let recv_handle =
+            tokio::spawn(async move { pubsub::receive_loop(rx, recv_local, recv_node).await });
+
         Ok(Self {
             local,
             clients,
             keys,
             node_id,
             cfg: RedisConfig::from_server_config(cfg),
+            recv_handle,
         })
     }
 
@@ -163,7 +180,42 @@ impl Adapter for RedisAdapter {
         event: ServerEvent,
         except: Option<SocketId>,
     ) {
-        self.local.broadcast(app, channel, event, except).await
+        // 1. Local delivery on THIS node — typed event, honouring `except`.
+        self.local
+            .broadcast(app, channel, event.clone(), except.clone())
+            .await;
+
+        // 2. Fan out to the rest of the cluster. Publish the *pre-encoded* v7 frame
+        //    so remote nodes deliver it verbatim (no re-encoding). Always publish —
+        //    even with no local subscribers — because a REST trigger may land on a
+        //    node where the channel is only subscribed elsewhere.
+        let frame = crate::protocol::v7::frames::encode(&event);
+        let env = envelope::Envelope {
+            node_id: self.node_id.clone(),
+            app: app.to_string(),
+            channel: channel.to_string(),
+            event: serde_json::Value::String(frame),
+            except: except.as_ref().map(|s| s.as_str().to_string()),
+        };
+        // Publish as a UTF-8 string (the envelope JSON is valid UTF-8); the receive
+        // loop reads it back with `Value::into_string()` — a proven round-trip.
+        let payload = match String::from_utf8(env.encode()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, app, channel, "envelope was not valid UTF-8");
+                return;
+            }
+        };
+        let key = self.keys.msg(app, channel);
+        if let Err(e) = self
+            .clients
+            .pool
+            .next()
+            .publish::<(), _, _>(key, payload)
+            .await
+        {
+            tracing::warn!(error = %e, app, channel, "redis publish failed");
+        }
     }
 
     async fn channels(&self, app: &str, prefix: Option<&str>) -> Vec<ChannelSummary> {
