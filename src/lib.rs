@@ -10,6 +10,7 @@ pub mod presence;
 pub mod protocol;
 pub mod server;
 pub mod user;
+pub mod webhook;
 pub mod ws;
 
 pub mod auth;
