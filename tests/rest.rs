@@ -529,6 +529,26 @@ async fn rest_trigger_encrypted_plus_public_is_400() {
     assert_eq!(resp.status(), 400);
 }
 
+/// An empty channel name must be rejected on the REST trigger path (400) — parity P14.
+#[tokio::test]
+async fn rest_trigger_empty_channel_name_is_400() {
+    let addr = spawn().await;
+    let body = json!({
+        "name": "e",
+        "data": "x",
+        "channels": [""]
+    })
+    .to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
 /// A single encrypted channel alone is allowed (200).
 #[tokio::test]
 async fn rest_trigger_encrypted_solo_is_200() {
