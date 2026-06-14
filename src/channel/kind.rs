@@ -55,7 +55,7 @@ impl ChannelInfo {
 /// The `#` prefix used by server-to-user channels is handled before this
 /// function is called and must NOT be stripped here.
 pub fn validate_channel_name(name: &str, max_len: usize) -> bool {
-    if name.len() > max_len {
+    if name.is_empty() || name.len() > max_len {
         return false;
     }
     name.chars()
@@ -95,6 +95,12 @@ mod tests {
         assert!(AuthKind::Private.requires_auth());
         assert!(AuthKind::Presence.requires_auth());
         assert!(AuthKind::PrivateEncrypted.requires_auth());
+    }
+
+    // P14 — empty channel name must be rejected
+    #[test]
+    fn validate_channel_name_rejects_empty() {
+        assert!(!validate_channel_name("", 164), "empty name must be invalid (P14)");
     }
 
     // P8 — channel-name validation

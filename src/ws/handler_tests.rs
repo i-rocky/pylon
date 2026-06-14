@@ -1291,6 +1291,28 @@ async fn subscribe_server_to_user_channel_still_works_after_p8() {
     );
 }
 
+// P14 — empty channel name must be rejected with 4009
+
+#[tokio::test]
+async fn subscribe_empty_channel_name_errors_4009() {
+    let (mut c, mut rx) = ctx(app(false));
+    c.dispatch(ClientCommand::Subscribe {
+        channel: "".into(),
+        auth: None,
+        channel_data: None,
+    })
+    .await;
+    match rx.try_recv() {
+        Ok(ServerEvent::SubscriptionError {
+            channel, status, ..
+        }) => {
+            assert_eq!(channel, "");
+            assert_eq!(status, 4009, "empty channel name must yield 4009 (P14)");
+        }
+        other => panic!("expected SubscriptionError 4009 for empty channel name, got {other:?}"),
+    }
+}
+
 // P4 — presence channels must NOT receive pusher_internal:subscription_count
 
 /// Subscribe to `channel` (with valid auth if presence) on an app that has
