@@ -100,7 +100,10 @@ mod tests {
     // P14 — empty channel name must be rejected
     #[test]
     fn validate_channel_name_rejects_empty() {
-        assert!(!validate_channel_name("", 164), "empty name must be invalid (P14)");
+        assert!(
+            !validate_channel_name("", 164),
+            "empty name must be invalid (P14)"
+        );
     }
 
     // P8 — channel-name validation

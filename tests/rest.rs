@@ -915,12 +915,9 @@ async fn ws_unknown_app_key_close_frame_carries_4001() {
     // Drain frames until we see a Close.
     let mut close_code: Option<u16> = None;
     while let Some(Ok(msg)) = ws.next().await {
-        match msg {
-            Message::Close(frame) => {
-                close_code = frame.map(|f| u16::from(f.code));
-                break;
-            }
-            _ => {}
+        if let Message::Close(frame) = msg {
+            close_code = frame.map(|f| u16::from(f.code));
+            break;
         }
     }
     assert_eq!(

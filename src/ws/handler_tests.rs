@@ -1596,7 +1596,9 @@ async fn client_event_oversize_name_returns_4301_and_does_not_broadcast() {
 
     // Sender must receive a 4301 ClientEventError.
     match rx_sender.try_recv() {
-        Ok(ServerEvent::ClientEventError { code, channel: ch, .. }) => {
+        Ok(ServerEvent::ClientEventError {
+            code, channel: ch, ..
+        }) => {
             assert_eq!(code, 4301, "oversize event name must return 4301 (P16)");
             assert_eq!(ch, channel, "error must carry the channel name");
         }

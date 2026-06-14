@@ -311,9 +311,7 @@ impl ConnectionContext {
             self.send_self(ServerEvent::ClientEventError {
                 channel,
                 code: 4301,
-                message: format!(
-                    "Event name is too long. Maximum allowed size is {max}."
-                ),
+                message: format!("Event name is too long. Maximum allowed size is {max}."),
             });
             return;
         }
