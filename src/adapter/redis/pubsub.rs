@@ -59,7 +59,12 @@ pub async fn receive_loop(
                         // the excepted socket lives on the originating node).
                         let except = env.except.as_deref().map(SocketId::from_raw);
                         local
-                            .broadcast(&env.app, &env.channel, ServerEvent::Raw(frame), except)
+                            .broadcast(
+                                &env.app,
+                                &env.channel,
+                                ServerEvent::Raw(std::sync::Arc::from(frame)),
+                                except,
+                            )
                             .await;
                     }
                     EnvelopeKind::UserSend => {
@@ -68,7 +73,11 @@ pub async fn receive_loop(
                             None => continue,
                         };
                         local
-                            .send_to_user(&env.app, &env.channel, ServerEvent::Raw(frame))
+                            .send_to_user(
+                                &env.app,
+                                &env.channel,
+                                ServerEvent::Raw(std::sync::Arc::from(frame)),
+                            )
                             .await;
                     }
                     EnvelopeKind::UserTerminate => {

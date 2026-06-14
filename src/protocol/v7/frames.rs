@@ -105,7 +105,7 @@ pub fn encode(event: &ServerEvent) -> String {
         ServerEvent::Close { .. } => String::new(),
         // Already a finished v7 wire frame (produced on the originating node and
         // relayed verbatim by the Redis adapter): emit it byte-for-byte.
-        ServerEvent::Raw(s) => s.clone(),
+        ServerEvent::Raw(s) => s.to_string(),
     }
 }
 
@@ -185,6 +185,14 @@ mod tests {
 
     fn parse(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn raw_arc_encodes_verbatim() {
+        use std::sync::Arc;
+        let frame: Arc<str> = Arc::from("{\"event\":\"x\"}");
+        let ev = crate::protocol::event::ServerEvent::Raw(frame);
+        assert_eq!(encode(&ev), "{\"event\":\"x\"}");
     }
 
     #[test]

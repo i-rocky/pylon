@@ -103,7 +103,7 @@ pub enum ServerEvent {
     /// A pre-encoded v7 wire frame delivered verbatim. Used by the Redis adapter
     /// to fan a broadcast out to local sockets on a REMOTE node without
     /// re-encoding (the originating node already produced the exact frame).
-    Raw(String),
+    Raw(std::sync::Arc<str>),
 }
 
 #[cfg(test)]
