@@ -2,6 +2,7 @@
 //! a Redis impl lands in SP7 behind this same trait — no handler changes.
 
 pub mod local;
+pub mod redis;
 
 use crate::channel::cache::CachedEvent;
 use crate::channel::outcome::{ChannelSummary, SubscribeOutcome, UnsubscribeOutcome};
