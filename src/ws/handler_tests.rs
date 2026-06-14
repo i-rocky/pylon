@@ -70,6 +70,7 @@ fn ctx(app: App) -> (ConnectionContext, mpsc::UnboundedReceiver<ServerEvent>) {
         user: None,
         webhooks: crate::webhook::WebhookHandle::null(),
         presence_membership: std::collections::HashMap::new(),
+        client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
     (c, rx)
 }
@@ -275,6 +276,7 @@ async fn presence_unsubscribe_broadcasts_member_removed_to_others() {
             user: None,
             webhooks: crate::webhook::WebhookHandle::null(),
             presence_membership: std::collections::HashMap::new(),
+            client_event_rate: crate::ws::rate::RateWindow::new(0),
         };
         (c, rx)
     };
@@ -430,6 +432,7 @@ async fn client_event_on_encrypted_channel_is_dropped() {
             user: None,
             webhooks: crate::webhook::WebhookHandle::null(),
             presence_membership: std::collections::HashMap::new(),
+            client_event_rate: crate::ws::rate::RateWindow::new(0),
         };
         (c, rx)
     };
@@ -629,6 +632,7 @@ async fn presence_over_member_cap_errors() {
             user: None,
             webhooks: crate::webhook::WebhookHandle::null(),
             presence_membership: std::collections::HashMap::new(),
+            client_event_rate: crate::ws::rate::RateWindow::new(0),
         };
         (c, rx)
     };
@@ -791,6 +795,7 @@ async fn subscribe_emits_channel_occupied_then_close_emits_vacated() {
         user: None,
         webhooks,
         presence_membership: std::collections::HashMap::new(),
+        client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
 
     // Subscribe to a public channel → occupied.
@@ -861,6 +866,7 @@ async fn rapid_subscribe_unsubscribe_in_window_emits_nothing() {
         user: None,
         webhooks,
         presence_membership: std::collections::HashMap::new(),
+        client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
 
     c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
@@ -913,6 +919,7 @@ async fn presence_first_and_last_emit_member_added_then_removed() {
         user: None,
         webhooks,
         presence_membership: std::collections::HashMap::new(),
+        client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
 
     c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
@@ -990,6 +997,7 @@ async fn client_event_on_presence_includes_user_id_webhook() {
         user: None,
         webhooks,
         presence_membership: std::collections::HashMap::new(),
+        client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
     c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
         channel: "presence-room".into(),
@@ -1045,6 +1053,7 @@ async fn client_event_on_private_omits_user_id_webhook() {
         user: None,
         webhooks,
         presence_membership: std::collections::HashMap::new(),
+        client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
     c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
         channel: "private-c".into(),
@@ -1098,6 +1107,7 @@ async fn client_event_webhook_gated_off_when_app_lacks_it() {
         user: None,
         webhooks,
         presence_membership: std::collections::HashMap::new(),
+        client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
     c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
         channel: "private-c".into(),
@@ -1149,6 +1159,7 @@ async fn cache_channel_miss_emits_cache_miss_webhook() {
         user: None,
         webhooks,
         presence_membership: std::collections::HashMap::new(),
+        client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
     // public cache channel: no auth, miss on first subscribe.
     c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
@@ -1451,6 +1462,7 @@ async fn relayed_client_event_frame(
             user: None,
             webhooks: crate::webhook::WebhookHandle::null(),
             presence_membership: std::collections::HashMap::new(),
+            client_event_rate: crate::ws::rate::RateWindow::new(0),
         };
         (c, rx)
     };
@@ -1504,5 +1516,102 @@ async fn private_client_event_broadcast_omits_user_id() {
     assert!(
         frame.get("user_id").is_none(),
         "private client-event broadcast must not carry user_id"
+    );
+}
+
+// P12 — per-connection client-event rate limit (10/s) → in-band 4301 + drop
+
+/// Sender and receiver share an adapter; sender has a tight rate window of 3.
+/// After 3 allowed events, the 4th must produce a 4301 to the SENDER and the
+/// RECEIVER must have received exactly 3 ChannelEvent broadcasts.
+#[tokio::test]
+async fn client_event_rate_limit_returns_4301_and_drops() {
+    let registry = Arc::new(Registry::new());
+    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
+
+    // Build sender with a 3-event/second rate window.
+    let (tx_sender, mut rx_sender) = mpsc::unbounded_channel();
+    let mut sender = ConnectionContext {
+        app: app_with_client_messages(true),
+        socket_id: SocketId::generate(),
+        self_tx: tx_sender,
+        adapter: adapter.clone(),
+        limits: crate::server::config::ServerConfig::default().limits(),
+        subscribed: HashSet::new(),
+        user: None,
+        webhooks: crate::webhook::WebhookHandle::null(),
+        presence_membership: std::collections::HashMap::new(),
+        client_event_rate: crate::ws::rate::RateWindow::new(3),
+    };
+
+    // Build receiver (unlimited, just needs to see broadcasts).
+    let (tx_recv, mut rx_recv) = mpsc::unbounded_channel();
+    let mut receiver = ConnectionContext {
+        app: app_with_client_messages(true),
+        socket_id: SocketId::generate(),
+        self_tx: tx_recv,
+        adapter: adapter.clone(),
+        limits: crate::server::config::ServerConfig::default().limits(),
+        subscribed: HashSet::new(),
+        user: None,
+        webhooks: crate::webhook::WebhookHandle::null(),
+        presence_membership: std::collections::HashMap::new(),
+        client_event_rate: crate::ws::rate::RateWindow::new(0),
+    };
+
+    // Both subscribe to the same private channel.
+    let channel = "private-rate-test";
+    for c in [&mut sender, &mut receiver] {
+        let sid = c.socket_id.as_str().to_string();
+        let sig = crate::auth::signature::channel_signature("s", &sid, channel, None);
+        c.dispatch(ClientCommand::Subscribe {
+            channel: channel.into(),
+            auth: Some(format!("k:{sig}")),
+            channel_data: None,
+        })
+        .await;
+    }
+    // Drain subscription_succeeded frames from both.
+    while rx_sender.try_recv().is_ok() {}
+    while rx_recv.try_recv().is_ok() {}
+
+    // Fire 4 client events in a burst (all within the same 1-second window).
+    for _ in 0..4 {
+        sender
+            .dispatch(ClientCommand::ClientEvent {
+                event: "client-foo".into(),
+                channel: channel.into(),
+                data: serde_json::json!({"n": 1}),
+            })
+            .await;
+    }
+
+    // Receiver must have received exactly 3 ChannelEvent broadcasts (not 4).
+    let mut broadcast_count = 0;
+    while let Ok(ev) = rx_recv.try_recv() {
+        if matches!(ev, ServerEvent::ChannelEvent { .. }) {
+            broadcast_count += 1;
+        }
+    }
+    assert_eq!(
+        broadcast_count, 3,
+        "receiver should see exactly 3 broadcasts; 4th was rate-limited"
+    );
+
+    // Sender must have received exactly one 4301 ClientEventError.
+    let mut rate_errors = 0;
+    while let Ok(ev) = rx_sender.try_recv() {
+        if let ServerEvent::ClientEventError {
+            code, channel: ch, ..
+        } = ev
+        {
+            assert_eq!(code, 4301, "rate-limit error must be code 4301");
+            assert_eq!(ch, channel, "error must carry the channel name");
+            rate_errors += 1;
+        }
+    }
+    assert_eq!(
+        rate_errors, 1,
+        "sender must receive exactly one 4301 rate-limit error"
     );
 }

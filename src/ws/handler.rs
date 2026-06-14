@@ -21,6 +21,8 @@ pub struct ConnectionContext {
     pub webhooks: crate::webhook::WebhookHandle,
     /// presence channel → this connection's member user_id (for client_event.user_id).
     pub presence_membership: std::collections::HashMap<String, String>,
+    /// Per-connection client-event rate limiter (Pusher: 10 events/sec/connection → 4301).
+    pub client_event_rate: crate::ws::rate::RateWindow,
 }
 
 impl ConnectionContext {

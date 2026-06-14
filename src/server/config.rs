@@ -7,6 +7,7 @@ pub struct Limits {
     pub max_watchlist_size: usize,
     pub max_channel_name_length: usize,
     pub max_event_name_length: usize,
+    pub max_client_events_per_second: u32,
     pub max_presence_user_id_length: usize,
     pub max_presence_user_info_bytes: usize,
 }
@@ -33,6 +34,7 @@ pub struct ServerConfig {
     pub webhook_max_concurrency: usize,
     pub max_channel_name_length: usize,
     pub max_event_name_length: usize,
+    pub max_client_events_per_second: u32,
     pub max_presence_user_id_length: usize,
     pub max_presence_user_info_bytes: usize,
 }
@@ -60,6 +62,7 @@ impl Default for ServerConfig {
             webhook_max_concurrency: 100,
             max_channel_name_length: 164,
             max_event_name_length: 200,
+            max_client_events_per_second: 10,
             max_presence_user_id_length: 128,
             max_presence_user_info_bytes: 1024,
         }
@@ -163,6 +166,11 @@ impl ServerConfig {
                 c.max_event_name_length = p;
             }
         }
+        if let Ok(v) = std::env::var("PYLON_MAX_CLIENT_EVENTS_PER_SECOND") {
+            if let Ok(p) = v.parse() {
+                c.max_client_events_per_second = p;
+            }
+        }
         if let Ok(v) = std::env::var("PYLON_MAX_PRESENCE_USER_ID_LENGTH") {
             if let Ok(p) = v.parse() {
                 c.max_presence_user_id_length = p;
@@ -183,6 +191,7 @@ impl ServerConfig {
             max_watchlist_size: self.max_watchlist_size,
             max_channel_name_length: self.max_channel_name_length,
             max_event_name_length: self.max_event_name_length,
+            max_client_events_per_second: self.max_client_events_per_second,
             max_presence_user_id_length: self.max_presence_user_id_length,
             max_presence_user_info_bytes: self.max_presence_user_info_bytes,
         }
@@ -209,6 +218,7 @@ mod tests {
         assert_eq!(c.max_watchlist_size, 100);
         assert_eq!(c.max_channel_name_length, 164);
         assert_eq!(c.max_event_name_length, 200);
+        assert_eq!(c.max_client_events_per_second, 10);
         assert_eq!(c.max_presence_user_id_length, 128);
         assert_eq!(c.max_presence_user_info_bytes, 1024);
         // webhook tunables (spec §6)

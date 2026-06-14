@@ -282,7 +282,12 @@ impl ConnectionContext {
         });
     }
 
-    pub(in crate::ws) async fn client_event(&self, event: String, channel: String, data: Value) {
+    pub(in crate::ws) async fn client_event(
+        &mut self,
+        event: String,
+        channel: String,
+        data: Value,
+    ) {
         if !self.app.client_messages_enabled {
             self.send_self(ServerEvent::ClientEventError {
                 channel,
@@ -314,6 +319,16 @@ impl ConnectionContext {
                 channel,
                 code: 4301,
                 message: "Client event rejected - the data is too large".into(),
+            });
+            return;
+        }
+        // Rate-limit client events: drop + send in-band 4301 if the per-second
+        // window is exhausted (Pusher parity: 10 client events/sec/connection).
+        if !self.client_event_rate.check() {
+            self.send_self(ServerEvent::ClientEventError {
+                channel,
+                code: 4301,
+                message: "Client event rejected due to rate limit".to_string(),
             });
             return;
         }

@@ -48,6 +48,9 @@ pub async fn run(socket: WebSocket, codec: Box<dyn Codec>, params: ConnectionPar
         socket_id,
         self_tx: tx.clone(),
         adapter: params.adapter.clone(),
+        client_event_rate: crate::ws::rate::RateWindow::new(
+            params.limits.max_client_events_per_second,
+        ),
         limits: params.limits,
         subscribed: HashSet::new(),
         user: None,

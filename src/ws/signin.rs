@@ -187,6 +187,7 @@ mod tests {
             user: None,
             webhooks: crate::webhook::WebhookHandle::null(),
             presence_membership: std::collections::HashMap::new(),
+            client_event_rate: crate::ws::rate::RateWindow::new(0),
         };
         (c, rx)
     }
