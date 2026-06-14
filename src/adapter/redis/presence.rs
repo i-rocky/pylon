@@ -3,12 +3,15 @@
 //! adapter on error. (members/user_count/reap land in later SP7b tasks.)
 
 use super::client::Scripts;
+use super::envelope::Envelope;
 use super::keys::{member_token, Keys};
 use crate::presence::member::PresenceMember;
-use crate::protocol::event::PresencePayload;
+use crate::protocol::event::{PresencePayload, ServerEvent};
 use crate::protocol::socket_id::SocketId;
+use crate::webhook::event::WebhookEvent;
+use crate::webhook::WebhookHandle;
 use fred::clients::Pool;
-use fred::interfaces::HashesInterface;
+use fred::interfaces::{HashesInterface, PubsubInterface};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
@@ -103,6 +106,87 @@ pub(super) async fn user_count(
 ) -> anyhow::Result<usize> {
     let n: i64 = pool.next().hlen(keys.presusers(app, channel)).await?;
     Ok(n.max(0) as usize)
+}
+
+/// Sweeper crash-time reap of ONE stale presence member token. Decrements the user's
+/// cluster refcount; on the →0 edge removes the user + emits `member_removed` (broadcast
+/// cross-node via the channel's msg pub/sub, and a webhook). Best-effort: logs + returns
+/// on any Redis error, never panics. The broadcast envelope's `node_id` is the DEAD node
+/// (the token prefix) so every LIVE node — including this sweeper's — delivers it.
+pub(super) async fn reap_member(
+    pool: &Pool,
+    keys: &Keys,
+    app: &str,
+    channel: &str,
+    token: &str,
+    webhooks: &WebhookHandle,
+) {
+    let presmembers = keys.presmembers(app, channel);
+    let user_id: Option<String> = match pool.next().hget(&presmembers, token).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, app, channel, token, "sweeper: HGET presmembers failed");
+            return;
+        }
+    };
+    let Some(user_id) = user_id else { return };
+    if let Err(e) = pool
+        .next()
+        .hdel::<i64, _, _>(&presmembers, token.to_string())
+        .await
+    {
+        tracing::warn!(error = %e, app, channel, token, "sweeper: HDEL presmembers failed");
+    }
+    let conn: i64 = match pool
+        .next()
+        .hincrby(keys.presusers(app, channel), &user_id, -1)
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, app, channel, user_id, "sweeper: HINCRBY presusers failed");
+            return;
+        }
+    };
+    if conn <= 0 {
+        let _ = pool
+            .next()
+            .hdel::<i64, _, _>(keys.presusers(app, channel), user_id.clone())
+            .await;
+        let _ = pool
+            .next()
+            .hdel::<i64, _, _>(keys.presinfo(app, channel), user_id.clone())
+            .await;
+        let dead_node = token
+            .split_once(':')
+            .map(|(n, _)| n.to_string())
+            .unwrap_or_default();
+        let frame = crate::protocol::v7::frames::encode(&ServerEvent::MemberRemoved {
+            channel: channel.to_string(),
+            user_id: user_id.clone(),
+        });
+        let env = Envelope {
+            node_id: dead_node,
+            app: app.to_string(),
+            channel: channel.to_string(),
+            event: Value::String(frame),
+            except: None,
+        };
+        if let Ok(payload) = String::from_utf8(env.encode()) {
+            if let Err(e) = pool
+                .next()
+                .publish::<(), _, _>(keys.msg(app, channel), payload)
+                .await
+            {
+                tracing::warn!(error = %e, app, channel, "sweeper: PUBLISH member_removed failed");
+            }
+        }
+        webhooks.enqueue(WebhookEvent::MemberRemoved {
+            app: app.to_string(),
+            channel: channel.to_string(),
+            user_id,
+        });
+    }
 }
 
 /// Cluster roster from `presinfo`: sorted ids, id→user_info hash, distinct count.

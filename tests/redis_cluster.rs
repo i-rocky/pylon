@@ -1000,3 +1000,84 @@ async fn cross_node_presence_user_count_and_members() {
     .await
     .expect("presence user_count/members test must not hang (Redis up?)");
 }
+
+/// C1 (SP7b): when the lease-locked sweeper reaps a crashed node's presence member, it
+/// must decrement that user's cluster refcount and, on the →0 edge, remove the user from
+/// the cluster roster (and emit `member_removed`). u1 connects on A and u2 on B; A
+/// "crashes" (drop aborts its heartbeat) so u1's `expireAt` goes stale while u2 (B, still
+/// heart-beating) stays fresh. B's sweep reaps u1 → the roster shrinks to {u2} and the
+/// cluster `user_count` drops to 1. The `member_removed` emit (broadcast + webhook) rides
+/// the same →0 edge as the roster/user_count change; we observe it via Redis state (the
+/// presence side-tables), which proves the reap+emit path ran.
+///
+/// (RED before C1: the sweeper HDELs the stale occ token but never touches the presence
+/// side-tables, so u1 stays in `presence_members` and `user_count` stays Some(2).)
+#[tokio::test]
+async fn sweeper_emits_member_removed_for_crashed_presence_member() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let prefix = random_prefix();
+        // ttl=2s, heartbeat=1s — the same comfortable margin the sibling crash tests use.
+        // A's `expireAt` (last stamped ≤ ~one heartbeat after the drop) is reapable after
+        // the sleep below, while B's 1s heartbeat keeps u2 fresh AND keeps the occ key's
+        // whole-key TTL alive so its presence side-tables survive to be reaped.
+        let adapter_a = connect_adapter_with_prefix_ttl(&prefix, 2, 1).await;
+        let adapter_b = connect_adapter_with_prefix_ttl(&prefix, 2, 1).await;
+
+        // u1's connection on A, u2's connection on B → cluster presence {u1, u2}.
+        let (_s1, h1, m1) = presence_handle("u1", serde_json::json!({"name": "Ann"}));
+        adapter_a
+            .subscribe(TEST_APP, "presence-room", h1, Some(m1))
+            .await;
+        let (_s2, h2, m2) = presence_handle("u2", serde_json::json!({"name": "Bob"}));
+        adapter_b
+            .subscribe(TEST_APP, "presence-room", h2, Some(m2))
+            .await;
+
+        // Sanity: before the crash the cluster sees both users.
+        let before = adapter_b.presence_members(TEST_APP, "presence-room").await;
+        let before_ids: Vec<String> = before.iter().map(|m| m.user_id.clone()).collect();
+        assert_eq!(
+            before_ids,
+            vec!["u1".to_string(), "u2".to_string()],
+            "before the crash the cluster roster must be {{u1, u2}}"
+        );
+
+        // Crash A: dropping the adapter aborts its heartbeat, so u1's `expireAt` stops
+        // being re-stamped and falls into the past after the TTL. (Must be the LAST ref.)
+        drop(adapter_a);
+
+        // Sleep past u1's worst-case `expireAt` (≤ ~2s after its last stamp) so u1 is
+        // reliably stale, while B's 1s heartbeat keeps u2 fresh and the occ key alive.
+        tokio::time::sleep(Duration::from_millis(2600)).await;
+
+        // B sweeps: it holds the lease, reaps u1's stale occ token, and the presence
+        // branch decrements u1's refcount to 0 → removes u1 + emits member_removed.
+        let webhooks = pylon::webhook::WebhookHandle::null();
+        let (acquired, reaped, _vacated) = adapter_b.sweep_now(&webhooks, now_ms()).await;
+        assert!(acquired, "B must acquire the sweep lease (no other holder)");
+        assert!(
+            reaped >= 1,
+            "B must reap u1's stale member (reaped={reaped})"
+        );
+
+        // The roster now reflects only u2 — u1's →0 edge removed it from the cluster
+        // presence side-tables (the same edge that emitted member_removed).
+        let after = adapter_b.presence_members(TEST_APP, "presence-room").await;
+        let after_ids: Vec<String> = after.iter().map(|m| m.user_id.clone()).collect();
+        assert_eq!(
+            after_ids,
+            vec!["u2".to_string()],
+            "after the sweep the cluster roster must be {{u2}} only (u1 reaped)"
+        );
+
+        let summary = adapter_b.channel(TEST_APP, "presence-room").await;
+        assert_eq!(
+            summary.user_count,
+            Some(1),
+            "after the sweep the cluster user_count must drop to 1 (got {:?})",
+            summary.user_count
+        );
+    })
+    .await
+    .expect("sweeper member_removed test must not hang (Redis up?)");
+}
