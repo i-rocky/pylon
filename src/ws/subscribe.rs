@@ -162,6 +162,11 @@ impl ConnectionContext {
                 let occupied = out.occupied;
                 if let Some(join) = out.presence {
                     self.subscribed.insert(channel.clone());
+                    // Record this socket's presence member id so a later
+                    // `client_event` on this channel can attach `user_id`. Clone
+                    // before the `first_for_user` block moves `join.member.user_id`.
+                    self.presence_membership
+                        .insert(channel.clone(), join.member.user_id.clone());
                     self.send_self(ServerEvent::SubscriptionSucceeded {
                         channel: channel.clone(),
                         presence: Some(join.roster),
@@ -205,7 +210,15 @@ impl ConnectionContext {
                     event: cached.event,
                     data: Value::String(cached.data),
                 },
-                None => ServerEvent::CacheMiss { channel },
+                None => {
+                    if self.app.has_cache_miss_webhooks {
+                        self.emit_webhook(crate::webhook::event::WebhookEvent::CacheMiss {
+                            app: self.app.id.clone(),
+                            channel: channel.clone(),
+                        });
+                    }
+                    ServerEvent::CacheMiss { channel }
+                }
             };
             self.send_self(event);
         }
@@ -257,6 +270,12 @@ impl ConnectionContext {
         {
             return;
         }
+        // Capture clones for the webhook before the broadcast moves `event`/`data`.
+        // `user_id` is present only if this socket joined `channel` as a presence
+        // member (recorded in `presence_membership` at subscribe).
+        let user_id = self.presence_membership.get(&channel).cloned();
+        let wh_event = event.clone();
+        let wh_data = data.clone();
         self.adapter
             .broadcast(
                 &self.app.id,
@@ -269,5 +288,15 @@ impl ConnectionContext {
                 Some(self.socket_id.clone()),
             )
             .await;
+        if self.app.has_client_event_webhooks {
+            self.emit_webhook(crate::webhook::event::WebhookEvent::ClientEvent {
+                app: self.app.id.clone(),
+                channel,
+                event: wh_event,
+                data: wh_data,
+                socket_id: self.socket_id.as_str().to_string(),
+                user_id,
+            });
+        }
     }
 }

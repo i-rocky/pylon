@@ -78,6 +78,7 @@ impl ConnectionContext {
 
     async fn unsubscribe(&mut self, channel: String) {
         if self.subscribed.remove(&channel) {
+            self.presence_membership.remove(&channel);
             let out = self
                 .adapter
                 .unsubscribe(&self.app.id, &channel, &self.socket_id)

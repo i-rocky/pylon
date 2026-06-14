@@ -900,3 +900,209 @@ async fn presence_first_and_last_emit_member_added_then_removed() {
         "got {names:?}"
     );
 }
+
+#[tokio::test]
+async fn client_event_on_presence_includes_user_id_webhook() {
+    let mut app = serde_json::from_value::<crate::app::App>(serde_json::json!({
+        "name": "t", "id": "app", "key": "app-key", "secret": "app-secret",
+        "client_messages_enabled": true,
+        "webhooks": [{ "url": "https://e.test/wh", "event_types": ["client_event"] }]
+    }))
+    .unwrap();
+    app.recompute_has_flags();
+
+    let (webhooks, recorder) = recording_webhooks(app.clone(), 30);
+    let adapter: std::sync::Arc<dyn crate::adapter::Adapter> =
+        std::sync::Arc::new(crate::adapter::local::LocalAdapter::new(
+            std::sync::Arc::new(crate::channel::registry::Registry::new()),
+        ));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let cd = r#"{"user_id":"u1"}"#;
+    let auth = format!(
+        "app-key:{}",
+        crate::auth::signature::channel_signature("app-secret", "9.9", "presence-room", Some(cd))
+    );
+    let mut c = crate::ws::handler::ConnectionContext {
+        app,
+        socket_id: crate::protocol::socket_id::SocketId::from_raw("9.9"),
+        self_tx: tx,
+        adapter,
+        limits: crate::server::config::ServerConfig::default().limits(),
+        subscribed: std::collections::HashSet::new(),
+        user: None,
+        webhooks,
+        presence_membership: std::collections::HashMap::new(),
+    };
+    c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
+        channel: "presence-room".into(),
+        auth: Some(auth),
+        channel_data: Some(cd.into()),
+    })
+    .await;
+    c.dispatch(crate::protocol::command::ClientCommand::ClientEvent {
+        event: "client-msg".into(),
+        channel: "presence-room".into(),
+        data: serde_json::json!({"hello":"world"}),
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+    let recorded = recorder.recorded().await;
+    let env: serde_json::Value = serde_json::from_str(&recorded[0].body).unwrap();
+    let ev = &env["events"][0];
+    assert_eq!(ev["name"], "client_event");
+    assert_eq!(ev["channel"], "presence-room");
+    assert_eq!(ev["event"], "client-msg");
+    assert_eq!(ev["data"], serde_json::json!({"hello":"world"}));
+    assert_eq!(ev["socket_id"], "9.9");
+    assert_eq!(ev["user_id"], "u1", "presence sender carries user_id");
+}
+
+#[tokio::test]
+async fn client_event_on_private_omits_user_id_webhook() {
+    let mut app = serde_json::from_value::<crate::app::App>(serde_json::json!({
+        "name": "t", "id": "app", "key": "app-key", "secret": "app-secret",
+        "client_messages_enabled": true,
+        "webhooks": [{ "url": "https://e.test/wh", "event_types": ["client_event"] }]
+    }))
+    .unwrap();
+    app.recompute_has_flags();
+    let (webhooks, recorder) = recording_webhooks(app.clone(), 30);
+    let adapter: std::sync::Arc<dyn crate::adapter::Adapter> =
+        std::sync::Arc::new(crate::adapter::local::LocalAdapter::new(
+            std::sync::Arc::new(crate::channel::registry::Registry::new()),
+        ));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let auth = format!(
+        "app-key:{}",
+        crate::auth::signature::channel_signature("app-secret", "9.9", "private-c", None)
+    );
+    let mut c = crate::ws::handler::ConnectionContext {
+        app,
+        socket_id: crate::protocol::socket_id::SocketId::from_raw("9.9"),
+        self_tx: tx,
+        adapter,
+        limits: crate::server::config::ServerConfig::default().limits(),
+        subscribed: std::collections::HashSet::new(),
+        user: None,
+        webhooks,
+        presence_membership: std::collections::HashMap::new(),
+    };
+    c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
+        channel: "private-c".into(),
+        auth: Some(auth),
+        channel_data: None,
+    })
+    .await;
+    c.dispatch(crate::protocol::command::ClientCommand::ClientEvent {
+        event: "client-msg".into(),
+        channel: "private-c".into(),
+        data: serde_json::json!({"x":1}),
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+    let recorded = recorder.recorded().await;
+    let env: serde_json::Value = serde_json::from_str(&recorded[0].body).unwrap();
+    assert!(
+        env["events"][0].get("user_id").is_none(),
+        "private sender has no user_id"
+    );
+}
+
+#[tokio::test]
+async fn client_event_webhook_gated_off_when_app_lacks_it() {
+    // App has client messaging but NO client_event webhook → no delivery.
+    let mut app = serde_json::from_value::<crate::app::App>(serde_json::json!({
+        "name": "t", "id": "app", "key": "app-key", "secret": "app-secret",
+        "client_messages_enabled": true,
+        "webhooks": [{ "url": "https://e.test/wh", "event_types": ["channel_occupied"] }]
+    }))
+    .unwrap();
+    app.recompute_has_flags();
+    let (webhooks, recorder) = recording_webhooks(app.clone(), 30);
+    let adapter: std::sync::Arc<dyn crate::adapter::Adapter> =
+        std::sync::Arc::new(crate::adapter::local::LocalAdapter::new(
+            std::sync::Arc::new(crate::channel::registry::Registry::new()),
+        ));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let auth = format!(
+        "app-key:{}",
+        crate::auth::signature::channel_signature("app-secret", "9.9", "private-c", None)
+    );
+    let mut c = crate::ws::handler::ConnectionContext {
+        app,
+        socket_id: crate::protocol::socket_id::SocketId::from_raw("9.9"),
+        self_tx: tx,
+        adapter,
+        limits: crate::server::config::ServerConfig::default().limits(),
+        subscribed: std::collections::HashSet::new(),
+        user: None,
+        webhooks,
+        presence_membership: std::collections::HashMap::new(),
+    };
+    c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
+        channel: "private-c".into(),
+        auth: Some(auth),
+        channel_data: None,
+    })
+    .await;
+    c.dispatch(crate::protocol::command::ClientCommand::ClientEvent {
+        event: "client-msg".into(),
+        channel: "private-c".into(),
+        data: serde_json::json!({"x":1}),
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+    // Only channel_occupied may appear; never a client_event.
+    let has_ce = recorder.recorded().await.iter().any(|d| {
+        let env: serde_json::Value = serde_json::from_str(&d.body).unwrap();
+        env["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == "client_event")
+    });
+    assert!(!has_ce, "client_event webhook must be gated off");
+}
+
+#[tokio::test]
+async fn cache_channel_miss_emits_cache_miss_webhook() {
+    let mut app = serde_json::from_value::<crate::app::App>(serde_json::json!({
+        "name": "t", "id": "app", "key": "app-key", "secret": "app-secret",
+        "webhooks": [{ "url": "https://e.test/wh", "event_types": ["cache_miss"] }]
+    }))
+    .unwrap();
+    app.recompute_has_flags();
+    let (webhooks, recorder) = recording_webhooks(app.clone(), 30);
+    let adapter: std::sync::Arc<dyn crate::adapter::Adapter> =
+        std::sync::Arc::new(crate::adapter::local::LocalAdapter::new(
+            std::sync::Arc::new(crate::channel::registry::Registry::new()),
+        ));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut c = crate::ws::handler::ConnectionContext {
+        app,
+        socket_id: crate::protocol::socket_id::SocketId::from_raw("9.9"),
+        self_tx: tx,
+        adapter,
+        limits: crate::server::config::ServerConfig::default().limits(),
+        subscribed: std::collections::HashSet::new(),
+        user: None,
+        webhooks,
+        presence_membership: std::collections::HashMap::new(),
+    };
+    // public cache channel: no auth, miss on first subscribe.
+    c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
+        channel: "cache-x".into(),
+        auth: None,
+        channel_data: None,
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+    let recorded = recorder.recorded().await;
+    let env: serde_json::Value = serde_json::from_str(&recorded[0].body).unwrap();
+    assert_eq!(env["events"][0]["name"], "cache_miss");
+    assert_eq!(env["events"][0]["channel"], "cache-x");
+}
