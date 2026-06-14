@@ -386,3 +386,49 @@ async fn client_event_broadcast_excludes_sender() {
         "pusher:pong"
     );
 }
+
+#[tokio::test]
+async fn malformed_frame_silently_dropped_connection_stays_alive() {
+    // P2: sending an unparseable text frame must NOT produce a pusher:error 4200
+    // in-band event. The server must drop the frame silently and keep the
+    // connection alive (a subsequent ping/pong must succeed).
+    let addr = spawn(ServerConfig::default()).await;
+    let mut ws = connect(addr, "?protocol=7").await;
+    let _ = established_socket_id(&mut ws).await; // consume connection_established
+
+    // Send a garbage text frame that cannot be decoded as a valid Pusher command.
+    ws.send(Message::Text("not json at all".into()))
+        .await
+        .unwrap();
+
+    // Give the server a brief window to (incorrectly) emit a pusher:error frame.
+    // If it does, we catch it here and fail the test.
+    let maybe_err = tokio::time::timeout(std::time::Duration::from_millis(300), ws.next()).await;
+
+    match maybe_err {
+        Ok(Some(Ok(Message::Text(t)))) => {
+            let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+            if v["event"] == "pusher:error" {
+                panic!(
+                    "server emitted pusher:error in response to malformed frame \
+                     (got code {}); should have silently dropped it",
+                    v["data"]["code"]
+                );
+            }
+            // Any other text frame (unexpected but not the bug) — fall through.
+        }
+        Ok(Some(Ok(Message::Close(_)))) => {
+            panic!("server closed connection on malformed frame; should silently drop");
+        }
+        // Timeout (no frame) or non-text frames are fine.
+        _ => {}
+    }
+
+    // Connection must still be alive: a ping must get a pong.
+    send_json(&mut ws, json!({ "event": "pusher:ping", "data": {} })).await;
+    let pong = next_json(&mut ws).await;
+    assert_eq!(
+        pong["event"], "pusher:pong",
+        "connection should remain alive after malformed frame"
+    );
+}

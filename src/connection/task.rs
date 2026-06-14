@@ -3,7 +3,6 @@
 use crate::adapter::Adapter;
 use crate::app::App;
 use crate::protocol::codec::Codec;
-use crate::protocol::error::PusherError;
 use crate::protocol::event::ServerEvent;
 use crate::protocol::socket_id::SocketId;
 use crate::ws::handler::ConnectionContext;
@@ -72,8 +71,10 @@ pub async fn run(socket: WebSocket, codec: Box<dyn Codec>, params: ConnectionPar
                         ping_sent_at = None;
                         match codec.decode(t.as_str()) {
                             Ok(cmd) => ctx.dispatch(cmd).await,
-                            Err(_) => {
-                                let _ = tx.send(ServerEvent::Error(PusherError::new(4200, "Invalid message")));
+                            Err(e) => {
+                                // Unparseable frames are silently dropped; 4200 is a
+                                // close/reconnect code and must not be sent in-band.
+                                tracing::trace!("dropping malformed client frame: {e}");
                             }
                         }
                     }
