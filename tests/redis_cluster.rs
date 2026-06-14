@@ -9,10 +9,18 @@
 //! is no silent skip.
 
 use fred::prelude::*;
+use pylon::adapter::redis::keys::Keys;
 use pylon::adapter::redis::{client::RedisClients, RedisAdapter};
+use pylon::adapter::Adapter;
+use pylon::connection::handle::ConnectionHandle;
+use pylon::protocol::socket_id::SocketId;
 use pylon::server::config::ServerConfig;
 use std::time::Duration;
 use uuid::Uuid;
+
+/// Fixed app id used by the cluster lifecycle tests. Channel/app ids are plain
+/// string args to the adapter; they don't come from `ServerConfig`.
+const TEST_APP: &str = "app1";
 
 /// Test Redis URL: `PYLON_TEST_REDIS_URL` or the documented default.
 fn test_redis_url() -> String {
@@ -39,6 +47,15 @@ fn redis_test_config(prefix: &str) -> ServerConfig {
 /// is down.
 async fn connect_adapter() -> RedisAdapter {
     let cfg = redis_test_config(&random_prefix());
+    RedisAdapter::new(&cfg)
+        .await
+        .expect("RedisAdapter::new must connect to the test Redis")
+}
+
+/// Build a connected `RedisAdapter` sharing an explicit `prefix` — used to form a
+/// multi-node cluster (several adapters) over one Redis, all seeing the same keys.
+async fn connect_adapter_with_prefix(prefix: &str) -> RedisAdapter {
+    let cfg = redis_test_config(prefix);
     RedisAdapter::new(&cfg)
         .await
         .expect("RedisAdapter::new must connect to the test Redis")
@@ -101,4 +118,73 @@ async fn smoke_connectivity() {
     // Clean shutdown of the test clients (the adapter drops on scope exit).
     let _ = clients.sub.quit().await;
     let _ = clients.pool.quit().await;
+}
+
+/// B1: the per-(app,channel) Redis-subscription lifecycle. A node's SubscriberClient
+/// must track the `keys.msg(app, channel)` pub/sub channel exactly while it has at
+/// least one node-local subscriber on that channel — subscribe on the 0→1 edge,
+/// unsubscribe on the 1→0 edge.
+#[tokio::test]
+async fn redis_sub_lifecycle_tracks_channels() {
+    // Two adapters (A and B) form a 2-node cluster on one Redis via a shared prefix.
+    let prefix = random_prefix();
+    let _node_a = connect_adapter_with_prefix(&prefix).await;
+    let node_b = connect_adapter_with_prefix(&prefix).await;
+
+    let keys = Keys::new(&prefix);
+    let msg_key = keys.msg(TEST_APP, "public-room");
+
+    // A fake connection handle — `ConnectionHandle`'s fields are `pub`, so it is
+    // constructible directly from an integration test.
+    let socket_id = SocketId::generate();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let handle = ConnectionHandle {
+        socket_id: socket_id.clone(),
+        mailbox: tx,
+    };
+
+    // Before any subscribe, B must NOT be tracking the msg channel.
+    assert!(
+        !tracked_contains(&node_b, &msg_key),
+        "B must not track {msg_key} before any local subscriber"
+    );
+
+    // Subscribe the fake socket on B → node-local 0→1 edge → B SUBSCRIBEs to Redis.
+    let out = tokio::time::timeout(
+        Duration::from_secs(2),
+        node_b.subscribe(TEST_APP, "public-room", handle, None),
+    )
+    .await
+    .expect("subscribe must not hang (Redis up?)");
+    assert_eq!(
+        out.subscription_count, 1,
+        "first local subscriber → count 1"
+    );
+
+    assert!(
+        tracked_contains(&node_b, &msg_key),
+        "B must track {msg_key} after the node-local 0→1 edge"
+    );
+
+    // Unsubscribe that socket on B → node-local 1→0 edge → B UNSUBSCRIBEs from Redis.
+    let out = tokio::time::timeout(
+        Duration::from_secs(2),
+        node_b.unsubscribe(TEST_APP, "public-room", &socket_id),
+    )
+    .await
+    .expect("unsubscribe must not hang (Redis up?)");
+    assert_eq!(
+        out.subscription_count, 0,
+        "last local subscriber gone → count 0"
+    );
+
+    assert!(
+        !tracked_contains(&node_b, &msg_key),
+        "B must no longer track {msg_key} after the node-local 1→0 edge"
+    );
+}
+
+/// Whether `adapter`'s SubscriberClient currently tracks `key` as a subscription.
+fn tracked_contains(adapter: &RedisAdapter, key: &str) -> bool {
+    adapter.tracked_redis_channels().iter().any(|c| c == key)
 }

@@ -23,6 +23,7 @@ use crate::protocol::socket_id::SocketId;
 use crate::server::config::ServerConfig;
 use crate::user::{UserJoinOutcome, UserLeaveOutcome};
 use async_trait::async_trait;
+use fred::interfaces::PubsubInterface;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -56,9 +57,7 @@ impl RedisConfig {
 /// adapter; later phases add the Redis fan-out.
 pub struct RedisAdapter {
     local: LocalAdapter,
-    #[allow(dead_code)] // wired in B/C/D/E
     clients: client::RedisClients,
-    #[allow(dead_code)] // wired in B/C/D/E
     keys: keys::Keys,
     #[allow(dead_code)] // wired in B/C/D/E
     node_id: String,
@@ -82,6 +81,19 @@ impl RedisAdapter {
             cfg: RedisConfig::from_server_config(cfg),
         })
     }
+
+    /// Test-support accessor: the set of Redis pub/sub channels this node's
+    /// SubscriberClient is currently tracking. Used by the cluster integration
+    /// tests to assert the per-(app,channel) subscription lifecycle.
+    #[doc(hidden)]
+    pub fn tracked_redis_channels(&self) -> Vec<String> {
+        self.clients
+            .sub
+            .tracked_channels()
+            .into_iter()
+            .map(|c| c.to_string())
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -93,7 +105,28 @@ impl Adapter for RedisAdapter {
         handle: ConnectionHandle,
         member: Option<PresenceMember>,
     ) -> SubscribeOutcome {
-        self.local.subscribe(app, channel, handle, member).await
+        let out = self.local.subscribe(app, channel, handle, member).await;
+
+        // The Redis-subscription lifecycle is keyed on the node-LOCAL subscriber
+        // edge: subscribe to the msg channel when this node goes 0 → 1. We capture
+        // the local count now because C1 will overwrite `out.subscription_count`
+        // with the *cluster*-wide count — the lifecycle must stay on the local edge.
+        let local_count = out.subscription_count;
+        if local_count == 1 {
+            let msg_key = self.keys.msg(app, channel);
+            if let Err(e) = self.clients.sub.subscribe(msg_key.clone()).await {
+                // The local subscription already succeeded; a Redis SUBSCRIBE
+                // failure only costs cross-node delivery for this channel on this
+                // node. Log loudly but never panic the connection task.
+                tracing::warn!(
+                    error = %e,
+                    channel = %msg_key,
+                    "failed to SUBSCRIBE to Redis msg channel on 0→1 edge"
+                );
+            }
+        }
+
+        out
     }
 
     async fn unsubscribe(
@@ -102,7 +135,25 @@ impl Adapter for RedisAdapter {
         channel: &str,
         socket_id: &SocketId,
     ) -> UnsubscribeOutcome {
-        self.local.unsubscribe(app, channel, socket_id).await
+        let out = self.local.unsubscribe(app, channel, socket_id).await;
+
+        // Mirror of `subscribe`: tear down the Redis subscription on the node-LOCAL
+        // 1 → 0 edge. Keyed on the local count (see note in `subscribe`): C1 will
+        // overwrite `out.subscription_count` with the cluster count, so the
+        // lifecycle decision must read the node-local count captured here.
+        let local_count = out.subscription_count;
+        if local_count == 0 {
+            let msg_key = self.keys.msg(app, channel);
+            if let Err(e) = self.clients.sub.unsubscribe(msg_key.clone()).await {
+                tracing::warn!(
+                    error = %e,
+                    channel = %msg_key,
+                    "failed to UNSUBSCRIBE from Redis msg channel on 1→0 edge"
+                );
+            }
+        }
+
+        out
     }
 
     async fn broadcast(
