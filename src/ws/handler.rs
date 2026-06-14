@@ -118,6 +118,13 @@ impl ConnectionContext {
     }
 
     pub(in crate::ws) async fn maybe_emit_count(&self, channel: &str, count: usize) {
+        // Presence channels communicate membership via member_added/member_removed;
+        // pusher_internal:subscription_count must not be emitted for them (Pusher parity P4).
+        if crate::channel::kind::ChannelInfo::of(channel).auth
+            == crate::channel::kind::AuthKind::Presence
+        {
+            return;
+        }
         if self.app.subscription_count_enabled {
             self.adapter
                 .broadcast(

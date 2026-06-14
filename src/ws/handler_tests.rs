@@ -1109,6 +1109,63 @@ async fn cache_channel_miss_emits_cache_miss_webhook() {
     assert_eq!(env["events"][0]["channel"], "cache-x");
 }
 
+// P4 — presence channels must NOT receive pusher_internal:subscription_count
+
+/// Subscribe to `channel` (with valid auth if presence) on an app that has
+/// `subscription_count_enabled = true`, then drain all queued events and return
+/// whether any of them were a `SubscriptionCount` frame.
+async fn sub_count_emitted_after_subscribe(channel: &str, channel_data: Option<&str>) -> bool {
+    let (mut c, mut rx) = ctx(app(true)); // subscription_count_enabled = true
+    let sid = c.socket_id.as_str().to_string();
+    let auth = if channel_data.is_some()
+        || channel.starts_with("presence-")
+        || channel.starts_with("private-")
+    {
+        let sig = crate::auth::signature::channel_signature("s", &sid, channel, channel_data);
+        Some(format!("k:{sig}"))
+    } else {
+        None
+    };
+    c.dispatch(ClientCommand::Subscribe {
+        channel: channel.into(),
+        auth,
+        channel_data: channel_data.map(String::from),
+    })
+    .await;
+    let mut saw_count = false;
+    while let Ok(ev) = rx.try_recv() {
+        if matches!(ev, ServerEvent::SubscriptionCount { .. }) {
+            saw_count = true;
+        }
+    }
+    saw_count
+}
+
+#[tokio::test]
+async fn subscription_count_not_emitted_for_presence_channel() {
+    // Presence channels must never receive pusher_internal:subscription_count
+    // (Pusher parity P4 — count is communicated via member_added/member_removed).
+    let emitted = sub_count_emitted_after_subscribe(
+        "presence-room",
+        Some(r#"{"user_id":"u1","user_info":{}}"#),
+    )
+    .await;
+    assert!(
+        !emitted,
+        "subscription_count must NOT be emitted on presence channels (P4)"
+    );
+}
+
+#[tokio::test]
+async fn subscription_count_emitted_for_public_channel() {
+    // Public channels must still receive subscription_count when enabled.
+    let emitted = sub_count_emitted_after_subscribe("room", None).await;
+    assert!(
+        emitted,
+        "subscription_count MUST be emitted on public channels when enabled"
+    );
+}
+
 // P3 — presence client-events must carry the originator's top-level `user_id`
 // in the broadcast frame; private channels must omit it. pusher-js
 // presence_channel.ts reads `event.user_id` → `metadata.user_id`.
