@@ -1541,6 +1541,75 @@ async fn private_client_event_broadcast_omits_user_id() {
     );
 }
 
+// P16 — oversize client-event NAME must emit in-band 4301 (not silent drop)
+
+#[tokio::test]
+async fn client_event_oversize_name_returns_4301_and_does_not_broadcast() {
+    // Use a shared adapter so we can check the receiver gets nothing.
+    let registry = Arc::new(Registry::new());
+    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
+    let mk = || {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let c = ConnectionContext {
+            app: app_with_client_messages(true),
+            socket_id: SocketId::generate(),
+            self_tx: tx,
+            adapter: adapter.clone(),
+            limits: crate::server::config::ServerConfig::default().limits(),
+            subscribed: HashSet::new(),
+            user: None,
+            webhooks: crate::webhook::WebhookHandle::null(),
+            presence_membership: std::collections::HashMap::new(),
+            client_event_rate: crate::ws::rate::RateWindow::new(100), // generous budget
+        };
+        (c, rx)
+    };
+    let (mut sender, mut rx_sender) = mk();
+    let (mut receiver, mut rx_receiver) = mk();
+
+    // Both subscribe to the same private channel.
+    let channel = "private-name-len-test";
+    for c in [&mut sender, &mut receiver] {
+        let sid = c.socket_id.as_str().to_string();
+        let sig = crate::auth::signature::channel_signature("s", &sid, channel, None);
+        c.dispatch(ClientCommand::Subscribe {
+            channel: channel.into(),
+            auth: Some(format!("k:{sig}")),
+            channel_data: None,
+        })
+        .await;
+    }
+    while rx_sender.try_recv().is_ok() {}
+    while rx_receiver.try_recv().is_ok() {}
+
+    // Build an event name that is 201 chars (> default max 200).
+    let long_event = "client-".to_string() + &"x".repeat(194); // 7 + 194 = 201
+    assert_eq!(long_event.len(), 201);
+
+    sender
+        .dispatch(ClientCommand::ClientEvent {
+            event: long_event.clone(),
+            channel: channel.into(),
+            data: serde_json::json!({}),
+        })
+        .await;
+
+    // Sender must receive a 4301 ClientEventError.
+    match rx_sender.try_recv() {
+        Ok(ServerEvent::ClientEventError { code, channel: ch, .. }) => {
+            assert_eq!(code, 4301, "oversize event name must return 4301 (P16)");
+            assert_eq!(ch, channel, "error must carry the channel name");
+        }
+        other => panic!("expected ClientEventError 4301 for oversize event name, got {other:?}"),
+    }
+
+    // Receiver must NOT have received the event.
+    assert!(
+        rx_receiver.try_recv().is_err(),
+        "oversize event name must not be broadcast to receiver"
+    );
+}
+
 // P12 — per-connection client-event rate limit (10/s) → in-band 4301 + drop
 
 /// Sender and receiver share an adapter; sender has a tight rate window of 3.

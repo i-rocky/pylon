@@ -303,13 +303,18 @@ impl ConnectionContext {
         if !allowed || !self.subscribed.contains(&channel) {
             return; // silently dropped, matching Soketi/Pusher
         }
-        // P9: client-events with an oversized name are silently dropped.
+        // P16: client-events with an oversized name emit in-band 4301 (soketi parity).
+        // This gate must remain BEFORE the rate-limit check so oversized-name events
+        // do NOT consume rate budget.
         if event.len() > self.limits.max_event_name_length {
-            tracing::debug!(
-                app = %self.app.id,
-                event_len = event.len(),
-                "client-event dropped: event name exceeds max_event_name_length"
-            );
+            let max = self.limits.max_event_name_length;
+            self.send_self(ServerEvent::ClientEventError {
+                channel,
+                code: 4301,
+                message: format!(
+                    "Event name is too long. Maximum allowed size is {max}."
+                ),
+            });
             return;
         }
         // Oversize client-event payloads return pusher:error 4301 (soketi parity).
