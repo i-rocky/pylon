@@ -12,6 +12,7 @@ use fred::prelude::*;
 use pylon::adapter::redis::keys::Keys;
 use pylon::adapter::redis::{client::RedisClients, RedisAdapter};
 use pylon::adapter::Adapter;
+use pylon::channel::cache::CachedEvent;
 use pylon::connection::handle::ConnectionHandle;
 use pylon::protocol::event::ServerEvent;
 use pylon::protocol::socket_id::SocketId;
@@ -500,6 +501,95 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// E1: a cache-channel last-event written on one node must be readable on ANOTHER
+/// node — the cache store is Redis-backed, not node-local. A `cache_set` on adapter A
+/// must be visible to a `cache_get` on adapter B sharing the same prefix. (This fails
+/// while `cache_set`/`cache_get` delegate to the in-memory `LocalAdapter`: B's local
+/// store would be empty, so the cross-node read returns None.)
+#[tokio::test]
+async fn cache_set_on_one_node_is_readable_on_another() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let adapter_a = connect_adapter_with_prefix(&prefix).await;
+        let adapter_b = connect_adapter_with_prefix(&prefix).await;
+
+        adapter_a
+            .cache_set(
+                TEST_APP,
+                "cache-x",
+                CachedEvent {
+                    event: "e".into(),
+                    data: "d".into(),
+                },
+                Duration::from_secs(30),
+            )
+            .await;
+
+        let got = adapter_b.cache_get(TEST_APP, "cache-x").await;
+        assert_eq!(
+            got,
+            Some(CachedEvent {
+                event: "e".into(),
+                data: "d".into(),
+            }),
+            "cache_set on A must be readable via cache_get on B (Redis-backed)"
+        );
+    })
+    .await
+    .expect("cross-node cache test must not hang (Redis up?)");
+}
+
+/// E1: a `cache_get` for a channel that was never set returns None (a benign
+/// `pusher:cache_miss`), not an error.
+#[tokio::test]
+async fn cache_get_is_none_when_absent() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let adapter_a = connect_adapter_with_prefix(&prefix).await;
+        assert_eq!(
+            adapter_a.cache_get(TEST_APP, "cache-never").await,
+            None,
+            "an unset cache channel must read back None"
+        );
+    })
+    .await
+    .expect("absent-cache test must not hang (Redis up?)");
+}
+
+/// E1: a cache entry expires once its Redis PX TTL elapses. Set with a 150ms TTL,
+/// wait 300ms, then the GET returns nil → None (Redis handles expiry natively; the
+/// Redis adapter does NO manual expiry check).
+#[tokio::test]
+async fn cache_entry_expires() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let adapter_a = connect_adapter_with_prefix(&prefix).await;
+
+        adapter_a
+            .cache_set(
+                TEST_APP,
+                "cache-x",
+                CachedEvent {
+                    event: "e".into(),
+                    data: "d".into(),
+                },
+                Duration::from_millis(150),
+            )
+            .await;
+
+        // Real (short) sleep past the PX TTL — the only timing-sensitive assertion.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(
+            adapter_a.cache_get(TEST_APP, "cache-x").await,
+            None,
+            "cache entry must be gone after its Redis PX TTL elapsed"
+        );
+    })
+    .await
+    .expect("cache-expiry test must not hang (Redis up?)");
 }
 
 /// D2: the lease-locked sweeper reaps members whose `expireAt` is in the past (a

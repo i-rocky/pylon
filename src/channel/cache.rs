@@ -6,7 +6,11 @@ use std::time::Instant;
 
 /// The last event seen on a cache channel: the event name and its verbatim,
 /// already-serialized `data` string — stored exactly as it was relayed.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Serialize`/`Deserialize` let the Redis adapter persist the cached last-event as
+/// JSON so it is shared across nodes (a plain data struct — the derives add no
+/// behaviour and the in-memory `LocalAdapter` ignores them).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CachedEvent {
     pub event: String,
     pub data: String,

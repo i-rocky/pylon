@@ -29,6 +29,7 @@ use fred::clients::Pool;
 use fred::interfaces::{
     EventInterface, HashesInterface, KeysInterface, PubsubInterface, SetsInterface,
 };
+use fred::types::Expiration;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
@@ -580,11 +581,49 @@ impl Adapter for RedisAdapter {
     }
 
     async fn cache_set(&self, app: &str, channel: &str, event: CachedEvent, ttl: Duration) {
-        self.local.cache_set(app, channel, event, ttl).await
+        let key = self.keys.cache(app, channel);
+        let json = match serde_json::to_string(&event) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, app, channel, "redis cache_set serialize failed");
+                return;
+            }
+        };
+        let ttl_ms = ttl.as_millis() as u64;
+        // Redis `PX 0` (or negative) is an error. A ttl of 0 means "immediately
+        // expired", so we SKIP the SET entirely — a subsequent `cache_get` then sees
+        // no key and returns None. This mirrors the `LocalAdapter`'s `<` expiry
+        // semantics (a ttl-0 entry is treated as already expired) without writing a
+        // doomed key. The production cache ttl (`cache_ttl_secs`, default 1800s) is
+        // always non-zero, so this only guards the degenerate case.
+        if ttl_ms == 0 {
+            return;
+        }
+        if let Err(e) = self
+            .clients
+            .pool
+            .next()
+            .set::<(), _, _>(key, json, Some(Expiration::PX(ttl_ms as i64)), None, false)
+            .await
+        {
+            tracing::warn!(error = %e, app, channel, "redis cache_set failed");
+        }
     }
 
     async fn cache_get(&self, app: &str, channel: &str) -> Option<CachedEvent> {
-        self.local.cache_get(app, channel).await
+        let key = self.keys.cache(app, channel);
+        // GET returns nil → `None` after the PX TTL elapses; Redis handles expiry
+        // natively so there is NO manual expiry check here (unlike `LocalAdapter`).
+        let raw: Option<String> = match self.clients.pool.next().get(key).await {
+            Ok(v) => v,
+            Err(e) => {
+                // Degrade to a benign cache_miss. Do NOT fall back to the node-local
+                // cache — that would be cross-node-inconsistent.
+                tracing::warn!(error = %e, app, channel, "redis cache_get failed");
+                return None;
+            }
+        };
+        raw.and_then(|s| serde_json::from_str::<CachedEvent>(&s).ok())
     }
 
     async fn signin_user(
