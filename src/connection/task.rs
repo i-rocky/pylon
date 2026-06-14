@@ -115,7 +115,7 @@ pub async fn run(socket: WebSocket, codec: Box<dyn Codec>, params: ConnectionPar
                         let _ = sink
                             .send(Message::Close(Some(CloseFrame {
                                 code: 4201,
-                                reason: "Pong reply not received".into(),
+                                reason: "Pong reply not received: ping was sent to the client, but no reply was received".into(),
                             })))
                             .await;
                         break;

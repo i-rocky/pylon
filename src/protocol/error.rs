@@ -22,19 +22,13 @@ impl PusherError {
         Self::new(4004, "App connection limit reached")
     }
     pub fn invalid_version() -> Self {
-        Self::new(4006, "Invalid protocol version")
+        Self::new(4006, "Invalid version string format")
     }
     pub fn unsupported_protocol() -> Self {
         Self::new(4007, "Unsupported protocol version")
     }
     pub fn no_protocol() -> Self {
         Self::new(4008, "No protocol version supplied")
-    }
-    pub fn unauthorized() -> Self {
-        Self::new(4009, "Connection is unauthorized")
-    }
-    pub fn pong_not_received() -> Self {
-        Self::new(4201, "Pong reply not received")
     }
 }
 
@@ -49,8 +43,14 @@ mod tests {
         assert_eq!(PusherError::invalid_version().code, 4006);
         assert_eq!(PusherError::unsupported_protocol().code, 4007);
         assert_eq!(PusherError::no_protocol().code, 4008);
-        assert_eq!(PusherError::unauthorized().code, 4009);
-        assert_eq!(PusherError::pong_not_received().code, 4201);
         assert!(!PusherError::app_not_found().message.is_empty());
+    }
+
+    #[test]
+    fn invalid_version_message_matches_spec() {
+        assert_eq!(
+            PusherError::invalid_version().message,
+            "Invalid version string format"
+        );
     }
 }
