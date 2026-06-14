@@ -144,6 +144,28 @@ impl ConnectionContext {
                         )
                     }
                 };
+                // P10: enforce presence user_id length and user_info byte limits.
+                // Order: verify (done above) → parse (done above) → size check → cap check → add.
+                if member.user_id.chars().count() > self.limits.max_presence_user_id_length {
+                    return self.send_subscription_error(
+                        &channel,
+                        "InvalidPresenceData",
+                        "user_id exceeds maximum length",
+                        401,
+                    );
+                }
+                if !member.user_info.is_null() {
+                    let info_bytes =
+                        serde_json::to_string(&member.user_info).map_or(0, |s| s.len());
+                    if info_bytes > self.limits.max_presence_user_info_bytes {
+                        return self.send_subscription_error(
+                            &channel,
+                            "InvalidPresenceData",
+                            "user_info exceeds maximum size",
+                            401,
+                        );
+                    }
+                }
                 // Enforce the configurable presence member cap (pylon-chosen rejection shape).
                 let current = self
                     .adapter

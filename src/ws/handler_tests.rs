@@ -1281,6 +1281,95 @@ async fn subscription_count_emitted_for_public_channel() {
     );
 }
 
+// P10 — presence user_id (≤128 chars) and user_info (≤1024 bytes) size limits
+
+/// Build a properly-signed presence subscribe command for the given channel_data JSON string.
+fn signed_presence_sub(c: &ConnectionContext, channel_data: &str) -> ClientCommand {
+    let sid = c.socket_id.as_str().to_string();
+    let sig =
+        crate::auth::signature::channel_signature("s", &sid, "presence-x", Some(channel_data));
+    ClientCommand::Subscribe {
+        channel: "presence-x".into(),
+        auth: Some(format!("k:{sig}")),
+        channel_data: Some(channel_data.to_string()),
+    }
+}
+
+#[tokio::test]
+async fn presence_subscribe_with_oversized_user_id_errors() {
+    // user_id of 129 chars exceeds the 128-char limit → subscription_error
+    let long_uid = "u".repeat(129);
+    let cd = serde_json::json!({"user_id": long_uid, "user_info": {}}).to_string();
+    let (mut c, mut rx) = ctx(app(false));
+    let cmd = signed_presence_sub(&c, &cd);
+    c.dispatch(cmd).await;
+    match rx.try_recv() {
+        Ok(ServerEvent::SubscriptionError {
+            channel,
+            error_type,
+            ..
+        }) => {
+            assert_eq!(channel, "presence-x");
+            assert_eq!(error_type, "InvalidPresenceData");
+        }
+        other => panic!("expected SubscriptionError for oversized user_id, got {other:?}"),
+    }
+    // Must NOT have been registered
+    assert_eq!(
+        c.adapter
+            .channel("app", "presence-x")
+            .await
+            .subscription_count,
+        0
+    );
+}
+
+#[tokio::test]
+async fn presence_subscribe_with_oversized_user_info_errors() {
+    // user_info serialized to >1024 bytes → subscription_error
+    // Build a user_info value whose JSON representation exceeds 1024 bytes.
+    let big_val: String = "x".repeat(1030);
+    let cd = serde_json::json!({"user_id": "u1", "user_info": {"data": big_val}}).to_string();
+    let (mut c, mut rx) = ctx(app(false));
+    let cmd = signed_presence_sub(&c, &cd);
+    c.dispatch(cmd).await;
+    match rx.try_recv() {
+        Ok(ServerEvent::SubscriptionError {
+            channel,
+            error_type,
+            ..
+        }) => {
+            assert_eq!(channel, "presence-x");
+            assert_eq!(error_type, "InvalidPresenceData");
+        }
+        other => panic!("expected SubscriptionError for oversized user_info, got {other:?}"),
+    }
+    assert_eq!(
+        c.adapter
+            .channel("app", "presence-x")
+            .await
+            .subscription_count,
+        0
+    );
+}
+
+#[tokio::test]
+async fn presence_subscribe_with_valid_sized_data_succeeds() {
+    // user_id exactly 128 chars and user_info just under 1024 bytes → succeeds
+    let uid_128 = "u".repeat(128);
+    // small user_info well under 1024 bytes
+    let cd = serde_json::json!({"user_id": uid_128, "user_info": {"role": "admin"}}).to_string();
+    let (mut c, mut rx) = ctx(app(false));
+    let cmd = signed_presence_sub(&c, &cd);
+    c.dispatch(cmd).await;
+    match rx.try_recv() {
+        Ok(ServerEvent::SubscriptionSucceeded { channel, .. }) => {
+            assert_eq!(channel, "presence-x");
+        }
+        other => panic!("expected SubscriptionSucceeded for valid presence data, got {other:?}"),
+    }
+}
+
 // P3 — presence client-events must carry the originator's top-level `user_id`
 // in the broadcast frame; private channels must omit it. pusher-js
 // presence_channel.ts reads `event.user_id` → `metadata.user_id`.
