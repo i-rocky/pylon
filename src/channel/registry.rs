@@ -112,6 +112,20 @@ impl Registry {
             .unwrap_or_default()
     }
 
+    /// Every local subscription as `(app, channel, socket_id)`, across all channels.
+    /// One tuple per socket. Used by the Redis adapter's membership TTL heartbeat to
+    /// re-stamp each local member's `expireAt` so live nodes never expire.
+    pub fn local_members(&self) -> Vec<(String, String, SocketId)> {
+        let mut out = Vec::new();
+        for entry in self.channels.iter() {
+            let (app, channel) = entry.key();
+            for sid in entry.value().socket_ids() {
+                out.push((app.clone(), channel.clone(), sid));
+            }
+        }
+        out
+    }
+
     /// Number of tracked `(app, channel)` entries. Test-only.
     #[cfg(test)]
     pub fn channel_entry_count(&self) -> usize {
@@ -195,6 +209,31 @@ mod tests {
         let reg = Registry::new();
         let sid = SocketId::generate();
         assert!(!reg.unsubscribe("app", "missing", &sid).vacated);
+    }
+
+    #[test]
+    fn local_members_enumerates_every_subscription_across_channels() {
+        let reg = Registry::new();
+        let (h1, _r1) = handle();
+        let (h2, _r2) = handle();
+        let (h3, _r3) = handle();
+        let s1 = h1.socket_id.clone();
+        let s2 = h2.socket_id.clone();
+        let s3 = h3.socket_id.clone();
+        // Two channels: "c1" has two sockets, "c2" has one.
+        reg.subscribe("app", "c1", h1, None);
+        reg.subscribe("app", "c1", h2, None);
+        reg.subscribe("app", "c2", h3, None);
+
+        let mut got = reg.local_members();
+        got.sort();
+        let mut want = vec![
+            ("app".to_string(), "c1".to_string(), s1),
+            ("app".to_string(), "c1".to_string(), s2),
+            ("app".to_string(), "c2".to_string(), s3),
+        ];
+        want.sort();
+        assert_eq!(got, want);
     }
 
     #[test]

@@ -44,6 +44,20 @@ fn redis_test_config(prefix: &str) -> ServerConfig {
     }
 }
 
+/// Build a `ServerConfig` for the Redis adapter with explicit, short membership TTL
+/// and heartbeat cadence. Lets the heartbeat test prove a live node keeps its members
+/// alive past a TTL that would otherwise have elapsed.
+fn redis_test_config_with_ttl(prefix: &str, ttl_secs: u64, heartbeat_secs: u64) -> ServerConfig {
+    ServerConfig {
+        adapter: "redis".into(),
+        redis_url: test_redis_url(),
+        redis_prefix: prefix.into(),
+        redis_membership_ttl_secs: ttl_secs,
+        redis_presence_heartbeat_secs: heartbeat_secs,
+        ..ServerConfig::default()
+    }
+}
+
 /// Build a connected `RedisAdapter` against the test Redis. Fails loud if Redis
 /// is down.
 async fn connect_adapter() -> RedisAdapter {
@@ -423,4 +437,44 @@ async fn cluster_membership_count_and_occupancy() {
         !all.iter().any(|c| c.name == "public-room"),
         "channels() must not list a vacated channel"
     );
+}
+
+/// C2: the membership TTL heartbeat. A node spawns a task that, every
+/// `redis_presence_heartbeat_secs`, re-stamps every LOCAL member's `expireAt` and
+/// bumps the occ-hash whole-key TTL. With a 2s TTL and a 1s heartbeat, a member
+/// subscribed once must STILL be present after 2.5s — proving the refresh ran.
+/// Without the heartbeat the `EXPIRE 2` would have elapsed and the count would be 0.
+#[tokio::test]
+async fn membership_heartbeat_keeps_member_alive_past_ttl() {
+    tokio::time::timeout(Duration::from_secs(6), async {
+        let prefix = random_prefix();
+        // Short TTL (2s) + faster heartbeat (1s): re-stamps at ~1s and ~2s.
+        let cfg = redis_test_config_with_ttl(&prefix, 2, 1);
+        let adapter = RedisAdapter::new(&cfg)
+            .await
+            .expect("RedisAdapter::new must connect to the test Redis");
+
+        // One local subscriber on a public channel.
+        let (_sock, handle) = fake_handle();
+        let out = adapter
+            .subscribe(TEST_APP, "public-room", handle, None)
+            .await;
+        assert_eq!(
+            out.subscription_count, 1,
+            "first subscriber → cluster count 1"
+        );
+
+        // Sleep past the 2s TTL. The 1s heartbeat must have re-stamped the member
+        // (and bumped the key TTL) at ~1s and ~2s, so it is still alive.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+
+        let summary = adapter.channel(TEST_APP, "public-room").await;
+        assert_eq!(
+            summary.subscription_count, 1,
+            "heartbeat must keep the member alive past the {}s TTL (got {})",
+            cfg.redis_membership_ttl_secs, summary.subscription_count
+        );
+    })
+    .await
+    .expect("heartbeat test must not hang (Redis up?)");
 }

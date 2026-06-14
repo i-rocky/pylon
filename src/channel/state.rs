@@ -84,6 +84,12 @@ impl ChannelState {
         self.subscribers.len()
     }
 
+    /// Socket ids of every current subscriber. Used to enumerate local members for
+    /// the membership TTL heartbeat (each gets its `expireAt` re-stamped in Redis).
+    pub fn socket_ids(&self) -> Vec<SocketId> {
+        self.subscribers.keys().cloned().collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.subscribers.is_empty()
     }

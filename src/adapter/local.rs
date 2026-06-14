@@ -27,6 +27,13 @@ impl LocalAdapter {
             users: UserRegistry::new(),
         }
     }
+
+    /// Every local subscription as `(app, channel, socket_id)`. Exposed so the Redis
+    /// adapter's membership heartbeat can re-stamp each local member without reaching
+    /// into the private registry.
+    pub fn local_members(&self) -> Vec<(String, String, SocketId)> {
+        self.registry.local_members()
+    }
 }
 
 #[async_trait]

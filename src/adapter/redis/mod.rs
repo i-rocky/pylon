@@ -24,17 +24,64 @@ use crate::protocol::socket_id::SocketId;
 use crate::server::config::ServerConfig;
 use crate::user::{UserJoinOutcome, UserLeaveOutcome};
 use async_trait::async_trait;
-use fred::interfaces::{EventInterface, HashesInterface, PubsubInterface, SetsInterface};
+use fred::clients::Pool;
+use fred::interfaces::{
+    EventInterface, HashesInterface, KeysInterface, PubsubInterface, SetsInterface,
+};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::task::JoinHandle;
 
 /// Current wall-clock time as milliseconds since the Unix epoch. Used to stamp the
 /// per-member `expireAt` in the occupancy hash (the sweeper reaps stale members).
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Membership TTL heartbeat loop. Every `interval_secs`, re-stamp each LOCAL
+/// member's `expireAt` in its channel's occupancy hash and bump that hash's
+/// whole-key TTL, so a live node never lets its members expire. A dead node simply
+/// stops ticking — its entries go stale and the per-key `EXPIRE` reaps them.
+///
+/// One Redis error refreshes one member; it is logged and skipped, never fatal —
+/// the loop runs for the adapter's lifetime.
+async fn heartbeat_loop(
+    local: Arc<LocalAdapter>,
+    pool: Pool,
+    keys: keys::Keys,
+    node_id: String,
+    ttl_secs: u64,
+    interval_secs: u64,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
+    loop {
+        ticker.tick().await;
+        let expire_at = (now_ms() + ttl_secs * 1000).to_string();
+        for (app, channel, socket_id) in local.local_members() {
+            let occ = keys.occ(&app, &channel);
+            let token = keys::member_token(&node_id, socket_id.as_str());
+            // Pipeline: HSET occ token expire_at ; EXPIRE occ ttl_secs. Refreshes the
+            // per-member stamp and the whole-key TTL backstop in one round-trip.
+            let pipe = pool.next().pipeline();
+            if let Err(e) = async {
+                pipe.hset::<(), _, _>(&occ, (token.clone(), expire_at.clone()))
+                    .await?;
+                pipe.expire::<(), _>(&occ, ttl_secs as i64, None).await?;
+                pipe.all::<()>().await
+            }
+            .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    app, channel,
+                    "redis membership heartbeat refresh failed; skipping this member"
+                );
+            }
+        }
+    }
 }
 
 /// The few `ServerConfig` knobs the Redis adapter needs to keep around for the
@@ -79,7 +126,12 @@ pub struct RedisAdapter {
     /// The pub/sub receive loop. Kept alive for the adapter's lifetime — dropping
     /// it would abort cross-node delivery on this node.
     #[allow(dead_code)]
-    recv_handle: tokio::task::JoinHandle<()>,
+    recv_handle: JoinHandle<()>,
+    /// The membership TTL heartbeat. Re-stamps every local member's `expireAt` and
+    /// bumps the occ-hash TTL on each tick. Kept alive for the adapter's lifetime —
+    /// dropping it stops the refresh and this node's members would expire.
+    #[allow(dead_code)]
+    heartbeat_handle: JoinHandle<()>,
 }
 
 impl RedisAdapter {
@@ -100,15 +152,32 @@ impl RedisAdapter {
         let recv_handle =
             tokio::spawn(async move { pubsub::receive_loop(rx, recv_local, recv_node).await });
 
+        let redis_cfg = RedisConfig::from_server_config(cfg);
+
+        // Spawn the membership TTL heartbeat. It re-stamps every local member's
+        // `expireAt` and bumps the occ-hash TTL every `presence_heartbeat_secs`, so a
+        // live node never lets its members expire. fred clients are cheap clones; the
+        // handle is stored so the task is not dropped (which would stop the refresh).
+        let hb_local = local.clone();
+        let hb_pool = clients.pool.clone();
+        let hb_keys = keys.clone();
+        let hb_node = node_id.clone();
+        let hb_ttl = redis_cfg.membership_ttl_secs;
+        let hb_interval = redis_cfg.presence_heartbeat_secs;
+        let heartbeat_handle = tokio::spawn(async move {
+            heartbeat_loop(hb_local, hb_pool, hb_keys, hb_node, hb_ttl, hb_interval).await
+        });
+
         Ok(Self {
             local,
             clients,
             keys,
             node_id,
-            cfg: RedisConfig::from_server_config(cfg),
+            cfg: redis_cfg,
             // `from_lua` is local (SHA-1 only) — no Redis round-trip here.
             scripts: client::Scripts::new(),
             recv_handle,
+            heartbeat_handle,
         })
     }
 
