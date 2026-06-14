@@ -322,13 +322,54 @@ async fn rest_trigger_two_encrypted_channels_is_400() {
     assert_eq!(resp.status(), 400);
 }
 
+/// Encrypted channel alongside ANY other channel must be rejected (400).
 #[tokio::test]
-async fn rest_trigger_mixed_one_encrypted_one_public_is_200() {
+async fn rest_trigger_encrypted_plus_public_is_400() {
     let addr = spawn().await;
     let body = json!({
         "name": "secret",
         "data": "x",
-        "channels": ["public-room", "private-encrypted-a"]
+        "channels": ["private-encrypted-a", "public-b"]
+    })
+    .to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+/// A single encrypted channel alone is allowed (200).
+#[tokio::test]
+async fn rest_trigger_encrypted_solo_is_200() {
+    let addr = spawn().await;
+    let body = json!({
+        "name": "secret",
+        "data": "x",
+        "channels": ["private-encrypted-a"]
+    })
+    .to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+/// Two plaintext channels together are still allowed (200).
+#[tokio::test]
+async fn rest_trigger_two_plaintext_channels_is_200() {
+    let addr = spawn().await;
+    let body = json!({
+        "name": "ev",
+        "data": "x",
+        "channels": ["public-a", "public-b"]
     })
     .to_string();
     let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
