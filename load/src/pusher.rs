@@ -170,9 +170,8 @@ mod frame_tests {
 
 use crate::metrics::{Counters, Latency};
 use futures_util::{SinkExt, StreamExt};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 

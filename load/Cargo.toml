@@ -5,6 +5,10 @@ edition = "2021"
 description = "Pusher-protocol load-test harness for pylon"
 publish = false
 
+[lib]
+name = "pylon_load"
+path = "src/lib.rs"
+
 [[bin]]
 name = "pylon-load"
 path = "src/main.rs"
@@ -29,3 +33,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 # Spawn a real pylon server in-process for the smoke test.
 pylon = { path = ".." }
+# `axum::serve` the pylon router on a loopback port in the smoke test.
+axum = { version = "0.8", features = ["ws"] }

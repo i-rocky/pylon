@@ -1,12 +1,7 @@
 //! pylon-load — Pusher-protocol load-test harness.
-#![allow(dead_code)]
-mod cli;
-mod metrics;
-mod pusher;
-mod scenario;
-
 use clap::Parser;
-use cli::{Cli, Scenario};
+use pylon_load::cli::{Cli, Scenario};
+use pylon_load::scenario;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
