@@ -42,7 +42,16 @@ pub fn encode(event: &ServerEvent) -> String {
             channel,
             event,
             data,
-        } => json!({ "event": event, "channel": channel, "data": data }).to_string(),
+            user_id,
+        } => {
+            let mut frame = json!({ "event": event, "channel": channel, "data": data });
+            // Presence client-events carry the originator's `user_id` at the top
+            // level. Emit the key ONLY when present — never as `null`.
+            if let Some(uid) = user_id {
+                frame["user_id"] = json!(uid);
+            }
+            frame.to_string()
+        }
         ServerEvent::SubscriptionError {
             channel,
             error_type,

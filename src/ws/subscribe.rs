@@ -209,6 +209,7 @@ impl ConnectionContext {
                     channel,
                     event: cached.event,
                     data: Value::String(cached.data),
+                    user_id: None,
                 },
                 None => {
                     if self.app.has_cache_miss_webhooks {
@@ -284,6 +285,8 @@ impl ConnectionContext {
                     channel: channel.clone(),
                     event,
                     data,
+                    // Presence members broadcast their `user_id`; private has none.
+                    user_id: user_id.clone(),
                 },
                 Some(self.socket_id.clone()),
             )

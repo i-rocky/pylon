@@ -81,6 +81,7 @@ async fn deliver(
                     channel: channel.to_string(),
                     event: name.to_string(),
                     data: Value::String(data.to_string()),
+                    user_id: None,
                 },
             )
             .await;
@@ -96,6 +97,7 @@ async fn deliver(
                 channel: channel.to_string(),
                 event: name.to_string(),
                 data: Value::String(data.to_string()),
+                user_id: None,
             },
             except,
         )

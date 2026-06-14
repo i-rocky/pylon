@@ -435,6 +435,7 @@ async fn cache_subscribe_replays_cached_event() {
             channel,
             event,
             data,
+            ..
         }) => {
             assert_eq!(channel, "cache-feed");
             assert_eq!(event, "my-event");
@@ -541,6 +542,7 @@ async fn encrypted_cache_subscribe_replays_after_auth() {
             channel,
             event,
             data,
+            ..
         }) => {
             assert_eq!(channel, "private-encrypted-cache-x");
             assert_eq!(event, "secret");
@@ -1105,4 +1107,85 @@ async fn cache_channel_miss_emits_cache_miss_webhook() {
     let env: serde_json::Value = serde_json::from_str(&recorded[0].body).unwrap();
     assert_eq!(env["events"][0]["name"], "cache_miss");
     assert_eq!(env["events"][0]["channel"], "cache-x");
+}
+
+// P3 — presence client-events must carry the originator's top-level `user_id`
+// in the broadcast frame; private channels must omit it. pusher-js
+// presence_channel.ts reads `event.user_id` → `metadata.user_id`.
+
+/// Two members on a shared adapter; A subscribes to `channel` with `channel_data`
+/// (when presence), then triggers `client-foo`. Returns the v7-encoded frame B
+/// receives for that broadcast.
+async fn relayed_client_event_frame(
+    channel: &str,
+    channel_data: Option<&str>,
+) -> serde_json::Value {
+    let registry = Arc::new(Registry::new());
+    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
+    let mk = |adapter: Arc<dyn Adapter>| {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let c = ConnectionContext {
+            app: app_with_client_messages(true),
+            socket_id: SocketId::generate(),
+            self_tx: tx,
+            adapter,
+            limits: crate::server::config::ServerConfig::default().limits(),
+            subscribed: HashSet::new(),
+            user: None,
+            webhooks: crate::webhook::WebhookHandle::null(),
+            presence_membership: std::collections::HashMap::new(),
+        };
+        (c, rx)
+    };
+    let (mut a, _rxa) = mk(adapter.clone());
+    let (mut b, mut rxb) = mk(adapter.clone());
+    for c in [&mut a, &mut b] {
+        let sid = c.socket_id.as_str().to_string();
+        let sig = crate::auth::signature::channel_signature("s", &sid, channel, channel_data);
+        c.dispatch(ClientCommand::Subscribe {
+            channel: channel.into(),
+            auth: Some(format!("k:{sig}")),
+            channel_data: channel_data.map(String::from),
+        })
+        .await;
+    }
+    while rxb.try_recv().is_ok() {} // drain b's subscription_succeeded + member_added
+
+    a.dispatch(ClientCommand::ClientEvent {
+        event: "client-foo".into(),
+        channel: channel.into(),
+        data: serde_json::json!({"hello": "world"}),
+    })
+    .await;
+
+    let frame = match rxb.try_recv() {
+        Ok(ev @ ServerEvent::ChannelEvent { .. }) => ev,
+        other => panic!("expected relayed ChannelEvent, got {other:?}"),
+    };
+    serde_json::from_str(&crate::protocol::v7::frames::encode(&frame)).unwrap()
+}
+
+#[tokio::test]
+async fn presence_client_event_broadcast_carries_user_id() {
+    // Member A joins presence-room as user_id "u1"; the frame B receives for A's
+    // client event must carry top-level `user_id: "u1"`.
+    let frame = relayed_client_event_frame("presence-room", Some(r#"{"user_id":"u1"}"#)).await;
+    assert_eq!(frame["event"], "client-foo");
+    assert_eq!(frame["channel"], "presence-room");
+    assert_eq!(
+        frame["user_id"], "u1",
+        "presence client-event broadcast must carry the sender's user_id"
+    );
+}
+
+#[tokio::test]
+async fn private_client_event_broadcast_omits_user_id() {
+    // No presence membership on a private channel → no top-level user_id.
+    let frame = relayed_client_event_frame("private-c", None).await;
+    assert_eq!(frame["event"], "client-foo");
+    assert_eq!(frame["channel"], "private-c");
+    assert!(
+        frame.get("user_id").is_none(),
+        "private client-event broadcast must not carry user_id"
+    );
 }

@@ -38,10 +38,15 @@ pub enum ServerEvent {
     },
     Error(PusherError),
     /// Generic channel delivery (client events SP2, REST triggers SP2).
+    /// `user_id` is the originator's presence `user_id`, present ONLY on a
+    /// presence client-event broadcast (pusher-js `presence_channel.ts` reads
+    /// `event.user_id` → `metadata.user_id`). `None` everywhere else; the v7
+    /// encoder omits the key when `None` (never emits `null`).
     ChannelEvent {
         channel: String,
         event: String,
         data: Value,
+        user_id: Option<String>,
     },
     /// `pusher:subscription_error` — non-fatal, channel-scoped. Data is an OBJECT.
     SubscriptionError {
