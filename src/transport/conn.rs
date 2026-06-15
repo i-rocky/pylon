@@ -54,6 +54,12 @@ pub enum WriteStatus {
 pub enum ConnError {
     /// The outbound queue is over its high-water mark; the caller must close the
     /// connection (a slow consumer we refuse to buffer for unbounded).
+    ///
+    /// SP10: the per-connection out-queue is now byte-bounded **drop-head**
+    /// ([`Connection::queue`] drops the oldest frame(s) to fit rather than
+    /// rejecting), so this variant is no longer produced by the queue path. It is
+    /// retained for the read paths' API shape and possible future use.
+    #[allow(dead_code)]
     Backpressure,
     /// The peer closed (EOF with nothing buffered) or the socket errored.
     Closed,
@@ -108,24 +114,42 @@ impl Connection {
         self.stream
     }
 
-    /// Queue a pre-encoded frame for sending.
+    /// Queue a pre-encoded frame for sending (SP10 byte-bounded **drop-head**).
     ///
-    /// If appending would push the total queued bytes past `high_water`, the
-    /// frame is **not** appended and [`ConnError::Backpressure`] is returned —
-    /// the caller is expected to close the connection rather than let a slow
-    /// consumer balloon our memory. Otherwise the frame is appended and `Ok` is
-    /// returned. The frame still needs a [`flush`](Self::flush) (or a writable
-    /// event) to actually go out.
-    pub fn queue(&mut self, frame: Arc<[u8]>) -> Result<(), ConnError> {
-        let len = frame.len();
-        // Reject *before* appending so `out_bytes` never exceeds high_water and
-        // the rejected frame leaves no trace.
-        if self.out_bytes + len > self.high_water {
-            return Err(ConnError::Backpressure);
+    /// Appends `frame`; if that would push the total queued bytes past
+    /// `high_water`, the **oldest droppable** frame(s) are evicted (drop-head,
+    /// freshest-wins for a live feed) until the new frame fits, decrementing the
+    /// byte counter for each. WebSocket delivery is at-most-once, so dropping the
+    /// stalest queued frame for a slow consumer is correct — and it keeps memory
+    /// bounded under a publish flood (the SP9 hang fix).
+    ///
+    /// The frame currently mid-write — the front when `out_cursor > 0` — is
+    /// **never** evicted: removing it would splice the peer's byte stream at an
+    /// arbitrary offset and corrupt the connection. In that case the oldest
+    /// droppable index is `1`, not `0`.
+    ///
+    /// If even after dropping everything droppable the new frame still doesn't fit
+    /// (a single frame larger than the cap, or a locked front leaving no room),
+    /// it is enqueued anyway — a single legitimate frame must remain deliverable;
+    /// `high_water` is a soft target, not a hard per-frame reject.
+    ///
+    /// Returns the number of frames dropped. The appended frame still needs a
+    /// [`flush`](Self::flush) (or a writable event) to actually go out.
+    pub fn queue(&mut self, frame: Arc<[u8]>) -> usize {
+        let flen = frame.len();
+        let mut dropped = 0;
+        // The frame currently mid-write (front when out_cursor>0) is "locked"; the
+        // oldest droppable index is 1 in that case, else 0.
+        let locked = if self.out_cursor > 0 { 1 } else { 0 };
+        while self.out_bytes + flen > self.high_water && self.out.len() > locked {
+            // Remove the oldest droppable frame.
+            let victim = self.out.remove(locked).expect("len checked");
+            self.out_bytes -= victim.len();
+            dropped += 1;
         }
-        self.out_bytes += len;
+        self.out_bytes += flen;
         self.out.push_back(frame);
-        Ok(())
+        dropped
     }
 
     /// Write as much of the queued data as the socket will accept, right now.
@@ -238,6 +262,48 @@ impl Connection {
     pub fn has_pending_writes(&self) -> bool {
         !self.out.is_empty()
     }
+
+    // ---- test accessors -------------------------------------------------------
+    // Read-only views of the private out-queue state, used by the drop-head unit
+    // tests. `#[cfg(test)]` so they add no surface (or dead-code warnings) to the
+    // library build.
+
+    /// Total bytes currently queued across all of `out`.
+    #[cfg(test)]
+    pub fn out_bytes(&self) -> usize {
+        self.out_bytes
+    }
+
+    /// Number of frames currently queued.
+    #[cfg(test)]
+    pub fn queued_len(&self) -> usize {
+        self.out.len()
+    }
+
+    /// Byte offset already written into the front frame (partial-write cursor).
+    #[cfg(test)]
+    pub fn out_cursor(&self) -> usize {
+        self.out_cursor
+    }
+
+    /// First byte of the front (oldest) queued frame.
+    #[cfg(test)]
+    pub fn peek_front_byte(&self) -> u8 {
+        self.out.front().map(|f| f[0]).unwrap()
+    }
+
+    /// First byte of the back (newest) queued frame.
+    #[cfg(test)]
+    pub fn peek_back_byte(&self) -> u8 {
+        self.out.back().map(|f| f[0]).unwrap()
+    }
+
+    /// Whether the front frame is the 4 MB "huge" frame the drop-head test
+    /// enqueues first (identified by its length), i.e. index 0 is untouched.
+    #[cfg(test)]
+    pub fn front_is_the_huge_frame(&self) -> bool {
+        self.out.front().map(|f| f.len() == 4_000_000).unwrap_or(false)
+    }
 }
 
 #[cfg(test)]
@@ -258,6 +324,27 @@ mod tests {
         server.set_nonblocking(true).unwrap();
         let mio_server = mio::net::TcpStream::from_std(server);
         client.set_nonblocking(false).unwrap(); // blocking peer for test simplicity
+        (mio_server, client)
+    }
+
+    /// A socket pair like [`pair`], but with a tiny `SO_SNDBUF` on the server end
+    /// so a multi-MB frame cannot be written in one `flush` — the first flush
+    /// fills the kernel send buffer and stops partway, leaving `out_cursor > 0`
+    /// on the front frame. The blocking peer is returned but deliberately *not*
+    /// drained by the caller, so the send buffer stays full and the front stays
+    /// mid-write.
+    fn pair_tiny_sndbuf() -> (mio::net::TcpStream, StdTcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = StdTcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server.set_nonblocking(true).unwrap();
+        // Shrink the send buffer so a 4 MB frame is forced into a partial write.
+        socket2::SockRef::from(&server)
+            .set_send_buffer_size(8 * 1024)
+            .unwrap();
+        let mio_server = mio::net::TcpStream::from_std(server);
+        client.set_nonblocking(false).unwrap();
         (mio_server, client)
     }
 
@@ -289,9 +376,9 @@ mod tests {
         expected.extend_from_slice(&f2);
         expected.extend_from_slice(&f3);
 
-        conn.queue(f1).unwrap();
-        conn.queue(f2).unwrap();
-        conn.queue(f3).unwrap();
+        assert_eq!(conn.queue(f1), 0);
+        assert_eq!(conn.queue(f2), 0);
+        assert_eq!(conn.queue(f3), 0);
         assert!(conn.has_pending_writes());
 
         assert_eq!(conn.flush(), WriteStatus::Drained);
@@ -324,7 +411,7 @@ mod tests {
         let total = frame_bytes.len();
 
         let mut conn = Connection::new(server, total + 1);
-        conn.queue(Arc::clone(&frame_bytes)).unwrap();
+        assert_eq!(conn.queue(Arc::clone(&frame_bytes)), 0);
 
         // First flush: the kernel send buffer fills and we stop partway.
         assert_eq!(conn.flush(), WriteStatus::WouldBlock);
@@ -397,25 +484,45 @@ mod tests {
         assert_eq!(&received[payload_start..], &payload[..]);
     }
 
-    // ---- backpressure ---------------------------------------------------------
+    // ---- drop-head (SP10) -----------------------------------------------------
     #[test]
-    fn queue_past_high_water_rejects_without_growing() {
-        let (server, _client) = pair();
-        let mut conn = Connection::new(server, 100);
+    fn queue_drops_oldest_when_over_cap_keeping_newest() {
+        let (mio_s, _peer) = pair(); // existing test helper
+        let mut c = Connection::new(mio_s, 100); // 100-byte cap
+        // frames of 40 bytes each; 3 of them = 120 > 100 → oldest dropped, newest kept
+        let f = |n: u8| -> std::sync::Arc<[u8]> {
+            std::sync::Arc::from(vec![n; 40].into_boxed_slice())
+        };
+        assert_eq!(c.queue(f(1)), 0); // returns dropped count = 0
+        assert_eq!(c.queue(f(2)), 0); // out_bytes = 80
+        let dropped = c.queue(f(3)); // 120 > 100 → drop oldest (f(1)) → out = [f2,f3], 80 bytes
+        assert_eq!(dropped, 1);
+        assert_eq!(c.out_bytes(), 80);
+        assert_eq!(c.queued_len(), 2);
+        // the surviving frames are the NEWEST two (f2, f3), not f1
+        assert_eq!(c.peek_back_byte(), 3);
+        assert_eq!(c.peek_front_byte(), 2);
+    }
 
-        // A ~50-byte frame fits; queue two (~100 bytes) to sit at the limit.
-        let small = text_frame(&[0u8; 44]); // 2 header + 44 = 46 bytes
-        let len = small.len();
-        conn.queue(Arc::clone(&small)).unwrap();
-        conn.queue(Arc::clone(&small)).unwrap();
-        let bytes_before = conn.out_bytes;
-        assert_eq!(bytes_before, 2 * len);
-
-        // The third would push past 100 -> rejected, queue unchanged.
-        let err = conn.queue(Arc::clone(&small)).unwrap_err();
-        assert_eq!(err, ConnError::Backpressure);
-        assert_eq!(conn.out_bytes, bytes_before, "out_bytes grew on rejection");
-        assert_eq!(conn.out.len(), 2, "rejected frame was appended");
+    #[test]
+    fn drop_head_never_evicts_the_partially_written_front() {
+        let (mio_s, peer) = pair_tiny_sndbuf(); // tiny SO_SNDBUF so flush leaves a partial front
+        let mut c = Connection::new(mio_s, 100);
+        c.queue(std::sync::Arc::from(
+            vec![1u8; 4_000_000].into_boxed_slice(),
+        )); // huge → partial write
+        let _ = c.flush(); // out_cursor now > 0 on front
+        assert!(c.out_cursor() > 0);
+        // queue more small frames past the cap; the mid-write front MUST survive (peer would corrupt otherwise)
+        for n in 0..50u8 {
+            let _ = c.queue(std::sync::Arc::from(vec![n; 40].into_boxed_slice()));
+        }
+        assert!(c.out_cursor() > 0, "front still mid-write");
+        assert!(c.front_is_the_huge_frame()); // i.e. index 0 is untouched
+        // Keep the peer alive until here so the socket doesn't close mid-test and
+        // turn the partial write into a Closed status.
+        let _ = peer.peer_addr();
+        drop(peer);
     }
 
     // ---- read_frames parses a masked client frame ----------------------------

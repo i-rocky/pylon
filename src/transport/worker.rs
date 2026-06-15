@@ -431,9 +431,8 @@ fn handle_handshake(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig) -> Actio
         HeadResult::NeedMore => Action::Keep,
         HeadResult::WsUpgrade { key: ws_key, path } => {
             let response = handshake::accept_response(&ws_key).into_boxed_slice();
-            if entry.conn.queue(Arc::from(response)).is_err() {
-                return Action::Close;
-            }
+            // Drop-head queue never rejects; the 101 response always enqueues.
+            let _ = entry.conn.queue(Arc::from(response));
             // A browser never sends data frames before the 101, so any bytes
             // after the head would be a protocol error anyway; clearing is safe.
             entry.inbuf.clear();
@@ -454,14 +453,7 @@ fn handle_handshake(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig) -> Actio
                         let text = session.codec.encode(&established);
                         let mut out = BytesMut::new();
                         frame::encode_text(&mut out, text.as_bytes());
-                        if entry
-                            .conn
-                            .queue(Arc::from(out.to_vec().into_boxed_slice()))
-                            .is_err()
-                        {
-                            session.conn_count.fetch_sub(1, Ordering::SeqCst);
-                            return Action::Close;
-                        }
+                        let _ = entry.conn.queue(Arc::from(out.to_vec().into_boxed_slice()));
                         entry.session = Some(session);
                     }
                     None => return Action::Close,
@@ -583,25 +575,13 @@ fn echo_frames(poll: &Poll, entry: &mut Entry, frames: Vec<frame::Frame>) -> Act
             OpCode::Text | OpCode::Binary | OpCode::Continuation => {
                 let mut out = BytesMut::new();
                 frame::encode(&mut out, f.fin, f.opcode, &f.payload);
-                if entry
-                    .conn
-                    .queue(Arc::from(out.to_vec().into_boxed_slice()))
-                    .is_err()
-                {
-                    return Action::Close;
-                }
+                let _ = entry.conn.queue(Arc::from(out.to_vec().into_boxed_slice()));
                 wrote = true;
             }
             OpCode::Ping => {
                 let mut out = BytesMut::new();
                 frame::encode(&mut out, true, OpCode::Pong, &f.payload);
-                if entry
-                    .conn
-                    .queue(Arc::from(out.to_vec().into_boxed_slice()))
-                    .is_err()
-                {
-                    return Action::Close;
-                }
+                let _ = entry.conn.queue(Arc::from(out.to_vec().into_boxed_slice()));
                 wrote = true;
             }
             // A peer pong is unsolicited noise here; ignore it.
@@ -646,13 +626,7 @@ fn dispatch_frames(poll: &Poll, entry: &mut Entry, frames: Vec<frame::Frame>) ->
             OpCode::Ping => {
                 let mut out = BytesMut::new();
                 frame::encode(&mut out, true, OpCode::Pong, &f.payload);
-                if entry
-                    .conn
-                    .queue(Arc::from(out.to_vec().into_boxed_slice()))
-                    .is_err()
-                {
-                    return Action::Close;
-                }
+                let _ = entry.conn.queue(Arc::from(out.to_vec().into_boxed_slice()));
             }
             OpCode::Pong => {}
             // Binary/Continuation are not part of the Pusher protocol; ignore.
@@ -692,13 +666,7 @@ fn drain_session(poll: &Poll, entry: &mut Entry) -> (Action, bool) {
                 frame_body.extend_from_slice(&code.to_be_bytes());
                 frame_body.extend_from_slice(reason.as_bytes());
                 frame::encode(&mut out, true, OpCode::Close, &frame_body);
-                if entry
-                    .conn
-                    .queue(Arc::from(out.to_vec().into_boxed_slice()))
-                    .is_err()
-                {
-                    return (Action::Close, wrote);
-                }
+                let _ = entry.conn.queue(Arc::from(out.to_vec().into_boxed_slice()));
                 wrote = true;
                 close_after = true;
                 break;
@@ -707,13 +675,7 @@ fn drain_session(poll: &Poll, entry: &mut Entry) -> (Action, bool) {
                 let text = session.codec.encode(&other);
                 let mut out = BytesMut::new();
                 frame::encode_text(&mut out, text.as_bytes());
-                if entry
-                    .conn
-                    .queue(Arc::from(out.to_vec().into_boxed_slice()))
-                    .is_err()
-                {
-                    return (Action::Close, wrote);
-                }
+                let _ = entry.conn.queue(Arc::from(out.to_vec().into_boxed_slice()));
                 wrote = true;
             }
         }
@@ -995,13 +957,12 @@ fn drain_broadcasts(
             if entry.session.is_none() || entry.conn.state != ConnState::Open {
                 continue;
             }
-            if entry.conn.queue(msg.frame.clone()).is_err() {
-                // Backpressure: this slow consumer is closed (parity with the
-                // per-connection mailbox high-water policy).
-                to_close.push(token);
-            } else {
-                touched.insert(token);
-            }
+            // SP10: the per-connection queue is byte-bounded drop-head — it never
+            // rejects. A slow consumer simply loses its OLDEST queued frame(s)
+            // (freshest-wins, at-most-once), keeping memory bounded without
+            // closing the connection or stalling the fast path.
+            let _dropped = entry.conn.queue(msg.frame.clone());
+            touched.insert(token);
         }
     }
 
