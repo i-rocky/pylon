@@ -259,6 +259,11 @@ impl ConnectionContext {
     /// Emit `channel_occupied` if this subscribe was the 0→1 edge and the app
     /// wants it. Called once per successful subscribe.
     pub(in crate::ws) fn emit_occupied_if_edge(&self, channel: &str, occupied: bool) {
+        // Clustered: the bridge fires the single cluster-wide channel_occupied on the
+        // cluster 0→1 edge. The handler must NOT fire the node-local one.
+        if self.clustered {
+            return;
+        }
         if occupied && self.app.has_channel_occupied_webhooks {
             self.emit_webhook(crate::webhook::event::WebhookEvent::ChannelOccupied {
                 app: self.app.id.clone(),

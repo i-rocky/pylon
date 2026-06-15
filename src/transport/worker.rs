@@ -779,6 +779,9 @@ fn establish_session(env: &Arc<DispatchEnv>, path: &str) -> Result<Session, Reje
         webhooks: env.webhooks.clone(),
         presence_membership: HashMap::new(),
         saturated: env.saturated.clone(),
+        // Task 3.6 flips this true for the clustered percore path; until then the
+        // not-yet-clustered percore path keeps the node-local handler emits.
+        clustered: false,
     };
 
     Ok(Session {

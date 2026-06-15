@@ -73,6 +73,7 @@ fn ctx(app: App) -> (ConnectionContext, mpsc::UnboundedReceiver<ServerEvent>) {
         webhooks: crate::webhook::WebhookHandle::null(),
         presence_membership: std::collections::HashMap::new(),
         saturated: None,
+        clustered: false,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
     (c, rx)
@@ -305,6 +306,7 @@ async fn presence_unsubscribe_broadcasts_member_removed_to_others() {
             webhooks: crate::webhook::WebhookHandle::null(),
             presence_membership: std::collections::HashMap::new(),
             saturated: None,
+            clustered: false,
             client_event_rate: crate::ws::rate::RateWindow::new(0),
         };
         (c, rx)
@@ -465,6 +467,7 @@ async fn client_event_on_encrypted_channel_is_dropped() {
             webhooks: crate::webhook::WebhookHandle::null(),
             presence_membership: std::collections::HashMap::new(),
             saturated: None,
+            clustered: false,
             client_event_rate: crate::ws::rate::RateWindow::new(0),
         };
         (c, rx)
@@ -666,6 +669,7 @@ async fn presence_over_member_cap_errors() {
             webhooks: crate::webhook::WebhookHandle::null(),
             presence_membership: std::collections::HashMap::new(),
             saturated: None,
+            clustered: false,
             client_event_rate: crate::ws::rate::RateWindow::new(0),
         };
         (c, rx)
@@ -830,6 +834,7 @@ async fn subscribe_emits_channel_occupied_then_close_emits_vacated() {
         webhooks,
         presence_membership: std::collections::HashMap::new(),
         saturated: None,
+        clustered: false,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
 
@@ -902,6 +907,7 @@ async fn rapid_subscribe_unsubscribe_in_window_emits_nothing() {
         webhooks,
         presence_membership: std::collections::HashMap::new(),
         saturated: None,
+        clustered: false,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
 
@@ -956,6 +962,7 @@ async fn presence_first_and_last_emit_member_added_then_removed() {
         webhooks,
         presence_membership: std::collections::HashMap::new(),
         saturated: None,
+        clustered: false,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
 
@@ -1035,6 +1042,7 @@ async fn client_event_on_presence_includes_user_id_webhook() {
         webhooks,
         presence_membership: std::collections::HashMap::new(),
         saturated: None,
+        clustered: false,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
     c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
@@ -1092,6 +1100,7 @@ async fn client_event_on_private_omits_user_id_webhook() {
         webhooks,
         presence_membership: std::collections::HashMap::new(),
         saturated: None,
+        clustered: false,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
     c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
@@ -1147,6 +1156,7 @@ async fn client_event_webhook_gated_off_when_app_lacks_it() {
         webhooks,
         presence_membership: std::collections::HashMap::new(),
         saturated: None,
+        clustered: false,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
     c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
@@ -1200,6 +1210,7 @@ async fn cache_channel_miss_emits_cache_miss_webhook() {
         webhooks,
         presence_membership: std::collections::HashMap::new(),
         saturated: None,
+        clustered: false,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
     // public cache channel: no auth, miss on first subscribe.
@@ -1526,6 +1537,7 @@ async fn relayed_client_event_frame(
             webhooks: crate::webhook::WebhookHandle::null(),
             presence_membership: std::collections::HashMap::new(),
             saturated: None,
+            clustered: false,
             client_event_rate: crate::ws::rate::RateWindow::new(0),
         };
         (c, rx)
@@ -1602,6 +1614,7 @@ async fn client_event_oversize_name_returns_4301_and_does_not_broadcast() {
             webhooks: crate::webhook::WebhookHandle::null(),
             presence_membership: std::collections::HashMap::new(),
             saturated: None,
+            clustered: false,
             client_event_rate: crate::ws::rate::RateWindow::new(100), // generous budget
         };
         (c, rx)
@@ -1677,6 +1690,7 @@ async fn client_event_rate_limit_returns_4301_and_drops() {
         webhooks: crate::webhook::WebhookHandle::null(),
         presence_membership: std::collections::HashMap::new(),
         saturated: None,
+        clustered: false,
         client_event_rate: crate::ws::rate::RateWindow::new(3),
     };
 
@@ -1693,6 +1707,7 @@ async fn client_event_rate_limit_returns_4301_and_drops() {
         webhooks: crate::webhook::WebhookHandle::null(),
         presence_membership: std::collections::HashMap::new(),
         saturated: None,
+        clustered: false,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
 

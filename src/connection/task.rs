@@ -59,6 +59,8 @@ pub async fn run(socket: WebSocket, codec: Box<dyn Codec>, params: ConnectionPar
         // Legacy transport self-throttles via synchronous mailbox sends; SP10's
         // saturation admission applies to percore only.
         saturated: None,
+        // Legacy (axum) transport is never clustered; the cluster path is percore-only.
+        clustered: false,
     };
 
     let activity = Duration::from_secs(params.activity_timeout as u64);

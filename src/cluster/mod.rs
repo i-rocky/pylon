@@ -7,4 +7,5 @@
 //!
 //! [`ClusterBridge`]: bridge::ClusterBridge
 
+pub mod adapter;
 pub mod bridge;

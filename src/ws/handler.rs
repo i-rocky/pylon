@@ -29,6 +29,14 @@ pub struct ConnectionContext {
     /// of the REST 503. `None` off-percore (legacy transport / tests), so the
     /// drop never fires and behaviour is unchanged.
     pub saturated: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// SP11: whether this connection runs on the clustered percore path. When `true`
+    /// the cluster `ClusterBridge` owns the single cluster-wide channel-edge emits — the
+    /// clustered `subscription_count` broadcast, `channel_occupied`, and
+    /// `channel_vacated` — so the handler MUST NOT emit the node-local versions (they
+    /// would duplicate/wrong-count across nodes). `false` everywhere off-cluster (legacy
+    /// transport, tests, and the not-yet-clustered percore path), so behaviour is
+    /// byte-identical until Task 3.6 flips it true.
+    pub clustered: bool,
 }
 
 impl ConnectionContext {
@@ -122,7 +130,9 @@ impl ConnectionContext {
                     }
                 }
             }
-            if out.vacated && self.app.has_channel_vacated_webhooks {
+            // Clustered: the bridge fires the single cluster-wide channel_vacated on the
+            // cluster 1→0 edge. The handler must NOT fire the node-local one.
+            if !self.clustered && out.vacated && self.app.has_channel_vacated_webhooks {
                 self.emit_webhook(crate::webhook::event::WebhookEvent::ChannelVacated {
                     app: self.app.id.clone(),
                     channel: channel.clone(),
@@ -134,6 +144,12 @@ impl ConnectionContext {
     }
 
     pub(in crate::ws) async fn maybe_emit_count(&self, channel: &str, count: usize) {
+        // Clustered: the bridge broadcasts the cluster-wide subscription_count (a single
+        // emit on the node's RedisAdapter). The handler must NOT broadcast the node-local
+        // count — it would be wrong cross-node and double-counted.
+        if self.clustered {
+            return;
+        }
         // Presence channels communicate membership via member_added/member_removed;
         // pusher_internal:subscription_count must not be emitted for them (Pusher parity P4).
         if crate::channel::kind::ChannelInfo::of(channel).auth

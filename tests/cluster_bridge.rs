@@ -15,6 +15,8 @@
 //! [`ClusterHandle`]: pylon::cluster::bridge::ClusterHandle
 
 use pylon::adapter::local::LocalAdapter;
+use pylon::app::static_file::StaticFileAppManager;
+use pylon::app::AppManager;
 use pylon::channel::registry::Registry;
 use pylon::cluster::bridge;
 use pylon::server::config::ServerConfig;
@@ -82,9 +84,16 @@ async fn cluster_bridge_starts_clones_publishes_and_drops_cleanly() {
         // The SAME `LocalAdapter` the percore workers would broadcast through.
         let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
         let webhooks = WebhookHandle::null();
+        // The bridge resolves per-app flags itself; a single app is enough for the smoke.
+        let apps: Arc<dyn AppManager> = Arc::new(
+            StaticFileAppManager::from_json(
+                r#"[{"name":"T","id":"app","key":"k","secret":"s"}]"#,
+            )
+            .expect("apps json must parse"),
+        );
 
         // 1. Start: a real connect to the test Redis must succeed.
-        let bridge = bridge::start(&cfg, local, webhooks)
+        let bridge = bridge::start(&cfg, local, webhooks, apps)
             .expect("ClusterBridge::start must connect to the test Redis and report ready");
 
         // The live node id is non-empty (a UUID minted by the adapter).
