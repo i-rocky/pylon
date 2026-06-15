@@ -59,12 +59,17 @@ pub enum ClusterCmd {
     /// Record cluster-wide membership for `(app, channel, socket_id)` and, on the
     /// resulting cluster edges, broadcast the cluster `subscription_count` and fire
     /// `channel_occupied`. `node_first` is the worker's node-local 0→1 subscriber edge
-    /// (computed from its `LocalAdapter` before this is fired). Maps to
-    /// [`RedisAdapter::cluster_subscribe`].
+    /// (computed from its `LocalAdapter` before this is fired). For a CACHE channel,
+    /// also replay the cluster-wide last event (or send `pusher:cache_miss`) to the
+    /// joining connection's `mailbox` — the worker's `ClusterAdapter::cache_get` is
+    /// node-local, so the cluster (Redis) cache replay MUST happen here on the bridge.
+    /// Maps to [`RedisAdapter::cluster_subscribe`] (+ [`RedisAdapter::cache_get`] for
+    /// cache channels).
     Subscribe {
         app: Arc<str>,
         channel: Arc<str>,
         socket_id: SocketId,
+        mailbox: UnboundedSender<ServerEvent>,
         node_first: bool,
     },
     /// Remove cluster-wide membership for `(app, channel, socket_id)` and, on the
@@ -154,18 +159,22 @@ impl ClusterHandle {
     /// Fire a cluster Subscribe at the bridge. NON-BLOCKING, drop-on-full/closed exactly
     /// like [`publish`](ClusterHandle::publish) — the worker must NEVER block on the
     /// bridge. A dropped Subscribe at most costs this node a missed cluster count/occupied
-    /// edge for one connection; the node-local subscribe already succeeded on the worker.
+    /// edge for one connection (and, for a cache channel, the cluster cache replay) — the
+    /// node-local subscribe already succeeded on the worker. `mailbox` is the joining
+    /// connection's frame channel, used to deliver the cache replay / `cache_miss`.
     pub fn subscribe(
         &self,
         app: Arc<str>,
         channel: Arc<str>,
         socket_id: SocketId,
+        mailbox: UnboundedSender<ServerEvent>,
         node_first: bool,
     ) {
         let cmd = ClusterCmd::Subscribe {
             app,
             channel,
             socket_id,
+            mailbox,
             node_first,
         };
         match self.tx.try_send(cmd) {
@@ -472,6 +481,7 @@ async fn handle_cmd(
             app,
             channel,
             socket_id,
+            mailbox,
             node_first,
         } => {
             // Cluster half: authoritative cluster `(count, occupied)` + the node-local
@@ -511,6 +521,37 @@ async fn handle_cmd(
                     app: app.to_string(),
                     channel: channel.to_string(),
                 });
+            }
+            // Cache channels: replay the CLUSTER-wide last event (Redis-backed) straight
+            // to the joining connection's mailbox — or signal a miss. The worker's handler
+            // suppresses its node-local replay in cluster mode (`ConnectionContext::
+            // clustered`), so a subscriber on this node still sees an event published on
+            // ANY node. Ordering is preserved: the handler sends `subscription_succeeded`
+            // INLINE (non-presence, no cluster data) before this async mailbox frame.
+            // A closed mailbox `send` returns `Err` — a safe no-op (the connection is gone).
+            // Match the handler's frame shape + webhook semantics in `ws::subscribe`.
+            if ChannelInfo::of(&channel).cache {
+                match adapter.cache_get(&app, &channel).await {
+                    Some(cached) => {
+                        let _ = mailbox.send(ServerEvent::ChannelEvent {
+                            channel: channel.to_string(),
+                            event: cached.event,
+                            data: serde_json::Value::String(cached.data),
+                            user_id: None,
+                        });
+                    }
+                    None => {
+                        if a.has_cache_miss_webhooks {
+                            webhooks.enqueue(WebhookEvent::CacheMiss {
+                                app: app.to_string(),
+                                channel: channel.to_string(),
+                            });
+                        }
+                        let _ = mailbox.send(ServerEvent::CacheMiss {
+                            channel: channel.to_string(),
+                        });
+                    }
+                }
             }
         }
         ClusterCmd::Unsubscribe {

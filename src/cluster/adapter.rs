@@ -80,7 +80,8 @@ impl Adapter for ClusterAdapter {
         let node_first = out.subscription_count == 1;
         // Fire-and-forget at the bridge. Presence routes to PresenceSubscribe (cluster
         // roster + member_added + channel_occupied); non-presence routes to Subscribe
-        // (cluster subscription_count + channel_occupied).
+        // (cluster subscription_count + channel_occupied + the cache replay / cache_miss
+        // for cache channels, delivered to this connection's `mailbox`).
         match &member {
             Some(m) => self.handle.presence_subscribe(
                 Arc::from(app),
@@ -94,6 +95,7 @@ impl Adapter for ClusterAdapter {
                 Arc::from(app),
                 Arc::from(channel),
                 socket_id,
+                mailbox,
                 node_first,
             ),
         }
@@ -166,12 +168,18 @@ impl Adapter for ClusterAdapter {
     }
 
     async fn cache_set(&self, app: &str, channel: &str, event: CachedEvent, ttl: Duration) {
-        // Redis-backed cache is layered in by Task 3.5; node-local for now.
+        // Cache WRITES on the percore worker path stay node-local: the cluster (Redis)
+        // cache is populated by the REST publish path on each node (which drives the
+        // node's `RedisAdapter::cache_set`). The worker never writes the cache here.
         self.local.cache_set(app, channel, event, ttl).await
     }
 
     async fn cache_get(&self, app: &str, channel: &str) -> Option<CachedEvent> {
-        // Redis-backed cache is layered in by Task 3.5; node-local for now.
+        // Node-local read only. The CLUSTER (Redis) cache replay for a subscribing
+        // connection is done by the bridge's `ClusterCmd::Subscribe` arm (it reads the
+        // node's `RedisAdapter` and sends the replay to the connection's mailbox), so the
+        // worker's own inline cache replay in `ws::subscribe` is suppressed in cluster
+        // mode. This node-local read remains for any non-cluster fallback caller.
         self.local.cache_get(app, channel).await
     }
 

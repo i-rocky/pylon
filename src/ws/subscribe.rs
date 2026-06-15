@@ -245,7 +245,13 @@ impl ConnectionContext {
         // Cache channels: after subscription_succeeded, replay the last event to
         // this new subscriber only — or signal a miss. `subscribed` contains the
         // channel iff the subscribe above succeeded (auth failures returned early).
-        if info.cache && self.subscribed.contains(&channel) {
+        //
+        // Clustered: the bridge does the cluster (Redis) cache replay/miss to this
+        // connection's mailbox (see `ClusterCmd::Subscribe`) — the node-local
+        // `cache_get` here would only see node-local events and spuriously miss an
+        // event published on another node. So skip the whole block in cluster mode;
+        // `subscription_succeeded` was already sent inline above, preserving ordering.
+        if !self.clustered && info.cache && self.subscribed.contains(&channel) {
             let event = match self.adapter.cache_get(&self.app.id, &channel).await {
                 Some(cached) => ServerEvent::ChannelEvent {
                     channel,
