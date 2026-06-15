@@ -196,32 +196,43 @@ impl ConnectionContext {
                     // Record this socket's presence member id so a later
                     // `client_event` on this channel can attach `user_id`. Clone
                     // before the `first_for_user` block moves `join.member.user_id`.
+                    // UNGUARDED in cluster mode: the worker must still index the
+                    // connection locally (for delivery + client_event.user_id).
                     self.presence_membership
                         .insert(channel.clone(), join.member.user_id.clone());
-                    self.send_self(ServerEvent::SubscriptionSucceeded {
-                        channel: channel.clone(),
-                        presence: Some(join.roster),
-                    });
-                    if join.first_for_user {
-                        let uid = join.member.user_id.clone();
-                        self.adapter
-                            .broadcast(
-                                &self.app.id,
-                                &channel,
-                                ServerEvent::MemberAdded {
-                                    channel: channel.clone(),
-                                    user_id: join.member.user_id,
-                                    user_info: join.member.user_info,
-                                },
-                                Some(self.socket_id.clone()),
-                            )
-                            .await;
-                        if self.app.has_member_added_webhooks {
-                            self.emit_webhook(crate::webhook::event::WebhookEvent::MemberAdded {
-                                app: self.app.id.clone(),
-                                channel: channel.clone(),
-                                user_id: uid,
-                            });
+                    // Clustered: the bridge sends `subscription_succeeded` with the
+                    // CLUSTER-wide roster (straight to this connection's mailbox) and
+                    // fires the single cluster-wide `member_added` + its webhook. The
+                    // handler must NOT emit the node-local versions — they would carry a
+                    // node-local roster and double/wrong-count `member_added` cross-node.
+                    if !self.clustered {
+                        self.send_self(ServerEvent::SubscriptionSucceeded {
+                            channel: channel.clone(),
+                            presence: Some(join.roster),
+                        });
+                        if join.first_for_user {
+                            let uid = join.member.user_id.clone();
+                            self.adapter
+                                .broadcast(
+                                    &self.app.id,
+                                    &channel,
+                                    ServerEvent::MemberAdded {
+                                        channel: channel.clone(),
+                                        user_id: join.member.user_id,
+                                        user_info: join.member.user_info,
+                                    },
+                                    Some(self.socket_id.clone()),
+                                )
+                                .await;
+                            if self.app.has_member_added_webhooks {
+                                self.emit_webhook(
+                                    crate::webhook::event::WebhookEvent::MemberAdded {
+                                        app: self.app.id.clone(),
+                                        channel: channel.clone(),
+                                        user_id: uid,
+                                    },
+                                );
+                            }
                         }
                     }
                 }

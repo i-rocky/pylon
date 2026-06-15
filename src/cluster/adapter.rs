@@ -11,14 +11,18 @@
 //!   roster). The bridge, on the node's single `RedisAdapter`, computes the authoritative
 //!   cluster count and fires the single cluster-wide `subscription_count` /
 //!   `channel_occupied` / `channel_vacated` — which the connection handler suppresses in
-//!   cluster mode (`ConnectionContext::clustered`).
+//!   cluster mode (`ConnectionContext::clustered`). For PRESENCE channels the worker still
+//!   does the node-local join (so the connection is indexed for delivery), but the bridge
+//!   owns the cluster-wide outputs: it sends the cluster ROSTER back as
+//!   `subscription_succeeded` and fires the single cluster-wide `member_added` /
+//!   `member_removed` (`PresenceSubscribe` / `PresenceLeave`).
 //! - `broadcast`: local delivery happens here on the worker; the bridge's `Publish` does
 //!   ONLY the Redis publish, so there is no double local delivery and self-dedup stops the
 //!   origin re-receiving its own frame.
 //!
-//! Presence roster cluster-correctness, presence capacity, cache, signin/watchlist are
-//! LATER tasks (3.4 / 3.5): those methods delegate straight to `local` for now (see the
-//! per-method notes). They are not exercised by Task 3.3a's tests.
+//! Presence CAPACITY enforcement, cache, signin/watchlist are LATER tasks (3.4b / 3.5):
+//! those methods delegate straight to `local` for now (see the per-method notes). They are
+//! not exercised by this task's tests.
 
 use crate::adapter::local::LocalAdapter;
 use crate::adapter::Adapter;
@@ -59,23 +63,40 @@ impl Adapter for ClusterAdapter {
         handle: ConnectionHandle,
         member: Option<PresenceMember>,
     ) -> SubscribeOutcome {
-        // Capture the socket id BEFORE `handle` is moved into the local adapter.
+        // Capture the socket id + mailbox BEFORE `handle` is moved into the local adapter.
+        // The mailbox lets the bridge send the CLUSTER-wide `subscription_succeeded` roster
+        // straight to this connection on the presence path.
         let socket_id = handle.socket_id.clone();
+        let mailbox = handle.mailbox.clone();
         // Node-local subscribe (synchronous) — the returned outcome is node-local truth.
-        let out = self.local.subscribe(app, channel, handle, member).await;
+        // For presence this also indexes the connection for delivery on this worker (so it
+        // receives member_added/removed and broadcasts); the cluster roster + member_added
+        // come from the bridge, not this node-local outcome.
+        let out = self
+            .local
+            .subscribe(app, channel, handle, member.clone())
+            .await;
         // The node-local 0→1 edge drives the bridge's Redis msg-channel subscribe-on-first.
         let node_first = out.subscription_count == 1;
-        // Fire-and-forget: the bridge computes the cluster count + occupied edge and emits
-        // the single cluster-wide subscription_count / channel_occupied. Uniform for
-        // public/private/presence channels (presence roster cluster-correctness is Task
-        // 3.4; here presence still returns the node-local roster — no test asserts cluster
-        // presence in Task 3.3a).
-        self.handle.subscribe(
-            Arc::from(app),
-            Arc::from(channel),
-            socket_id,
-            node_first,
-        );
+        // Fire-and-forget at the bridge. Presence routes to PresenceSubscribe (cluster
+        // roster + member_added + channel_occupied); non-presence routes to Subscribe
+        // (cluster subscription_count + channel_occupied).
+        match &member {
+            Some(m) => self.handle.presence_subscribe(
+                Arc::from(app),
+                Arc::from(channel),
+                m.clone(),
+                socket_id,
+                mailbox,
+                node_first,
+            ),
+            None => self.handle.subscribe(
+                Arc::from(app),
+                Arc::from(channel),
+                socket_id,
+                node_first,
+            ),
+        }
         out
     }
 
@@ -87,12 +108,23 @@ impl Adapter for ClusterAdapter {
     ) -> UnsubscribeOutcome {
         let out = self.local.unsubscribe(app, channel, socket_id).await;
         let node_last = out.subscription_count == 0;
-        self.handle.unsubscribe(
-            Arc::from(app),
-            Arc::from(channel),
-            socket_id.clone(),
-            node_last,
-        );
+        // Presence routes to PresenceLeave (cluster member_removed + channel_vacated);
+        // non-presence routes to Unsubscribe (cluster subscription_count + channel_vacated).
+        match &out.presence {
+            Some(leave) => self.handle.presence_leave(
+                Arc::from(app),
+                Arc::from(channel),
+                leave.user_id.clone(),
+                socket_id.clone(),
+                node_last,
+            ),
+            None => self.handle.unsubscribe(
+                Arc::from(app),
+                Arc::from(channel),
+                socket_id.clone(),
+                node_last,
+            ),
+        }
         out
     }
 

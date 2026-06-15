@@ -107,26 +107,35 @@ impl ConnectionContext {
                 .adapter
                 .unsubscribe(&self.app.id, &channel, &self.socket_id)
                 .await;
-            if let Some(leave) = out.presence {
-                if leave.last_for_user {
-                    let uid = leave.user_id.clone();
-                    self.adapter
-                        .broadcast(
-                            &self.app.id,
-                            &channel,
-                            ServerEvent::MemberRemoved {
-                                channel: channel.clone(),
-                                user_id: leave.user_id,
-                            },
-                            None,
-                        )
-                        .await;
-                    if self.app.has_member_removed_webhooks {
-                        self.emit_webhook(crate::webhook::event::WebhookEvent::MemberRemoved {
-                            app: self.app.id.clone(),
-                            channel: channel.clone(),
-                            user_id: uid,
-                        });
+            // Clustered: the bridge fires the single cluster-wide `member_removed` + its
+            // webhook on the cluster-wide last-for-user edge (`PresenceLeave`). The handler
+            // must NOT emit the node-local versions — they would double/wrong-fire across
+            // nodes. The node-local unsubscribe above still ran (the connection is
+            // de-indexed locally); only the cluster-wide wire output is deferred.
+            if !self.clustered {
+                if let Some(leave) = out.presence {
+                    if leave.last_for_user {
+                        let uid = leave.user_id.clone();
+                        self.adapter
+                            .broadcast(
+                                &self.app.id,
+                                &channel,
+                                ServerEvent::MemberRemoved {
+                                    channel: channel.clone(),
+                                    user_id: leave.user_id,
+                                },
+                                None,
+                            )
+                            .await;
+                        if self.app.has_member_removed_webhooks {
+                            self.emit_webhook(
+                                crate::webhook::event::WebhookEvent::MemberRemoved {
+                                    app: self.app.id.clone(),
+                                    channel: channel.clone(),
+                                    user_id: uid,
+                                },
+                            );
+                        }
                     }
                 }
             }
