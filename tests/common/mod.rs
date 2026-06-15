@@ -1,20 +1,12 @@
-//! Consolidated, transport-parameterized test harness for the WS-driving suites
-//! (`integration`, `signin`, `watchlist`, `webhooks`).
+//! Consolidated test harness for the WS-driving suites (`integration`, `signin`,
+//! `watchlist`, `webhooks`).
 //!
-//! Each `tests/*.rs` is its own crate, so before SP11 every WS suite carried its
-//! OWN copy of `spawn`/`connect`/`next_json`/`established_socket_id`/`auth_token`.
-//! This module hoists those into one place (the SP4 consolidation follow-up) AND
-//! makes the server transport selectable at runtime via the `PYLON_TEST_TRANSPORT`
-//! env var:
-//!
-//! * unset / `"legacy"` (default) → [`spawn_legacy`]: the axum `build_router`
-//!   + `axum::serve` path the suites have always used.
-//! * `"percore"` → [`spawn_percore`]: a real per-core `mio` worker fleet
-//!   ([`pylon::transport::run_percore`]) with the REST handoff plane wired, bound
-//!   to an ephemeral port — the SP11 single-node parity proof.
-//!
-//! Both paths are exercised by the SAME test bodies; any percore divergence from
-//! legacy surfaces as a failed assertion (the headline parity gate).
+//! Each `tests/*.rs` is its own crate, so every WS suite once carried its OWN copy
+//! of `spawn`/`connect`/`next_json`/`established_socket_id`/`auth_token`. This
+//! module hoists those into one place and drives them all on the percore transport
+//! — a real per-core `mio` worker fleet ([`pylon::transport::run_percore`]) with
+//! the REST handoff plane wired, bound to an ephemeral port (the only transport;
+//! the legacy axum WS path was removed in SP11).
 //!
 //! A test file builds a [`SpawnSpec`] (mirroring the constructible `AppState`
 //! fields + the concrete `LocalAdapter` the percore sharded fan-out installs on)
@@ -94,24 +86,10 @@ impl SpawnSpec {
     }
 }
 
-/// The transport selected by `PYLON_TEST_TRANSPORT` (default: legacy).
-fn selected_transport() -> &'static str {
-    // Leak a small owned string so the comparison is cheap and `'static`.
-    match std::env::var("PYLON_TEST_TRANSPORT").ok().as_deref() {
-        Some("percore") => "percore",
-        _ => "legacy",
-    }
-}
-
-/// Spawn the server for `spec` on the transport chosen by `PYLON_TEST_TRANSPORT`
-/// and return its bound `127.0.0.1` address. The default (legacy) path is an
-/// in-process axum server; `percore` starts a real per-core worker fleet + REST
-/// plane. Identical externally — same `ws://`/`http://` URLs.
+/// Spawn the server for `spec` on the percore transport and return its bound
+/// `127.0.0.1` address — a real per-core worker fleet + REST plane.
 pub async fn spawn(spec: SpawnSpec) -> SocketAddr {
-    match selected_transport() {
-        "percore" => spawn_percore(spec).await,
-        _ => spawn_legacy(spec).await,
-    }
+    spawn_percore(spec).await
 }
 
 /// Convenience for the common case: the standard capacity-2 [`APPS`] app, a null
@@ -120,37 +98,18 @@ pub async fn spawn_default(config: ServerConfig) -> SocketAddr {
     spawn(SpawnSpec::with_apps(config, APPS)).await
 }
 
-/// The legacy transport: `axum::serve(build_router(state))` on `127.0.0.1:0`.
-pub async fn spawn_legacy(spec: SpawnSpec) -> SocketAddr {
-    let state = AppState {
-        config: spec.config,
-        apps: spec.apps,
-        adapter: spec.local.clone(),
-        conn_counts: spec.conn_counts,
-        webhooks: spec.webhooks,
-        saturated: None,
-    };
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, build_router(state)).await.unwrap();
-    });
-    addr
-}
-
 /// The percore transport: a real per-core `mio` worker fleet bound to an
 /// ephemeral `127.0.0.1` port, with the REST handoff plane wired so REST-driven
 /// behaviors (server-to-user triggers, terminate_connections, webhooks-occupied
-/// publishes) work exactly as on legacy.
+/// publishes) work end-to-end.
 ///
-/// Mirrors `main.rs`'s `TransportMode::Percore` branch: build the REST `AppState`
-/// plus a handoff channel, spawn `rest::serve` on the tokio runtime, then run
+/// Mirrors `main.rs`'s single-node percore wiring: build the REST `AppState` plus
+/// a handoff channel, spawn `rest::serve` on the tokio runtime, then run
 /// [`pylon::transport::run_percore`] on a dedicated blocking thread. The worker
 /// installs the sharded broadcast sink on the concrete `LocalAdapter` and serves
 /// the full v7 protocol; plain-HTTP connections are handed off to the axum REST
-/// router. The returned guard is leaked (the OS reclaims the listener + threads at
-/// process exit) — test processes are short-lived, matching how `spawn_legacy`
-/// leaks its `tokio::spawn`ed server.
+/// router. The worker thread + shutdown flag are leaked (the OS reclaims the
+/// listener + threads at process exit) — test processes are short-lived.
 pub async fn spawn_percore(spec: SpawnSpec) -> SocketAddr {
     let SpawnSpec {
         mut config,
@@ -170,10 +129,9 @@ pub async fn spawn_percore(spec: SpawnSpec) -> SocketAddr {
     };
     config.bind = "127.0.0.1".into();
     config.port = port;
-    config.transport = pylon::server::config::TransportMode::Percore;
-    // A single worker keeps the test deterministic: one accept queue, one slab,
-    // so subscribe/broadcast ordering matches the legacy single-task path. (The
-    // multi-worker sharded fan-out is proven separately by percore_multiworker.)
+    // A single worker keeps the test deterministic: one accept queue, one slab, so
+    // subscribe/broadcast ordering is a single sequential stream. (The multi-worker
+    // sharded fan-out is proven separately by percore_multiworker.)
     config.workers = 1;
 
     let adapter: Arc<dyn Adapter> = local.clone();
@@ -302,7 +260,6 @@ pub async fn spawn_percore_cluster(prefix: &str) -> (SocketAddr, ClusterNodeGuar
     };
     config.bind = "127.0.0.1".into();
     config.port = port;
-    config.transport = pylon::server::config::TransportMode::Percore;
     config.workers = 1;
 
     let apps: Arc<dyn AppManager> =

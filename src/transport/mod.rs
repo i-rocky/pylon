@@ -60,7 +60,7 @@ pub fn percore_total_inflight_bytes() -> u64 {
         .unwrap_or(0)
 }
 
-/// Run the per-core (`PYLON_TRANSPORT=percore`) transport as the actual server.
+/// Run the per-core transport as the actual server.
 ///
 /// Takes the already-built shared pieces (the same ones `main`/`AppState`
 /// assemble), builds ONE shared [`DispatchEnv`], then spawns

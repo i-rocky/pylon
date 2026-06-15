@@ -27,23 +27,74 @@ const SECRET2: &str = "app2-secret";
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// Spawn the multi-app REST + WS server on a real single-worker percore fleet
+/// (the only transport). The worker serves WS clients directly and hands plain-
+/// HTTP (REST) connections off to the axum `Router` via the handoff plane, exactly
+/// as `main.rs` wires the single-node percore path. The worker thread + shutdown
+/// flag are leaked; the OS reclaims them at process exit (test processes are
+/// short-lived).
 async fn spawn() -> SocketAddr {
+    use std::sync::atomic::AtomicBool;
+
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
-    let state = AppState {
-        config: ServerConfig::default(),
-        apps,
-        adapter,
-        conn_counts: Arc::new(Default::default()),
-        webhooks: pylon::webhook::WebhookHandle::null(),
-        saturated: None,
+    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
+    let adapter: Arc<dyn Adapter> = local.clone();
+    let conn_counts = Arc::new(Default::default());
+    let webhooks = pylon::webhook::WebhookHandle::null();
+
+    // Reserve a free ephemeral port, then release it before the worker re-binds
+    // with SO_REUSEPORT (race-free in practice).
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
     };
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, build_router(state)).await.unwrap();
+    // One worker keeps subscribe/broadcast ordering a single sequential stream.
+    let config = ServerConfig {
+        bind: "127.0.0.1".into(),
+        port,
+        workers: 1,
+        ..ServerConfig::default()
+    };
+
+    // REST handoff plane: the worker hands plain-HTTP connections to this axum
+    // router via `rest_tx`; `rest::serve` drives them on the tokio runtime.
+    let (rest_tx, rest_rx) =
+        tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
+    let rest_state = AppState {
+        config: config.clone(),
+        apps: apps.clone(),
+        adapter: adapter.clone(),
+        conn_counts: Arc::clone(&conn_counts),
+        webhooks: webhooks.clone(),
+        saturated: Some(local.saturation_flag()),
+    };
+    tokio::spawn(pylon::transport::rest::serve(rest_rx, build_router(rest_state)));
+
+    // Run the blocking `mio` worker on a dedicated thread.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let worker_shutdown = shutdown.clone();
+    let worker_config = config.clone();
+    let local_for_sink = Some(local.clone());
+    let handle = std::thread::spawn(move || {
+        let _ = pylon::transport::run_percore(
+            worker_config,
+            apps,
+            adapter,
+            conn_counts,
+            webhooks,
+            Some(rest_tx),
+            worker_shutdown,
+            local_for_sink,
+            // Single-node (not clustered).
+            false,
+        );
     });
-    addr
+    std::mem::forget((shutdown, handle));
+
+    // Give the worker a moment to bind its SO_REUSEPORT listener.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    format!("127.0.0.1:{port}").parse().unwrap()
 }
 
 /// Build the signed query string for a request, returning the full URL query.

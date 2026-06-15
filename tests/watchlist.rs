@@ -1,9 +1,8 @@
 //! End-to-end watchlist lifecycle over real WebSockets.
 //!
-//! The spawn/connect helpers live in `tests/common/mod.rs` and dispatch between
-//! the legacy axum transport and the percore worker fleet on
-//! `PYLON_TEST_TRANSPORT`. Exercises the signed-in watchlist flow against the
-//! live server:
+//! The spawn/connect helpers live in `tests/common/mod.rs` and run the percore
+//! worker fleet (the only transport). Exercises the signed-in watchlist flow
+//! against the live server:
 //!   1. online/offline events cross between two signed-in users; and
 //!   2. an oversized watchlist yields a non-fatal 4302 (connection survives).
 

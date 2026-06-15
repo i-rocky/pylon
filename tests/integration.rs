@@ -1,9 +1,8 @@
 //! In-process integration tests driving the server with a real WS client.
 //!
 //! The spawn/connect/helper plumbing lives in `tests/common/mod.rs`; the
-//! `spawn_default` helper dispatches between the legacy axum transport and the
-//! percore worker fleet on `PYLON_TEST_TRANSPORT` (default legacy), so this exact
-//! suite is the SP11 single-node parity proof on both transports.
+//! `spawn_default` helper runs the percore worker fleet (the only transport), so
+//! this suite is the single-node percore proof.
 
 mod common;
 use common::*;

@@ -26,16 +26,16 @@ pub struct ConnectionContext {
     /// SP10 admission control: the percore broadcast pipeline's saturation flag.
     /// When set and saturated, a WS `client-*` event is dropped at ingress
     /// (mirroring the rate-limit drop) instead of broadcasting — the WS analogue
-    /// of the REST 503. `None` off-percore (legacy transport / tests), so the
-    /// drop never fires and behaviour is unchanged.
+    /// of the REST 503. `None` when no concrete local adapter backs the sink (the
+    /// redis+percore fallback) or in tests, so the drop never fires.
     pub saturated: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// SP11: whether this connection runs on the clustered percore path. When `true`
     /// the cluster `ClusterBridge` owns the single cluster-wide channel-edge emits — the
     /// clustered `subscription_count` broadcast, `channel_occupied`, and
     /// `channel_vacated` — so the handler MUST NOT emit the node-local versions (they
-    /// would duplicate/wrong-count across nodes). `false` everywhere off-cluster (legacy
-    /// transport, tests, and the not-yet-clustered percore path), so behaviour is
-    /// byte-identical until Task 3.6 flips it true.
+    /// would duplicate/wrong-count across nodes). `false` for the standalone
+    /// (single-node) percore path and in tests, where the handler keeps its
+    /// node-local emits.
     pub clustered: bool,
 }
 

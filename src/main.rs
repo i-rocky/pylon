@@ -6,7 +6,7 @@ use pylon::app::static_file::StaticFileAppManager;
 use pylon::app::AppManager;
 use pylon::channel::registry::Registry;
 use pylon::cluster::adapter::ClusterAdapter;
-use pylon::server::config::{ServerConfig, TransportMode};
+use pylon::server::config::ServerConfig;
 use pylon::server::router::{build_router, AppState};
 use pylon::server::shutdown::shutdown_signal;
 use pylon::webhook::dispatcher::SystemClock;
@@ -52,150 +52,84 @@ async fn main() -> anyhow::Result<()> {
     pylon::init_tracing();
     let config = ServerConfig::from_env();
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_file(&config.apps_path)?);
-    let is_redis = config.adapter == "redis";
 
-    // The redis+percore combination is the CLUSTERED production path: the node's single
+    // The redis adapter is the CLUSTERED production path: the node's single
     // `RedisAdapter` is owned by a `ClusterBridge` (on its own runtime), the percore workers
     // drive a `ClusterAdapter` over the shared `LocalAdapter` + the bridge handle, and each
     // connection defers its single-emit cluster edges to the bridge. It has its own startup
     // ordering (the webhook dispatcher's occupancy source reads through the bridge's adapter,
     // so webhooks are attached AFTER the bridge is up), so it runs in a dedicated function.
-    // The other three combinations (redis+legacy, local+legacy, local+percore) keep the
-    // straight-line wiring below, unchanged.
-    if is_redis && config.transport == TransportMode::Percore {
+    // The local (single-node) path keeps the straight-line wiring below.
+    if config.adapter == "redis" {
         return run_redis_percore(config, apps).await;
     }
-    // Keep the concrete `Arc<RedisAdapter>` so we can start the sweeper AFTER the
-    // webhook dispatcher exists (the sweeper needs the `WebhookHandle`; the dispatcher
-    // needs the adapter-backed occupancy source — start_sweeper breaks that cycle).
-    let redis: Option<Arc<pylon::adapter::redis::RedisAdapter>> = if is_redis {
-        Some(Arc::new(
-            pylon::adapter::redis::RedisAdapter::new(&config).await?,
-        ))
-    } else {
-        None
-    };
-    // Keep the CONCRETE local adapter (when not redis) so the percore transport
-    // can install its sharded broadcast sink on it. `None` under redis.
-    let local: Option<Arc<LocalAdapter>> = match &redis {
-        Some(_) => None,
-        None => Some(Arc::new(LocalAdapter::new(Arc::new(Registry::new())))),
-    };
-    let adapter: Arc<dyn Adapter> = match (&redis, &local) {
-        (Some(r), _) => r.clone(),
-        (None, Some(l)) => l.clone(),
-        // Unreachable: exactly one of redis/local is set above.
-        (None, None) => Arc::new(LocalAdapter::new(Arc::new(Registry::new()))),
-    };
 
-    // Cluster-aware `channel_vacated` grace window (Task D1): only the Redis
-    // (multi-node) path debounces+rechecks vacated. The local path fires
-    // immediately (grace = 0, no occupancy source).
-    let (vacated_grace_ms, occupancy): (u64, Option<Arc<dyn OccupancySource>>) = if is_redis {
-        (
-            config.webhook_vacated_grace_ms,
-            Some(Arc::new(pylon::webhook::AdapterOccupancy(adapter.clone()))),
-        )
-    } else {
-        (0, None)
-    };
-    let webhooks = spawn_webhooks(&config, apps.clone(), vacated_grace_ms, occupancy);
+    // The CONCRETE local adapter, so the percore transport can install its sharded
+    // broadcast sink on it.
+    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
+    let adapter: Arc<dyn Adapter> = local.clone();
 
-    // Now that the webhook handle exists, start the Redis sweeper with the SAME
-    // handle AppState uses, so vacated webhooks from sweeps and from WS-driven
-    // unsubscribes share one dispatcher (grace + cluster re-check).
-    if let Some(r) = &redis {
-        r.start_sweeper(webhooks.clone());
-    }
+    // The single-node local path fires `channel_vacated` immediately (no grace
+    // window, no occupancy source — those are the Redis multi-node path's, handled
+    // in `run_redis_percore`).
+    let webhooks = spawn_webhooks(&config, apps.clone(), 0, None);
 
-    // Shared connection counters, used by both transports (axum `AppState` and
-    // the percore `DispatchEnv` mirror this type exactly).
+    // Shared connection counters (the axum REST `AppState` and the percore
+    // `DispatchEnv` mirror this type exactly).
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
 
-    match config.transport {
-        TransportMode::Legacy => {
-            let state = AppState {
-                config: config.clone(),
-                apps,
-                adapter,
-                conn_counts,
-                webhooks,
-                // Legacy transport self-throttles; no SP10 saturation admission.
-                saturated: None,
-            };
-            let listener =
-                tokio::net::TcpListener::bind((config.bind.as_str(), config.port)).await?;
-            tracing::info!("pylon listening on {}:{}", config.bind, config.port);
-            axum::serve(listener, build_router(state))
-                .with_graceful_shutdown(shutdown_signal())
-                .await?;
-        }
-        TransportMode::Percore => {
-            // The percore worker is a blocking `mio` loop; run it on a dedicated
-            // blocking thread and flip the shared shutdown flag when the signal
-            // future resolves. Webhooks/adapter background tasks (e.g. the Redis
-            // sweeper) were already spawned on this tokio runtime above and keep
-            // running independently of the worker thread.
-            //
-            // REST handoff (SP9 §3.4): the worker accepts every connection but
-            // can only drive WS itself. It transfers plain-HTTP (Pusher REST
-            // publish) connections over `rest_tx` to a tokio task that serves
-            // them with the SAME axum `Router` the legacy transport uses. The
-            // task is spawned HERE, on the runtime, BEFORE the blocking worker
-            // call — so a runtime handle exists to serve the handed-off fds.
-            let (rest_tx, rest_rx) =
-                tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
-            let rest_state = AppState {
-                config: config.clone(),
-                apps: apps.clone(),
-                adapter: adapter.clone(),
-                conn_counts: conn_counts.clone(),
-                webhooks: webhooks.clone(),
-                // SP10: the REST 503 admission gate reads the percore saturation
-                // flag (the LocalAdapter's, shared with the sink). `None` for the
-                // redis+percore fallback (no concrete local adapter).
-                saturated: local.as_ref().map(|l| l.saturation_flag()),
-            };
-            let rest_router = build_router(rest_state);
-            tokio::spawn(pylon::transport::rest::serve(rest_rx, rest_router));
+    // The percore worker is a blocking `mio` loop; run it on a dedicated blocking
+    // thread and flip the shared shutdown flag when the signal future resolves.
+    // Webhooks/adapter background tasks (e.g. the Redis sweeper) were already
+    // spawned on this tokio runtime above and keep running independently of the
+    // worker thread.
+    //
+    // REST handoff (SP9 §3.4): the worker accepts every connection but can only
+    // drive WS itself. It transfers plain-HTTP (Pusher REST publish) connections
+    // over `rest_tx` to a tokio task that serves them with the axum `Router`. The
+    // task is spawned HERE, on the runtime, BEFORE the blocking worker call — so a
+    // runtime handle exists to serve the handed-off fds.
+    let (rest_tx, rest_rx) =
+        tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
+    let rest_state = AppState {
+        config: config.clone(),
+        apps: apps.clone(),
+        adapter: adapter.clone(),
+        conn_counts: conn_counts.clone(),
+        webhooks: webhooks.clone(),
+        // SP10: the REST 503 admission gate reads the percore saturation flag (the
+        // LocalAdapter's, shared with the sink).
+        saturated: Some(local.saturation_flag()),
+    };
+    let rest_router = build_router(rest_state);
+    tokio::spawn(pylon::transport::rest::serve(rest_rx, rest_router));
 
-            // Per-core sharded fan-out applies only to the local adapter. With
-            // redis+percore the concrete `LocalAdapter` isn't available, so the
-            // sink is skipped and broadcasts fall back to the legacy mailbox path.
-            if local.is_none() {
-                tracing::warn!(
-                    "redis adapter with percore transport: sharded broadcast \
-                     fan-out is unavailable; using the legacy mailbox path"
-                );
-            }
-            let local_for_sink = local.clone();
+    let local_for_sink = Some(local.clone());
 
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let worker_shutdown = shutdown.clone();
-            let worker_config = config.clone();
-            let worker = tokio::task::spawn_blocking(move || {
-                pylon::transport::run_percore(
-                    worker_config,
-                    apps,
-                    adapter,
-                    conn_counts,
-                    webhooks,
-                    Some(rest_tx),
-                    worker_shutdown,
-                    local_for_sink,
-                    // The dedicated cluster bridge (SP11 §3.6) wires `clustered:
-                    // true` via its own harness; the standalone `main` percore
-                    // path is not clustered.
-                    false,
-                )
-            });
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let worker_shutdown = shutdown.clone();
+    let worker_config = config.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        pylon::transport::run_percore(
+            worker_config,
+            apps,
+            adapter,
+            conn_counts,
+            webhooks,
+            Some(rest_tx),
+            worker_shutdown,
+            local_for_sink,
+            // The dedicated cluster bridge (SP11 §3.6) wires `clustered: true` via
+            // its own harness (`run_redis_percore`); this standalone `main` percore
+            // path is not clustered.
+            false,
+        )
+    });
 
-            // Wait for Ctrl-C / SIGTERM, then signal the worker to stop and join.
-            shutdown_signal().await;
-            shutdown.store(true, Ordering::SeqCst);
-            worker.await??;
-        }
-    }
+    // Wait for Ctrl-C / SIGTERM, then signal the worker to stop and join.
+    shutdown_signal().await;
+    shutdown.store(true, Ordering::SeqCst);
+    worker.await??;
     Ok(())
 }
 

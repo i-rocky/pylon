@@ -32,7 +32,7 @@ use pylon::app::static_file::StaticFileAppManager;
 use pylon::app::AppManager;
 use pylon::auth::signature::{hmac_sha256_hex, md5_hex};
 use pylon::channel::registry::Registry;
-use pylon::server::config::{ServerConfig, TransportMode};
+use pylon::server::config::ServerConfig;
 use pylon::server::router::{build_router, AppState};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -69,7 +69,6 @@ static HARNESS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// directly (no process-global `PYLON_*` env, so tests stay parallel-safe).
 fn base_config(port: u16) -> ServerConfig {
     ServerConfig {
-        transport: TransportMode::Percore,
         bind: "127.0.0.1".to_string(),
         port,
         workers: N_WORKERS,

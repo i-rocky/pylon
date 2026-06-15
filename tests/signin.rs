@@ -1,8 +1,7 @@
 //! End-to-end `pusher:signin` handshake over a real WebSocket.
 //!
-//! The spawn/connect helpers live in `tests/common/mod.rs` and dispatch between
-//! the legacy axum transport and the percore worker fleet on
-//! `PYLON_TEST_TRANSPORT`. Drives the signin handler: happy path acks
+//! The spawn/connect helpers live in `tests/common/mod.rs` and run the percore
+//! worker fleet (the only transport). Drives the signin handler: happy path acks
 //! `signin_success`, a bad signature yields 4009 + a server-initiated close; the
 //! REST-driven server-to-user / terminate paths exercise the percore REST plane.
 

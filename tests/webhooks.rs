@@ -3,10 +3,10 @@
 //! captures the signed POST. Verifies the envelope shape AND the
 //! `X-Pusher-Signature` exactly as pusher-http-node's WebHook validator would.
 //!
-//! The pylon spawn dispatches between legacy and percore via `tests/common`'s
-//! [`common::spawn`] on `PYLON_TEST_TRANSPORT`, but wires a REAL `webhook::spawn`
-//! dispatcher with a live `HttpTransport` instead of the null sink — so the
-//! occupied/vacated webhook fires identically on both transports.
+//! The pylon spawn runs the percore worker fleet via `tests/common`'s
+//! [`common::spawn`], but wires a REAL `webhook::spawn` dispatcher with a live
+//! `HttpTransport` instead of the null sink — so the occupied/vacated webhook
+//! fires end-to-end.
 
 mod common;
 use common::{spawn, SpawnSpec, Ws};

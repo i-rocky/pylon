@@ -1,10 +1,10 @@
 //! Per-worker timer wheel for connection liveness (SP11 §4).
 //!
-//! The legacy per-connection task (`connection/task.rs:113-135`) runs a tokio
-//! `interval` per socket: after `activity_timeout` seconds of no inbound traffic
-//! it sends a `pusher:ping`; if that ping goes unanswered for `pong_timeout`
-//! seconds it closes the connection with code `4201`. The per-core transport has
-//! no per-connection tokio runtime, so it can't lean on a timer-per-socket.
+//! The Pusher v7 liveness contract: after `activity_timeout` seconds of no
+//! inbound traffic the server sends a `pusher:ping`; if that ping goes unanswered
+//! for `pong_timeout` seconds it closes the connection with code `4201`. The
+//! per-core transport has no per-connection tokio runtime, so it can't lean on a
+//! timer-per-socket.
 //!
 //! [`TimerWheel`] reproduces those exact semantics with one structure per worker:
 //! a [`BTreeMap`] keyed by absolute deadline (monotonic ms since the worker
@@ -19,8 +19,8 @@
 //! the old timeline entry in place and is reconciled lazily: when `due` pops a
 //! deadline it checks the side table and discards the entry if the connection
 //! has since been rescheduled past it. A `touch` arriving while a ping is
-//! outstanding therefore *cancels* the pending `4201` close — exactly the legacy
-//! `ping_sent_at = None` on inbound activity.
+//! outstanding therefore *cancels* the pending `4201` close — any inbound frame
+//! is liveness activity that clears the pong deadline.
 //!
 //! Time is injected (every method takes `now_ms`) so the unit test is fully
 //! deterministic. The worker feeds it the same monotonic clock it already
@@ -83,8 +83,8 @@ pub struct TimerWheel {
 }
 
 impl TimerWheel {
-    /// Build a wheel with the legacy default timeouts (120 s idle / 30 s pong).
-    /// Tests use this so the in-ms assertions match the legacy seconds.
+    /// Build a wheel with the default timeouts (120 s idle / 30 s pong). Tests use
+    /// this so the in-ms assertions match the default seconds.
     pub fn new() -> Self {
         Self::with_timeouts(120, 30)
     }
@@ -103,8 +103,8 @@ impl TimerWheel {
     /// Record inbound activity on `conn` at `now_ms`: (re)schedule its idle
     /// deadline at `now + activity_timeout`. If a ping was outstanding (a pong
     /// deadline was armed), this supersedes it — i.e. a pong arriving in time
-    /// cancels the pending `4201` close (parity with the legacy
-    /// `ping_sent_at = None` on any inbound frame).
+    /// cancels the pending `4201` close (any inbound frame clears the pong
+    /// deadline).
     pub fn touch(&mut self, conn: ConnId, now_ms: u64) {
         let deadline_ms = now_ms.saturating_add(self.activity_timeout_ms);
         self.schedule(conn, deadline_ms, Kind::Idle);

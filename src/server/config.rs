@@ -1,23 +1,5 @@
 //! Server-level configuration (defaults + `PYLON_*` env overrides).
 
-/// Selects the I/O transport implementation. `Legacy` is the default
-/// tokio-tungstenite path; `Percore` is the SP9 per-core slab transport.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TransportMode {
-    Legacy,
-    Percore,
-}
-
-impl TransportMode {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "legacy" => Some(Self::Legacy),
-            "percore" => Some(Self::Percore),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub max_presence_members: usize,
@@ -66,8 +48,7 @@ pub struct ServerConfig {
     pub redis_sweep_interval_secs: u64,
     pub webhook_vacated_grace_ms: u64,
     pub redis_sharded_pubsub: bool,
-    pub transport: TransportMode,
-    /// Number of per-core worker threads for `TransportMode::Percore`. `0` means
+    /// Number of per-core worker threads for the percore transport. `0` means
     /// "auto" — one worker per available CPU. See [`ServerConfig::worker_count`].
     pub workers: usize,
     // ── SP10 adaptive overload (all auto-derived; overrides only) ──────────────
@@ -142,7 +123,6 @@ impl Default for ServerConfig {
             redis_sweep_interval_secs: 10,
             webhook_vacated_grace_ms: 3000,
             redis_sharded_pubsub: false,
-            transport: TransportMode::Legacy,
             workers: 0,
             memory_budget_bytes: 0,
             memory_budget_fraction: 0.0,
@@ -311,11 +291,6 @@ impl ServerConfig {
         }
         if let Ok(v) = std::env::var("PYLON_REDIS_SHARDED_PUBSUB") {
             c.redis_sharded_pubsub = v == "1" || v.eq_ignore_ascii_case("true");
-        }
-        if let Ok(v) = std::env::var("PYLON_TRANSPORT") {
-            if let Some(m) = TransportMode::parse(&v) {
-                c.transport = m;
-            }
         }
         if let Ok(v) = std::env::var("PYLON_WORKERS") {
             if let Ok(p) = v.parse() {
@@ -575,12 +550,6 @@ mod tests {
     }
 
     #[test]
-    fn transport_defaults_to_legacy() {
-        let c = ServerConfig::default();
-        assert_eq!(c.transport, TransportMode::Legacy);
-    }
-
-    #[test]
     fn workers_default_is_auto() {
         let c = ServerConfig::default();
         assert_eq!(c.workers, 0);
@@ -604,13 +573,6 @@ mod tests {
         assert_eq!(c.workers, 3);
         assert_eq!(c.worker_count(), 3);
         std::env::remove_var("PYLON_WORKERS");
-    }
-
-    #[test]
-    fn transport_mode_parse() {
-        assert_eq!(TransportMode::parse("percore"), Some(TransportMode::Percore));
-        assert_eq!(TransportMode::parse("legacy"), Some(TransportMode::Legacy));
-        assert_eq!(TransportMode::parse("nonsense"), None);
     }
 
     #[test]

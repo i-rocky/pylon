@@ -19,16 +19,17 @@ pub struct AppState {
     pub webhooks: WebhookHandle,
     /// SP10 admission control: the percore broadcast pipeline's saturation flag,
     /// threaded as a side channel (NOT via the `Adapter` trait, which stays
-    /// unchanged). `Some` under the percore transport (a clone of the
-    /// `LocalAdapter`'s flag); `None` for the legacy/local path, where
-    /// [`AppState::is_saturated`] is always `false` so the 503 gate is a no-op.
+    /// unchanged). `Some` whenever a concrete `LocalAdapter` backs the broadcast
+    /// sink (a clone of its flag); `None` when there's no concrete local adapter
+    /// (the redis+percore fallback) or in tests, where [`AppState::is_saturated`]
+    /// is always `false` so the 503 gate is a no-op.
     pub saturated: Option<Arc<AtomicBool>>,
 }
 
 impl AppState {
-    /// Cheap admission-control check: is the publish pipeline saturated? Off
-    /// percore (`saturated == None`) this is always `false`, so the REST 503 gate
-    /// and the WS client-event drop are no-ops and behaviour is unchanged.
+    /// Cheap admission-control check: is the publish pipeline saturated? With no
+    /// saturation flag wired (`saturated == None`) this is always `false`, so the
+    /// REST 503 gate and the WS client-event drop are no-ops.
     pub fn is_saturated(&self) -> bool {
         self.saturated
             .as_ref()
@@ -46,8 +47,6 @@ pub fn build_router(state: AppState) -> Router {
         .max_batch_events
         .saturating_mul(state.config.max_event_payload_bytes)
         .saturating_add(64 * 1024);
-    let router = Router::new()
-        .route("/", get(crate::http::root))
-        .route("/app/{key}", get(crate::ws::upgrade::upgrade));
+    let router = Router::new().route("/", get(crate::http::root));
     crate::http::rest::merge(router, body_limit).with_state(state)
 }

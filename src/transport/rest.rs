@@ -1,11 +1,10 @@
 //! REST handoff for the per-core transport (SP9 §3.4).
 //!
-//! In `PYLON_TRANSPORT=percore` the `mio` worker owns the listener and accepts
-//! every connection. WebSocket clients are driven on the worker thread; a plain
-//! HTTP request (a Pusher REST publish, `POST /apps/{id}/events`) cannot be
-//! served there. Instead the worker hands the raw connection — plus the request
-//! head bytes it already read — to the tokio runtime, where the *same* axum
-//! [`Router`] the legacy transport uses serves it.
+//! The `mio` worker owns the listener and accepts every connection. WebSocket
+//! clients are driven on the worker thread; a plain HTTP request (a Pusher REST
+//! publish, `POST /apps/{id}/events`) cannot be served there. Instead the worker
+//! hands the raw connection — plus the request head bytes it already read — to the
+//! tokio runtime, where the axum [`Router`] serves it.
 //!
 //! The pieces:
 //!

@@ -23,7 +23,7 @@ use pylon::app::static_file::StaticFileAppManager;
 use pylon::app::AppManager;
 use pylon::auth::signature::{channel_signature, hmac_sha256_hex, md5_hex};
 use pylon::channel::registry::Registry;
-use pylon::server::config::{ServerConfig, TransportMode};
+use pylon::server::config::ServerConfig;
 use pylon::server::router::{build_router, AppState};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -76,7 +76,6 @@ fn free_port() -> u16 {
 async fn spawn() -> Harness {
     let port = free_port();
     let config = ServerConfig {
-        transport: TransportMode::Percore,
         bind: "127.0.0.1".to_string(),
         port,
         workers: N_WORKERS,

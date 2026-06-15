@@ -20,7 +20,7 @@
 //!   Used by the transport's own unit tests.
 //! * [`Mode::Dispatch`] — the real Pusher v7 protocol. On handshake completion
 //!   the worker resolves the `/app/{key}` tenant, builds a
-//!   [`ConnectionContext`] (mirroring `ws::upgrade`), emits
+//!   [`ConnectionContext`], emits
 //!   `pusher:connection_established`, and from then on decodes each inbound Text
 //!   frame to a [`ClientCommand`] and drives `ctx.dispatch(..)` via
 //!   `block_on`. After every dispatch (and once per loop iteration) every Open
@@ -35,7 +35,7 @@
 //! Safe Rust — the crate root sets `#![deny(unsafe_code)]`; this module adds no
 //! `unsafe`.
 //!
-//! Multiple of these worker loops run in `TransportMode::Percore` (one per CPU),
+//! Multiple of these worker loops run in the percore transport (one per CPU),
 //! each with its own `SO_REUSEPORT` listener on the same `bind:port`, so the
 //! kernel spreads accepts across workers; see [`crate::transport::run_percore`].
 
@@ -71,16 +71,15 @@ const LISTENER: Token = Token(usize::MAX);
 const BCAST_WAKER: Token = Token(usize::MAX - 1);
 
 /// Shared, `Arc`-cloneable bundle of the `AppState` pieces a [`Mode::Dispatch`]
-/// worker needs to build a [`ConnectionContext`] per connection — the same
-/// inputs `ws::upgrade::serve` threads into `ConnectionParams`.
+/// worker needs to build a [`ConnectionContext`] per connection.
 pub struct DispatchEnv {
     pub apps: Arc<dyn AppManager>,
     pub adapter: Arc<dyn Adapter>,
     pub limits: crate::server::config::Limits,
     pub activity_timeout: u32,
     /// SP11 §4: seconds to wait for a `pusher:pong` after an idle `pusher:ping`
-    /// before closing the connection with code `4201` (legacy parity:
-    /// `connection/task.rs`). Drives this worker's [`TimerWheel`].
+    /// before closing the connection with code `4201`. Drives this worker's
+    /// [`TimerWheel`].
     pub pong_timeout: u32,
     pub strict_protocol: bool,
     /// Per-app live connection counters (shared with the rest of the server),
@@ -170,7 +169,7 @@ pub enum Mode {
 }
 
 /// Per-connection v7 protocol state, present once the WS handshake completes on
-/// a [`Mode::Dispatch`] worker. Mirrors what `connection::task::run` owns.
+/// a [`Mode::Dispatch`] worker.
 struct Session {
     ctx: ConnectionContext,
     /// Inbound side of the connection mailbox; the matching sender lives in
@@ -279,7 +278,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
 
     // SP11 §4: per-worker liveness timer wheel. Idle-pings a silent connection
     // after `activity_timeout` and closes it `4201` if a pong doesn't follow
-    // within `pong_timeout` — the legacy `connection/task.rs` semantics without a
+    // within `pong_timeout` — the Pusher v7 liveness contract without a
     // per-connection tokio timer. Keyed by the slab token. Only meaningful for
     // dispatch workers (echo workers / pre-handshake conns never enter it); the
     // timeouts come from the dispatch env (config-derived).
@@ -393,9 +392,8 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         // SP11 §4: inbound bytes are activity — reset this
                         // connection's idle deadline (and cancel any pending
                         // pong-timeout close: a `pusher:pong`, like any other
-                        // inbound frame, is just activity). Mirrors legacy
-                        // `last_activity = now; ping_sent_at = None`. Only
-                        // dispatch (`liveness`) workers run the wheel.
+                        // inbound frame, is just activity). Only dispatch
+                        // (`liveness`) workers run the wheel.
                         if liveness {
                             wheel.touch(key, now_ms);
                         }
@@ -534,8 +532,8 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
 }
 
 /// SP11 §4: queue a `pusher:ping` (v7 `{"event":"pusher:ping","data":{}}`) onto
-/// `key`'s out-queue and flush, mirroring how the legacy task and
-/// [`drain_session`] emit a server frame. Returns `true` if the frame was queued
+/// `key`'s out-queue and flush, the same way [`drain_session`] emits a server
+/// frame. Returns `true` if the frame was queued
 /// (the connection exists, is Open, and has a session); `false` otherwise (caller
 /// drops the wheel entry). A flush that backpressures arms writable interest; a
 /// flush that fails closes the connection on the next event.
@@ -561,9 +559,9 @@ fn queue_ping(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u6
     true
 }
 
-/// SP11 §4: send a WebSocket Close frame with code `4201` (pong-timeout) — the
-/// exact legacy `connection/task.rs` payload — then let the caller `remove` the
-/// connection. Mirrors the `ServerEvent::Close` arm of [`drain_session`].
+/// SP11 §4: send a WebSocket Close frame with code `4201` (pong-timeout) with the
+/// canonical Pusher v7 reason text, then let the caller `remove` the connection.
+/// Mirrors the `ServerEvent::Close` arm of [`drain_session`].
 fn send_close_4201(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) {
     let Some(entry) = conns.get_mut(key) else {
         return;
@@ -676,8 +674,7 @@ fn handle_handshake(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig, now_ns: 
             // check capacity, create the mailbox + ConnectionContext, and queue
             // the connection_established frame. On a rejection (unknown app 4001,
             // unsupported protocol 4007, over-capacity 4004) emit the `pusher:error`
-            // frame + a WS Close carrying the error code — byte-for-byte parity with
-            // the legacy `ws::upgrade::reject`.
+            // frame + a WS Close carrying the error code.
             if let Mode::Dispatch(env) = &cfg.mode {
                 match establish_session(env, &path) {
                     Ok(session) => {
@@ -722,20 +719,19 @@ fn handle_handshake(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig, now_ns: 
 
 /// A pre-session rejection: the `pusher:error` to emit plus the codec that should
 /// encode it. `codec` is `None` only when protocol negotiation itself failed (no
-/// codec exists yet) — then the error frame is a hand-built raw JSON object, the
-/// exact `ws::upgrade::reject(.., None)` fallback.
+/// codec exists yet) — then the error frame is a hand-built raw JSON object (the
+/// no-codec fallback).
 struct Reject {
     error: crate::protocol::error::PusherError,
     codec: Option<Box<dyn Codec>>,
 }
 
 /// Resolve the app + protocol from a `/app/{key}?protocol=N` path and build the
-/// v7 [`Session`], mirroring `ws::upgrade::serve`: negotiate codec, look up the
-/// app by key, enforce per-app capacity, and assemble the [`ConnectionContext`]
-/// the same way `connection::task::run` does. Returns `Err(Reject)` on any
+/// v7 [`Session`]: negotiate codec, look up the app by key, enforce per-app
+/// capacity, and assemble the [`ConnectionContext`]. Returns `Err(Reject)` on any
 /// rejection (unsupported protocol → 4007, unknown app → 4001, over capacity →
 /// 4004), carrying the `pusher:error` + the codec to encode it — so the caller
-/// emits the error frame then a WS Close, matching legacy byte-for-byte.
+/// emits the error frame then a WS Close.
 fn establish_session(env: &Arc<DispatchEnv>, path: &str) -> Result<Session, Reject> {
     use crate::protocol::error::PusherError;
     let (key, protocol) = parse_app_path(path);
@@ -804,8 +800,7 @@ fn establish_session(env: &Arc<DispatchEnv>, path: &str) -> Result<Session, Reje
 /// Queue the pre-session rejection frames onto `entry`'s out-queue: first the
 /// `pusher:error` Text frame (codec-encoded when a codec exists, else the raw
 /// JSON fallback), then a WebSocket Close frame carrying the error `code` +
-/// `message`. Mirrors `ws::upgrade::reject` exactly so the percore rejection is
-/// byte-for-byte identical to legacy. The caller flushes and closes.
+/// `message`. The caller flushes and closes.
 fn queue_reject(entry: &mut Entry, reject: &Reject, now_ns: u64) {
     // 1) the pusher:error Text frame.
     let text = match &reject.codec {
@@ -835,8 +830,7 @@ fn queue_reject(entry: &mut Entry, reject: &Reject, now_ns: u64) {
 }
 
 /// Split a `/app/{key}` path (with an optional `?protocol=N&...` query) into the
-/// app key and the `protocol` query value, mirroring how axum's `Path`/`Query`
-/// extractors feed `ws::upgrade`.
+/// app key and the `protocol` query value.
 fn parse_app_path(path: &str) -> (String, Option<String>) {
     let (raw_path, query) = match path.split_once('?') {
         Some((p, q)) => (p, Some(q)),
@@ -926,15 +920,14 @@ fn dispatch_frames(
                 };
                 let text = match std::str::from_utf8(&f.payload) {
                     Ok(t) => t,
-                    // A non-UTF-8 text frame is malformed; mirror legacy and drop.
+                    // A non-UTF-8 text frame is malformed; drop it.
                     Err(_) => continue,
                 };
                 match session.codec.decode(text) {
                     Ok(cmd) => dispatch_command(session, cmd),
                     Err(e) => {
-                        // Unparseable frames are silently dropped (parity with
-                        // `connection::task`); 4200 is a close/reconnect code and
-                        // must not be sent in-band.
+                        // Unparseable frames are silently dropped; 4200 is a
+                        // close/reconnect code and must not be sent in-band.
                         tracing::trace!("dropping malformed client frame: {e}");
                     }
                 }
