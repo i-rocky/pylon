@@ -1427,3 +1427,164 @@ async fn watch_initial_snapshot_is_cluster_wide() {
     .await
     .expect("cluster watch-snapshot test must not hang (Redis up?)");
 }
+
+// ---------------------------------------------------------------------------
+// SP11 Phase 3.1: direct tests for the extracted cluster-only coordination ops.
+//
+// These call the `cluster_*` methods (the Redis/cluster half the `ClusterBridge`
+// will own) DIRECTLY — without any `LocalAdapter` subscribe — and assert they
+// return the authoritative cluster value. They are the same random-prefix-isolated,
+// fail-loud-if-Redis-down shape as the suite above.
+// ---------------------------------------------------------------------------
+
+/// `cluster_subscribe` records cluster-wide membership and returns the AUTHORITATIVE
+/// `(count, occupied)` WITHOUT any local subscribe. Two nodes calling it for the same
+/// channel see cluster counts 1 (occupied) then 2 (not occupied) — proving it reads the
+/// cluster `HLEN`, not a node-local view. The `node_first` flag drives the msg-channel
+/// subscribe lifecycle, so the caller's Redis subscriber tracks the channel.
+#[tokio::test]
+async fn cluster_subscribe_returns_cluster_count_without_local() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let adapter_a = connect_adapter_with_prefix(&prefix).await;
+        let adapter_b = connect_adapter_with_prefix(&prefix).await;
+
+        let sock_a = SocketId::generate();
+        let (count_a, occ_a) = adapter_a
+            .cluster_subscribe(TEST_APP, "public-room", &sock_a, true)
+            .await;
+        assert_eq!(count_a, 1, "first cluster member → cluster count 1");
+        assert!(occ_a, "0→1 cluster edge must report occupied");
+
+        // `node_first == true` must have SUBSCRIBEd the msg channel on A.
+        let key = Keys::new(&prefix).msg(TEST_APP, "public-room");
+        assert!(
+            adapter_a.tracked_redis_channels().contains(&key),
+            "node_first must SUBSCRIBE the channel's msg key"
+        );
+
+        // A second node's cluster_subscribe sees the cluster count 2, NOT occupied —
+        // proving the count is the cluster HLEN, not a node-local 1.
+        let sock_b = SocketId::generate();
+        let (count_b, occ_b) = adapter_b
+            .cluster_subscribe(TEST_APP, "public-room", &sock_b, true)
+            .await;
+        assert_eq!(count_b, 2, "second cluster member on another node → count 2");
+        assert!(!occ_b, "a non-0→1 cluster_subscribe must NOT report occupied");
+
+        // `cluster_unsubscribe` mirrors it: 2→1 (not vacated), then 1→0 (vacated).
+        let (rem_b, vac_b) = adapter_b
+            .cluster_unsubscribe(TEST_APP, "public-room", &sock_b, true)
+            .await;
+        assert_eq!(rem_b, 1, "one cluster member remains → count 1");
+        assert!(!vac_b, "a non-1→0 cluster_unsubscribe must NOT report vacated");
+
+        let (rem_a, vac_a) = adapter_a
+            .cluster_unsubscribe(TEST_APP, "public-room", &sock_a, true)
+            .await;
+        assert_eq!(rem_a, 0, "last cluster member gone → count 0");
+        assert!(vac_a, "1→0 cluster edge must report vacated");
+    })
+    .await
+    .expect("cluster_subscribe direct test must not hang (Redis up?)");
+}
+
+/// `cluster_presence_capacity` returns the cluster distinct-user count and whether a
+/// given user is already in the cluster roster — the presence-subscribe admission probe —
+/// reading cross-node Redis state, not any node-local roster. After `cluster_presence_join`
+/// of u1 on A and u2 on B, A's probe sees count 2, `already_member` true for u1 / u2 and
+/// false for an unseen u3.
+#[tokio::test]
+async fn cluster_presence_capacity_is_cluster_wide() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let adapter_a = connect_adapter_with_prefix(&prefix).await;
+        let adapter_b = connect_adapter_with_prefix(&prefix).await;
+
+        let (s1, _h1, m1) = presence_handle("u1", serde_json::json!({"name":"Ann"}));
+        let (first1, _roster1) = adapter_a
+            .cluster_presence_join(TEST_APP, "presence-room", &m1, &s1)
+            .await
+            .expect("cluster_presence_join on A must succeed");
+        assert!(first1, "u1's first cluster connection must be first_for_user");
+
+        let (s2, _h2, m2) = presence_handle("u2", serde_json::json!({"name":"Bob"}));
+        adapter_b
+            .cluster_presence_join(TEST_APP, "presence-room", &m2, &s2)
+            .await
+            .expect("cluster_presence_join on B must succeed");
+
+        // A's capacity probe is cluster-wide: 2 distinct users, u1 & u2 already members.
+        let (count, u1_member) = adapter_a
+            .cluster_presence_capacity(TEST_APP, "presence-room", "u1")
+            .await;
+        assert_eq!(count, 2, "cluster distinct-user count must be 2");
+        assert!(u1_member, "u1 must read as already a cluster member");
+
+        let (_c, u2_member) = adapter_a
+            .cluster_presence_capacity(TEST_APP, "presence-room", "u2")
+            .await;
+        assert!(u2_member, "u2 (joined on B) must read as already a member on A");
+
+        let (_c, u3_member) = adapter_a
+            .cluster_presence_capacity(TEST_APP, "presence-room", "u3")
+            .await;
+        assert!(!u3_member, "an unseen user must NOT read as already a member");
+
+        // Leaving drops the cluster count back down (last_for_user edge).
+        let last1 = adapter_a
+            .cluster_presence_leave(TEST_APP, "presence-room", "u1", &s1)
+            .await
+            .expect("cluster_presence_leave must succeed");
+        assert!(last1, "u1's only cluster connection leaving → last_for_user");
+        let (count_after, _) = adapter_a
+            .cluster_presence_capacity(TEST_APP, "presence-room", "u1")
+            .await;
+        assert_eq!(count_after, 1, "after u1 leaves, cluster count is 1 (u2)");
+    })
+    .await
+    .expect("cluster_presence_capacity direct test must not hang (Redis up?)");
+}
+
+/// `cluster_publish_broadcast` PUBLISHes the Broadcast envelope on the channel's `msg`
+/// key for cross-node delivery — and does NO local delivery itself (that is the caller's
+/// job). A second node subscribed to the channel receives the pre-encoded frame; the
+/// publisher does not loop it back into any local mailbox (it has none here).
+#[tokio::test]
+async fn cluster_publish_broadcast_fans_out_only_remote() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let adapter_a = connect_adapter_with_prefix(&prefix).await;
+        let adapter_b = connect_adapter_with_prefix(&prefix).await;
+
+        // B subscribes locally so its receive loop will deliver A's remote broadcast.
+        let (sock_b, handle_b, mut rx_b) = recording_handle();
+        adapter_b
+            .subscribe(TEST_APP, "public-room", handle_b, None)
+            .await;
+
+        // A publishes ONLY the cluster half — a pre-encoded v7 frame — with no local
+        // delivery. B's subscriber receives it and re-delivers to B's local socket.
+        let frame =
+            pylon::protocol::v7::frames::encode(&ServerEvent::Raw(std::sync::Arc::from("ping")));
+        adapter_a
+            .cluster_publish_broadcast(TEST_APP, "public-room", frame.clone(), None)
+            .await;
+
+        let received = tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
+            .await
+            .expect("B must receive the cross-node broadcast in time")
+            .expect("B's mailbox must yield the broadcast");
+        match received {
+            ServerEvent::Raw(f) => assert_eq!(&*f, &frame, "B must get A's pre-encoded frame"),
+            other => panic!("expected a Raw frame, got {other:?}"),
+        }
+
+        // Cleanup B's membership so the prefix's keys vacate cleanly.
+        adapter_b
+            .unsubscribe(TEST_APP, "public-room", &sock_b)
+            .await;
+    })
+    .await
+    .expect("cluster_publish_broadcast direct test must not hang (Redis up?)");
+}

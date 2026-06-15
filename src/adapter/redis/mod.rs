@@ -22,7 +22,7 @@ use crate::channel::outcome::{ChannelSummary, SubscribeOutcome, UnsubscribeOutco
 use crate::channel::registry::Registry;
 use crate::connection::handle::ConnectionHandle;
 use crate::presence::member::PresenceMember;
-use crate::protocol::event::ServerEvent;
+use crate::protocol::event::{PresencePayload, ServerEvent};
 use crate::protocol::socket_id::SocketId;
 use crate::server::config::ServerConfig;
 use crate::user::{UserJoinOutcome, UserLeaveOutcome};
@@ -328,6 +328,465 @@ impl RedisAdapter {
     }
 }
 
+/// Cluster-only coordination ops, factored out of the `Adapter` trait methods.
+///
+/// Each of these does ONLY the Redis/cluster half of an operation — the SUBSCRIBE_LUA /
+/// presence / user / pub-sub work — and performs NO `self.local.*` call. The local half
+/// (and the node-first / node-last edge it computes) is the caller's responsibility: the
+/// `Adapter` impl below threads it in from its own `LocalAdapter`, and the percore
+/// `ClusterBridge` will thread it in from its worker-local `LocalAdapter`. Behavior is
+/// identical to the inline code these were extracted from — they are the single source of
+/// truth that both callers now share.
+impl RedisAdapter {
+    /// Cluster half of `subscribe`: record cluster-wide membership (SUBSCRIBE_LUA), index
+    /// the app, and drive the node-local Redis `msg`-channel subscribe-on-first lifecycle.
+    ///
+    /// `node_first` is the node-local 0→1 subscriber edge (the caller computes it from its
+    /// own `LocalAdapter` — `out.subscription_count == 1`). Returns the AUTHORITATIVE
+    /// `(cluster_count, occupied)`. On any Redis error every step degrades gracefully
+    /// (logged, never fatal); the returned count then stays `0` and the caller keeps its
+    /// node-local outcome, exactly as the inline path did.
+    #[doc(hidden)]
+    pub async fn cluster_subscribe(
+        &self,
+        app: &str,
+        channel: &str,
+        socket_id: &SocketId,
+        node_first: bool,
+    ) -> (usize, bool) {
+        // Subscribe to the msg channel when this NODE goes 0 → 1 for the channel.
+        if node_first {
+            let msg_key = self.keys.msg(app, channel);
+            if let Err(e) = self.clients.sub.subscribe(msg_key.clone()).await {
+                // The local subscription already succeeded; a Redis SUBSCRIBE
+                // failure only costs cross-node delivery for this channel on this
+                // node. Log loudly but never panic the connection task.
+                tracing::warn!(
+                    error = %e,
+                    channel = %msg_key,
+                    "failed to SUBSCRIBE to Redis msg channel on 0→1 edge"
+                );
+            }
+        }
+
+        // Record cluster-wide membership and read back the AUTHORITATIVE count.
+        // Atomic Lua: HSET member, refresh whole-key TTL, HLEN, index on the 0→1
+        // cluster edge. On any Redis error, report a zero count so the caller keeps
+        // its node-local outcome (graceful degradation — a membership write failure
+        // must never fail the subscribe).
+        let ttl_secs = self.cfg.membership_ttl_secs;
+        let occ = self.keys.occ(app, channel);
+        let chans = self.keys.chans(app);
+        let token = keys::member_token(&self.node_id, socket_id.as_str());
+        let argv = vec![
+            token,
+            (now_ms() + ttl_secs * 1000).to_string(),
+            ttl_secs.to_string(),
+            channel.to_string(),
+        ];
+        let mut count = 0usize;
+        let mut occupied = false;
+        match self
+            .scripts
+            .subscribe
+            .evalsha_with_reload::<i64, _, _>(self.clients.pool.next(), vec![occ, chans], argv)
+            .await
+        {
+            Ok(c) => {
+                count = c as usize;
+                occupied = c == 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    app, channel,
+                    "redis SUBSCRIBE membership script failed; keeping node-local count"
+                );
+            }
+        }
+
+        // Index the app so the sweeper can enumerate it (SMEMBERS apps → SMEMBERS
+        // chans(app)). Idempotent and cheap; the apps set is bounded by configured
+        // apps so it needs no cleanup. Log + ignore errors — this is best-effort.
+        if let Err(e) = self
+            .clients
+            .pool
+            .next()
+            .sadd::<i64, _, _>(self.keys.apps(), app.to_string())
+            .await
+        {
+            tracing::warn!(error = %e, app, "redis SADD apps failed; sweeper may miss this app");
+        }
+
+        (count, occupied)
+    }
+
+    /// Cluster half of `unsubscribe`: remove cluster-wide membership (UNSUBSCRIBE_LUA) and
+    /// tear down the node-local Redis `msg`-channel subscription on the node-local 1 → 0
+    /// edge (`node_last`, computed by the caller as `out.subscription_count == 0`). Returns
+    /// the AUTHORITATIVE `(cluster_count, vacated)`; on Redis error returns `(0, false)` so
+    /// the caller keeps its node-local outcome.
+    #[doc(hidden)]
+    pub async fn cluster_unsubscribe(
+        &self,
+        app: &str,
+        channel: &str,
+        socket_id: &SocketId,
+        node_last: bool,
+    ) -> (usize, bool) {
+        // Tear down the Redis subscription on the node-LOCAL 1 → 0 edge.
+        if node_last {
+            let msg_key = self.keys.msg(app, channel);
+            if let Err(e) = self.clients.sub.unsubscribe(msg_key.clone()).await {
+                tracing::warn!(
+                    error = %e,
+                    channel = %msg_key,
+                    "failed to UNSUBSCRIBE from Redis msg channel on 1→0 edge"
+                );
+            }
+        }
+
+        // Remove cluster-wide membership and read back the AUTHORITATIVE remaining
+        // count. Atomic Lua: HDEL member, HLEN, and on the 1→0 cluster edge DEL the
+        // now-empty hash + de-index. On Redis error, report a zero count so the caller
+        // keeps its node-local outcome.
+        let occ = self.keys.occ(app, channel);
+        let chans = self.keys.chans(app);
+        let token = keys::member_token(&self.node_id, socket_id.as_str());
+        let argv = vec![token, channel.to_string()];
+        match self
+            .scripts
+            .unsubscribe
+            .evalsha_with_reload::<i64, _, _>(self.clients.pool.next(), vec![occ, chans], argv)
+            .await
+        {
+            Ok(count) => (count as usize, count == 0),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    app, channel,
+                    "redis UNSUBSCRIBE membership script failed; keeping node-local count"
+                );
+                (0, false)
+            }
+        }
+    }
+
+    /// Cluster half of a presence join: PRESENCE_JOIN refcount + cluster roster read.
+    /// Returns `(first_for_user, cluster_roster)`. Propagates the Redis error (the caller
+    /// keeps its node-local join on `Err`, as the inline path did).
+    #[doc(hidden)]
+    pub async fn cluster_presence_join(
+        &self,
+        app: &str,
+        channel: &str,
+        member: &PresenceMember,
+        socket_id: &SocketId,
+    ) -> anyhow::Result<(bool, PresencePayload)> {
+        presence::join(
+            &self.scripts,
+            &self.clients.pool,
+            &self.keys,
+            &self.node_id,
+            app,
+            channel,
+            member,
+            socket_id,
+        )
+        .await
+    }
+
+    /// Cluster half of a presence leave: PRESENCE_LEAVE refcount. Returns `last_for_user`.
+    /// Propagates the Redis error (the caller keeps its node-local leave on `Err`).
+    #[doc(hidden)]
+    pub async fn cluster_presence_leave(
+        &self,
+        app: &str,
+        channel: &str,
+        user_id: &str,
+        socket_id: &SocketId,
+    ) -> anyhow::Result<bool> {
+        presence::leave(
+            &self.scripts,
+            &self.clients.pool,
+            &self.keys,
+            &self.node_id,
+            app,
+            channel,
+            user_id,
+            socket_id,
+        )
+        .await
+    }
+
+    /// Cluster presence capacity probe for the presence-subscribe admission check: the
+    /// cluster distinct-user count (`HLEN presusers`) and whether `user_id` is already in
+    /// the cluster roster (`HEXISTS presusers user_id`). Both reads are best-effort: a
+    /// Redis error degrades to `(0, false)` so the capacity gate fails open rather than
+    /// rejecting a join on a transient blip.
+    #[doc(hidden)]
+    pub async fn cluster_presence_capacity(
+        &self,
+        app: &str,
+        channel: &str,
+        user_id: &str,
+    ) -> (usize, bool) {
+        let count = match presence::user_count(&self.clients.pool, &self.keys, app, channel).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(error = %e, app, channel, "redis presence user_count failed; capacity check degrades to 0");
+                0
+            }
+        };
+        let already_member: bool = match self
+            .clients
+            .pool
+            .next()
+            .hexists(self.keys.presusers(app, channel), user_id)
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, app, channel, user_id, "redis HEXISTS presusers failed; treating as not-yet-member");
+                false
+            }
+        };
+        (count, already_member)
+    }
+
+    /// Cluster half of `signin_user`: USER_SIGNIN refcount, the node-local `usermsg`
+    /// subscribe-on-first lifecycle, the `apps` index, and the WatchOnline publish on the
+    /// cluster 0→1 edge. `node_first` is the node-local first-connection edge (the caller
+    /// computes it as `out.first_for_user`). Returns the cluster `first_for_user`; on Redis
+    /// error returns `node_first` so the caller keeps its node-local outcome.
+    #[doc(hidden)]
+    pub async fn cluster_signin(
+        &self,
+        app: &str,
+        user_id: &str,
+        socket_id: &SocketId,
+        node_first: bool,
+    ) -> bool {
+        // usermsg sub lifecycle on the node-LOCAL first-connection edge: when this node
+        // gains its first connection for the user (0→1), SUBSCRIBE the per-user `usermsg`
+        // channel so cross-node send/terminate reach this node.
+        if node_first {
+            if let Err(e) = self
+                .clients
+                .sub
+                .subscribe(self.keys.usermsg(app, user_id))
+                .await
+            {
+                tracing::warn!(error = %e, app, user_id, "failed to SUBSCRIBE usermsg on local 0→1");
+            }
+        }
+
+        // Index the app so the sweeper can enumerate it (SMEMBERS apps → SMEMBERS
+        // users(app)) for the user-binding sweep — exactly as `subscribe` does for the
+        // channel sweep. Without this, a user that only ever SIGNED IN (never subscribed
+        // a channel) would leave `apps` empty and the sweeper could not reap its stale
+        // bindings on a crash. Idempotent + cheap; log + ignore errors (best-effort).
+        if let Err(e) = self
+            .clients
+            .pool
+            .next()
+            .sadd::<i64, _, _>(self.keys.apps(), app.to_string())
+            .await
+        {
+            tracing::warn!(error = %e, app, "redis SADD apps (signin) failed; sweeper may miss this app");
+        }
+
+        // Cluster online edge: USER_SIGNIN returns the cluster `first_for_user`
+        // (HLEN == 1). On any Redis error, report false so the caller keeps node-local.
+        match user::signin(
+            &self.scripts,
+            &self.clients.pool,
+            &self.keys,
+            &self.node_id,
+            app,
+            user_id,
+            socket_id,
+            self.cfg.membership_ttl_secs,
+        )
+        .await
+        {
+            Ok(first) => {
+                if first {
+                    // Notify the cluster the user came online. Remote nodes deliver
+                    // it to their local watchers; the origin's local watchers are
+                    // notified directly (self-dedup'd by the receive loop).
+                    user::publish(
+                        &self.clients.pool,
+                        &self.keys.watch(app, user_id),
+                        &self.node_id,
+                        app,
+                        user_id,
+                        envelope::EnvelopeKind::WatchOnline,
+                        serde_json::Value::Null,
+                    )
+                    .await;
+                }
+                first
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, app, user_id, "redis user signin failed; keeping node-local");
+                node_first
+            }
+        }
+    }
+
+    /// Cluster half of `signout_user`: USER_SIGNOUT refcount, the node-local `usermsg`
+    /// unsubscribe-on-last lifecycle, and the WatchOffline publish on the cluster 1→0
+    /// edge. `node_last` is the node-local last-connection edge (the caller computes it as
+    /// `out.last_for_user`). Returns the cluster `last_for_user`; on Redis error returns
+    /// `node_last` so the caller keeps its node-local outcome.
+    #[doc(hidden)]
+    pub async fn cluster_signout(
+        &self,
+        app: &str,
+        user_id: &str,
+        socket_id: &SocketId,
+        node_last: bool,
+    ) -> bool {
+        // usermsg sub teardown on the node-LOCAL last-connection edge (1→0).
+        if node_last {
+            if let Err(e) = self
+                .clients
+                .sub
+                .unsubscribe(self.keys.usermsg(app, user_id))
+                .await
+            {
+                tracing::warn!(error = %e, app, user_id, "failed to UNSUBSCRIBE usermsg on local 1→0");
+            }
+        }
+
+        // Cluster offline edge: USER_SIGNOUT returns the cluster `last_for_user`
+        // (HLEN == 0). On any Redis error, report false so the caller keeps node-local.
+        match user::signout(
+            &self.scripts,
+            &self.clients.pool,
+            &self.keys,
+            &self.node_id,
+            app,
+            user_id,
+            socket_id,
+        )
+        .await
+        {
+            Ok(last) => {
+                if last {
+                    user::publish(
+                        &self.clients.pool,
+                        &self.keys.watch(app, user_id),
+                        &self.node_id,
+                        app,
+                        user_id,
+                        envelope::EnvelopeKind::WatchOffline,
+                        serde_json::Value::Null,
+                    )
+                    .await;
+                }
+                last
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, app, user_id, "redis user signout failed; keeping node-local");
+                node_last
+            }
+        }
+    }
+
+    /// Cluster half of `watch`: SUBSCRIBE the per-user `watch` Redis channel for every
+    /// `newly_watched` user (the users whose node-LOCAL watcher set just went 0→1, which
+    /// the caller computes from `LocalAdapter::watch_edges`) so this node receives their
+    /// cluster online/offline transitions, then return the cluster-wide online subset of
+    /// `watched`. Per-user `is_online` errors degrade to the node-local check for that
+    /// user's snapshot entry, exactly as the inline path did.
+    #[doc(hidden)]
+    pub async fn cluster_watch(
+        &self,
+        app: &str,
+        watched: &[String],
+        newly_watched: &[String],
+    ) -> Vec<String> {
+        // Subscribe to each newly-watched user's watch channel so this node receives
+        // their cluster online/offline transitions.
+        for u in newly_watched {
+            if let Err(e) = self.clients.sub.subscribe(self.keys.watch(app, u)).await {
+                tracing::warn!(error = %e, app, user = %u, "failed to SUBSCRIBE watch channel");
+            }
+        }
+        // Cluster-wide initial online snapshot: is_user_online per watched user.
+        let mut online = Vec::new();
+        for u in watched {
+            match user::is_online(&self.clients.pool, &self.keys, app, u).await {
+                Ok(true) => online.push(u.clone()),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, app, user = %u, "redis is_online failed; using local for snapshot");
+                    if self.local.is_user_online(app, u).await {
+                        online.push(u.clone());
+                    }
+                }
+            }
+        }
+        online
+    }
+
+    /// Cluster half of `unwatch`: UNSUBSCRIBE the per-user `watch` Redis channels for the
+    /// users whose node-LOCAL watcher set just went 1→0 (`no_longer_watched`, computed by
+    /// the caller from `LocalAdapter::unwatch_edges`).
+    #[doc(hidden)]
+    pub async fn cluster_unwatch(&self, app: &str, no_longer_watched: &[String]) {
+        for u in no_longer_watched {
+            if let Err(e) = self.clients.sub.unsubscribe(self.keys.watch(app, u)).await {
+                tracing::warn!(error = %e, app, user = %u, "failed to UNSUBSCRIBE watch channel");
+            }
+        }
+    }
+
+    /// Cluster half of `broadcast`: PUBLISH the Broadcast envelope (the pre-encoded v7
+    /// `frame`) on the channel's `msg` pub/sub key so every other node delivers it. The
+    /// local delivery is done separately by the caller. Always publishes — even with no
+    /// local subscribers — because a REST trigger may land on a node where the channel is
+    /// only subscribed elsewhere. Best-effort: logs + returns on any Redis error.
+    #[doc(hidden)]
+    pub async fn cluster_publish_broadcast(
+        &self,
+        app: &str,
+        channel: &str,
+        frame: String,
+        except: Option<&SocketId>,
+    ) {
+        let env = envelope::Envelope {
+            node_id: self.node_id.clone(),
+            app: app.to_string(),
+            kind: envelope::EnvelopeKind::Broadcast,
+            channel: channel.to_string(),
+            event: serde_json::Value::String(frame),
+            except: except.map(|s| s.as_str().to_string()),
+        };
+        // Publish as a UTF-8 string (the envelope JSON is valid UTF-8); the receive
+        // loop reads it back with `Value::into_string()` — a proven round-trip.
+        let payload = match String::from_utf8(env.encode()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, app, channel, "envelope was not valid UTF-8");
+                return;
+            }
+        };
+        let key = self.keys.msg(app, channel);
+        if let Err(e) = self
+            .clients
+            .pool
+            .next()
+            .publish::<(), _, _>(key, payload)
+            .await
+        {
+            tracing::warn!(error = %e, app, channel, "redis publish failed");
+        }
+    }
+}
+
 impl Drop for RedisAdapter {
     /// Dropping the adapter "crashes" this node: abort every background task so it
     /// stops re-stamping its members' `expireAt` (membership heartbeat) and stops
@@ -366,82 +825,27 @@ impl Adapter for RedisAdapter {
         // edge: subscribe to the msg channel when this node goes 0 → 1. We capture
         // the local count now because the cluster count (below) overwrites
         // `out.subscription_count` — the lifecycle must stay on the local edge.
-        let local_count = out.subscription_count;
-        if local_count == 1 {
-            let msg_key = self.keys.msg(app, channel);
-            if let Err(e) = self.clients.sub.subscribe(msg_key.clone()).await {
-                // The local subscription already succeeded; a Redis SUBSCRIBE
-                // failure only costs cross-node delivery for this channel on this
-                // node. Log loudly but never panic the connection task.
-                tracing::warn!(
-                    error = %e,
-                    channel = %msg_key,
-                    "failed to SUBSCRIBE to Redis msg channel on 0→1 edge"
-                );
-            }
-        }
+        let node_first = out.subscription_count == 1;
 
-        // Record cluster-wide membership and read back the AUTHORITATIVE count.
-        // Atomic Lua: HSET member, refresh whole-key TTL, HLEN, index on the 0→1
-        // cluster edge. On any Redis error, keep the node-local outcome (graceful
-        // degradation — a membership write failure must never fail the subscribe).
-        let ttl_secs = self.cfg.membership_ttl_secs;
-        let occ = self.keys.occ(app, channel);
-        let chans = self.keys.chans(app);
-        let token = keys::member_token(&self.node_id, socket_id.as_str());
-        let argv = vec![
-            token,
-            (now_ms() + ttl_secs * 1000).to_string(),
-            ttl_secs.to_string(),
-            channel.to_string(),
-        ];
-        match self
-            .scripts
-            .subscribe
-            .evalsha_with_reload::<i64, _, _>(self.clients.pool.next(), vec![occ, chans], argv)
-            .await
-        {
-            Ok(count) => {
-                out.subscription_count = count as usize;
-                out.occupied = count == 1;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    app, channel,
-                    "redis SUBSCRIBE membership script failed; keeping node-local count"
-                );
-            }
-        }
-
-        // Index the app so the sweeper can enumerate it (SMEMBERS apps → SMEMBERS
-        // chans(app)). Idempotent and cheap; the apps set is bounded by configured
-        // apps so it needs no cleanup. Log + ignore errors — this is best-effort.
-        if let Err(e) = self
-            .clients
-            .pool
-            .next()
-            .sadd::<i64, _, _>(self.keys.apps(), app.to_string())
-            .await
-        {
-            tracing::warn!(error = %e, app, "redis SADD apps failed; sweeper may miss this app");
+        // Cluster half: SUBSCRIBE_LUA authoritative count + occupied edge + the node-local
+        // msg-channel subscribe-on-first + the app index. On any Redis error this returns a
+        // zero count and we KEEP the node-local outcome (graceful degradation — a membership
+        // write failure must never fail the subscribe).
+        let (count, occupied) = self
+            .cluster_subscribe(app, channel, &socket_id, node_first)
+            .await;
+        if count > 0 {
+            out.subscription_count = count;
+            out.occupied = occupied;
         }
 
         // Presence: overwrite the node-local PresenceJoin with cluster truth — the
         // first_for_user edge (HINCRBY refcount) and the cluster-wide roster. On any
         // Redis error keep the node-local join (graceful degradation).
         if let Some(join) = out.presence.as_mut() {
-            match presence::join(
-                &self.scripts,
-                &self.clients.pool,
-                &self.keys,
-                &self.node_id,
-                app,
-                channel,
-                &join.member,
-                &socket_id,
-            )
-            .await
+            match self
+                .cluster_presence_join(app, channel, &join.member, &socket_id)
+                .await
             {
                 Ok((first_for_user, roster)) => {
                     join.first_for_user = first_for_user;
@@ -468,57 +872,25 @@ impl Adapter for RedisAdapter {
         // 1 → 0 edge. Keyed on the local count (see note in `subscribe`): the cluster
         // count below overwrites `out.subscription_count`, so the lifecycle decision
         // must read the node-local count captured here.
-        let local_count = out.subscription_count;
-        if local_count == 0 {
-            let msg_key = self.keys.msg(app, channel);
-            if let Err(e) = self.clients.sub.unsubscribe(msg_key.clone()).await {
-                tracing::warn!(
-                    error = %e,
-                    channel = %msg_key,
-                    "failed to UNSUBSCRIBE from Redis msg channel on 1→0 edge"
-                );
-            }
-        }
+        let node_last = out.subscription_count == 0;
 
-        // Remove cluster-wide membership and read back the AUTHORITATIVE remaining
-        // count. Atomic Lua: HDEL member, HLEN, and on the 1→0 cluster edge DEL the
-        // now-empty hash + de-index. On Redis error, keep the node-local outcome.
-        let occ = self.keys.occ(app, channel);
-        let chans = self.keys.chans(app);
-        let token = keys::member_token(&self.node_id, socket_id.as_str());
-        let argv = vec![token, channel.to_string()];
-        match self
-            .scripts
-            .unsubscribe
-            .evalsha_with_reload::<i64, _, _>(self.clients.pool.next(), vec![occ, chans], argv)
-            .await
-        {
-            Ok(count) => {
-                out.subscription_count = count as usize;
-                out.vacated = count == 0;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    app, channel,
-                    "redis UNSUBSCRIBE membership script failed; keeping node-local count"
-                );
-            }
+        // Cluster half: the node-local msg-channel unsubscribe-on-last + UNSUBSCRIBE_LUA
+        // authoritative remaining count + vacated edge. On Redis error this returns the
+        // `(0, false)` sentinel — which a real success never produces (a real 1→0 success is
+        // `(0, true)`) — so we keep the node-local outcome only in that exact case.
+        let (count, vacated) = self
+            .cluster_unsubscribe(app, channel, socket_id, node_last)
+            .await;
+        if count > 0 || vacated {
+            out.subscription_count = count;
+            out.vacated = vacated;
         }
 
         // Presence: overwrite last_for_user with the cluster refcount edge.
         if let Some(leave) = out.presence.as_mut() {
-            match presence::leave(
-                &self.scripts,
-                &self.clients.pool,
-                &self.keys,
-                &self.node_id,
-                app,
-                channel,
-                &leave.user_id,
-                socket_id,
-            )
-            .await
+            match self
+                .cluster_presence_leave(app, channel, &leave.user_id, socket_id)
+                .await
             {
                 Ok(last_for_user) => leave.last_for_user = last_for_user,
                 Err(e) => {
@@ -547,33 +919,8 @@ impl Adapter for RedisAdapter {
         //    even with no local subscribers — because a REST trigger may land on a
         //    node where the channel is only subscribed elsewhere.
         let frame = crate::protocol::v7::frames::encode(&event);
-        let env = envelope::Envelope {
-            node_id: self.node_id.clone(),
-            app: app.to_string(),
-            kind: envelope::EnvelopeKind::Broadcast,
-            channel: channel.to_string(),
-            event: serde_json::Value::String(frame),
-            except: except.as_ref().map(|s| s.as_str().to_string()),
-        };
-        // Publish as a UTF-8 string (the envelope JSON is valid UTF-8); the receive
-        // loop reads it back with `Value::into_string()` — a proven round-trip.
-        let payload = match String::from_utf8(env.encode()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, app, channel, "envelope was not valid UTF-8");
-                return;
-            }
-        };
-        let key = self.keys.msg(app, channel);
-        if let Err(e) = self
-            .clients
-            .pool
-            .next()
-            .publish::<(), _, _>(key, payload)
-            .await
-        {
-            tracing::warn!(error = %e, app, channel, "redis publish failed");
-        }
+        self.cluster_publish_broadcast(app, channel, frame, except.as_ref())
+            .await;
     }
 
     async fn channels(&self, app: &str, prefix: Option<&str>) -> Vec<ChannelSummary> {
@@ -731,72 +1078,18 @@ impl Adapter for RedisAdapter {
         let socket_id = handle.socket_id.clone();
         let mut out = self.local.signin_user(app, user_id, handle).await;
 
-        // usermsg sub lifecycle on the node-LOCAL first-connection edge. Read it
-        // BEFORE the cluster Lua overwrites `out.first_for_user`: when this node
-        // gains its first connection for the user (0→1), SUBSCRIBE the per-user
-        // `usermsg` channel so cross-node send/terminate reach this node.
-        if out.first_for_user {
-            if let Err(e) = self
-                .clients
-                .sub
-                .subscribe(self.keys.usermsg(app, user_id))
-                .await
-            {
-                tracing::warn!(error = %e, app, user_id, "failed to SUBSCRIBE usermsg on local 0→1");
-            }
-        }
+        // The node-LOCAL first-connection edge, read BEFORE the cluster half overwrites
+        // `out.first_for_user`: when this node gains its first connection for the user
+        // (0→1), the cluster half SUBSCRIBEs the per-user `usermsg` channel.
+        let node_first = out.first_for_user;
 
-        // Index the app so the sweeper can enumerate it (SMEMBERS apps → SMEMBERS
-        // users(app)) for the user-binding sweep — exactly as `subscribe` does for the
-        // channel sweep. Without this, a user that only ever SIGNED IN (never subscribed
-        // a channel) would leave `apps` empty and the sweeper could not reap its stale
-        // bindings on a crash. Idempotent + cheap; log + ignore errors (best-effort).
-        if let Err(e) = self
-            .clients
-            .pool
-            .next()
-            .sadd::<i64, _, _>(self.keys.apps(), app.to_string())
-            .await
-        {
-            tracing::warn!(error = %e, app, "redis SADD apps (signin) failed; sweeper may miss this app");
-        }
-
-        // Cluster online edge: USER_SIGNIN returns the cluster `first_for_user`
-        // (HLEN == 1). On any Redis error, keep the node-local outcome.
-        match user::signin(
-            &self.scripts,
-            &self.clients.pool,
-            &self.keys,
-            &self.node_id,
-            app,
-            user_id,
-            &socket_id,
-            self.cfg.membership_ttl_secs,
-        )
-        .await
-        {
-            Ok(first) => {
-                out.first_for_user = first;
-                if first {
-                    // Notify the cluster the user came online. Remote nodes deliver
-                    // it to their local watchers; the origin's local watchers are
-                    // notified directly (self-dedup'd by the receive loop).
-                    user::publish(
-                        &self.clients.pool,
-                        &self.keys.watch(app, user_id),
-                        &self.node_id,
-                        app,
-                        user_id,
-                        envelope::EnvelopeKind::WatchOnline,
-                        serde_json::Value::Null,
-                    )
-                    .await;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, app, user_id, "redis user signin failed; keeping node-local")
-            }
-        }
+        // Cluster half: USER_SIGNIN refcount (the cluster `first_for_user`) + usermsg
+        // subscribe-on-first + the app index + the WatchOnline publish on the cluster 0→1
+        // edge. The cluster `first_for_user` overwrites the node-local one; on any Redis
+        // error this returns false, keeping the node-local outcome.
+        out.first_for_user = self
+            .cluster_signin(app, user_id, &socket_id, node_first)
+            .await;
         out
     }
 
@@ -808,51 +1101,18 @@ impl Adapter for RedisAdapter {
     ) -> UserLeaveOutcome {
         let mut out = self.local.signout_user(app, user_id, socket_id).await;
 
-        // usermsg sub teardown on the node-LOCAL last-connection edge (1→0). Read
-        // it BEFORE the cluster Lua overwrites `out.last_for_user`.
-        if out.last_for_user {
-            if let Err(e) = self
-                .clients
-                .sub
-                .unsubscribe(self.keys.usermsg(app, user_id))
-                .await
-            {
-                tracing::warn!(error = %e, app, user_id, "failed to UNSUBSCRIBE usermsg on local 1→0");
-            }
-        }
+        // The node-LOCAL last-connection edge (1→0), read BEFORE the cluster half
+        // overwrites `out.last_for_user`: on it the cluster half UNSUBSCRIBEs the per-user
+        // `usermsg` channel.
+        let node_last = out.last_for_user;
 
-        // Cluster offline edge: USER_SIGNOUT returns the cluster `last_for_user`
-        // (HLEN == 0). On any Redis error, keep the node-local outcome.
-        match user::signout(
-            &self.scripts,
-            &self.clients.pool,
-            &self.keys,
-            &self.node_id,
-            app,
-            user_id,
-            socket_id,
-        )
-        .await
-        {
-            Ok(last) => {
-                out.last_for_user = last;
-                if last {
-                    user::publish(
-                        &self.clients.pool,
-                        &self.keys.watch(app, user_id),
-                        &self.node_id,
-                        app,
-                        user_id,
-                        envelope::EnvelopeKind::WatchOffline,
-                        serde_json::Value::Null,
-                    )
-                    .await;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, app, user_id, "redis user signout failed; keeping node-local")
-            }
-        }
+        // Cluster half: USER_SIGNOUT refcount (the cluster `last_for_user`) + usermsg
+        // unsubscribe-on-last + the WatchOffline publish on the cluster 1→0 edge. The
+        // cluster `last_for_user` overwrites the node-local one; on any Redis error this
+        // returns `node_last`, keeping the node-local outcome.
+        out.last_for_user = self
+            .cluster_signout(app, user_id, socket_id, node_last)
+            .await;
         out
     }
 
@@ -908,36 +1168,14 @@ impl Adapter for RedisAdapter {
     ) -> Vec<String> {
         // Record watchers locally + learn which users this node now newly watches.
         let (_local_online, newly_watched) = self.local.watch_edges(app, handle, watched.clone());
-        // Subscribe to each newly-watched user's watch channel so this node receives
-        // their cluster online/offline transitions.
-        for u in &newly_watched {
-            if let Err(e) = self.clients.sub.subscribe(self.keys.watch(app, u)).await {
-                tracing::warn!(error = %e, app, user = %u, "failed to SUBSCRIBE watch channel");
-            }
-        }
-        // Cluster-wide initial online snapshot: is_user_online per watched user.
-        let mut online = Vec::new();
-        for u in &watched {
-            match user::is_online(&self.clients.pool, &self.keys, app, u).await {
-                Ok(true) => online.push(u.clone()),
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!(error = %e, app, user = %u, "redis is_online failed; using local for snapshot");
-                    if self.local.is_user_online(app, u).await {
-                        online.push(u.clone());
-                    }
-                }
-            }
-        }
-        online
+        // Cluster half: SUBSCRIBE each newly-watched user's watch channel + the cluster-wide
+        // initial online snapshot.
+        self.cluster_watch(app, &watched, &newly_watched).await
     }
 
     async fn unwatch(&self, app: &str, socket_id: &SocketId) {
-        for u in self.local.unwatch_edges(app, socket_id) {
-            if let Err(e) = self.clients.sub.unsubscribe(self.keys.watch(app, &u)).await {
-                tracing::warn!(error = %e, app, user = %u, "failed to UNSUBSCRIBE watch channel");
-            }
-        }
+        let no_longer_watched = self.local.unwatch_edges(app, socket_id);
+        self.cluster_unwatch(app, &no_longer_watched).await;
     }
 
     async fn watchers_of(&self, app: &str, user_id: &str) -> Vec<ConnectionHandle> {
