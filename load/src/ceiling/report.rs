@@ -117,6 +117,17 @@ pub fn human(env: &Envelope, rec: Option<&Recommendation>) -> String {
             fmt_thousands(per_core),
             t.stop_reason,
         ));
+        if !b.per_core_busy.is_empty() {
+            // Show the first physical_cores entries (or all if fewer).
+            let show = if env.physical_cores > 0 {
+                b.per_core_busy.len().min(env.physical_cores)
+            } else {
+                b.per_core_busy.len()
+            };
+            let cores_str: Vec<String> =
+                b.per_core_busy[..show].iter().map(|v| format!("{}%", v.round() as u64)).collect();
+            lines.push(format!("              per-core busy: [{}]", cores_str.join(" ")));
+        }
     }
 
     if let Some(r) = rec {
@@ -154,15 +165,19 @@ pub fn json(env: &Envelope, rec: Option<&Recommendation>) -> String {
     let tput_val = match &env.tput {
         Some(t) => {
             let b = &t.best;
+            let mut best_obj = serde_json::json!({
+                "rate": b.rate,
+                "delivered_per_s": b.delivered_per_s,
+                "drop_pct": b.drop_pct,
+                "p50_ms": b.p50_ms,
+                "p99_ms": b.p99_ms,
+                "cpu_busy_pct": b.cpu_busy_pct,
+            });
+            if !b.per_core_busy.is_empty() {
+                best_obj["per_core_busy"] = serde_json::json!(b.per_core_busy);
+            }
             serde_json::json!({
-                "best": {
-                    "rate": b.rate,
-                    "delivered_per_s": b.delivered_per_s,
-                    "drop_pct": b.drop_pct,
-                    "p50_ms": b.p50_ms,
-                    "p99_ms": b.p99_ms,
-                    "cpu_busy_pct": b.cpu_busy_pct,
-                },
+                "best": best_obj,
                 "stop_reason": format!("{:?}", t.stop_reason),
             })
         }
@@ -216,6 +231,7 @@ mod tests {
             p50_ms: 5,
             p99_ms: 40,
             cpu_busy_pct: 90.0,
+            per_core_busy: vec![],
         };
         let tput = TputCeiling {
             best: best.clone(),
@@ -245,6 +261,7 @@ mod tests {
             p50_ms: 5,
             p99_ms: 40,
             cpu_busy_pct: 95.0,
+            per_core_busy: vec![],
         };
         let tput = TputCeiling {
             best: best.clone(),

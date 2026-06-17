@@ -22,6 +22,8 @@ pub struct TputStep {
     pub p50_ms: u64,
     pub p99_ms: u64,
     pub cpu_busy_pct: f64,
+    /// Per-core busy% sampled via mpstat during the publish window (empty if mpstat absent).
+    pub per_core_busy: Vec<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -143,19 +145,23 @@ pub async fn run(child: &PylonChild, opts: &RateRampOpts) -> TputCeiling {
         let rec0 = h.counters.received.load(Ordering::Relaxed);
         let (u0, s0) = child.cpu_ticks().unwrap_or((0, 0));
 
-        // Run open-loop publisher for this step.
-        let r = publish_openloop(
-            opts.rest.clone(),
-            "app".into(),
-            opts.key.clone(),
-            opts.secret.clone(),
-            channels_vec.clone(),
-            rate,
-            opts.max_inflight,
-            opts.step_secs,
-            h.counters.clone(),
-        )
-        .await;
+        // Run open-loop publisher concurrently with mpstat so the CPU sample
+        // covers the active publish window rather than the idle settle period.
+        let mpstat_fut = super::mpstat::sample(1, opts.step_secs.max(1));
+        let (r, cpu_sample) = tokio::join!(
+            publish_openloop(
+                opts.rest.clone(),
+                "app".into(),
+                opts.key.clone(),
+                opts.secret.clone(),
+                channels_vec.clone(),
+                rate,
+                opts.max_inflight,
+                opts.step_secs,
+                h.counters.clone(),
+            ),
+            mpstat_fut
+        );
 
         // Sample CPU at the END of the active publish window (before the settle below),
         // so cpu_busy_pct reflects load during step_secs, not the idle drain.
@@ -193,6 +199,7 @@ pub async fn run(child: &PylonChild, opts: &RateRampOpts) -> TputCeiling {
             0.0
         };
 
+        let per_core_busy = cpu_sample.map(|c| c.per_core_busy).unwrap_or_default();
         let step = TputStep {
             rate,
             delivered_per_s,
@@ -200,6 +207,7 @@ pub async fn run(child: &PylonChild, opts: &RateRampOpts) -> TputCeiling {
             p50_ms,
             p99_ms,
             cpu_busy_pct,
+            per_core_busy,
         };
         steps.push(step.clone());
 

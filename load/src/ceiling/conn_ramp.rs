@@ -93,6 +93,10 @@ pub async fn run(child: &PylonChild, spec: &BoxSpec, opts: &ConnRampOpts) -> Con
     let mut total: usize = 0;
     let mut rss: u64 = rss_idle;
     let stop_reason;
+    // Safety: track progress between batches to detect backpressure plateau.
+    // Without this, a server that stops accepting connections (but doesn't fail
+    // them) would cause unbounded batch spawning, potentially OOM-ing the host.
+    let mut last_subscribed = 0u64;
 
     loop {
         // Spawn one batch of subscribers, all on channel "ceil".
@@ -107,18 +111,29 @@ pub async fn run(child: &PylonChild, spec: &BoxSpec, opts: &ConnRampOpts) -> Con
 
         rss = child.rss_bytes().unwrap_or(rss);
         let connect_failed = h.counters.connect_failed.load(Ordering::Relaxed);
+        let subscribed = h.counters.subscribed.load(Ordering::Relaxed);
 
+        // Check hard stop conditions first (mem / failures / max) — highest priority.
         if let Some(reason) = should_stop(
             rss,
             mem_ceiling,
             connect_failed,
             opts.fail_threshold,
-            h.counters.subscribed.load(Ordering::Relaxed),
+            subscribed,
             opts.max_conns as u64,
         ) {
             stop_reason = reason;
             break;
         }
+
+        // No-progress safety check: if the server accepted fewer than half a batch
+        // it is not keeping up (backpressure plateau). Stop now to prevent the
+        // load-generator from OOM-ing the machine by endlessly spawning batches.
+        if subscribed.saturating_sub(last_subscribed) < (opts.conn_batch as u64 / 2) {
+            stop_reason = StopReason::Backpressure;
+            break;
+        }
+        last_subscribed = subscribed;
     }
 
     let max_conns = h.counters.subscribed.load(Ordering::Relaxed);

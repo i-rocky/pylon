@@ -53,7 +53,11 @@ impl PylonChild {
             match child.try_wait() {
                 Ok(Some(status)) => bail!("pylon child exited early with status {status}"),
                 Ok(None) => {}
-                Err(e) => bail!("try_wait error: {e}"),
+                Err(e) => {
+                    let _ = child.start_kill();
+                    let _ = child.try_wait();
+                    bail!("try_wait error: {e}");
+                }
             }
 
             if TcpStream::connect(&addr as &str).is_ok() {
