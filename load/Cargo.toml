@@ -18,7 +18,7 @@ name = "pylon-ceiling"
 path = "src/bin/ceiling.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "process"] }
 tokio-tungstenite = "0.24"
 url = "2"
 futures-util = "0.3"
