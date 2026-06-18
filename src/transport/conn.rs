@@ -16,7 +16,7 @@
 //!   it, leaving any partial-frame remainder in the buffer for next time.
 //!
 //! Every method is non-blocking and 100% safe Rust (the crate root sets
-//! `#![forbid(unsafe_code)]`). None of them ever loops on `WouldBlock`; the
+//! `#![deny(unsafe_code)]`). None of them ever loops on `WouldBlock`; the
 //! worker re-arms epoll interest and calls back.
 
 use crate::transport::frame::{self, Frame, ParseError};
