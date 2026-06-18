@@ -54,7 +54,7 @@ setting only one is a fatal configuration error. An empty string is treated the 
 | `PYLON_TLS_KEY` | _(none)_ | Path to the PEM private key file (PKCS#8, RSA, or EC). Must be set with `PYLON_TLS_CERT`. |
 | `PYLON_TLS_CA` | _(none)_ | Optional path to a PEM CA certificate. When set, enables mTLS client verification (requires cert+key). |
 
-TLS configuration is covered in detail on the TLS page (coming soon).
+TLS configuration is covered in detail on the [TLS / SSL](tls.md) page.
 
 ---
 
@@ -124,7 +124,7 @@ a specific workload.
 For the authoritative full list of variables (including any added after this page was written),
 see [`src/server/config.rs`](https://github.com/oyro-os/pylon/blob/master/src/server/config.rs).
 
-Production tuning guidance (NUMA pinning, memory-budget sizing, CoDel tuning) will be covered
-on the Production Tuning page (coming soon). Clustering and Redis adapter setup will be covered
-on the Clustering page (coming soon). Metrics and health endpoints are described on the
-Observability page (coming soon).
+Production tuning guidance (NUMA pinning, memory-budget sizing, CoDel tuning) is covered on the
+[Production Tuning](production-tuning.md) page. Clustering and Redis adapter setup is covered on
+the [Clustering & Scaling](clustering.md) page. Metrics and health endpoints are described on the
+[Observability](observability.md) page.
