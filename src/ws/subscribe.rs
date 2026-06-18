@@ -31,6 +31,20 @@ impl ConnectionContext {
             );
         }
 
+        // Task 3: memory-pressure admission gate — reject NEW subscriptions when
+        // the broadcast pipeline is saturated. Runs after the idempotency guard
+        // (re-subscribes already returned above) and after the sub-cap check, so
+        // only truly new subscriptions hit this gate. `is_saturated()` is `false`
+        // when no flag is wired (off-percore / tests) → inert in the common case.
+        if self.is_saturated() {
+            return self.send_subscription_error(
+                &channel,
+                "LimitReached",
+                "Server is over capacity; try again shortly",
+                4009,
+            );
+        }
+
         // Reserved `#` channels are server-managed, never normal subscriptions.
         if let Some(uid) = channel.strip_prefix(SERVER_TO_USER_PREFIX) {
             let ok = self.user.as_ref().is_some_and(|u| u.id == uid);

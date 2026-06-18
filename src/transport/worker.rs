@@ -1128,6 +1128,23 @@ fn establish_session(
         });
     }
 
+    // Task 3: memory-pressure admission gate — reject new connections when the
+    // broadcast pipeline is saturated. Runs after the node-ceiling fetch_add, so
+    // we MUST release the count we just took (same accounting discipline as the
+    // node-ceiling reject above). `None` ⇒ flag is not wired (echo workers /
+    // tests) → never saturated → never rejects.
+    if env
+        .saturated
+        .as_ref()
+        .is_some_and(|s| s.load(Ordering::Relaxed))
+    {
+        NODE_CONNS.fetch_sub(1, Ordering::SeqCst);
+        return Err(Reject {
+            error: PusherError::server_over_capacity(),
+            codec: Some(codec),
+        });
+    }
+
     let counter = env
         .conn_counts
         .entry(app.id.clone())

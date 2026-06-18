@@ -1925,3 +1925,155 @@ async fn client_event_rate_limit_returns_4301_and_drops() {
         "sender must receive exactly one 4301 rate-limit error"
     );
 }
+
+// ── Task 3: memory-pressure subscription gate ────────────────────────────────
+
+/// Build a `ConnectionContext` with `saturated` forced to `true` via an
+/// `Arc<AtomicBool>` so the subscribe gate fires, and return both the context
+/// and the flag so the test can flip it back.
+fn ctx_saturated(
+    app: App,
+) -> (
+    ConnectionContext,
+    mpsc::UnboundedReceiver<ServerEvent>,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let registry = Arc::new(Registry::new());
+    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let c = ConnectionContext {
+        app: std::sync::Arc::new(app),
+        socket_id: SocketId::generate(),
+        self_tx: tx,
+        adapter,
+        limits: crate::server::config::ServerConfig::default().limits(),
+        subscribed: std::collections::HashSet::new(),
+        user: None,
+        webhooks: crate::webhook::WebhookHandle::null(),
+        presence_membership: std::collections::HashMap::new(),
+        saturated: Some(flag.clone()),
+        clustered: false,
+        mailbox_notify: None,
+        client_event_rate: crate::ws::rate::RateWindow::new(0),
+    };
+    (c, rx, flag)
+}
+
+/// Under saturation, a NEW public subscribe returns `pusher:subscription_error`
+/// with type "LimitReached" (code 4009) instead of succeeding.
+#[tokio::test]
+async fn subscribe_rejected_under_saturation_public() {
+    let (mut c, mut rx, _flag) = ctx_saturated(app(false));
+    c.dispatch(ClientCommand::Subscribe {
+        channel: "public-chan".into(),
+        auth: None,
+        channel_data: None,
+    })
+    .await;
+    match rx.try_recv() {
+        Ok(ServerEvent::SubscriptionError {
+            error_type,
+            status,
+            channel,
+            ..
+        }) => {
+            assert_eq!(
+                error_type, "LimitReached",
+                "saturation gate must use LimitReached error type"
+            );
+            assert_eq!(status, 4009, "saturation gate must use status 4009");
+            assert_eq!(channel, "public-chan");
+        }
+        other => panic!("expected SubscriptionError for saturated subscribe, got {other:?}"),
+    }
+    // The channel must NOT have been registered (subscribe was rejected).
+    assert!(
+        !c.subscribed.contains("public-chan"),
+        "rejected subscribe must not appear in subscribed set"
+    );
+}
+
+/// Under saturation, a NEW private subscribe is also rejected (saturation gate
+/// runs before auth work, so auth is never attempted on the saturated path).
+#[tokio::test]
+async fn subscribe_rejected_under_saturation_private() {
+    let (mut c, mut rx, _flag) = ctx_saturated(app(false));
+    let sid = c.socket_id.as_str().to_string();
+    let sig = crate::auth::signature::channel_signature("s", &sid, "private-sat", None);
+    c.dispatch(ClientCommand::Subscribe {
+        channel: "private-sat".into(),
+        auth: Some(format!("k:{sig}")),
+        channel_data: None,
+    })
+    .await;
+    match rx.try_recv() {
+        Ok(ServerEvent::SubscriptionError {
+            error_type, status, ..
+        }) => {
+            assert_eq!(error_type, "LimitReached");
+            assert_eq!(status, 4009);
+        }
+        other => panic!("expected SubscriptionError under saturation, got {other:?}"),
+    }
+}
+
+/// When the flag is `false` (normal operation), the subscribe gate is inert and
+/// a public subscribe succeeds as usual.
+#[tokio::test]
+async fn subscribe_succeeds_when_not_saturated() {
+    let (mut c, mut rx, flag) = ctx_saturated(app(false));
+    // Clear the saturation flag — this is the normal (not-saturated) case.
+    flag.store(false, std::sync::atomic::Ordering::SeqCst);
+    c.dispatch(ClientCommand::Subscribe {
+        channel: "public-ok".into(),
+        auth: None,
+        channel_data: None,
+    })
+    .await;
+    assert!(
+        matches!(rx.try_recv(), Ok(ServerEvent::SubscriptionSucceeded { .. })),
+        "subscribe must succeed when saturation flag is false"
+    );
+    assert!(
+        c.subscribed.contains("public-ok"),
+        "channel must appear in subscribed set after successful subscribe"
+    );
+}
+
+/// Re-subscribing an already-held channel is ALWAYS idempotent — the idempotency
+/// guard (first check in `subscribe`) returns before the saturation gate, so an
+/// existing subscriber is never disrupted even when the flag is true.
+#[tokio::test]
+async fn resub_already_held_channel_is_idempotent_under_saturation() {
+    // First, subscribe normally (flag off).
+    let (mut c, mut rx, flag) = ctx_saturated(app(false));
+    flag.store(false, std::sync::atomic::Ordering::SeqCst);
+    c.dispatch(ClientCommand::Subscribe {
+        channel: "public-held".into(),
+        auth: None,
+        channel_data: None,
+    })
+    .await;
+    // Drain the success.
+    while rx.try_recv().is_ok() {}
+    assert!(c.subscribed.contains("public-held"));
+
+    // Now set saturation true and re-subscribe the same channel.
+    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    c.dispatch(ClientCommand::Subscribe {
+        channel: "public-held".into(),
+        auth: None,
+        channel_data: None,
+    })
+    .await;
+    // The idempotency guard must return early (no frame queued, no error).
+    assert!(
+        rx.try_recv().is_err(),
+        "re-subscribe of an already-held channel must produce no frame (idempotent path)"
+    );
+    assert!(
+        c.subscribed.contains("public-held"),
+        "channel must still be in subscribed set after idempotent re-subscribe"
+    );
+}
