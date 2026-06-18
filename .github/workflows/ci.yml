@@ -31,7 +31,7 @@ jobs:
       # Tests isolate themselves with random key prefixes.
       PYLON_TEST_REDIS_URL: redis://127.0.0.1:6379
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Toolchain + rustfmt/clippy are pinned by rust-toolchain.toml; rustup
       # auto-installs it so CI matches local builds exactly.
