@@ -29,13 +29,12 @@ use rustls::ServerConfig as RustlsServerConfig;
 ///   (the leaf cert first, intermediates after — the usual chain ordering).
 /// - `key_path`: path to a PEM file containing a PKCS#8, PKCS#1 RSA, or
 ///   SEC1 EC private key.
-/// - `ca_path`: when `Some`, load the CA cert and require + verify client
-///   certificates (mTLS). Currently **not implemented** — passing `Some` returns a
-///   clear `Err`; the code is structured so it can be wired up in the next task
-///   without touching the call-site.
+/// - `ca_path`: when `Some`, load the CA cert(s) from that PEM file and
+///   require + verify client certificates (mTLS) using
+///   [`rustls::server::WebPkiClientVerifier`].
 ///
 /// Returns a clear, user-readable `Err` on any failure (missing file, permission
-/// error, malformed PEM, no private key found, etc.). Never panics.
+/// error, malformed PEM, no private key found, empty CA bundle, etc.). Never panics.
 pub fn load_server_config(
     cert_path: &str,
     key_path: &str,
@@ -70,17 +69,53 @@ pub fn load_server_config(
             .with_context(|| {
                 format!("PYLON_TLS_KEY: failed to parse PEM private key from '{key_path}'")
             })?
-            .ok_or_else(|| {
-                anyhow!("PYLON_TLS_KEY: no private key found in '{key_path}'")
+            .ok_or_else(|| anyhow!("PYLON_TLS_KEY: no private key found in '{key_path}'"))?;
+
+    // ── 4. mTLS path: require + verify client certificates ───────────────────
+    if let Some(ca) = ca_path {
+        // 4a. Load CA cert(s) into a RootCertStore.
+        let ca_file = File::open(ca)
+            .with_context(|| format!("PYLON_TLS_CA: cannot open CA certificate file '{ca}'"))?;
+        let mut roots = rustls::RootCertStore::empty();
+        let mut added = 0usize;
+        for cert_result in rustls_pemfile::certs(&mut BufReader::new(ca_file)) {
+            let cert = cert_result.with_context(|| {
+                format!("PYLON_TLS_CA: failed to parse PEM certificate from '{ca}'")
+            })?;
+            roots
+                .add(cert)
+                .with_context(|| format!("PYLON_TLS_CA: invalid certificate in '{ca}'"))?;
+            added += 1;
+        }
+        if added == 0 {
+            return Err(anyhow!(
+                "PYLON_TLS_CA: no CA certificates found in '{ca}'"
+            ));
+        }
+
+        // 4b. Build a WebPkiClientVerifier that REQUIRES a valid client cert.
+        //     `builder(roots)` uses the process-default CryptoProvider (ring,
+        //     installed above). The `std` feature (already enabled) is sufficient —
+        //     no extra rustls feature flag is needed for WebPkiClientVerifier.
+        let verifier =
+            rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .map_err(|e| {
+                    anyhow!("PYLON_TLS_CA: failed to build client-cert verifier: {e}")
+                })?;
+
+        // 4c. Build the ServerConfig with mTLS client-cert verification.
+        let config = RustlsServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs, key)
+            .with_context(|| {
+                format!(
+                    "failed to build rustls mTLS ServerConfig from \
+                     cert='{cert_path}' key='{key_path}' ca='{ca}'"
+                )
             })?;
 
-    // ── 4. mTLS: not yet implemented ─────────────────────────────────────────
-    if let Some(ca) = ca_path {
-        return Err(anyhow!(
-            "PYLON_TLS_CA: mTLS client-certificate verification is not yet implemented \
-             (ca_path = '{ca}'). Remove PYLON_TLS_CA to run without mTLS, or wait for \
-             the follow-up task that wires up WebPkiClientVerifier."
-        ));
+        return Ok(Arc::new(config));
     }
 
     // ── 5. Build the ServerConfig (no client auth) ────────────────────────────
@@ -104,8 +139,9 @@ pub fn load_server_config(
 /// | `None`          | `None`         | `Ok(None)` (plain mode)        |
 /// | one set, other not | —           | `Err(…)` (fatal misconfig)     |
 ///
-/// When `tls_ca_path` is `Some` the mTLS path is requested; this currently
-/// returns an explicit error (see [`load_server_config`]).
+/// When `tls_ca_path` is `Some` the mTLS path is requested; a
+/// `WebPkiClientVerifier` is built and the resulting `ServerConfig` requires
+/// a valid client certificate on every connection.
 pub fn resolve_tls(
     cert_path: &Option<String>,
     key_path: &Option<String>,
@@ -248,5 +284,137 @@ mod tests {
 
         assert!(result.is_ok(), "expected Ok(Some(…)), got: {result:?}");
         assert!(result.unwrap().is_some(), "expected Some(Arc<ServerConfig>)");
+    }
+
+    // ── mTLS helpers ──────────────────────────────────────────────────────────
+
+    /// Write a PEM certificate (from `rcgen::Certificate::pem()`) to a temp file.
+    /// Returns the path.
+    fn write_pem_cert(tag: &str, pem: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("pylon-test-ca-{}-{tag}.pem", std::process::id()));
+        let mut f = File::create(&path).expect("create temp CA file");
+        f.write_all(pem.as_bytes()).expect("write CA PEM");
+        path
+    }
+
+    /// Generate a CA cert + a server cert signed by that CA using rcgen 0.13.
+    /// Returns `(ca_cert_pem, server_cert_pem, server_key_pem)`.
+    fn generate_ca_and_server_cert() -> (String, String, String) {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+
+        // CA key + cert
+        let ca_key = KeyPair::generate().expect("rcgen: CA key");
+        let mut ca_params = CertificateParams::new(vec!["pylon-test-ca".to_string()])
+            .expect("rcgen: CA params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params
+            .self_signed(&ca_key)
+            .expect("rcgen: CA self-signed cert");
+
+        // Server leaf key + cert signed by CA
+        let server_key = KeyPair::generate().expect("rcgen: server key");
+        let server_params =
+            CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .expect("rcgen: server params");
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .expect("rcgen: server cert signed by CA");
+
+        (
+            ca_cert.pem(),
+            server_cert.pem(),
+            server_key.serialize_pem(),
+        )
+    }
+
+    // ── mTLS tests ────────────────────────────────────────────────────────────
+
+    /// `load_server_config` with a valid server cert+key AND a valid CA cert
+    /// returns `Ok` — the mTLS `ServerConfig` builds with the client-cert
+    /// verifier wired.
+    #[test]
+    fn load_server_config_mtls_valid_ca_returns_ok() {
+        let (ca_pem, server_cert_pem, server_key_pem) = generate_ca_and_server_cert();
+
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let cert_path = dir.join(format!("pylon-mtls-cert-{pid}-valid.pem"));
+        let key_path = dir.join(format!("pylon-mtls-key-{pid}-valid.pem"));
+        let ca_path = write_pem_cert(&format!("{pid}-valid"), &ca_pem);
+
+        let mut f = File::create(&cert_path).unwrap();
+        f.write_all(server_cert_pem.as_bytes()).unwrap();
+        let mut f = File::create(&key_path).unwrap();
+        f.write_all(server_key_pem.as_bytes()).unwrap();
+
+        let result = load_server_config(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+            Some(ca_path.to_str().unwrap()),
+        );
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&ca_path);
+
+        assert!(
+            result.is_ok(),
+            "expected Ok(Arc<ServerConfig>) for mTLS, got: {result:?}"
+        );
+    }
+
+    /// `load_server_config` with a bogus (nonexistent) `ca_path` returns `Err`,
+    /// no panic, and the error mentions `PYLON_TLS_CA`.
+    #[test]
+    fn load_server_config_mtls_missing_ca_returns_err() {
+        // Use a self-signed cert as the server cert so only the CA lookup fails.
+        let (cert_path, key_path) = generate_self_signed_cert_files("mtls-missing-ca");
+
+        let result = load_server_config(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+            Some("/nonexistent/path/ca.pem"),
+        );
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+
+        assert!(result.is_err(), "expected Err for missing CA path");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("PYLON_TLS_CA"),
+            "error should mention PYLON_TLS_CA: {msg}"
+        );
+    }
+
+    /// `load_server_config` with a CA file that contains no certificates
+    /// returns `Err` mentioning `PYLON_TLS_CA`.
+    #[test]
+    fn load_server_config_mtls_empty_ca_returns_err() {
+        let (cert_path, key_path) = generate_self_signed_cert_files("mtls-empty-ca");
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let ca_path = dir.join(format!("pylon-mtls-empty-ca-{pid}.pem"));
+        // Write a valid-looking but cert-less PEM file.
+        let mut f = File::create(&ca_path).unwrap();
+        f.write_all(b"# no certs here\n").unwrap();
+
+        let result = load_server_config(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+            Some(ca_path.to_str().unwrap()),
+        );
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&ca_path);
+
+        assert!(result.is_err(), "expected Err for empty CA file");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("PYLON_TLS_CA"),
+            "error should mention PYLON_TLS_CA: {msg}"
+        );
     }
 }
