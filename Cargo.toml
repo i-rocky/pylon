@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "A Pusher-compatible real-time WebSocket server"
 repository = "https://github.com/oyro-os/pylon"
+homepage = "https://github.com/oyro-os/pylon"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["pusher", "websocket", "realtime", "pubsub", "channels"]
+categories = ["network-programming", "web-programming::websocket"]
 
 [features]
 # Exposes off-hot-path debug accessors (e.g. `percore_total_inflight_bytes`) for
