@@ -449,6 +449,10 @@ async fn spawn_tls_server_large(
         workers: 1,
         tls_cert_path: Some(cert_path.to_str().unwrap().to_string()),
         tls_key_path: Some(key_path.to_str().unwrap().to_string()),
+        // 0 = unlimited: this test subscribes one connection to LARGE_N_CHANNELS
+        // channels to build a large REST response body; the subscription cap must
+        // not limit it.
+        max_subscriptions_per_connection: 0,
         ..ServerConfig::default()
     };
     let tls = pylon::transport::tls::resolve_tls(
