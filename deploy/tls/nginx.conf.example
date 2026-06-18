@@ -1,0 +1,140 @@
+# nginx.conf.example — nginx TLS-terminating reverse proxy for pylon
+#
+# Terminates TLS on port 443 and proxies plain HTTP/WebSocket to pylon on
+# 127.0.0.1:7000. Long-lived WebSocket connections require specific settings
+# (proxy_http_version, Upgrade/Connection headers, and generous timeouts) that
+# are easy to get wrong — they are all present and correct here.
+#
+# Prerequisites:
+#   • Install certbot and obtain a certificate for your domain:
+#       certbot certonly --nginx -d your.domain.example
+#     Certbot writes certs to /etc/letsencrypt/live/<domain>/ and configures
+#     auto-renewal via a systemd timer or cron job.
+#   • Adjust "your.domain.example" and the cert paths throughout this file.
+#
+# Include this file from your main nginx.conf, or drop it in /etc/nginx/conf.d/.
+
+# ---------------------------------------------------------------------------
+# Upstream — pylon backend node(s)
+# ---------------------------------------------------------------------------
+# For a single node:
+#   server 127.0.0.1:7000;
+#
+# For multiple nodes (Redis adapter ties them together — they share presence
+# and pub/sub state, so any node can serve any client):
+#   server 10.0.0.1:7000;
+#   server 10.0.0.2:7000;
+#
+# nginx uses round-robin by default. Add "ip_hash;" to pin clients by IP if
+# desired, though pylon does not require session affinity.
+
+upstream pylon {
+    server 127.0.0.1:7000;
+    # server 10.0.0.2:7000;   # add more nodes here (Redis adapter required)
+
+    # Keep a pool of idle connections to pylon to avoid TCP handshake overhead.
+    keepalive 64;
+}
+
+# ---------------------------------------------------------------------------
+# HTTP → HTTPS redirect
+# ---------------------------------------------------------------------------
+server {
+    listen 80;
+    listen [::]:80;
+    server_name your.domain.example;
+
+    # ACME HTTP-01 challenge (certbot webroot / standalone plugin).
+    # Remove if you use the DNS-01 challenge instead.
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# ---------------------------------------------------------------------------
+# HTTPS — TLS termination + WebSocket proxy
+# ---------------------------------------------------------------------------
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name your.domain.example;
+
+    # ------------------------------------------------------------------
+    # TLS — certificates managed by certbot
+    # Paths are set by: certbot certonly --nginx -d your.domain.example
+    # ------------------------------------------------------------------
+    ssl_certificate     /etc/letsencrypt/live/your.domain.example/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/your.domain.example/privkey.pem;
+
+    # Modern TLS — drop SSLv3/TLS 1.0/1.1 (PCI-DSS and NIST guidance).
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # Strong cipher suite (TLS 1.3 ciphers are negotiated automatically).
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+
+    # Session resumption — reduces handshake cost for reconnecting clients.
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_tickets off;
+
+    # HSTS — instruct browsers to always use HTTPS (31536000 s = 1 year).
+    # Remove or shorten while testing; only set after TLS is confirmed working.
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    # ------------------------------------------------------------------
+    # Main proxy location — all paths including WS, /health, /ready
+    # ------------------------------------------------------------------
+    location / {
+        proxy_pass http://pylon;
+
+        # WebSocket upgrade — the #1 thing that breaks WS behind nginx.
+        # These three headers MUST be present and in this form.
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # Standard forwarding headers. pylon uses X-Forwarded-For for
+        # client IP logging; X-Forwarded-Proto lets pylon know the
+        # original scheme was HTTPS (wss://).
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Long timeouts for persistent WebSocket connections.
+        # A Pusher client's heartbeat interval is 120 s; nginx's default
+        # proxy_read_timeout of 60 s would silently kill idle connections.
+        # Set both to well above the heartbeat period.
+        proxy_read_timeout  3600s;
+        proxy_send_timeout  3600s;
+
+        # Disable buffering for streaming/WS responses.
+        proxy_buffering off;
+
+        # Reuse keepalive connections to upstream.
+        proxy_set_header Connection "";
+    }
+
+    # ------------------------------------------------------------------
+    # Optional: restrict /metrics to internal networks
+    # Metrics expose connection counts, Redis lag, and memory stats.
+    # Uncomment and adjust the allow/deny rules before deploying.
+    # ------------------------------------------------------------------
+    # location /metrics {
+    #     proxy_pass http://pylon;
+    #     proxy_http_version 1.1;
+    #     proxy_set_header Host            $host;
+    #     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    #
+    #     allow 10.0.0.0/8;
+    #     allow 172.16.0.0/12;
+    #     allow 192.168.0.0/16;
+    #     allow 127.0.0.1;
+    #     deny  all;
+    # }
+}

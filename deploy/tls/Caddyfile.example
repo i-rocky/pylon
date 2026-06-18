@@ -1,0 +1,53 @@
+# Caddyfile.example — Caddy v2 reverse proxy for pylon
+#
+# Caddy auto-provisions and renews TLS certificates via Let's Encrypt (ACME).
+# Requirements:
+#   • Replace "your.domain.example" with a real, publicly resolvable hostname.
+#   • Ports 80 and 443 must be reachable from the internet (ACME HTTP-01 challenge).
+#   • No manual certificate management — Caddy handles it automatically.
+#
+# Caddy proxies WebSocket Upgrade frames transparently; no special WS directives
+# are needed. Long-lived connections are also handled correctly by default.
+#
+# X-Forwarded-For, X-Forwarded-Proto, and X-Forwarded-Host are set automatically
+# by Caddy's reverse_proxy directive. pylon reads X-Forwarded-For if configured
+# to trust the proxy (see PYLON_TRUSTED_PROXIES in your env file).
+#
+# Usage:
+#   caddy run --config Caddyfile.example
+
+your.domain.example {
+    # Terminate TLS here; forward plain HTTP/WS to pylon on localhost:7000.
+    # All paths — including /health, /ready, /metrics, and the Pusher WS
+    # endpoint (/app/<key>) — pass through unchanged.
+    reverse_proxy 127.0.0.1:7000
+
+    # -------------------------------------------------------------------------
+    # Optional: restrict /metrics to internal networks only.
+    # Metrics expose connection counts, memory, and Redis lag — keep them off
+    # the public internet. Uncomment the block below and adjust the CIDR.
+    #
+    # @internal {
+    #     path /metrics
+    #     remote_ip 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+    # }
+    # @metrics_public {
+    #     path /metrics
+    #     not remote_ip 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+    # }
+    # handle @metrics_public {
+    #     respond "Forbidden" 403
+    # }
+    # handle @internal {
+    #     reverse_proxy 127.0.0.1:7000
+    # }
+    #
+    # If you use the block above, change the top-level reverse_proxy to a
+    # path matcher that excludes /metrics:
+    #
+    # @public {
+    #     not path /metrics
+    # }
+    # reverse_proxy @public 127.0.0.1:7000
+    # -------------------------------------------------------------------------
+}

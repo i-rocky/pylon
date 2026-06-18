@@ -238,6 +238,106 @@ helm upgrade pylon ./deploy/helm/pylon \
 
 ---
 
+## TLS
+
+pylon listens on plain `ws://` and HTTP by default. TLS is optional and can be
+added in two ways — choose one.
+
+### Option 1 — Reverse proxy (recommended)
+
+The dominant topology for production, cloud LBs, and Kubernetes: a TLS-
+terminating proxy speaks `wss://` to clients while pylon stays plain on its
+internal port (default `7000`).
+
+**Caddy** (easiest — auto-HTTPS via Let's Encrypt, no cert management):
+
+```bash
+# Install Caddy, then:
+caddy run --config deploy/tls/Caddyfile.example
+```
+
+Caddy provisions and renews certificates automatically. It requires a real,
+publicly resolvable domain and ports 80/443 reachable from the internet. See
+`deploy/tls/Caddyfile.example` for the full annotated config.
+
+**nginx** (more explicit, good for existing nginx deployments):
+
+See `deploy/tls/nginx.conf.example`. Key points:
+- Obtain a certificate first: `certbot certonly --nginx -d your.domain.example`
+- WebSocket proxying requires these three headers (the most common omission):
+  ```nginx
+  proxy_http_version 1.1;
+  proxy_set_header Upgrade    $http_upgrade;
+  proxy_set_header Connection "upgrade";
+  ```
+- Timeouts are set to `3600s` — well above the Pusher heartbeat period of 120 s.
+  nginx's default `proxy_read_timeout` of 60 s silently kills idle connections.
+- Multiple pylon nodes can be listed in the `upstream pylon {}` block for load
+  balancing; the Redis adapter (`PYLON_ADAPTER=redis`) ties them together.
+
+### Option 2 — Native TLS (single-node / no proxy)
+
+Set two environment variables to have pylon serve `wss://` directly:
+
+```env
+PYLON_TLS_CERT=/path/to/fullchain.pem
+PYLON_TLS_KEY=/path/to/privkey.pem
+```
+
+Both must be set together (PEM format). Omit both for plain `ws://`. This is
+suitable for single-node deploys without a load balancer in front.
+
+### Kubernetes
+
+Terminate TLS at the **Ingress** using cert-manager + Let's Encrypt. The pod
+and Service stay on plain HTTP — no changes to the pylon deployment are needed.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pylon
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    # Raise read timeout above the Pusher heartbeat period (120 s).
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # Required for WebSocket upgrade on nginx-ingress:
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - your.domain.example
+      secretName: pylon-tls
+  rules:
+    - host: your.domain.example
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: pylon
+                port:
+                  number: 7000
+```
+
+cert-manager creates the `pylon-tls` Secret and renews it automatically.
+
+### Keeping /metrics off the public listener
+
+`/metrics` exposes connection counts, Redis lag, and memory stats — it should
+not be publicly reachable. Options:
+- **Proxy ACL:** uncomment the `location /metrics { allow ... ; deny all; }`
+  block in `nginx.conf.example`, or the equivalent matcher in `Caddyfile.example`.
+- **Kubernetes:** add an `nginx.ingress.kubernetes.io/whitelist-source-range`
+  annotation on a separate Ingress rule for `/metrics`, or use a dedicated
+  Prometheus `ServiceMonitor` that scrapes the pod IP directly (bypassing the
+  Ingress entirely).
+
+---
+
 ## File index
 
 ```
@@ -252,14 +352,17 @@ deploy/
 │   ├── Dockerfile                   Multi-stage build (rust:bookworm → debian-slim)
 │   ├── .dockerignore
 │   └── docker-compose.yml           2-node cluster + Redis
-└── helm/
-    └── pylon/
-        ├── Chart.yaml
-        ├── values.yaml
-        └── templates/
-            ├── _helpers.tpl
-            ├── configmap.yaml       apps.json ConfigMap
-            ├── deployment.yaml      Deployment with probes + grace period
-            ├── service.yaml
-            └── hpa.yaml             HorizontalPodAutoscaler (gated by values)
+├── helm/
+│   └── pylon/
+│       ├── Chart.yaml
+│       ├── values.yaml
+│       └── templates/
+│           ├── _helpers.tpl
+│           ├── configmap.yaml       apps.json ConfigMap
+│           ├── deployment.yaml      Deployment with probes + grace period
+│           ├── service.yaml
+│           └── hpa.yaml             HorizontalPodAutoscaler (gated by values)
+└── tls/
+    ├── Caddyfile.example            Caddy v2 auto-HTTPS reverse proxy
+    └── nginx.conf.example           nginx TLS termination with WS proxy
 ```
