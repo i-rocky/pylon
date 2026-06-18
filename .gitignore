@@ -13,3 +13,6 @@
 
 # Internal research/design docs — kept locally, purged from public history.
 /docs/superpowers
+
+# Python venv for docs builds (local only)
+/.venv
