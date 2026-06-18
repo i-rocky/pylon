@@ -66,7 +66,12 @@ pub struct PercoreMetricsSnapshot {
 /// fleet has been started (e.g. REST-only test environments).
 pub fn percore_metrics_snapshot() -> Option<PercoreMetricsSnapshot> {
     use std::sync::atomic::Ordering;
-    let guard = PERCORE_REGISTRY.get()?.lock().unwrap();
+    // Recover from a poisoned lock instead of panicking: the `/metrics` handler must
+    // never fail, and the registry is only ever held for trivial atomic reads.
+    let guard = PERCORE_REGISTRY
+        .get()?
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let inflight: Vec<u64> = guard
         .inflight_slots
         .iter()

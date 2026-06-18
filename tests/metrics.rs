@@ -190,8 +190,8 @@ async fn metrics_percore_metrics_present() {
         .unwrap();
 
     assert!(
-        body.contains("pylon_inflight_bytes_total"),
-        "pylon_inflight_bytes_total must appear:\n{body}"
+        body.contains("pylon_inflight_bytes_sum"),
+        "pylon_inflight_bytes_sum must appear:\n{body}"
     );
     assert!(
         body.contains("pylon_worker_budget_bytes"),

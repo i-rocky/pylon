@@ -94,9 +94,11 @@ pub fn encode(snapshot: &MetricsSnapshot) -> String {
             let _ = writeln!(out, "pylon_inflight_bytes{{worker=\"{i}\"}} {inflight}");
         }
 
-        out.push_str("# HELP pylon_inflight_bytes_total Total bytes queued across all workers\n");
-        out.push_str("# TYPE pylon_inflight_bytes_total gauge\n");
-        let _ = writeln!(out, "pylon_inflight_bytes_total {}", pc.inflight_total);
+        // `_sum` not `_total`: this is a gauge (sum of per-worker gauges), and the
+        // `_total` suffix conventionally signals a counter to Prometheus tooling.
+        out.push_str("# HELP pylon_inflight_bytes_sum Total bytes queued across all workers\n");
+        out.push_str("# TYPE pylon_inflight_bytes_sum gauge\n");
+        let _ = writeln!(out, "pylon_inflight_bytes_sum {}", pc.inflight_total);
 
         out.push_str("# HELP pylon_worker_budget_bytes Per-worker memory budget in bytes\n");
         out.push_str("# TYPE pylon_worker_budget_bytes gauge\n");
@@ -235,7 +237,7 @@ mod tests {
         assert!(text.contains("pylon_inflight_bytes{worker=\"1\"} 200\n"), "worker 1 inflight: {text}");
         assert!(text.contains("pylon_broadcast_dropped_total{worker=\"0\"} 5\n"), "worker 0 dropped: {text}");
         assert!(text.contains("pylon_broadcast_dropped_total{worker=\"1\"} 3\n"), "worker 1 dropped: {text}");
-        assert!(text.contains("pylon_inflight_bytes_total 300\n"), "inflight_total: {text}");
+        assert!(text.contains("pylon_inflight_bytes_sum 300\n"), "inflight_total: {text}");
         assert!(text.contains("pylon_budget_factor 0.900\n"), "budget_factor: {text}");
         assert!(text.contains(&format!("pylon_worker_budget_bytes {}\n", 1024 * 1024 * 512)), "budget_bytes: {text}");
         assert!(text.contains("# TYPE pylon_broadcast_dropped_total counter"), "type counter: {text}");
