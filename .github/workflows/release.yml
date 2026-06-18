@@ -3,6 +3,9 @@ name: release
 # Build per-architecture Linux binaries and a multi-arch container image,
 # and publish them on a version tag (e.g. `git tag v1.0.0 && git push --tags`).
 # `workflow_dispatch` runs the build for validation without publishing.
+#
+# The Rust toolchain (and rustfmt/clippy) is pinned by rust-toolchain.toml at the
+# repo root; `rustup` auto-installs it, so CI matches local builds exactly.
 
 on:
   push:
@@ -32,13 +35,16 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04-arm
             arch: arm64
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup show
+          rustup target add "$TARGET"
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -46,23 +52,23 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --locked --bin pylon --target ${{ matrix.target }}
+        run: cargo build --release --locked --bin pylon --target "$TARGET"
 
       - name: Package
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME}"
-          name="pylon-${version}-${{ matrix.target }}"
+          name="pylon-${version}-${TARGET}"
           dist="dist/${name}"
           mkdir -p "${dist}"
-          cp "target/${{ matrix.target }}/release/pylon" "${dist}/"
+          cp "target/${TARGET}/release/pylon" "${dist}/"
           strip "${dist}/pylon" || true
           cp LICENSE README.md apps.example.json "${dist}/"
           tar -C dist -czf "${name}.tar.gz" "${name}"
           sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
           # Stage the raw binary (under its docker arch) for the image job.
-          mkdir -p "bin/${{ matrix.arch }}"
-          cp "target/${{ matrix.target }}/release/pylon" "bin/${{ matrix.arch }}/pylon"
+          mkdir -p "bin/${ARCH}"
+          cp "target/${TARGET}/release/pylon" "bin/${ARCH}/pylon"
 
       - name: Upload release archive
         uses: actions/upload-artifact@v4
