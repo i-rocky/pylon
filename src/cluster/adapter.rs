@@ -159,7 +159,7 @@ impl Adapter for ClusterAdapter {
 
     async fn channels(&self, app: &str, prefix: Option<&str>) -> Vec<ChannelSummary> {
         // Cluster-correct channel listing is the REST plane's job (it queries the node's
-        // `RedisAdapter` directly); the worker path delegates to local for now.
+        // `RedisAdapter` directly). Node-local here; reached only as a non-cluster fallback.
         self.local.channels(app, prefix).await
     }
 
@@ -169,7 +169,9 @@ impl Adapter for ClusterAdapter {
     }
 
     async fn presence_members(&self, app: &str, channel: &str) -> Vec<PresenceMember> {
-        // Cluster presence roster is layered in by Task 3.4; node-local for now.
+        // Node-local roster. In cluster mode the bridge owns the cluster-wide presence
+        // roster + capacity; this worker method is reached only on the non-cluster path
+        // (the clustered subscribe is `!clustered`-guarded in `ws::subscribe`).
         self.local.presence_members(app, channel).await
     }
 
@@ -234,17 +236,20 @@ impl Adapter for ClusterAdapter {
     }
 
     async fn is_user_online(&self, app: &str, user_id: &str) -> bool {
-        // Cluster online check is layered in by Task 3.5; node-local for now.
+        // Node-local check. Cluster-wide online status is served by the REST plane via the
+        // node's `RedisAdapter`; not reached on the worker path in cluster mode.
         self.local.is_user_online(app, user_id).await
     }
 
     async fn send_to_user(&self, app: &str, user_id: &str, event: ServerEvent) {
-        // Cross-node user delivery is layered in by Task 3.5; node-local for now.
+        // Node-local delivery. Cross-node user delivery is a REST/admin op on the node's
+        // `RedisAdapter` (`bridge.adapter()`); never called on the worker path in cluster mode.
         self.local.send_to_user(app, user_id, event).await
     }
 
     async fn terminate_user(&self, app: &str, user_id: &str) -> Vec<SocketId> {
-        // Cross-node terminate is layered in by Task 3.5; node-local for now.
+        // Node-local terminate. Cross-node terminate is a REST/admin op on the node's
+        // `RedisAdapter`; not called on the worker path in cluster mode.
         self.local.terminate_user(app, user_id).await
     }
 
@@ -283,7 +288,9 @@ impl Adapter for ClusterAdapter {
     }
 
     async fn watchers_of(&self, app: &str, user_id: &str) -> Vec<ConnectionHandle> {
-        // Cluster watchlist is layered in by Task 3.5; node-local for now.
+        // Node-local watchers. In cluster mode `notify_watchers` is `!clustered`-guarded and
+        // the bridge does the local-watcher notify (the cluster-wide watch edge is published
+        // by `watch`/`unwatch` above); reached only on the non-cluster path.
         self.local.watchers_of(app, user_id).await
     }
 }
