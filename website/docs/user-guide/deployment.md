@@ -128,9 +128,9 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
     A multi-arch image (`linux/amd64` + `linux/arm64`) is published on each release:
 
     ```
-    ghcr.io/oyro-os/pylon:latest
-    ghcr.io/oyro-os/pylon:X.Y.Z   # pinned release
-    ghcr.io/oyro-os/pylon:X.Y     # floating minor
+    ghcr.io/i-rocky/pylon:latest
+    ghcr.io/i-rocky/pylon:X.Y.Z   # pinned release
+    ghcr.io/i-rocky/pylon:X.Y     # floating minor
     ```
 
     ### Single-node quick start
@@ -140,7 +140,7 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
       -v "$PWD/apps.json:/etc/pylon/apps.json:ro" \
       -e PYLON_APPS_PATH=/etc/pylon/apps.json \
       --ulimit nofile=1048576:1048576 \
-      ghcr.io/oyro-os/pylon:latest
+      ghcr.io/i-rocky/pylon:latest
     ```
 
     Volume-mount your `apps.json` at `/etc/pylon/apps.json` and pass the path

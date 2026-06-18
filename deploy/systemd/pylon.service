@@ -1,6 +1,6 @@
 [Unit]
 Description=Pylon — high-performance Pusher-compatible WebSocket server
-Documentation=https://github.com/oyro-os/pylon
+Documentation=https://github.com/i-rocky/pylon
 After=network-online.target
 Wants=network-online.target
 # If using the redis adapter, uncomment:

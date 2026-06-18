@@ -128,7 +128,7 @@ on the same host.
 ### Published image
 
 A ready-to-use multi-arch image (`linux/amd64` + `linux/arm64`) is published to GHCR on each
-release: `ghcr.io/oyro-os/pylon:latest` (also tagged `X.Y.Z` and `X.Y`). Pull it instead of
+release: `ghcr.io/i-rocky/pylon:latest` (also tagged `X.Y.Z` and `X.Y`). Pull it instead of
 building from source:
 
 ```bash
@@ -136,7 +136,7 @@ docker run -d --name pylon -p 7000:7000 \
   -v "$PWD/apps.json:/etc/pylon/apps.json:ro" \
   -e PYLON_APPS_PATH=/etc/pylon/apps.json \
   --ulimit nofile=1048576:1048576 \
-  ghcr.io/oyro-os/pylon:latest
+  ghcr.io/i-rocky/pylon:latest
 ```
 
 The published image is built by `.github/workflows/release.yml`, which packages the prebuilt

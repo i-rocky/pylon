@@ -89,7 +89,7 @@ docker run -d --name pylon \
   -v "$PWD/apps.json:/etc/pylon/apps.json:ro" \
   -e PYLON_APPS_PATH=/etc/pylon/apps.json \
   --ulimit nofile=1048576:1048576 \
-  ghcr.io/oyro-os/pylon:latest
+  ghcr.io/i-rocky/pylon:latest
 ```
 
 Tags: `latest`, `X.Y.Z`, and `X.Y`. A 2-node clustered example (with Redis) is in
@@ -98,7 +98,7 @@ Tags: `latest`, `X.Y.Z`, and `X.Y`. A 2-node clustered example (with Redis) is i
 ### Prebuilt binaries
 
 Each tagged release attaches Linux binaries for `x86_64` and `aarch64` (glibc 2.35+) to the
-[Releases page](https://github.com/oyro-os/pylon/releases), each as a `.tar.gz` with a matching
+[Releases page](https://github.com/i-rocky/pylon/releases), each as a `.tar.gz` with a matching
 `.sha256` checksum.
 
 ## Configuration

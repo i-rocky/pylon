@@ -1,7 +1,7 @@
 # Contributing
 
 Full contribution guidelines are in
-[`CONTRIBUTING.md`](https://github.com/oyro-os/pylon/blob/master/CONTRIBUTING.md)
+[`CONTRIBUTING.md`](https://github.com/i-rocky/pylon/blob/master/CONTRIBUTING.md)
 in the repository root. This page summarises the key expectations.
 
 ---
@@ -47,7 +47,7 @@ relevant Pusher documentation or observed behaviour.
 
 Do **not** open a public GitHub issue for security vulnerabilities. Follow the
 responsible disclosure process described in
-[`SECURITY.md`](https://github.com/oyro-os/pylon/blob/master/SECURITY.md).
+[`SECURITY.md`](https://github.com/i-rocky/pylon/blob/master/SECURITY.md).
 
 ---
 

@@ -51,9 +51,9 @@ produced.
 using Docker Buildx and pushes it to:
 
 ```
-ghcr.io/oyro-os/pylon:<version>
-ghcr.io/oyro-os/pylon:<major>.<minor>
-ghcr.io/oyro-os/pylon:latest
+ghcr.io/i-rocky/pylon:<version>
+ghcr.io/i-rocky/pylon:<major>.<minor>
+ghcr.io/i-rocky/pylon:latest
 ```
 
 The image is built for `linux/amd64` and `linux/arm64`.

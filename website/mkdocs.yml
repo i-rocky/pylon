@@ -1,8 +1,8 @@
 site_name: Pylon
 site_description: A self-hostable, Pusher-compatible realtime WebSocket server.
-site_url: https://oyro-os.github.io/pylon/
-repo_url: https://github.com/oyro-os/pylon
-repo_name: oyro-os/pylon
+site_url: https://i-rocky.github.io/pylon/
+repo_url: https://github.com/i-rocky/pylon
+repo_name: i-rocky/pylon
 edit_uri: edit/master/website/docs/
 copyright: >-
   Pylon is an independent, clean-room implementation. "Pusher" is a trademark of

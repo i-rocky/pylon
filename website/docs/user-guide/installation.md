@@ -14,7 +14,7 @@
     Registry on every release.
 
     ```sh
-    docker pull ghcr.io/oyro-os/pylon:latest
+    docker pull ghcr.io/i-rocky/pylon:latest
     ```
 
     Available tags: `latest`, `X.Y.Z` (exact release), and `X.Y` (latest patch in a minor series).
@@ -27,7 +27,7 @@
       -v "$PWD/apps.json:/etc/pylon/apps.json:ro" \
       -e PYLON_APPS_PATH=/etc/pylon/apps.json \
       --ulimit nofile=1048576:1048576 \
-      ghcr.io/oyro-os/pylon:latest
+      ghcr.io/i-rocky/pylon:latest
     ```
 
     !!! tip
@@ -36,7 +36,7 @@
 
 === "Binary"
 
-    Each tagged release on the [GitHub Releases page](https://github.com/oyro-os/pylon/releases)
+    Each tagged release on the [GitHub Releases page](https://github.com/i-rocky/pylon/releases)
     includes prebuilt Linux binaries for `x86_64` and `aarch64` (glibc 2.35+), each packaged as a
     `.tar.gz` with a matching `.sha256` checksum file.
 
@@ -44,8 +44,8 @@
 
     ```sh
     # Replace X.Y.Z and ARCH (x86_64 or aarch64) as appropriate
-    curl -LO https://github.com/oyro-os/pylon/releases/download/vX.Y.Z/pylon-X.Y.Z-ARCH-unknown-linux-gnu.tar.gz
-    curl -LO https://github.com/oyro-os/pylon/releases/download/vX.Y.Z/pylon-X.Y.Z-ARCH-unknown-linux-gnu.tar.gz.sha256
+    curl -LO https://github.com/i-rocky/pylon/releases/download/vX.Y.Z/pylon-X.Y.Z-ARCH-unknown-linux-gnu.tar.gz
+    curl -LO https://github.com/i-rocky/pylon/releases/download/vX.Y.Z/pylon-X.Y.Z-ARCH-unknown-linux-gnu.tar.gz.sha256
 
     sha256sum -c pylon-X.Y.Z-ARCH-unknown-linux-gnu.tar.gz.sha256
     tar xzf pylon-X.Y.Z-ARCH-unknown-linux-gnu.tar.gz
@@ -59,7 +59,7 @@
     automatically.
 
     ```sh
-    git clone https://github.com/oyro-os/pylon.git
+    git clone https://github.com/i-rocky/pylon.git
     cd pylon
     cargo build --release
     ```

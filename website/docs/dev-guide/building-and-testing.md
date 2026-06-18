@@ -89,5 +89,5 @@ The `load/` workspace crate contains scenario-based load tests and the
 search over connection counts to find the maximum sustainable concurrency on a
 given host, taking latency, CPU, and memory constraints as stop criteria.
 
-See [`load/`](https://github.com/oyro-os/pylon/tree/master/load) for details
+See [`load/`](https://github.com/i-rocky/pylon/tree/master/load) for details
 on running load scenarios and the ceiling tool.

@@ -6,7 +6,7 @@ Please **do not** open a public GitHub issue for security vulnerabilities.
 
 Instead, report them privately through one of:
 
-- GitHub's [private vulnerability reporting](https://github.com/oyro-os/pylon/security/advisories/new)
+- GitHub's [private vulnerability reporting](https://github.com/i-rocky/pylon/security/advisories/new)
   ("Report a vulnerability" under the repository's **Security** tab), or
 - email **smrockypk@gmail.com** with the details.
 

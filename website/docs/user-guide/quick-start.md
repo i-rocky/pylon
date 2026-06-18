@@ -53,7 +53,7 @@ your client and server SDKs. Keep `secret` private.
       -v "$PWD/apps.json:/etc/pylon/apps.json:ro" \
       -e PYLON_APPS_PATH=/etc/pylon/apps.json \
       --ulimit nofile=1048576:1048576 \
-      ghcr.io/oyro-os/pylon:latest
+      ghcr.io/i-rocky/pylon:latest
     ```
 
 Pylon listens on `0.0.0.0:7000` by default. Both the WebSocket endpoint (`ws://`) and the

@@ -5,8 +5,8 @@ This page documents the wire details that pylon enforces. In practice, app
 developers interact with the protocol through an official Pusher SDK — this
 page is reference material for contributors and integration authors.
 
-Sources: [`src/protocol/`](https://github.com/oyro-os/pylon/blob/master/src/protocol/),
-[`src/auth/`](https://github.com/oyro-os/pylon/blob/master/src/auth/)
+Sources: [`src/protocol/`](https://github.com/i-rocky/pylon/blob/master/src/protocol/),
+[`src/auth/`](https://github.com/i-rocky/pylon/blob/master/src/auth/)
 
 ---
 
@@ -53,7 +53,7 @@ not a double-encoded string:
 ```
 
 Source:
-[`src/protocol/v7/frames.rs`](https://github.com/oyro-os/pylon/blob/master/src/protocol/v7/frames.rs)
+[`src/protocol/v7/frames.rs`](https://github.com/i-rocky/pylon/blob/master/src/protocol/v7/frames.rs)
 
 ---
 
@@ -154,9 +154,9 @@ HMAC-SHA256(app_secret, "123.456::user::{\"id\":\"42\",\"name\":\"Alice\"}")
 ```
 
 Source:
-[`src/auth/signature.rs`](https://github.com/oyro-os/pylon/blob/master/src/auth/signature.rs),
-[`src/auth/channel.rs`](https://github.com/oyro-os/pylon/blob/master/src/auth/channel.rs),
-[`src/auth/user.rs`](https://github.com/oyro-os/pylon/blob/master/src/auth/user.rs)
+[`src/auth/signature.rs`](https://github.com/i-rocky/pylon/blob/master/src/auth/signature.rs),
+[`src/auth/channel.rs`](https://github.com/i-rocky/pylon/blob/master/src/auth/channel.rs),
+[`src/auth/user.rs`](https://github.com/i-rocky/pylon/blob/master/src/auth/user.rs)
 
 ---
 
@@ -197,5 +197,5 @@ For operator guidance on these codes see
 [Troubleshooting & FAQ](../user-guide/troubleshooting.md#close-codes).
 
 Sources:
-[`src/protocol/error.rs`](https://github.com/oyro-os/pylon/blob/master/src/protocol/error.rs),
-[`src/transport/worker.rs`](https://github.com/oyro-os/pylon/blob/master/src/transport/worker.rs)
+[`src/protocol/error.rs`](https://github.com/i-rocky/pylon/blob/master/src/protocol/error.rs),
+[`src/transport/worker.rs`](https://github.com/i-rocky/pylon/blob/master/src/transport/worker.rs)

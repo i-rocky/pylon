@@ -122,7 +122,7 @@ a specific workload.
 ---
 
 For the authoritative full list of variables (including any added after this page was written),
-see [`src/server/config.rs`](https://github.com/oyro-os/pylon/blob/master/src/server/config.rs).
+see [`src/server/config.rs`](https://github.com/i-rocky/pylon/blob/master/src/server/config.rs).
 
 Production tuning guidance (NUMA pinning, memory-budget sizing, CoDel tuning) is covered on the
 [Production Tuning](production-tuning.md) page. Clustering and Redis adapter setup is covered on

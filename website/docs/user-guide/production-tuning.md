@@ -81,7 +81,7 @@ sudo sysctl --system
 ```
 
 For a full explanation of every setting see
-[`docs/ops/sysctl-tuning.md`](https://github.com/oyro-os/pylon/blob/master/docs/ops/sysctl-tuning.md)
+[`docs/ops/sysctl-tuning.md`](https://github.com/i-rocky/pylon/blob/master/docs/ops/sysctl-tuning.md)
 in the repository. Key highlights:
 
 | Setting | Recommended value | Purpose |

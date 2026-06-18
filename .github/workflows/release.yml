@@ -18,7 +18,7 @@ permissions:
   packages: write   # push the image to GHCR
 
 env:
-  IMAGE_NAME: ghcr.io/oyro-os/pylon
+  IMAGE_NAME: ghcr.io/i-rocky/pylon
 
 jobs:
   # ── Native binary build, one job per architecture ──────────────────────────

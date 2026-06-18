@@ -7,10 +7,10 @@ This page describes the major subsystems and how data flows through them.
 
 ## Per-Core Transport
 
-The entry point is [`src/transport/mod.rs`](https://github.com/oyro-os/pylon/blob/master/src/transport/mod.rs).
+The entry point is [`src/transport/mod.rs`](https://github.com/i-rocky/pylon/blob/master/src/transport/mod.rs).
 `run_percore` spawns exactly one OS thread per logical CPU, each running an
 independent [`mio`](https://docs.rs/mio) event loop
-([`src/transport/worker.rs`](https://github.com/oyro-os/pylon/blob/master/src/transport/worker.rs)).
+([`src/transport/worker.rs`](https://github.com/i-rocky/pylon/blob/master/src/transport/worker.rs)).
 
 **Accept sharding via `SO_REUSEPORT`.** Every worker calls
 `reuseport_listener` to bind the *same* `bind:port` with `SO_REUSEPORT`. The
@@ -32,13 +32,13 @@ once the queue drains. This prevents spinning on idle sockets.
 `core_affinity` when the OS supports it, improving L1/L2 cache locality for
 connection state.
 
-Source: [`src/transport/worker.rs`](https://github.com/oyro-os/pylon/blob/master/src/transport/worker.rs)
+Source: [`src/transport/worker.rs`](https://github.com/i-rocky/pylon/blob/master/src/transport/worker.rs)
 
 ---
 
 ## Encode-Once Sharded Fan-Out
 
-Source: [`src/transport/fanout.rs`](https://github.com/oyro-os/pylon/blob/master/src/transport/fanout.rs)
+Source: [`src/transport/fanout.rs`](https://github.com/i-rocky/pylon/blob/master/src/transport/fanout.rs)
 
 The conventional approach (one `mpsc` send per subscriber) serialises fan-out
 on the publishing thread. Pylon replaces it with a per-worker hand-off:
@@ -57,8 +57,8 @@ memory. A `try_send` that finds the channel full drops the message and sets a
 `saturated` flag — the HTTP publish endpoint returns 503 while this flag is set.
 
 Source:
-[`src/transport/fanout.rs`](https://github.com/oyro-os/pylon/blob/master/src/transport/fanout.rs),
-[`src/transport/worker.rs`](https://github.com/oyro-os/pylon/blob/master/src/transport/worker.rs)
+[`src/transport/fanout.rs`](https://github.com/i-rocky/pylon/blob/master/src/transport/fanout.rs),
+[`src/transport/worker.rs`](https://github.com/i-rocky/pylon/blob/master/src/transport/worker.rs)
 (`drain_broadcasts`)
 
 ---
@@ -76,7 +76,7 @@ the `dirty_set` (O(dirty), not O(N)), so idle connections are never visited.
 
 ## Adapter Seam
 
-Source: [`src/adapter/mod.rs`](https://github.com/oyro-os/pylon/blob/master/src/adapter/mod.rs)
+Source: [`src/adapter/mod.rs`](https://github.com/i-rocky/pylon/blob/master/src/adapter/mod.rs)
 
 The `Adapter` trait abstracts all channel/presence/user state so the protocol
 handler in `src/ws/handler.rs` is identical in single-node and clustered
@@ -96,17 +96,17 @@ deployments. Two implementations sit behind the trait:
 Zero handler changes are required to switch between modes.
 
 Source:
-[`src/cluster/bridge.rs`](https://github.com/oyro-os/pylon/blob/master/src/cluster/bridge.rs),
-[`src/adapter/local.rs`](https://github.com/oyro-os/pylon/blob/master/src/adapter/local.rs),
-[`src/adapter/redis/`](https://github.com/oyro-os/pylon/blob/master/src/adapter/redis/)
+[`src/cluster/bridge.rs`](https://github.com/i-rocky/pylon/blob/master/src/cluster/bridge.rs),
+[`src/adapter/local.rs`](https://github.com/i-rocky/pylon/blob/master/src/adapter/local.rs),
+[`src/adapter/redis/`](https://github.com/i-rocky/pylon/blob/master/src/adapter/redis/)
 
 ---
 
 ## Adaptive Overload Control
 
 Source:
-[`src/transport/conn.rs`](https://github.com/oyro-os/pylon/blob/master/src/transport/conn.rs),
-[`src/transport/mod.rs`](https://github.com/oyro-os/pylon/blob/master/src/transport/mod.rs)
+[`src/transport/conn.rs`](https://github.com/i-rocky/pylon/blob/master/src/transport/conn.rs),
+[`src/transport/mod.rs`](https://github.com/i-rocky/pylon/blob/master/src/transport/mod.rs)
 
 Pylon degrades gracefully rather than collapsing under overload. Several
 mechanisms work in concert:
@@ -148,7 +148,7 @@ period (`PYLON_SHUTDOWN_GRACE_MS`) expires.
 
 The crate root declares `#![deny(unsafe_code)]`. The entire codebase is safe
 Rust with a single audited `unsafe` site: the fd-transfer path in
-[`src/transport/rest.rs`](https://github.com/oyro-os/pylon/blob/master/src/transport/rest.rs),
+[`src/transport/rest.rs`](https://github.com/i-rocky/pylon/blob/master/src/transport/rest.rs),
 which hands off an accepted TCP file descriptor from a worker thread to the
 tokio/axum REST plane.
 
