@@ -188,7 +188,7 @@ mod tests {
     ) -> (ConnectionContext, mpsc::UnboundedReceiver<ServerEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let c = ConnectionContext {
-            app: app(),
+            app: std::sync::Arc::new(app()),
             socket_id: SocketId::from_raw(socket),
             self_tx: tx,
             adapter,

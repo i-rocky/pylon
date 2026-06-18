@@ -41,5 +41,5 @@ pub async fn authenticate(
         state.config.rest_auth_window_secs,
     )
     .map_err(|_| RestError::unauthorized("invalid authentication"))?;
-    Ok(app)
+    Ok((*app).clone())
 }

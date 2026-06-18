@@ -15,11 +15,11 @@ mod pylon_dispatcher_helpers {
     pub struct OneApp(pub App);
     #[async_trait]
     impl AppManager for OneApp {
-        async fn by_key(&self, key: &str) -> Option<App> {
-            (self.0.key == key).then(|| self.0.clone())
+        async fn by_key(&self, key: &str) -> Option<std::sync::Arc<App>> {
+            (self.0.key == key).then(|| std::sync::Arc::new(self.0.clone()))
         }
-        async fn by_id(&self, id: &str) -> Option<App> {
-            (self.0.id == id).then(|| self.0.clone())
+        async fn by_id(&self, id: &str) -> Option<std::sync::Arc<App>> {
+            (self.0.id == id).then(|| std::sync::Arc::new(self.0.clone()))
         }
     }
 
@@ -65,7 +65,7 @@ fn ctx(app: App) -> (ConnectionContext, mpsc::UnboundedReceiver<ServerEvent>) {
     let registry = Arc::new(Registry::new());
     let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
     let c = ConnectionContext {
-        app,
+        app: std::sync::Arc::new(app),
         socket_id: SocketId::generate(),
         self_tx: tx,
         adapter,
@@ -299,7 +299,7 @@ async fn presence_unsubscribe_broadcasts_member_removed_to_others() {
     let mk = |adapter: Arc<dyn Adapter>| {
         let (tx, rx) = mpsc::unbounded_channel();
         let c = ConnectionContext {
-            app: app(false),
+            app: std::sync::Arc::new(app(false)),
             socket_id: SocketId::generate(),
             self_tx: tx,
             adapter,
@@ -461,7 +461,7 @@ async fn client_event_on_encrypted_channel_is_dropped() {
     let mk = |adapter: Arc<dyn Adapter>| {
         let (tx, rx) = mpsc::unbounded_channel();
         let c = ConnectionContext {
-            app: app_with_client_messages(true),
+            app: std::sync::Arc::new(app_with_client_messages(true)),
             socket_id: SocketId::generate(),
             self_tx: tx,
             adapter,
@@ -664,7 +664,7 @@ async fn presence_over_member_cap_errors() {
         let mut limits = crate::server::config::ServerConfig::default().limits();
         limits.max_presence_members = 1;
         let c = ConnectionContext {
-            app: app(false),
+            app: std::sync::Arc::new(app(false)),
             socket_id: SocketId::generate(),
             self_tx: tx,
             adapter: adapter.clone(),
@@ -830,7 +830,7 @@ async fn subscribe_emits_channel_occupied_then_close_emits_vacated() {
         ));
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut c = crate::ws::handler::ConnectionContext {
-        app,
+        app: std::sync::Arc::new(app),
         socket_id: crate::protocol::socket_id::SocketId::from_raw("1.1"),
         self_tx: tx,
         adapter,
@@ -904,7 +904,7 @@ async fn rapid_subscribe_unsubscribe_in_window_emits_nothing() {
         ));
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut c = crate::ws::handler::ConnectionContext {
-        app,
+        app: std::sync::Arc::new(app),
         socket_id: crate::protocol::socket_id::SocketId::from_raw("1.1"),
         self_tx: tx,
         adapter,
@@ -960,7 +960,7 @@ async fn presence_first_and_last_emit_member_added_then_removed() {
         crate::auth::signature::channel_signature("app-secret", "9.9", "presence-room", Some(cd))
     );
     let mut c = crate::ws::handler::ConnectionContext {
-        app,
+        app: std::sync::Arc::new(app),
         socket_id: socket,
         self_tx: tx,
         adapter,
@@ -1041,7 +1041,7 @@ async fn client_event_on_presence_includes_user_id_webhook() {
         crate::auth::signature::channel_signature("app-secret", "9.9", "presence-room", Some(cd))
     );
     let mut c = crate::ws::handler::ConnectionContext {
-        app,
+        app: std::sync::Arc::new(app),
         socket_id: crate::protocol::socket_id::SocketId::from_raw("9.9"),
         self_tx: tx,
         adapter,
@@ -1100,7 +1100,7 @@ async fn client_event_on_private_omits_user_id_webhook() {
         crate::auth::signature::channel_signature("app-secret", "9.9", "private-c", None)
     );
     let mut c = crate::ws::handler::ConnectionContext {
-        app,
+        app: std::sync::Arc::new(app),
         socket_id: crate::protocol::socket_id::SocketId::from_raw("9.9"),
         self_tx: tx,
         adapter,
@@ -1157,7 +1157,7 @@ async fn client_event_webhook_gated_off_when_app_lacks_it() {
         crate::auth::signature::channel_signature("app-secret", "9.9", "private-c", None)
     );
     let mut c = crate::ws::handler::ConnectionContext {
-        app,
+        app: std::sync::Arc::new(app),
         socket_id: crate::protocol::socket_id::SocketId::from_raw("9.9"),
         self_tx: tx,
         adapter,
@@ -1212,7 +1212,7 @@ async fn cache_channel_miss_emits_cache_miss_webhook() {
         ));
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut c = crate::ws::handler::ConnectionContext {
-        app,
+        app: std::sync::Arc::new(app),
         socket_id: crate::protocol::socket_id::SocketId::from_raw("9.9"),
         self_tx: tx,
         adapter,
@@ -1540,7 +1540,7 @@ async fn relayed_client_event_frame(
     let mk = |adapter: Arc<dyn Adapter>| {
         let (tx, rx) = mpsc::unbounded_channel();
         let c = ConnectionContext {
-            app: app_with_client_messages(true),
+            app: std::sync::Arc::new(app_with_client_messages(true)),
             socket_id: SocketId::generate(),
             self_tx: tx,
             adapter,
@@ -1618,7 +1618,7 @@ async fn client_event_oversize_name_returns_4301_and_does_not_broadcast() {
     let mk = || {
         let (tx, rx) = mpsc::unbounded_channel();
         let c = ConnectionContext {
-            app: app_with_client_messages(true),
+            app: std::sync::Arc::new(app_with_client_messages(true)),
             socket_id: SocketId::generate(),
             self_tx: tx,
             adapter: adapter.clone(),
@@ -1695,7 +1695,7 @@ async fn client_event_rate_limit_returns_4301_and_drops() {
     // Build sender with a 3-event/second rate window.
     let (tx_sender, mut rx_sender) = mpsc::unbounded_channel();
     let mut sender = ConnectionContext {
-        app: app_with_client_messages(true),
+        app: std::sync::Arc::new(app_with_client_messages(true)),
         socket_id: SocketId::generate(),
         self_tx: tx_sender,
         adapter: adapter.clone(),
@@ -1713,7 +1713,7 @@ async fn client_event_rate_limit_returns_4301_and_drops() {
     // Build receiver (unlimited, just needs to see broadcasts).
     let (tx_recv, mut rx_recv) = mpsc::unbounded_channel();
     let mut receiver = ConnectionContext {
-        app: app_with_client_messages(true),
+        app: std::sync::Arc::new(app_with_client_messages(true)),
         socket_id: SocketId::generate(),
         self_tx: tx_recv,
         adapter: adapter.clone(),

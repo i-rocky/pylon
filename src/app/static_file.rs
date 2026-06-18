@@ -1,16 +1,19 @@
 use super::{App, AppManager};
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct StaticFileAppManager {
-    apps: Vec<App>,
+    apps: Vec<Arc<App>>,
 }
 
 impl StaticFileAppManager {
     pub fn from_json(raw: &str) -> anyhow::Result<Self> {
-        let mut apps: Vec<App> = serde_json::from_str(raw)?;
-        for app in &mut apps {
+        let parsed: Vec<App> = serde_json::from_str(raw)?;
+        let mut apps: Vec<Arc<App>> = Vec::with_capacity(parsed.len());
+        for mut app in parsed {
             app.recompute_has_flags();
             app.validate().map_err(|e| anyhow::anyhow!(e))?;
+            apps.push(Arc::new(app));
         }
         Ok(Self { apps })
     }
@@ -21,10 +24,10 @@ impl StaticFileAppManager {
 
 #[async_trait::async_trait]
 impl AppManager for StaticFileAppManager {
-    async fn by_key(&self, key: &str) -> Option<App> {
+    async fn by_key(&self, key: &str) -> Option<Arc<App>> {
         self.apps.iter().find(|a| a.key == key).cloned()
     }
-    async fn by_id(&self, id: &str) -> Option<App> {
+    async fn by_id(&self, id: &str) -> Option<Arc<App>> {
         self.apps.iter().find(|a| a.id == id).cloned()
     }
 }
@@ -70,5 +73,22 @@ mod tests {
         let m = StaticFileAppManager::from_json(raw).unwrap();
         let app = m.by_id("a").await.unwrap();
         assert!(app.has_channel_occupied_webhooks);
+    }
+
+    #[tokio::test]
+    async fn by_id_and_by_key_share_one_arc() {
+        let m = StaticFileAppManager::from_json(SAMPLE).unwrap();
+        let a1 = m.by_id("app-id").await.unwrap();
+        let a2 = m.by_id("app-id").await.unwrap();
+        // Two lookups of the same app return the SAME backing Arc — no per-lookup clone.
+        assert!(
+            std::sync::Arc::ptr_eq(&a1, &a2),
+            "by_id must share one Arc<App>"
+        );
+        let k1 = m.by_key("app-key").await.unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&a1, &k1),
+            "by_key/by_id must share the same Arc<App>"
+        );
     }
 }

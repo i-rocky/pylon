@@ -255,11 +255,11 @@ mod tests {
 
     #[async_trait]
     impl AppManager for OneApp {
-        async fn by_key(&self, key: &str) -> Option<App> {
-            (self.0.key == key).then(|| self.0.clone())
+        async fn by_key(&self, key: &str) -> Option<std::sync::Arc<App>> {
+            (self.0.key == key).then(|| std::sync::Arc::new(self.0.clone()))
         }
-        async fn by_id(&self, id: &str) -> Option<App> {
-            (self.0.id == id).then(|| self.0.clone())
+        async fn by_id(&self, id: &str) -> Option<std::sync::Arc<App>> {
+            (self.0.id == id).then(|| std::sync::Arc::new(self.0.clone()))
         }
     }
 

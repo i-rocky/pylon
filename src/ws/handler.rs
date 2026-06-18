@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
 pub struct ConnectionContext {
-    pub app: App,
+    pub app: Arc<App>,
     pub socket_id: SocketId,
     pub self_tx: UnboundedSender<ServerEvent>,
     pub adapter: Arc<dyn Adapter>,

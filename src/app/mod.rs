@@ -4,6 +4,7 @@ pub mod static_file;
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// The six webhook event names, in canonical order. The only legal `event_types`.
 pub const WEBHOOK_EVENT_TYPES: [&str; 6] = [
@@ -99,8 +100,8 @@ impl App {
 
 #[async_trait::async_trait]
 pub trait AppManager: Send + Sync {
-    async fn by_key(&self, key: &str) -> Option<App>;
-    async fn by_id(&self, id: &str) -> Option<App>;
+    async fn by_key(&self, key: &str) -> Option<Arc<App>>;
+    async fn by_id(&self, id: &str) -> Option<Arc<App>>;
 }
 
 #[cfg(test)]
