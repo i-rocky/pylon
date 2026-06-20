@@ -21,6 +21,23 @@ pub struct WebhookDelivery {
     pub headers: BTreeMap<String, String>,
 }
 
+/// Serialize a JSON value with object keys sorted recursively, so the signed
+/// webhook body is byte-stable regardless of serde_json's `preserve_order`
+/// feature (which a transitive dependency such as `bson` may enable globally).
+fn sort_keys(v: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match v {
+        Value::Object(map) => {
+            let mut entries: Vec<(String, Value)> =
+                map.into_iter().map(|(k, val)| (k, sort_keys(val))).collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            Value::Object(entries.into_iter().collect())
+        }
+        Value::Array(arr) => Value::Array(arr.into_iter().map(sort_keys).collect()),
+        other => other,
+    }
+}
+
 /// Build the envelope `{ time_ms, events }`, serialize it, sign the raw body with
 /// `secret`, and assemble the header set. Per-endpoint `custom` headers are merged
 /// in FIRST, then the three Pusher headers overwrite — so custom headers can never
@@ -34,7 +51,7 @@ pub fn build_signed_delivery(
     custom: &BTreeMap<String, String>,
 ) -> WebhookDelivery {
     let envelope = json!({ "time_ms": time_ms, "events": events });
-    let body = serde_json::to_string(&envelope).expect("envelope serializes");
+    let body = serde_json::to_string(&sort_keys(envelope)).expect("envelope serializes");
     let signature = hmac_sha256_hex(secret, &body);
 
     let mut headers: BTreeMap<String, String> = custom.clone();
