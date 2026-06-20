@@ -359,8 +359,9 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     // the target connection's slab token onto `dirty_tx` and wakes `worker_waker`.
     // We then drain ONLY those tokens' sessions — idle connections are never
     // visited (O(dirty), not O(N)). On a dispatch worker the shared waker `Arc` +
-    // `dirty_tx` are cloned into each session's `ctx.mailbox_notify` at
-    // `establish_session`; echo workers never stamp one, so `dirty_rx` stays empty
+    // `dirty_tx` are cloned into each session's `ctx.mailbox_notify` in
+    // `handle_handshake` (and carried through `finish_establish`); echo workers
+    // never stamp one, so `dirty_rx` stays empty
     // and the selective drain is a no-op `try_recv` each iteration.
     let (dirty_tx, dirty_rx) = std::sync::mpsc::channel::<usize>();
     let mailbox_waker = worker_waker;
@@ -1799,6 +1800,14 @@ fn drain_resolved(
 
         match outcome {
             Ok(session) => {
+                // Liveness: the wheel was already touched when this connection's
+                // WS-upgrade read event arrived (the `wheel.touch` in the run loop's
+                // readable arm, BEFORE `handle_handshake` parked it), so a resumed
+                // connection carries the same idle deadline as a synchronously-
+                // established one — no re-touch is needed here. The park itself is
+                // bounded by the driver's own lookup timeout (sqlx acquire / mongo
+                // serverSelection / fred command), which is ≪ `activity_timeout`, so
+                // the wheel never evicts a still-parked connection in any sane config.
                 // Reborrow inline so the `entry` borrow drops before `fold_delta`.
                 let action = {
                     let entry = &mut conns[token];

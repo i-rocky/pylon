@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
 /// The per-worker notifier a [`Mailbox`] uses to wake its owning worker on a
-/// cross-connection send. Built in [`establish_session`](crate::transport::worker)
+/// cross-connection send. Built in `handle_handshake` (in `crate::transport::worker`)
 /// from the worker's dirty-token channel + the `MAILBOX_WAKER`.
 ///
 /// `token` is this connection's slab key (== its `mio::Token` value); `dirty` is
