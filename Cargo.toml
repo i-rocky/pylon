@@ -1,6 +1,6 @@
 [package]
 name = "pylon"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A Pusher-compatible real-time WebSocket server"
 repository = "https://github.com/i-rocky/pylon"
