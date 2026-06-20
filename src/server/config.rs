@@ -1,5 +1,21 @@
 //! Server-level configuration (defaults + `PYLON_*` env overrides).
 
+/// Which app-manager backend to use for app lookup.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AppManagerKind {
+    StaticFile,
+    Sqlite,
+}
+
+/// Parse `PYLON_APP_MANAGER` into an [`AppManagerKind`].
+/// Unknown values fall back to `StaticFile` (safe default).
+pub fn parse_app_manager(kind: Option<&str>) -> AppManagerKind {
+    match kind.unwrap_or("static") {
+        "sqlite" => AppManagerKind::Sqlite,
+        _ => AppManagerKind::StaticFile,
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub max_presence_members: usize,
@@ -127,6 +143,12 @@ pub struct ServerConfig {
     /// is full a `try_send` silently drops the frame and bumps the per-worker
     /// `pylon_mailbox_dropped_total` counter. `PYLON_MAILBOX_CAPACITY` (default 256).
     pub mailbox_capacity: usize,
+    /// Which app-manager backend to use. `PYLON_APP_MANAGER` (`static` | `sqlite`;
+    /// default `static`). Set to `sqlite` and provide `PYLON_APP_DSN`.
+    pub app_manager: AppManagerKind,
+    /// DSN for the SQLite app-manager. Required when `app_manager == Sqlite`.
+    /// `PYLON_APP_DSN` (e.g. `sqlite:///var/lib/pylon/apps.db`).
+    pub app_dsn: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -185,6 +207,8 @@ impl Default for ServerConfig {
             max_connections: 0,
             expected_per_conn_bytes: 8192,
             mailbox_capacity: 256,
+            app_manager: AppManagerKind::StaticFile,
+            app_dsn: None,
         }
     }
 }
@@ -216,6 +240,8 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("PYLON_APPS_PATH") {
             c.apps_path = v;
         }
+        c.app_manager = parse_app_manager(std::env::var("PYLON_APP_MANAGER").ok().as_deref());
+        c.app_dsn = std::env::var("PYLON_APP_DSN").ok();
         if let Ok(v) = std::env::var("PYLON_MAX_PRESENCE_MEMBERS") {
             if let Ok(p) = v.parse() {
                 c.max_presence_members = p;
@@ -741,6 +767,14 @@ mod tests {
         assert_eq!(c.workers, 3);
         assert_eq!(c.worker_count(), 3);
         std::env::remove_var("PYLON_WORKERS");
+    }
+
+    #[test]
+    fn parse_app_manager_maps_kinds() {
+        assert_eq!(parse_app_manager(None), AppManagerKind::StaticFile);
+        assert_eq!(parse_app_manager(Some("static")), AppManagerKind::StaticFile);
+        assert_eq!(parse_app_manager(Some("sqlite")), AppManagerKind::Sqlite);
+        assert_eq!(parse_app_manager(Some("weird")), AppManagerKind::StaticFile);
     }
 
     #[test]

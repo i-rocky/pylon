@@ -1119,12 +1119,11 @@ fn establish_session(
     };
 
     let app = match futures_executor::block_on(env.apps.by_key(&key)) {
-        Some(a) => a,
-        None => {
-            return Err(Reject {
-                error: PusherError::app_not_found(),
-                codec: Some(codec),
-            })
+        Ok(Some(a)) => a,
+        Ok(None) => return Err(Reject { error: PusherError::app_not_found(), codec: Some(codec) }),
+        Err(e) => {
+            tracing::warn!(key = %key, error = %e, "app lookup failed (transient)");
+            return Err(Reject { error: PusherError::backend_unavailable(), codec: Some(codec) });
         }
     };
 

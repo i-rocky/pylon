@@ -1,5 +1,6 @@
 //! App (tenant) definitions and the AppManager seam (static file now; DB in SP6).
 
+pub mod sql;
 pub mod static_file;
 
 use serde::Deserialize;
@@ -31,6 +32,8 @@ pub struct App {
     pub id: String,
     pub key: String,
     pub secret: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     #[serde(default)]
     pub client_messages_enabled: bool,
     #[serde(default)]
@@ -54,6 +57,10 @@ pub struct App {
     pub has_client_event_webhooks: bool,
     #[serde(skip)]
     pub has_cache_miss_webhooks: bool,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 impl App {
@@ -98,10 +105,27 @@ impl App {
     }
 }
 
+#[derive(Debug)]
+pub enum AppLookupError {
+    /// Transient backend failure (DB/Redis down, timeout). Reject retryably; do not cache.
+    Backend(String),
+    /// A row/document could not be decoded into `App`. Operational bug; reject retryably.
+    Decode(String),
+}
+impl std::fmt::Display for AppLookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AppLookupError::Backend(m) => write!(f, "app store backend error: {m}"),
+            AppLookupError::Decode(m) => write!(f, "app row decode error: {m}"),
+        }
+    }
+}
+impl std::error::Error for AppLookupError {}
+
 #[async_trait::async_trait]
 pub trait AppManager: Send + Sync {
-    async fn by_key(&self, key: &str) -> Option<Arc<App>>;
-    async fn by_id(&self, id: &str) -> Option<Arc<App>>;
+    async fn by_key(&self, key: &str) -> Result<Option<Arc<App>>, AppLookupError>;
+    async fn by_id(&self, id: &str) -> Result<Option<Arc<App>>, AppLookupError>;
 }
 
 #[cfg(test)]

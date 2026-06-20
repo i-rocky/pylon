@@ -742,8 +742,10 @@ async fn handle_cmd(
                 .await;
             // Resolve the per-app flags ourselves (the worker's handler is guarded off in
             // cluster mode). An app that vanished mid-flight just drops the edge.
-            let Some(a) = apps.by_id(&app).await else {
-                return;
+            let a = match apps.by_id(&app).await {
+                Ok(Some(a)) => a,
+                Ok(None) => return,
+                Err(e) => { tracing::warn!(error = %e, "cluster-edge app lookup failed; skipping"); return }
             };
             // Clustered subscription_count: a single cluster-wide emit (local-via-sink +
             // cluster publish through the adapter's `broadcast`). Mirror the handler's
@@ -820,8 +822,10 @@ async fn handle_cmd(
             let (count, vacated) = adapter
                 .cluster_unsubscribe(&app, &channel, &socket_id, node_last)
                 .await;
-            let Some(a) = apps.by_id(&app).await else {
-                return;
+            let a = match apps.by_id(&app).await {
+                Ok(Some(a)) => a,
+                Ok(None) => return,
+                Err(e) => { tracing::warn!(error = %e, "cluster-edge app lookup failed; skipping"); return }
             };
             // Clustered subscription_count — same gating as Subscribe (enabled +
             // non-presence + `count > 0`).
@@ -936,8 +940,10 @@ async fn handle_cmd(
             });
             // Resolve the per-app flags ourselves (the worker's handler is guarded off in
             // cluster mode). An app that vanished mid-flight just drops the edges.
-            let Some(a) = apps.by_id(&app).await else {
-                return;
+            let a = match apps.by_id(&app).await {
+                Ok(Some(a)) => a,
+                Ok(None) => return,
+                Err(e) => { tracing::warn!(error = %e, "cluster-edge app lookup failed; skipping"); return }
             };
             // Single cluster-wide `member_added` on the cluster-wide first connection for
             // this user (local-via-sink + cluster publish through `broadcast`, excluding
@@ -1005,8 +1011,10 @@ async fn handle_cmd(
                     false
                 }
             };
-            let Some(a) = apps.by_id(&app).await else {
-                return;
+            let a = match apps.by_id(&app).await {
+                Ok(Some(a)) => a,
+                Ok(None) => return,
+                Err(e) => { tracing::warn!(error = %e, "cluster-edge app lookup failed; skipping"); return }
             };
             // Single cluster-wide `member_removed` on the cluster-wide last connection for
             // this user, plus the `member_removed` webhook.

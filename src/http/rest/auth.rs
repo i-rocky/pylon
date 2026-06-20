@@ -25,11 +25,14 @@ pub async fn authenticate(
     params: &HashMap<String, String>,
     body: &[u8],
 ) -> Result<App, RestError> {
-    let app = state
-        .apps
-        .by_id(app_id)
-        .await
-        .ok_or_else(|| RestError::unauthorized("invalid authentication"))?;
+    let app = match state.apps.by_id(app_id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return Err(RestError::unauthorized("invalid authentication")),
+        Err(e) => {
+            tracing::warn!(app_id = %app_id, error = %e, "app lookup failed (transient)");
+            return Err(RestError::service_unavailable("app store temporarily unavailable"));
+        }
+    };
     crate::auth::rest::verify(
         &app.key,
         &app.secret,

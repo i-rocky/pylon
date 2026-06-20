@@ -139,8 +139,9 @@ impl WebhookDispatcher {
 
             if !immediate.is_empty() {
                 let app = match self.apps.by_id(&app_id).await {
-                    Some(a) => a,
-                    None => continue, // app vanished (hot-reload race): drop
+                    Ok(Some(a)) => a,
+                    Ok(None) => continue, // app vanished (hot-reload race): drop
+                    Err(e) => { tracing::warn!(error = %e, "webhook app lookup failed; skipping cycle"); continue }
                 };
                 if !app.webhooks.is_empty() {
                     Self::deliver_app_events(
@@ -186,8 +187,9 @@ impl WebhookDispatcher {
                             return;
                         }
                         let resolved = match apps.by_id(&app).await {
-                            Some(a) => a,
-                            None => return, // app vanished: drop
+                            Ok(Some(a)) => a,
+                            Ok(None) => return, // app vanished: drop
+                            Err(e) => { tracing::warn!(error = %e, "webhook app lookup failed; skipping cycle"); return }
                         };
                         if resolved.webhooks.is_empty() {
                             return;
@@ -243,6 +245,7 @@ impl WebhookDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::AppLookupError;
     use crate::app::AppManager;
     use crate::app::{App, WebhookConfig};
     use crate::webhook::occupancy::OccupancySource;
@@ -255,11 +258,11 @@ mod tests {
 
     #[async_trait]
     impl AppManager for OneApp {
-        async fn by_key(&self, key: &str) -> Option<std::sync::Arc<App>> {
-            (self.0.key == key).then(|| std::sync::Arc::new(self.0.clone()))
+        async fn by_key(&self, key: &str) -> Result<Option<std::sync::Arc<App>>, AppLookupError> {
+            Ok((self.0.key == key).then(|| std::sync::Arc::new(self.0.clone())))
         }
-        async fn by_id(&self, id: &str) -> Option<std::sync::Arc<App>> {
-            (self.0.id == id).then(|| std::sync::Arc::new(self.0.clone()))
+        async fn by_id(&self, id: &str) -> Result<Option<std::sync::Arc<App>>, AppLookupError> {
+            Ok((self.0.id == id).then(|| std::sync::Arc::new(self.0.clone())))
         }
     }
 

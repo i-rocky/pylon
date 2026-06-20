@@ -5,6 +5,7 @@ use pylon::adapter::local::LocalAdapter;
 use pylon::adapter::Adapter;
 use pylon::app::static_file::StaticFileAppManager;
 use pylon::app::AppManager;
+use pylon::server::config::AppManagerKind;
 use pylon::channel::registry::Registry;
 use pylon::cluster::adapter::ClusterAdapter;
 use pylon::server::config::ServerConfig;
@@ -70,7 +71,14 @@ async fn main() -> anyhow::Result<()> {
     let _dhat = dhat::Profiler::new_heap();
     pylon::init_tracing();
     let config = ServerConfig::from_env();
-    let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_file(&config.apps_path)?);
+    let apps: Arc<dyn AppManager> = match config.app_manager {
+        AppManagerKind::StaticFile => Arc::new(StaticFileAppManager::from_file(&config.apps_path)?),
+        AppManagerKind::Sqlite => {
+            let dsn = config.app_dsn.clone()
+                .ok_or_else(|| anyhow::anyhow!("PYLON_APP_MANAGER=sqlite requires PYLON_APP_DSN"))?;
+            Arc::new(pylon::app::sql::SqlAppManager::connect(&dsn).await?)
+        }
+    };
 
     // The redis adapter is the CLUSTERED production path: the node's single
     // `RedisAdapter` is owned by a `ClusterBridge` (on its own runtime), the percore workers

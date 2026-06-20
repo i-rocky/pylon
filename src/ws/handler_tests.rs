@@ -5,7 +5,7 @@ use pylon_dispatcher_helpers::*;
 use tokio::sync::mpsc;
 
 mod pylon_dispatcher_helpers {
-    use crate::app::{App, AppManager};
+    use crate::app::{App, AppLookupError, AppManager};
     use crate::webhook::dispatcher::FixedClock;
     use crate::webhook::transport::{RecordingTransport, WebhookTransport};
     use crate::webhook::{spawn, WebhookHandle};
@@ -15,11 +15,11 @@ mod pylon_dispatcher_helpers {
     pub struct OneApp(pub App);
     #[async_trait]
     impl AppManager for OneApp {
-        async fn by_key(&self, key: &str) -> Option<std::sync::Arc<App>> {
-            (self.0.key == key).then(|| std::sync::Arc::new(self.0.clone()))
+        async fn by_key(&self, key: &str) -> Result<Option<std::sync::Arc<App>>, AppLookupError> {
+            Ok((self.0.key == key).then(|| std::sync::Arc::new(self.0.clone())))
         }
-        async fn by_id(&self, id: &str) -> Option<std::sync::Arc<App>> {
-            (self.0.id == id).then(|| std::sync::Arc::new(self.0.clone()))
+        async fn by_id(&self, id: &str) -> Result<Option<std::sync::Arc<App>>, AppLookupError> {
+            Ok((self.0.id == id).then(|| std::sync::Arc::new(self.0.clone())))
         }
     }
 

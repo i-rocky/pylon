@@ -82,6 +82,8 @@ core_affinity = "0.8"
 # Parallelize the per-subscriber broadcast enqueue across a work-stealing pool
 # (SP9 fan-out): the single-threaded mailbox.send loop caps large-channel fan-out.
 rayon = "1"
+# SQL app store backend (sqlx Any driver: SQLite now, MySQL/Postgres later by DSN)
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "any", "sqlite", "macros"] }
 
 [dev-dependencies]
 # Self-reference with `test-hooks` so integration tests (which see `pylon` as an
@@ -97,6 +99,8 @@ criterion = "0.5"
 futures-util = "0.3"
 # Used by transport::conn tests to shrink SO_SNDBUF and force partial writes.
 socket2 = "0.5"
+# Temp files for SqlAppManager tests (avoids in-memory SQLite pool isolation issue)
+tempfile = "3"
 
 [[bench]]
 name = "fanout"

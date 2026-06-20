@@ -33,6 +33,10 @@ impl PusherError {
     pub fn server_over_capacity() -> Self {
         Self::new(4100, "Server is over capacity")
     }
+    /// Transient: app store unreachable. Client reconnects after backoff (41xx range).
+    pub fn backend_unavailable() -> Self {
+        Self::new(4103, "application store temporarily unavailable")
+    }
 }
 
 #[cfg(test)]
@@ -61,5 +65,11 @@ mod tests {
             PusherError::invalid_version().message,
             "Invalid version string format"
         );
+    }
+
+    #[test]
+    fn backend_unavailable_carries_4103() {
+        assert_eq!(PusherError::backend_unavailable().code, 4103);
+        assert!(!PusherError::backend_unavailable().message.is_empty());
     }
 }
