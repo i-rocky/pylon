@@ -461,48 +461,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn purge_app_closes_all_connections_with_4009() {
+    async fn purge_app_closes_subscribed_and_idle_connections_with_4009() {
         let app_registry = Arc::new(crate::adapter::app_registry::AppRegistry::new());
-        let adapter = LocalAdapter::new(
-            Arc::new(Registry::new()),
-            app_registry.clone(),
-        );
-        let (tx1, mut rx1) = mpsc::channel(1024);
-        let (tx2, mut rx2) = mpsc::channel(1024);
-        let s1 = SocketId::generate();
-        let s2 = SocketId::generate();
-        // Register both connections in the app registry (simulating the on-establish
-        // path that the worker does in production).
+        let adapter = LocalAdapter::new(Arc::new(Registry::new()), app_registry.clone());
+
+        // An IDLE (registered-but-unsubscribed) connection.
+        let (tx_idle, mut rx_idle) = mpsc::channel(1024);
+        let s_idle = SocketId::generate();
         app_registry.insert(
-            "myapp",
+            "app",
             ConnectionHandle {
-                socket_id: s1,
-                mailbox: crate::connection::handle::Mailbox::new(tx1, None, None),
+                socket_id: s_idle,
+                mailbox: crate::connection::handle::Mailbox::new(tx_idle, None, None),
             },
         );
-        app_registry.insert(
-            "myapp",
-            ConnectionHandle {
-                socket_id: s2,
-                mailbox: crate::connection::handle::Mailbox::new(tx2, None, None),
-            },
-        );
-        let mut ids = adapter.purge_app("myapp").await;
+        // A SUBSCRIBED connection (also registered in app_registry).
+        let (tx_sub, mut rx_sub) = mpsc::channel(1024);
+        let s_sub = SocketId::generate();
+        let sub_handle = ConnectionHandle {
+            socket_id: s_sub,
+            mailbox: crate::connection::handle::Mailbox::new(tx_sub, None, None),
+        };
+        app_registry.insert("app", sub_handle.clone());
+        adapter.subscribe("app", "c", sub_handle, None).await;
+
+        // purge_app enumerates via app_registry (complete), not the channel registry
+        // (which would miss the idle connection).
+        let mut ids = adapter.purge_app("app").await;
         ids.sort();
-        let mut expected = vec![s1, s2];
-        expected.sort();
-        assert_eq!(ids, expected);
-        // Both connections must have received error(4009) + close(4009).
-        for rx in [&mut rx1, &mut rx2] {
-            assert!(
-                matches!(rx.try_recv().map(|b| *b), Ok(ServerEvent::Error(e)) if e.code == 4009)
-            );
+        let mut want = vec![s_idle, s_sub];
+        want.sort();
+        assert_eq!(ids, want, "purge must return BOTH the idle and subscribed socket ids");
+
+        // BOTH connections received Error(4009) then Close(4009).
+        for rx in [&mut rx_idle, &mut rx_sub] {
+            assert!(matches!(rx.try_recv().map(|b| *b), Ok(ServerEvent::Error(e)) if e.code == 4009));
             assert!(matches!(
                 rx.try_recv().map(|b| *b),
                 Ok(ServerEvent::Close { code: 4009, .. })
             ));
         }
-        // The app entry is gone — a second purge returns empty.
-        assert!(adapter.purge_app("myapp").await.is_empty());
+        // The registry entry is fully drained.
+        assert!(app_registry.connected_app_ids().is_empty());
+        // A second purge is a no-op (no handles).
+        assert!(adapter.purge_app("app").await.is_empty());
     }
 }

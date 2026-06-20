@@ -1643,13 +1643,13 @@ async fn purge_app_closes_connections_and_removes_from_redis_apps_set() {
 
         // Now purge the app — all local connections closed, Redis `apps` SREM'd.
         let ids = adapter.purge_app(TEST_APP).await;
-        // The LocalAdapter holds the one connection we inserted via `subscribe`.
-        // On the test path there is no DispatchEnv, so `app_registry.drain_app`
-        // may return empty (the connection was not inserted there) — what matters is
-        // the Redis SREM ran (no panic, no error).
+        // The RedisAdapter's internal LocalAdapter has its own private AppRegistry
+        // with no worker-registered connections — `subscribe` goes to the channel
+        // registry only, not app_registry — so drain_app always returns empty here.
+        // The real point of this test is the SREM assertion below.
         assert!(
-            ids.len() <= 1,
-            "purge_app must return <=1 id (only those in app_registry)"
+            ids.is_empty(),
+            "RedisAdapter's private app_registry has no worker-registered conns; ids must be empty"
         );
 
         // The app must have been removed from the Redis `apps` set.
