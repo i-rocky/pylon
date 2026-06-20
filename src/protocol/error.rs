@@ -66,4 +66,10 @@ mod tests {
             "Invalid version string format"
         );
     }
+
+    #[test]
+    fn backend_unavailable_carries_4103() {
+        assert_eq!(PusherError::backend_unavailable().code, 4103);
+        assert!(!PusherError::backend_unavailable().message.is_empty());
+    }
 }

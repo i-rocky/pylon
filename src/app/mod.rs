@@ -31,6 +31,8 @@ pub struct App {
     pub id: String,
     pub key: String,
     pub secret: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     #[serde(default)]
     pub client_messages_enabled: bool,
     #[serde(default)]
@@ -54,9 +56,6 @@ pub struct App {
     pub has_client_event_webhooks: bool,
     #[serde(skip)]
     pub has_cache_miss_webhooks: bool,
-
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
 }
 
 fn default_enabled() -> bool {
