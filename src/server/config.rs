@@ -265,6 +265,7 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("PYLON_APP_CACHE") { c.app_cache = v != "0" && v.to_lowercase() != "off" && v.to_lowercase() != "false"; }
         if let Ok(v) = std::env::var("PYLON_APP_CACHE_MAX") { if let Ok(n) = v.parse() { c.app_cache_max = n; } }
         if let Ok(v) = std::env::var("PYLON_APP_CACHE_TTL") { if let Ok(n) = v.parse() { c.app_cache_ttl = n; } }
+        if let Ok(v) = std::env::var("PYLON_APP_CACHE_NEG_MAX") { if let Ok(n) = v.parse() { c.app_cache_neg_max = n; } }
         if let Ok(v) = std::env::var("PYLON_APP_CACHE_NEG_TTL") { if let Ok(n) = v.parse() { c.app_cache_neg_ttl = n; } }
         c.app_cache_redis_url = std::env::var("PYLON_APP_CACHE_REDIS_URL").ok();
         if let Ok(v) = std::env::var("PYLON_MAX_PRESENCE_MEMBERS") {
