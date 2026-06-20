@@ -114,6 +114,10 @@ harness = false
 name = "mailbox"
 harness = false
 
+[[bench]]
+name = "app_lookup"
+harness = false
+
 [profile.release]
 lto = true
 codegen-units = 1
