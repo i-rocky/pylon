@@ -60,7 +60,7 @@ impl ConnectionContext {
             .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed))
     }
 
-    pub(in crate::ws) fn handle(&self) -> ConnectionHandle {
+    pub(crate) fn handle(&self) -> ConnectionHandle {
         ConnectionHandle {
             socket_id: self.socket_id,
             // A WAKING mailbox: a cross-connection `send` marks this connection

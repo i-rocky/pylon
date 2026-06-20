@@ -19,6 +19,7 @@ pub mod timer;
 pub mod tls;
 pub mod worker;
 
+use crate::adapter::app_registry::AppRegistry;
 use crate::adapter::local::LocalAdapter;
 use crate::adapter::Adapter;
 use crate::app::AppManager;
@@ -160,6 +161,9 @@ pub fn run_percore(
     apps: Arc<dyn AppManager>,
     adapter: Arc<dyn Adapter>,
     conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>>,
+    // Per-app connection index shared with `LocalAdapter::purge_app`. Created once
+    // in `main.rs` (like `conn_counts`) and stamped into the `DispatchEnv`.
+    app_registry: Arc<AppRegistry>,
     webhooks: WebhookHandle,
     rest_handoff: Option<UnboundedSender<RestConn>>,
     shutdown: Arc<AtomicBool>,
@@ -210,6 +214,7 @@ pub fn run_percore(
         pong_timeout: config.pong_timeout,
         strict_protocol: config.strict_protocol,
         conn_counts,
+        app_registry,
         webhooks,
         saturated: saturated_flag,
         clustered,

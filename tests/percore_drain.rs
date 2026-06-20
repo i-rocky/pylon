@@ -91,6 +91,7 @@ async fn spawn_with_grace(grace_ms: u64) -> Harness {
         clustered: false,
         max_connections: 0,
         mailbox_capacity: 256,
+        app_registry: Arc::new(pylon::adapter::app_registry::AppRegistry::new()),
     });
 
     let port = free_port();

@@ -114,6 +114,7 @@ async fn spawn() -> Harness {
             apps,
             adapter,
             conn_counts,
+            Arc::new(pylon::adapter::app_registry::AppRegistry::new()),
             webhooks,
             Some(rest_tx),
             worker_shutdown,

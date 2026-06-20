@@ -127,6 +127,10 @@ async fn main() -> anyhow::Result<()> {
     // Shared connection counters (the axum REST `AppState` and the percore
     // `DispatchEnv` mirror this type exactly).
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
+    // Per-app connection index shared with `LocalAdapter::purge_app` (Phase 6),
+    // created once and threaded into both the worker fleet and the adapter.
+    let app_registry: Arc<pylon::adapter::app_registry::AppRegistry> =
+        Arc::new(pylon::adapter::app_registry::AppRegistry::new());
 
     // The percore worker is a blocking `mio` loop; run it on a dedicated blocking
     // thread and flip the shared shutdown flag when the signal future resolves.
@@ -186,6 +190,7 @@ async fn main() -> anyhow::Result<()> {
             apps,
             adapter,
             conn_counts,
+            app_registry,
             webhooks,
             Some(rest_tx),
             worker_shutdown,
@@ -263,6 +268,10 @@ async fn run_redis_percore(config: ServerConfig, apps: Arc<dyn AppManager>, inva
     bridge.attach_webhooks(webhooks.clone());
 
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
+    // Per-app connection index shared with `LocalAdapter::purge_app` (Phase 6),
+    // created once and threaded into both the worker fleet and the adapter.
+    let app_registry: Arc<pylon::adapter::app_registry::AppRegistry> =
+        Arc::new(pylon::adapter::app_registry::AppRegistry::new());
 
     // REST handoff plane: the worker hands plain-HTTP connections to this axum router via
     // `rest_tx`; `rest::serve` drives them on the tokio runtime. The REST `AppState` drives
@@ -322,6 +331,7 @@ async fn run_redis_percore(config: ServerConfig, apps: Arc<dyn AppManager>, inva
             apps,
             worker_adapter,
             conn_counts,
+            app_registry,
             webhooks,
             Some(rest_tx),
             worker_shutdown,

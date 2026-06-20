@@ -39,6 +39,7 @@
 //! each with its own `SO_REUSEPORT` listener on the same `bind:port`, so the
 //! kernel spreads accepts across workers; see [`crate::transport::run_percore`].
 
+use crate::adapter::app_registry::AppRegistry;
 use crate::adapter::Adapter;
 use crate::app::AppManager;
 use crate::connection::handle::MailboxNotify;
@@ -139,6 +140,10 @@ pub struct DispatchEnv {
     /// and shared across all connections (all workers use the same cap since this
     /// is in the shared `DispatchEnv`).
     pub mailbox_capacity: usize,
+    /// Per-app live CONNECTION index (shared with `LocalAdapter::purge_app`),
+    /// maintained beside `conn_counts`: inserted at establish, removed at close.
+    /// Mirrors how `conn_counts` is shared between `DispatchEnv` and `AppState`.
+    pub app_registry: Arc<AppRegistry>,
 }
 
 /// Configuration for a single worker event loop.
@@ -376,6 +381,16 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
         Mode::Echo => (TimerWheel::with_timeouts(0, 0), false),
     };
 
+    // Per-app shared maps the close path reclaims. Pulled into run-loop scope from
+    // the dispatch env once (Echo workers have no env → no per-app reclaim).
+    let (conn_counts, app_registry): (
+        Arc<DashMap<String, Arc<AtomicUsize>>>,
+        Arc<AppRegistry>,
+    ) = match &cfg.mode {
+        Mode::Dispatch(env) => (env.conn_counts.clone(), env.app_registry.clone()),
+        Mode::Echo => (Arc::new(DashMap::new()), Arc::new(AppRegistry::new())),
+    };
+
     let mut events = Events::with_capacity(1024);
     let mut conns: slab::Slab<Entry> = slab::Slab::new();
 
@@ -459,6 +474,8 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         &mut sid_to_token,
                         &mut wheel,
                         &mut inflight_bytes,
+                        &conn_counts,
+                        &app_registry,
                     );
                 }
                 tracing::debug!(
@@ -575,6 +592,8 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             &mut sid_to_token,
                             &mut wheel,
                             &mut inflight_bytes,
+                            &conn_counts,
+                            &app_registry,
                         );
                         continue;
                     }
@@ -606,6 +625,8 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                     &mut sid_to_token,
                                     &mut wheel,
                                     &mut inflight_bytes,
+                                    &conn_counts,
+                                    &app_registry,
                                 );
                                 continue;
                             }
@@ -659,6 +680,8 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                 &mut sid_to_token,
                                 &mut wheel,
                                 &mut inflight_bytes,
+                                &conn_counts,
+                                &app_registry,
                             );
                         }
                     }
@@ -685,6 +708,8 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 &mut codel_dropped_total,
                 saturated.as_ref(),
                 now_ns,
+                &conn_counts,
+                &app_registry,
             ) {
                 work = true;
             }
@@ -727,6 +752,8 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 &mut inflight_bytes,
                 &mut codel_dropped_total,
                 now_ns,
+                &conn_counts,
+                &app_registry,
             )
         {
             work = true;
@@ -772,6 +799,8 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             &mut sid_to_token,
                             &mut wheel,
                             &mut inflight_bytes,
+                            &conn_counts,
+                            &app_registry,
                         );
                         work = true;
                     }
@@ -1213,6 +1242,13 @@ fn establish_session(
         mailbox_dropped,
     };
 
+    // Register this live connection under its app so a cluster-wide `purge_app`
+    // can force-close it. `ctx.handle()` builds a WAKING mailbox (a cross-thread
+    // purge send marks this connection dirty + wakes the worker). All rejection
+    // paths above returned BEFORE `ctx` was built, so a rejected connection never
+    // registers — exactly as `conn_counts` is rolled back on reject.
+    env.app_registry.insert(&ctx.app.id, ctx.handle());
+
     Ok(Session {
         ctx,
         rx,
@@ -1503,6 +1539,8 @@ fn drain_dirty_sessions(
     inflight_bytes: &mut u64,
     codel_total: &mut u64,
     now_ns: u64,
+    conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
+    app_registry: &Arc<AppRegistry>,
 ) -> bool {
     // Drain the dirty-token queue into the reused set (dedup). Cheap + O(1) when
     // empty (the idle case). The set is cleared at the end so it never grows
@@ -1544,6 +1582,8 @@ fn drain_dirty_sessions(
                 sid_to_token,
                 wheel,
                 inflight_bytes,
+                conn_counts,
+                app_registry,
             );
             continue;
         }
@@ -1722,6 +1762,8 @@ fn remove(
     sid_to_token: &mut HashMap<SocketId, usize>,
     wheel: &mut TimerWheel,
     inflight_bytes: &mut u64,
+    conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
+    app_registry: &Arc<AppRegistry>,
 ) {
     // SP11 §4: drop the connection from the liveness wheel BEFORE the slab slot
     // (and thus its token) can be recycled by a future accept, so a new
@@ -1740,7 +1782,16 @@ fn remove(
         if let Some(mut session) = entry.session.take() {
             deindex_connection(&session, local_subs, sid_to_token);
             futures_executor::block_on(session.ctx.on_close());
+            let app_id = &session.ctx.app.id;
+            // Drop this connection from the per-app registry (remove_if-empty inside).
+            app_registry.remove(app_id, &session.ctx.socket_id);
             session.conn_count.fetch_sub(1, Ordering::SeqCst);
+            // Pre-existing leak fix: the per-app counter entry is created at
+            // establish (`entry().or_insert_with`) but was NEVER removed. Drop it
+            // atomically once it reaches 0 (a concurrent establish that bumped it
+            // back above 0 is re-checked under the shard lock), matching the other
+            // registries so even an idle app that is never deleted leaves no zombie.
+            conn_counts.remove_if(app_id, |_, c| c.load(Ordering::SeqCst) == 0);
             NODE_CONNS.fetch_sub(1, Ordering::SeqCst);
         }
         let _ = poll.registry().deregister(entry.conn.stream_mut());
@@ -1890,6 +1941,8 @@ fn drain_broadcasts(
     codel_total: &mut u64,
     saturated: Option<&Arc<AtomicBool>>,
     now_ns: u64,
+    conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
+    app_registry: &Arc<AppRegistry>,
 ) -> bool {
     let mut touched: HashSet<usize> = HashSet::new();
     // Connections that backpressured during delivery; closed after the drain so
@@ -1983,6 +2036,8 @@ fn drain_broadcasts(
             sid_to_token,
             wheel,
             inflight_bytes,
+            conn_counts,
+            app_registry,
         );
     }
     wrote

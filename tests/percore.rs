@@ -17,9 +17,11 @@ use pylon::app::AppManager;
 use pylon::auth::signature::channel_signature;
 use pylon::channel::registry::Registry;
 use pylon::server::config::ServerConfig;
+use dashmap::DashMap;
+use pylon::adapter::app_registry::AppRegistry;
 use pylon::transport::worker::{run, DispatchEnv, Mode, WorkerConfig};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
@@ -41,6 +43,8 @@ type Ws =
 struct Harness {
     port: u16,
     adapter: Arc<dyn Adapter>,
+    conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>>,
+    app_registry: Arc<AppRegistry>,
     shutdown: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -66,6 +70,8 @@ async fn spawn(config: ServerConfig) -> Harness {
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
     let registry = Arc::new(Registry::new());
     let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
+    let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
+    let app_registry = Arc::new(AppRegistry::new());
     let env = Arc::new(DispatchEnv {
         apps,
         adapter: adapter.clone(),
@@ -73,12 +79,13 @@ async fn spawn(config: ServerConfig) -> Harness {
         activity_timeout: config.activity_timeout,
         pong_timeout: config.pong_timeout,
         strict_protocol: config.strict_protocol,
-        conn_counts: Arc::new(Default::default()),
+        conn_counts: conn_counts.clone(),
         webhooks: pylon::webhook::WebhookHandle::null(),
         saturated: None,
         clustered: false,
         max_connections: 0,
         mailbox_capacity: 256,
+        app_registry: app_registry.clone(),
     });
 
     let port = free_port();
@@ -116,6 +123,8 @@ async fn spawn(config: ServerConfig) -> Harness {
     Harness {
         port,
         adapter,
+        conn_counts,
+        app_registry,
         shutdown,
         handle: Some(handle),
     }
@@ -277,6 +286,8 @@ async fn spawn_with_node_ceiling(max_connections: usize) -> Harness {
         Arc::new(StaticFileAppManager::from_json(APPS_UNLIMITED).unwrap());
     let registry = Arc::new(Registry::new());
     let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
+    let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
+    let app_registry = Arc::new(AppRegistry::new());
     let env = Arc::new(DispatchEnv {
         apps,
         adapter: adapter.clone(),
@@ -284,12 +295,13 @@ async fn spawn_with_node_ceiling(max_connections: usize) -> Harness {
         activity_timeout: 120,
         pong_timeout: 30,
         strict_protocol: false,
-        conn_counts: Arc::new(Default::default()),
+        conn_counts: conn_counts.clone(),
         webhooks: pylon::webhook::WebhookHandle::null(),
         saturated: None,
         clustered: false,
         max_connections,
         mailbox_capacity: 256,
+        app_registry: app_registry.clone(),
     });
 
     let port = free_port();
@@ -326,6 +338,8 @@ async fn spawn_with_node_ceiling(max_connections: usize) -> Harness {
     Harness {
         port,
         adapter,
+        conn_counts,
+        app_registry,
         shutdown,
         handle: Some(handle),
     }
@@ -473,6 +487,8 @@ async fn spawn_with_saturation_flag() -> (Harness, Arc<AtomicBool>) {
     let registry = Arc::new(pylon::channel::registry::Registry::new());
     let adapter: Arc<dyn Adapter> = Arc::new(pylon::adapter::local::LocalAdapter::new(registry));
     let sat_flag = Arc::new(AtomicBool::new(false));
+    let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
+    let app_registry = Arc::new(AppRegistry::new());
     let env = Arc::new(DispatchEnv {
         apps,
         adapter: adapter.clone(),
@@ -480,12 +496,13 @@ async fn spawn_with_saturation_flag() -> (Harness, Arc<AtomicBool>) {
         activity_timeout: 120,
         pong_timeout: 30,
         strict_protocol: false,
-        conn_counts: Arc::new(Default::default()),
+        conn_counts: conn_counts.clone(),
         webhooks: pylon::webhook::WebhookHandle::null(),
         saturated: Some(sat_flag.clone()),
         clustered: false,
         max_connections: 0,
         mailbox_capacity: 256,
+        app_registry: app_registry.clone(),
     });
 
     let port = free_port();
@@ -522,6 +539,8 @@ async fn spawn_with_saturation_flag() -> (Harness, Arc<AtomicBool>) {
     let h = Harness {
         port,
         adapter,
+        conn_counts,
+        app_registry,
         shutdown,
         handle: Some(handle),
     };
@@ -560,4 +579,29 @@ async fn saturated_accept_gate_rejects_4100_and_releases_counter() {
         "connection must succeed after saturation clears, got sid {sid:?}"
     );
     drop(ws2);
+}
+
+/// The `conn_counts` entry for an app must be REMOVED once its last connection
+/// closes (pre-existing leak fix), and the `AppRegistry` entry must clear too.
+#[tokio::test]
+async fn conn_counts_and_registry_self_clean_on_last_disconnect() {
+    let h = spawn(ServerConfig::default()).await;
+    let mut ws = try_connect(h.port).await;
+    let _ = established_socket_id(&mut ws).await;
+    // While connected: both shared maps carry an entry for "app".
+    assert!(h.conn_counts.contains_key("app"), "counter entry must exist while connected");
+    assert_eq!(h.app_registry.connected_app_ids(), vec!["app".to_string()]);
+
+    drop(ws);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // After the last disconnect: BOTH entries are gone (no zombie).
+    assert!(
+        !h.conn_counts.contains_key("app"),
+        "conn_counts entry must be removed when the app's last connection closes"
+    );
+    assert!(
+        h.app_registry.connected_app_ids().is_empty(),
+        "AppRegistry entry must be removed when the app's last connection closes"
+    );
 }
