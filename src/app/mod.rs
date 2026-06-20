@@ -1,5 +1,6 @@
 //! App (tenant) definitions and the AppManager seam (static file now; DB in SP6).
 
+pub mod cache;
 pub mod l2;
 pub mod sql;
 pub mod static_file;
