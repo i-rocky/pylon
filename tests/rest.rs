@@ -89,6 +89,7 @@ async fn spawn() -> SocketAddr {
             adapter,
             conn_counts,
             Arc::new(pylon::adapter::app_registry::AppRegistry::new()),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             webhooks,
             Some(rest_tx),
             worker_shutdown,

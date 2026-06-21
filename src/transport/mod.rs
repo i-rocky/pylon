@@ -164,6 +164,10 @@ pub fn run_percore(
     // Per-app connection index shared with `LocalAdapter::purge_app`. Created once
     // in `main.rs` (like `conn_counts`) and stamped into the `DispatchEnv`.
     app_registry: Arc<AppRegistry>,
+    // Node-level live connection counter, shared across all of this node's workers
+    // for the connection-ceiling check. Created once in `main.rs` alongside
+    // `conn_counts` and injected here so tests can supply an independent counter.
+    node_conns: Arc<AtomicUsize>,
     webhooks: WebhookHandle,
     rest_handoff: Option<UnboundedSender<RestConn>>,
     shutdown: Arc<AtomicBool>,
@@ -220,6 +224,7 @@ pub fn run_percore(
         pong_timeout: config.pong_timeout,
         strict_protocol: config.strict_protocol,
         conn_counts,
+        node_conns,
         app_registry,
         webhooks,
         saturated: saturated_flag,

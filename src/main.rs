@@ -131,6 +131,9 @@ async fn main() -> anyhow::Result<()> {
     // Shared connection counters (the axum REST `AppState` and the percore
     // `DispatchEnv` mirror this type exactly).
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
+    // Node-level live connection counter for the ceiling check — one per process,
+    // shared across all of this node's workers. Created alongside `conn_counts`.
+    let node_conns: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 
     // Build the AppPurger + invalidation subscriber once the adapter + conn_counts
     // exist. Only for DB-backed cache paths with an L2/pub-sub Redis URL.
@@ -226,6 +229,7 @@ async fn main() -> anyhow::Result<()> {
             adapter,
             conn_counts,
             app_registry,
+            node_conns,
             webhooks,
             Some(rest_tx),
             worker_shutdown,
@@ -314,6 +318,9 @@ async fn run_redis_percore(
     bridge.attach_webhooks(webhooks.clone());
 
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
+    // Node-level live connection counter for the ceiling check — one per process,
+    // shared across all of this node's workers. Created alongside `conn_counts`.
+    let node_conns: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 
     // Build the AppPurger + invalidation subscriber once the adapter + conn_counts
     // exist. Only for DB-backed cache paths with an L2/pub-sub Redis URL.
@@ -408,6 +415,7 @@ async fn run_redis_percore(
             worker_adapter,
             conn_counts,
             app_registry,
+            node_conns,
             webhooks,
             Some(rest_tx),
             worker_shutdown,

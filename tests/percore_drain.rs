@@ -86,6 +86,7 @@ async fn spawn_with_grace(grace_ms: u64) -> Harness {
         pong_timeout: config.pong_timeout,
         strict_protocol: config.strict_protocol,
         conn_counts: conn_counts.clone(),
+        node_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         webhooks: pylon::webhook::WebhookHandle::null(),
         saturated: None,
         clustered: false,

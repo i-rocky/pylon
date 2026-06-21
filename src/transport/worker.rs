@@ -93,14 +93,6 @@ pub fn percore_selective_drain_visits() -> u64 {
 /// mailbox drains then run and figure out what actually needs delivering.
 const WORKER_WAKER: Token = Token(usize::MAX - 1);
 
-/// Process-global live connection counter for the node-level ceiling check.
-///
-/// Incremented at accept (before the per-app capacity check); decremented either
-/// immediately if the node ceiling rejects the connection (before returning
-/// `Err(Reject)`) or in [`remove`] on every normal/timeout/drain close path.
-/// This ensures the count is released exactly once per accepted connection.
-static NODE_CONNS: AtomicUsize = AtomicUsize::new(0);
-
 /// Shared, `Arc`-cloneable bundle of the `AppState` pieces a [`Mode::Dispatch`]
 /// worker needs to build a [`ConnectionContext`] per connection.
 pub struct DispatchEnv {
@@ -116,6 +108,10 @@ pub struct DispatchEnv {
     /// Per-app live connection counters (shared with the rest of the server),
     /// mirroring `AppState::conn_counts`.
     pub conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>>,
+    /// Node-level live connection counter, shared across this node's workers for
+    /// the connection-ceiling check; injectable so tests get an independent counter
+    /// per harness (avoiding cross-test pollution from the old process-global static).
+    pub node_conns: Arc<AtomicUsize>,
     pub webhooks: crate::webhook::WebhookHandle,
     /// SP10 admission control: the shared percore saturation flag. Stamped onto
     /// each connection's [`ConnectionContext`] at session establish so a WS
@@ -130,8 +126,8 @@ pub struct DispatchEnv {
     /// not-yet-clustered percore path keeps the node-local handler emits.
     pub clustered: bool,
     /// Node-level connection ceiling enforced before the per-app `capacity` check.
-    /// `0` = unlimited (no ceiling check). When non-zero, the 3rd+ connection that
-    /// pushes the process-global [`NODE_CONNS`] counter to or above this limit is
+    /// `0` = unlimited (no ceiling check). When non-zero, the connection that
+    /// pushes [`node_conns`](DispatchEnv::node_conns) to or above this limit is
     /// rejected with code **4100** (`server_over_capacity`). The per-app `capacity`
     /// (code 4004) check continues to apply independently.
     pub max_connections: usize,
@@ -430,12 +426,22 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
 
     // Per-app shared maps the close path reclaims. Pulled into run-loop scope from
     // the dispatch env once (Echo workers have no env → no per-app reclaim).
-    let (conn_counts, app_registry): (
+    #[allow(clippy::type_complexity)]
+    let (conn_counts, app_registry, node_conns): (
         Arc<DashMap<String, Arc<AtomicUsize>>>,
         Arc<AppRegistry>,
+        Arc<AtomicUsize>,
     ) = match &cfg.mode {
-        Mode::Dispatch(env) => (env.conn_counts.clone(), env.app_registry.clone()),
-        Mode::Echo => (Arc::new(DashMap::new()), Arc::new(AppRegistry::new())),
+        Mode::Dispatch(env) => (
+            env.conn_counts.clone(),
+            env.app_registry.clone(),
+            env.node_conns.clone(),
+        ),
+        Mode::Echo => (
+            Arc::new(DashMap::new()),
+            Arc::new(AppRegistry::new()),
+            Arc::new(AtomicUsize::new(0)),
+        ),
     };
 
     let mut events = Events::with_capacity(1024);
@@ -523,6 +529,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         &mut inflight_bytes,
                         &conn_counts,
                         &app_registry,
+                        &node_conns,
                     );
                 }
                 tracing::debug!(
@@ -641,6 +648,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             &mut inflight_bytes,
                             &conn_counts,
                             &app_registry,
+                            &node_conns,
                         );
                         continue;
                     }
@@ -676,6 +684,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                     &mut inflight_bytes,
                                     &conn_counts,
                                     &app_registry,
+                                    &node_conns,
                                 );
                                 continue;
                             }
@@ -731,6 +740,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                 &mut inflight_bytes,
                                 &conn_counts,
                                 &app_registry,
+                                &node_conns,
                             );
                         }
                     }
@@ -759,6 +769,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 now_ns,
                 &conn_counts,
                 &app_registry,
+                &node_conns,
             ) {
                 work = true;
             }
@@ -803,6 +814,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 now_ns,
                 &conn_counts,
                 &app_registry,
+                &node_conns,
             )
         {
             work = true;
@@ -827,6 +839,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                     now_ns,
                     &conn_counts,
                     &app_registry,
+                    &node_conns,
                 ) {
                     work = true;
                 }
@@ -875,6 +888,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             &mut inflight_bytes,
                             &conn_counts,
                             &app_registry,
+                            &node_conns,
                         );
                         work = true;
                     }
@@ -1271,7 +1285,7 @@ struct Reject {
 /// the park-resume path (Task 3). Given a resolved `app` + a negotiated `codec`,
 /// enforce the node ceiling, the saturation gate, and the per-app capacity, then
 /// build the [`ConnectionContext`] and register the connection. Counters
-/// (`NODE_CONNS`, `conn_counts`) are incremented HERE and rolled back on every
+/// (`node_conns`, `conn_counts`) are incremented HERE and rolled back on every
 /// reject — never before the app is resolved — so a connection that drops before
 /// this runs (e.g. while parked) leaks nothing.
 fn finish_establish(
@@ -1285,9 +1299,9 @@ fn finish_establish(
 
     // Node-level ceiling check: enforced before the per-app capacity check.
     // `max_connections == 0` means unlimited (no ceiling).
-    let node_n = NODE_CONNS.fetch_add(1, Ordering::SeqCst);
+    let node_n = env.node_conns.fetch_add(1, Ordering::SeqCst);
     if env.max_connections != 0 && node_n >= env.max_connections {
-        NODE_CONNS.fetch_sub(1, Ordering::SeqCst);
+        env.node_conns.fetch_sub(1, Ordering::SeqCst);
         return Err(Reject {
             error: PusherError::server_over_capacity(),
             codec: Some(codec),
@@ -1304,7 +1318,7 @@ fn finish_establish(
         .as_ref()
         .is_some_and(|s| s.load(Ordering::Relaxed))
     {
-        NODE_CONNS.fetch_sub(1, Ordering::SeqCst);
+        env.node_conns.fetch_sub(1, Ordering::SeqCst);
         return Err(Reject {
             error: PusherError::server_over_capacity(),
             codec: Some(codec),
@@ -1319,7 +1333,7 @@ fn finish_establish(
     let current = counter.fetch_add(1, Ordering::SeqCst);
     if app.capacity != 0 && current >= app.capacity as usize {
         counter.fetch_sub(1, Ordering::SeqCst);
-        NODE_CONNS.fetch_sub(1, Ordering::SeqCst);
+        env.node_conns.fetch_sub(1, Ordering::SeqCst);
         return Err(Reject {
             error: PusherError::over_capacity(),
             codec: Some(codec),
@@ -1668,6 +1682,7 @@ fn drain_dirty_sessions(
     now_ns: u64,
     conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
     app_registry: &Arc<AppRegistry>,
+    node_conns: &Arc<AtomicUsize>,
 ) -> bool {
     // Drain the dirty-token queue into the reused set (dedup). Cheap + O(1) when
     // empty (the idle case). The set is cleared at the end so it never grows
@@ -1711,6 +1726,7 @@ fn drain_dirty_sessions(
                 inflight_bytes,
                 conn_counts,
                 app_registry,
+                node_conns,
             );
             continue;
         }
@@ -1761,6 +1777,7 @@ fn drain_resolved(
     now_ns: u64,
     conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
     app_registry: &Arc<AppRegistry>,
+    node_conns: &Arc<AtomicUsize>,
 ) -> bool {
     use crate::protocol::error::PusherError;
     let mut wrote_any = false;
@@ -1831,7 +1848,7 @@ fn drain_resolved(
                 if action == Action::Close {
                     remove(
                         poll, conns, token, local_subs, sid_to_token, wheel,
-                        inflight_bytes, conn_counts, app_registry,
+                        inflight_bytes, conn_counts, app_registry, node_conns,
                     );
                 }
             }
@@ -1848,7 +1865,7 @@ fn drain_resolved(
                 wrote_any = true;
                 remove(
                     poll, conns, token, local_subs, sid_to_token, wheel,
-                    inflight_bytes, conn_counts, app_registry,
+                    inflight_bytes, conn_counts, app_registry, node_conns,
                 );
             }
         }
@@ -2015,6 +2032,7 @@ fn remove(
     inflight_bytes: &mut u64,
     conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
     app_registry: &Arc<AppRegistry>,
+    node_conns: &Arc<AtomicUsize>,
 ) {
     // SP11 §4: drop the connection from the liveness wheel BEFORE the slab slot
     // (and thus its token) can be recycled by a future accept, so a new
@@ -2043,7 +2061,7 @@ fn remove(
             // back above 0 is re-checked under the shard lock), matching the other
             // registries so even an idle app that is never deleted leaves no zombie.
             conn_counts.remove_if(app_id, |_, c| c.load(Ordering::SeqCst) == 0);
-            NODE_CONNS.fetch_sub(1, Ordering::SeqCst);
+            node_conns.fetch_sub(1, Ordering::SeqCst);
         }
         let _ = poll.registry().deregister(entry.conn.stream_mut());
     }
@@ -2194,6 +2212,7 @@ fn drain_broadcasts(
     now_ns: u64,
     conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
     app_registry: &Arc<AppRegistry>,
+    node_conns: &Arc<AtomicUsize>,
 ) -> bool {
     let mut touched: HashSet<usize> = HashSet::new();
     // Connections that backpressured during delivery; closed after the drain so
@@ -2289,6 +2308,7 @@ fn drain_broadcasts(
             inflight_bytes,
             conn_counts,
             app_registry,
+            node_conns,
         );
     }
     wrote

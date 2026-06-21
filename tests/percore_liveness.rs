@@ -78,6 +78,7 @@ async fn spawn(activity_timeout: u32, pong_timeout: u32) -> Harness {
         pong_timeout: config.pong_timeout,
         strict_protocol: config.strict_protocol,
         conn_counts: Arc::new(Default::default()),
+        node_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         webhooks: pylon::webhook::WebhookHandle::null(),
         saturated: None,
         clustered: false,
