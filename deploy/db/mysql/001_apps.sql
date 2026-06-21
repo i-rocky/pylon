@@ -1,3 +1,8 @@
+-- pylon `apps` table (MySQL). pylon READS this table; your control plane writes it.
+-- `webhooks` (a JSON array) has NO column DEFAULT: MySQL < 8.0.13 cannot DEFAULT a
+-- TEXT column, so supply it on every INSERT ('[]' for an app with no webhooks).
+-- Boolean-ish columns use BIGINT (0/1) so the sqlx `Any` driver reads one uniform
+-- integer type across SQLite/MySQL/Postgres.
 CREATE TABLE IF NOT EXISTS apps (
     id          VARCHAR(255) NOT NULL PRIMARY KEY,
     `key`       VARCHAR(255) NOT NULL UNIQUE,

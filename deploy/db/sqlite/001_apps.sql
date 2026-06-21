@@ -1,3 +1,7 @@
+-- pylon `apps` table (SQLite — single-node/dev/edge). pylon READS this table; your
+-- control plane writes it. `webhooks` is a JSON array, defaulting to '[]' so an
+-- INSERT may omit it. Boolean-ish columns use INTEGER (0/1) so the sqlx `Any`
+-- driver reads one uniform integer type across SQLite/MySQL/Postgres.
 CREATE TABLE IF NOT EXISTS apps (
     id          TEXT    NOT NULL PRIMARY KEY,
     key         TEXT    NOT NULL UNIQUE,
