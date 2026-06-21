@@ -268,4 +268,38 @@ mod tests {
         assert_eq!(purged, 0, "a backend Err must NEVER purge a live app");
         assert!(rx.try_recv().is_err(), "no 4009 frame on a backend error");
     }
+
+    /// The spawned sweep LOOP fires on its own and purges a now-disabled app
+    /// (driver `Ok(None)`) with NO invalidation signal — the backstop's whole
+    /// contract. (A `tokio::time::interval`'s first tick is immediate, so this
+    /// resolves promptly rather than waiting a full interval.)
+    #[tokio::test]
+    async fn spawn_sweep_periodically_purges_a_disabled_app() {
+        let (app_registry, driver, cache, purger, mut rx) = setup(Outcome::None);
+        // Warm the cache so the sweep can resolve "a"'s key before purging.
+        let _ = cache.by_id("a").await;
+
+        let handle = spawn_sweep(1, app_registry, driver, cache, Arc::new(purger));
+
+        // The first tick drives one sweep_once immediately → the disabled app is
+        // force-closed (4009) by the background loop, no signal required.
+        let got_4009 = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                match rx.recv().await {
+                    Some(b) if matches!(*b, ServerEvent::Error(ref e) if e.code == 4009) => {
+                        return true
+                    }
+                    Some(_) => continue,
+                    None => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        handle.abort();
+        assert!(
+            got_4009,
+            "the spawned sweep loop must purge the disabled app (4009) on its own"
+        );
+    }
 }

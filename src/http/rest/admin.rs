@@ -126,4 +126,165 @@ mod tests {
         let b: InvalidateBody = serde_json::from_str(r#"{"key":"k","action":"refresh"}"#).unwrap();
         assert_eq!(b.action, crate::app::invalidation::InvalidateAction::Refresh);
     }
+
+    // ── Handler behavior: the full `post_invalidate` flow ────────────────────
+    // (`State`/`Path`/`Bytes`/`HeaderMap`/`AppState`/`post_invalidate` come via
+    // `use super::*`.)
+    use axum::http::StatusCode;
+    use std::sync::Arc;
+
+    /// Minimal `AppState` to drive the handler directly. `token` sets/clears the
+    /// admin token; `invalidator` is the publish handle (None ⇒ the 503 path).
+    fn test_state(
+        token: Option<&str>,
+        invalidator: Option<Arc<crate::app::invalidation::AppInvalidator>>,
+    ) -> AppState {
+        let config = crate::server::config::ServerConfig {
+            app_admin_token: token.map(|t| t.to_string()),
+            ..crate::server::config::ServerConfig::default()
+        };
+        AppState {
+            config,
+            apps: Arc::new(crate::app::static_file::StaticFileAppManager::from_json("[]").unwrap()),
+            adapter: Arc::new(crate::adapter::local::LocalAdapter::new(
+                Arc::new(crate::channel::registry::Registry::new()),
+                Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+            )),
+            conn_counts: Arc::new(dashmap::DashMap::new()),
+            webhooks: crate::webhook::WebhookHandle::null(),
+            saturated: None,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cluster_metrics: None,
+            invalidator,
+        }
+    }
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        h
+    }
+
+    #[tokio::test]
+    async fn handler_disabled_when_no_admin_token_returns_404() {
+        let err = post_invalidate(
+            State(test_state(None, None)),
+            Path("app1".into()),
+            HeaderMap::new(),
+            Bytes::from(r#"{"key":"k"}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn handler_bad_or_missing_token_returns_401() {
+        // Wrong token.
+        let err = post_invalidate(
+            State(test_state(Some("secret"), None)),
+            Path("app1".into()),
+            bearer("wrong"),
+            Bytes::from(r#"{"key":"k"}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        // No Authorization header at all.
+        let err2 = post_invalidate(
+            State(test_state(Some("secret"), None)),
+            Path("app1".into()),
+            HeaderMap::new(),
+            Bytes::from(r#"{"key":"k"}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err2.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn handler_auth_runs_strictly_before_body_parse() {
+        // A bad token with a MALFORMED body must return 401 (auth), NOT 400 (parse):
+        // an unauthenticated caller's body is never parsed (the Plan-5 hardening).
+        let err = post_invalidate(
+            State(test_state(Some("secret"), None)),
+            Path("app1".into()),
+            bearer("wrong"),
+            Bytes::from("definitely not json"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.status,
+            StatusCode::UNAUTHORIZED,
+            "auth must reject before the malformed body is parsed"
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_authed_with_bad_body_returns_400() {
+        let err = post_invalidate(
+            State(test_state(Some("secret"), None)),
+            Path("app1".into()),
+            bearer("secret"),
+            Bytes::from("not json"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn handler_authed_without_invalidator_returns_503() {
+        let err = post_invalidate(
+            State(test_state(Some("secret"), None)),
+            Path("app1".into()),
+            bearer("secret"),
+            Bytes::from(r#"{"key":"k"}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Redis-gated: the authenticated success path publishes to Redis pub/sub and
+    /// returns 202 Accepted.
+    #[tokio::test]
+    async fn handler_authed_with_invalidator_returns_202() {
+        use crate::app::cache::{CacheConfig, CachingAppManager};
+        let url = std::env::var("PYLON_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6390".into());
+        let apps: Arc<dyn crate::app::AppManager> =
+            Arc::new(crate::app::static_file::StaticFileAppManager::from_json("[]").unwrap());
+        let cache = Arc::new(CachingAppManager::new(
+            apps,
+            CacheConfig { max_capacity: 16, ttl_secs: 60, neg_max: 16, neg_ttl_secs: 60 },
+            None,
+        ));
+        let adapter: Arc<dyn crate::adapter::Adapter> =
+            Arc::new(crate::adapter::local::LocalAdapter::new(
+                Arc::new(crate::channel::registry::Registry::new()),
+                Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+            ));
+        let purger = Arc::new(crate::app::purger::AppPurger::new(
+            adapter,
+            Arc::new(dashmap::DashMap::new()),
+            cache,
+        ));
+        let inv = crate::app::invalidation::AppInvalidator::spawn(&url, purger)
+            .await
+            .expect("invalidator must connect to the test Redis");
+        let status = post_invalidate(
+            State(test_state(Some("secret"), Some(inv))),
+            Path("app1".into()),
+            bearer("secret"),
+            Bytes::from(r#"{"key":"k","action":"refresh"}"#),
+        )
+        .await
+        .expect("authed valid request must return 202");
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
 }
