@@ -28,8 +28,8 @@ pub fn negotiate(
 ) -> Result<Box<dyn Codec>, PusherError> {
     match protocol {
         Some(s) => {
-            let n: u8 = s.parse().map_err(|_| PusherError::invalid_version())?;
-            supported_or_4007(u32::from(n))
+            let n: u32 = s.parse().map_err(|_| PusherError::invalid_version())?;
+            supported_or_4007(n)
         }
         None => {
             if let Some(v) = version {
@@ -48,7 +48,7 @@ pub fn negotiate(
 /// wide (u32) so an out-of-range-but-well-formed major lands on 4007
 /// (unsupported) rather than 4006 (malformed).
 fn major_of(version: &str) -> Option<u32> {
-    version.split('.').next()?.parse().ok()
+    version.split('.').next().unwrap_or_default().parse().ok()
 }
 
 fn supported_or_4007(major: u32) -> Result<Box<dyn Codec>, PusherError> {
@@ -130,5 +130,25 @@ mod tests {
     #[test]
     fn unsupported_explicit_protocol_is_4007() {
         assert_eq!(negotiate(Some("3"), None, false).unwrap_err().code, 4007);
+    }
+
+    // A parseable-but-out-of-range protocol integer (e.g. 300) is merely
+    // *unsupported* (4007), not a malformed version string (4006) — same rule
+    // the wide-parse `version` inference already applies.
+    #[test]
+    fn out_of_range_protocol_integer_is_4007_not_4006() {
+        assert_eq!(negotiate(Some("300"), None, false).unwrap_err().code, 4007);
+    }
+
+    // Beyond u32 range the value is no longer a well-formed version integer;
+    // that stays a 4006.
+    #[test]
+    fn u32_overflow_protocol_integer_is_still_4006() {
+        assert_eq!(
+            negotiate(Some("99999999999"), None, false)
+                .unwrap_err()
+                .code,
+            4006
+        );
     }
 }
