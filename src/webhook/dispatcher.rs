@@ -3,7 +3,6 @@
 //! `event_types`, signing, and handing deliveries to a `WebhookTransport`.
 
 use crate::app::AppManager;
-use crate::webhook::batch::coalesce;
 use crate::webhook::event::WebhookEvent;
 use crate::webhook::occupancy::OccupancySource;
 use crate::webhook::transport::{build_signed_delivery, WebhookTransport};
@@ -104,8 +103,20 @@ impl WebhookDispatcher {
         }
     }
 
-    /// Partition by app, coalesce, then per configured endpoint filter by
-    /// `event_types`, build+sign one envelope, and deliver.
+    /// Partition by app, then per configured endpoint filter by `event_types`,
+    /// build+sign one envelope, and deliver.
+    ///
+    /// There is deliberately NO opposing-pair coalescing within a batch: the
+    /// hosted Channels webhooks doc
+    /// (https://pusher.com/docs/channels/server_api/webhooks/) scopes its
+    /// "delay of up to three seconds" and its reconnect-only suppression to
+    /// `channel_vacated` / `member_removed` — an already-fired
+    /// `channel_occupied` is never cancelled. So a channel created and vacated
+    /// within one window still gets BOTH events on hosted Channels. The former
+    /// 1:1 occupied↔vacated / member_added↔member_removed cancellation (audit
+    /// finding R12a) delivered NEITHER and was removed for parity; reconnect
+    /// suppression is provided by the cluster-path vacated grace + occupancy
+    /// recheck below.
     ///
     /// On the cluster path (`vacated_grace_ms > 0` and `occupancy.is_some()`)
     /// each surviving `channel_vacated` is NOT delivered inline; instead a
@@ -122,10 +133,10 @@ impl WebhookDispatcher {
         let cluster = self.vacated_grace_ms > 0 && self.occupancy.is_some();
 
         for (app_id, events) in by_app {
-            let survivors = coalesce(events);
-            if survivors.is_empty() {
-                continue;
-            }
+            // No coalescing — see the doc comment above (R12a: Pusher delivers
+            // both sides of a create-and-vacate within one window; suppression
+            // belongs to the reconnect path, not the batch window).
+            let survivors = events;
 
             // On the cluster path, peel surviving vacated events off for the
             // debounced grace+recheck; everything else delivers inline now.
@@ -139,8 +150,9 @@ impl WebhookDispatcher {
 
             if !immediate.is_empty() {
                 let app = match self.apps.by_id(&app_id).await {
-                    Ok(Some(a)) => a,
-                    Ok(None) => continue, // app vanished (hot-reload race): drop
+                    Ok(crate::app::AppLookup::Found(a)) => a,
+                    // App vanished OR was disabled (hot-reload race): drop.
+                    Ok(_) => continue,
                     Err(e) => {
                         tracing::warn!(error = %e, "webhook app lookup failed; skipping cycle");
                         continue;
@@ -190,8 +202,9 @@ impl WebhookDispatcher {
                             return;
                         }
                         let resolved = match apps.by_id(&app).await {
-                            Ok(Some(a)) => a,
-                            Ok(None) => return, // app vanished: drop
+                            Ok(crate::app::AppLookup::Found(a)) => a,
+                            // App vanished or disabled: drop.
+                            Ok(_) => return,
                             Err(e) => {
                                 tracing::warn!(error = %e, "webhook app lookup failed; skipping cycle");
                                 return;
@@ -264,11 +277,15 @@ mod tests {
 
     #[async_trait]
     impl AppManager for OneApp {
-        async fn by_key(&self, key: &str) -> Result<Option<std::sync::Arc<App>>, AppLookupError> {
-            Ok((self.0.key == key).then(|| std::sync::Arc::new(self.0.clone())))
+        async fn by_key(&self, key: &str) -> Result<crate::app::AppLookup, AppLookupError> {
+            Ok((self.0.key == key)
+                .then(|| std::sync::Arc::new(self.0.clone()))
+                .into())
         }
-        async fn by_id(&self, id: &str) -> Result<Option<std::sync::Arc<App>>, AppLookupError> {
-            Ok((self.0.id == id).then(|| std::sync::Arc::new(self.0.clone())))
+        async fn by_id(&self, id: &str) -> Result<crate::app::AppLookup, AppLookupError> {
+            Ok((self.0.id == id)
+                .then(|| std::sync::Arc::new(self.0.clone()))
+                .into())
         }
     }
 
@@ -330,7 +347,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn one_window_batches_and_coalesces_into_one_delivery() {
+    async fn one_window_batches_all_events_into_one_delivery() {
         let app = app_with(vec![WebhookConfig {
             url: "https://e.test/all".into(),
             event_types: vec![
@@ -355,7 +372,11 @@ mod tests {
         };
         let task = tokio::spawn(dispatcher.run());
 
-        // Three triggers inside ONE window: occ + vac (cancel) + miss (survives).
+        // Three triggers inside ONE window: occ + vac + miss. Pusher documents
+        // that channel_occupied fires immediately while channel_vacated is
+        // merely delayed ("up to three seconds") and suppressed only when the
+        // client reconnects — a channel created and vacated within one window
+        // still gets BOTH events. No opposing-pair cancellation (audit R12a).
         tx.send(occ()).await.unwrap();
         tx.send(vac()).await.unwrap();
         tx.send(miss()).await.unwrap();
@@ -376,10 +397,15 @@ mod tests {
         let events = env["events"].as_array().unwrap();
         assert_eq!(
             events.len(),
-            1,
-            "occ+vac coalesced away; only cache_miss left"
+            3,
+            "occ+vac+miss all delivered; no cancellation"
         );
-        assert_eq!(events[0]["name"], "cache_miss");
+        let names: Vec<&str> = events.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec!["channel_occupied", "channel_vacated", "cache_miss"],
+            "enqueue order preserved"
+        );
 
         drop(tx);
         let _ = task.await;

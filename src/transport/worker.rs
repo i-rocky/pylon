@@ -331,7 +331,7 @@ struct PendingEstablish {
 struct ResolvedApp {
     token: usize,
     gen: u64,
-    result: Result<Option<Arc<App>>, crate::app::AppLookupError>,
+    result: Result<crate::app::AppLookup, crate::app::AppLookupError>,
 }
 
 /// Build a `mio` listener bound to `addr` with `SO_REUSEADDR` + `SO_REUSEPORT`
@@ -1381,10 +1381,14 @@ fn handle_handshake(
                     }
                 };
                 let resolved = match env.apps.by_key_cached(&app_key) {
-                    Some(Ok(Some(app))) => {
+                    Some(Ok(crate::app::AppLookup::Found(app))) => {
                         finish_establish(env, app, codec, notify, cfg.mailbox_dropped_slot.clone())
                     }
-                    Some(Ok(None)) => Err(Reject {
+                    // R1: unknown AND disabled keys share the single WS answer
+                    // (4001 "Could not find app by key") — only REST carries the
+                    // 403 distinction.
+                    Some(Ok(crate::app::AppLookup::Disabled))
+                    | Some(Ok(crate::app::AppLookup::NotFound)) => Err(Reject {
                         error: PusherError::app_not_found(),
                         codec: Some(codec),
                     }),
@@ -2154,10 +2158,11 @@ fn drain_dirty_sessions(
 /// * `pending_establish.gen != gen` (or `pending_establish` is `None`) → the slab
 ///   token was recycled to a different connection; discard (no use-after-park).
 /// * else take the `PendingEstablish` and apply:
-///   * `Ok(Some(app))` → `finish_establish`; on `Ok(session)` queue
+///   * `Ok(Found(app))` → `finish_establish`; on `Ok(session)` queue
 ///     `connection_established` + store the session + flush; on `Err(reject)`
 ///     queue the reject + flush + `remove`.
-///   * `Ok(None)`  → reject `app_not_found` (4001) + flush + `remove`.
+///   * `Ok(Disabled | NotFound)` → reject `app_not_found` (4001) + flush +
+///     `remove` (R1: the WS side keeps ONE answer for an unusable key).
 ///   * `Err(_)`    → reject `backend_unavailable` (4103) + flush + `remove`.
 ///
 /// Returns whether it wrote anything (so the adaptive poll stays tight). O(1) when
@@ -2203,11 +2208,17 @@ fn drain_resolved(
         };
 
         let outcome = match result {
-            Ok(Some(app)) => finish_establish(env, app, pe.codec, pe.notify, pe.mailbox_dropped),
-            Ok(None) => Err(Reject {
-                error: PusherError::app_not_found(),
-                codec: Some(pe.codec),
-            }),
+            Ok(crate::app::AppLookup::Found(app)) => {
+                finish_establish(env, app, pe.codec, pe.notify, pe.mailbox_dropped)
+            }
+            // R1: unknown AND disabled keys share the 4001 WS answer (REST
+            // distinguishes disabled via 403; WS keeps one unusable-key code).
+            Ok(crate::app::AppLookup::Disabled) | Ok(crate::app::AppLookup::NotFound) => {
+                Err(Reject {
+                    error: PusherError::app_not_found(),
+                    codec: Some(pe.codec),
+                })
+            }
             Err(e) => {
                 tracing::warn!(key = %pe.key, error = %e, "offloaded app lookup failed (transient)");
                 Err(Reject {

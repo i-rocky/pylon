@@ -1,4 +1,4 @@
-use super::{App, AppLookupError, AppManager};
+use super::{App, AppLookup, AppLookupError, AppManager};
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -20,29 +20,31 @@ impl StaticFileAppManager {
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
         Self::from_json(&std::fs::read_to_string(path)?)
     }
+
+    /// Resolve by predicate, distinguishing a found-but-disabled app (`Disabled`,
+    /// REST 403) from no match at all (`NotFound`, REST 401).
+    fn resolve<F: Fn(&App) -> bool>(&self, pred: F) -> AppLookup {
+        match self.apps.iter().find(|a| pred(a)) {
+            Some(a) if a.enabled => AppLookup::Found(a.clone()),
+            Some(_) => AppLookup::Disabled,
+            None => AppLookup::NotFound,
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl AppManager for StaticFileAppManager {
-    async fn by_key(&self, key: &str) -> Result<Option<Arc<App>>, AppLookupError> {
-        Ok(self
-            .apps
-            .iter()
-            .find(|a| a.key == key && a.enabled)
-            .cloned())
+    async fn by_key(&self, key: &str) -> Result<AppLookup, AppLookupError> {
+        Ok(self.resolve(|a| a.key == key))
     }
-    async fn by_id(&self, id: &str) -> Result<Option<Arc<App>>, AppLookupError> {
-        Ok(self.apps.iter().find(|a| a.id == id && a.enabled).cloned())
+    async fn by_id(&self, id: &str) -> Result<AppLookup, AppLookupError> {
+        Ok(self.resolve(|a| a.id == id))
     }
 
-    fn by_key_cached(&self, key: &str) -> Option<Result<Option<Arc<App>>, AppLookupError>> {
+    fn by_key_cached(&self, key: &str) -> Option<Result<AppLookup, AppLookupError>> {
         // The whole app set is in memory; resolving never does I/O, so the static
         // path always answers synchronously and never offloads.
-        Some(Ok(self
-            .apps
-            .iter()
-            .find(|a| a.key == key && a.enabled)
-            .cloned()))
+        Some(Ok(self.resolve(|a| a.key == key)))
     }
 }
 
@@ -58,25 +60,41 @@ mod tests {
     #[tokio::test]
     async fn looks_up_by_key_and_id() {
         let m = StaticFileAppManager::from_json(SAMPLE).unwrap();
-        let app = m.by_key("app-key").await.unwrap().expect("found by key");
+        let AppLookup::Found(app) = m.by_key("app-key").await.unwrap() else {
+            panic!("found by key");
+        };
         assert_eq!(app.id, "app-id");
         assert_eq!(app.capacity, 2);
-        assert!(m.by_id("app-id").await.unwrap().is_some());
-        assert!(m.by_key("nope").await.unwrap().is_none()); // Ok(None), not Err
+        assert!(matches!(
+            m.by_id("app-id").await.unwrap(),
+            AppLookup::Found(_)
+        ));
+        // Ok(NotFound), not Err — unknown keys are a normal answer.
+        assert!(matches!(
+            m.by_key("nope").await.unwrap(),
+            AppLookup::NotFound
+        ));
     }
 
+    /// R1: a disabled app is `Disabled`, NOT `NotFound` — the REST layer maps
+    /// Disabled to 403 and NotFound to 401.
     #[tokio::test]
-    async fn disabled_app_resolves_to_none() {
+    async fn disabled_app_resolves_to_disabled_not_not_found() {
         let raw = r#"[{"name":"X","id":"a","key":"k","secret":"s","enabled":false}]"#;
         let m = StaticFileAppManager::from_json(raw).unwrap();
-        assert!(m.by_id("a").await.unwrap().is_none());
-        assert!(m.by_key("k").await.unwrap().is_none());
+        assert!(matches!(m.by_id("a").await.unwrap(), AppLookup::Disabled));
+        assert!(matches!(m.by_key("k").await.unwrap(), AppLookup::Disabled));
+        // The pre-R1 collapse is still available for WS-side callers.
+        assert!(m.by_id("a").await.unwrap().into_enabled().is_none());
     }
 
     #[tokio::test]
     async fn app_without_enabled_field_defaults_enabled() {
         let m = StaticFileAppManager::from_json(SAMPLE).unwrap(); // SAMPLE has no "enabled"
-        assert!(m.by_id("app-id").await.unwrap().is_some());
+        assert!(matches!(
+            m.by_id("app-id").await.unwrap(),
+            AppLookup::Found(_)
+        ));
     }
 
     #[test]
@@ -98,21 +116,29 @@ mod tests {
              "webhooks":[{"url":"https://e.test","event_types":["channel_occupied"]}]}
         ]"#;
         let m = StaticFileAppManager::from_json(raw).unwrap();
-        let app = m.by_id("a").await.unwrap().unwrap();
+        let AppLookup::Found(app) = m.by_id("a").await.unwrap() else {
+            panic!("expected Found");
+        };
         assert!(app.has_channel_occupied_webhooks);
     }
 
     #[tokio::test]
     async fn by_id_and_by_key_share_one_arc() {
         let m = StaticFileAppManager::from_json(SAMPLE).unwrap();
-        let a1 = m.by_id("app-id").await.unwrap().unwrap();
-        let a2 = m.by_id("app-id").await.unwrap().unwrap();
+        let (AppLookup::Found(a1), AppLookup::Found(a2)) = (
+            m.by_id("app-id").await.unwrap(),
+            m.by_id("app-id").await.unwrap(),
+        ) else {
+            panic!("expected Found");
+        };
         // Two lookups of the same app return the SAME backing Arc — no per-lookup clone.
         assert!(
             std::sync::Arc::ptr_eq(&a1, &a2),
             "by_id must share one Arc<App>"
         );
-        let k1 = m.by_key("app-key").await.unwrap().unwrap();
+        let AppLookup::Found(k1) = m.by_key("app-key").await.unwrap() else {
+            panic!("expected Found");
+        };
         assert!(
             std::sync::Arc::ptr_eq(&a1, &k1),
             "by_key/by_id must share the same Arc<App>"
@@ -122,19 +148,22 @@ mod tests {
     #[tokio::test]
     async fn by_key_cached_is_instant_and_matches_by_key() {
         let m = StaticFileAppManager::from_json(SAMPLE).unwrap();
-        // Hit: returns Some(Ok(Some(app))) without any I/O.
+        // Hit: returns Some(Ok(Found(app))) without any I/O.
         let probed = m.by_key_cached("app-key").expect("static always resolves");
-        assert_eq!(probed.unwrap().unwrap().id, "app-id");
-        // Miss-on-unknown: static resolves it as Some(Ok(None)), never None.
+        assert!(matches!(probed.unwrap(), AppLookup::Found(_)));
+        // Miss-on-unknown: static resolves it as Some(Ok(NotFound)), never None.
         let unknown = m.by_key_cached("nope").expect("static always resolves");
-        assert!(unknown.unwrap().is_none());
+        assert!(matches!(unknown.unwrap(), AppLookup::NotFound));
     }
 
     #[tokio::test]
-    async fn by_key_cached_honours_enabled_flag() {
+    async fn by_key_cached_distinguishes_disabled() {
         let raw = r#"[{"name":"X","id":"a","key":"k","secret":"s","enabled":false}]"#;
         let m = StaticFileAppManager::from_json(raw).unwrap();
         let probed = m.by_key_cached("k").expect("static always resolves");
-        assert!(probed.unwrap().is_none(), "disabled app resolves to None");
+        assert!(
+            matches!(probed.unwrap(), AppLookup::Disabled),
+            "disabled app probes as Disabled (WS maps it to the same 4001)"
+        );
     }
 }

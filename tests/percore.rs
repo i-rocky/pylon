@@ -67,7 +67,20 @@ fn free_port() -> u16 {
 /// Spawn a dispatch worker on its own OS thread with a `LocalAdapter`-backed
 /// environment mirroring `AppState`. Waits briefly for the listener to bind.
 async fn spawn(config: ServerConfig) -> Harness {
-    let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
+    spawn_with_apps(config, APPS).await
+}
+
+/// The R1 fixture: one enabled app plus one DISABLED app (`"enabled": false`).
+const APPS_WITH_DISABLED: &str = r#"[
+    {"name":"Test","id":"app","key":"app-key","secret":"app-secret",
+     "capacity":2,"client_messages_enabled":true,"subscription_count_enabled":true},
+    {"name":"Off","id":"off-app","key":"off-key","secret":"off-secret","enabled":false}
+]"#;
+
+/// [`spawn`] with a custom apps.json fixture (exercises the SYNCHRONOUS
+/// `by_key_cached` probe path of the static-file manager).
+async fn spawn_with_apps(config: ServerConfig, apps_json: &str) -> Harness {
+    let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(apps_json).unwrap());
     let registry = Arc::new(Registry::new());
     let app_registry = Arc::new(AppRegistry::new());
     let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry, app_registry.clone()));
@@ -684,6 +697,16 @@ async fn empty_app_key_errors_4005_path_not_found() {
 async fn unknown_app_key_still_errors_4001() {
     let h = spawn(ServerConfig::default()).await;
     let mut ws = connect_path(h.port, "/app/no-such-key?protocol=7").await;
+    assert_rejected_with(&mut ws, 4001, "Could not find app by key").await;
+}
+
+/// R1: a DISABLED app's key keeps the single WS answer for an unusable key —
+/// 4001 "Could not find app by key" (the audit's chosen behavior; the REST
+/// side distinguishes disabled via 403, the WS side does not).
+#[tokio::test]
+async fn disabled_app_key_still_errors_4001() {
+    let h = spawn_with_apps(ServerConfig::default(), APPS_WITH_DISABLED).await;
+    let mut ws = connect_path(h.port, "/app/off-key?protocol=7").await;
     assert_rejected_with(&mut ws, 4001, "Could not find app by key").await;
 }
 

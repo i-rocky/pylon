@@ -1,4 +1,4 @@
-use super::{App, AppLookupError, AppManager};
+use super::{App, AppLookup, AppLookupError, AppManager};
 use mongodb::{bson::doc, Client, Collection};
 use std::sync::Arc;
 
@@ -20,19 +20,26 @@ impl MongoAppManager {
         })
     }
 
-    async fn find(&self, field: &str, val: &str) -> Result<Option<Arc<App>>, AppLookupError> {
-        let filter = doc! { field: val, "enabled": true };
+    /// Find by field WITHOUT an `enabled: true` filter, so a found-but-disabled
+    /// document maps to `AppLookup::Disabled` (REST 403) rather than being
+    /// erased into `NotFound` (REST 401). R1.
+    async fn find(&self, field: &str, val: &str) -> Result<AppLookup, AppLookupError> {
+        let filter = doc! { field: val };
         match self
             .apps
             .find_one(filter)
             .await
             .map_err(|e| AppLookupError::Backend(e.to_string()))?
         {
-            None => Ok(None),
+            None => Ok(AppLookup::NotFound),
             Some(mut app) => {
                 app.recompute_has_flags();
                 app.validate().map_err(AppLookupError::Decode)?;
-                Ok(Some(Arc::new(app)))
+                if app.enabled {
+                    Ok(AppLookup::Found(Arc::new(app)))
+                } else {
+                    Ok(AppLookup::Disabled)
+                }
             }
         }
     }
@@ -40,10 +47,10 @@ impl MongoAppManager {
 
 #[async_trait::async_trait]
 impl AppManager for MongoAppManager {
-    async fn by_id(&self, id: &str) -> Result<Option<Arc<App>>, AppLookupError> {
+    async fn by_id(&self, id: &str) -> Result<AppLookup, AppLookupError> {
         self.find("id", id).await
     }
-    async fn by_key(&self, key: &str) -> Result<Option<Arc<App>>, AppLookupError> {
+    async fn by_key(&self, key: &str) -> Result<AppLookup, AppLookupError> {
         self.find("key", key).await
     }
 }

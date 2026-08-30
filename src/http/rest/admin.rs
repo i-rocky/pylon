@@ -6,7 +6,10 @@ use crate::http::error::RestError;
 use crate::server::router::AppState;
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{
+        rejection::BytesRejection,
+        {Path, State},
+    },
     http::HeaderMap,
 };
 
@@ -33,11 +36,13 @@ pub async fn post_invalidate(
     State(state): State<AppState>,
     Path(app_id): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Result<axum::http::StatusCode, RestError> {
     let Some(expected) = state.config.app_admin_token.as_deref() else {
         return Err(RestError::not_found("admin api disabled"));
     };
+    // Map the body-limit rejection (413) into a RestError (JSON error body).
+    let body = body.map_err(|e| RestError::from_rejection(e.status(), e.body_text()))?;
     let presented = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -182,7 +187,7 @@ mod tests {
             State(test_state(None, None)),
             Path("app1".into()),
             HeaderMap::new(),
-            Bytes::from(r#"{"key":"k"}"#),
+            Ok(Bytes::from(r#"{"key":"k"}"#)),
         )
         .await
         .unwrap_err();
@@ -196,7 +201,7 @@ mod tests {
             State(test_state(Some("secret"), None)),
             Path("app1".into()),
             bearer("wrong"),
-            Bytes::from(r#"{"key":"k"}"#),
+            Ok(Bytes::from(r#"{"key":"k"}"#)),
         )
         .await
         .unwrap_err();
@@ -206,7 +211,7 @@ mod tests {
             State(test_state(Some("secret"), None)),
             Path("app1".into()),
             HeaderMap::new(),
-            Bytes::from(r#"{"key":"k"}"#),
+            Ok(Bytes::from(r#"{"key":"k"}"#)),
         )
         .await
         .unwrap_err();
@@ -221,7 +226,7 @@ mod tests {
             State(test_state(Some("secret"), None)),
             Path("app1".into()),
             bearer("wrong"),
-            Bytes::from("definitely not json"),
+            Ok(Bytes::from("definitely not json")),
         )
         .await
         .unwrap_err();
@@ -238,7 +243,7 @@ mod tests {
             State(test_state(Some("secret"), None)),
             Path("app1".into()),
             bearer("secret"),
-            Bytes::from("not json"),
+            Ok(Bytes::from("not json")),
         )
         .await
         .unwrap_err();
@@ -251,7 +256,7 @@ mod tests {
             State(test_state(Some("secret"), None)),
             Path("app1".into()),
             bearer("secret"),
-            Bytes::from(r#"{"key":"k"}"#),
+            Ok(Bytes::from(r#"{"key":"k"}"#)),
         )
         .await
         .unwrap_err();
@@ -294,7 +299,7 @@ mod tests {
             State(test_state(Some("secret"), Some(inv))),
             Path("app1".into()),
             bearer("secret"),
-            Bytes::from(r#"{"key":"k","action":"refresh"}"#),
+            Ok(Bytes::from(r#"{"key":"k","action":"refresh"}"#)),
         )
         .await
         .expect("authed valid request must return 202");

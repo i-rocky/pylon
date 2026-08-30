@@ -63,13 +63,19 @@ fn redis_test_config(prefix: &str) -> ServerConfig {
 /// occupied/vacated webhooks — the exact per-app flags the bridge resolves to decide
 /// whether to broadcast the count and fire the webhooks.
 fn apps_manager() -> Arc<dyn AppManager> {
-    let raw = r#"[
-        {"name":"Test","id":"app","key":"app-key","secret":"app-secret",
+    apps_manager_with_event_types(r#"["channel_occupied","channel_vacated"]"#)
+}
+
+/// Like [`apps_manager`] but with the caller's `event_types` JSON array — the
+/// count-webhook test adds `subscription_count` to the operator opt-in.
+fn apps_manager_with_event_types(event_types: &str) -> Arc<dyn AppManager> {
+    let raw = format!(
+        r#"[{{"name":"Test","id":"app","key":"app-key","secret":"app-secret",
          "subscription_count_enabled":true,
-         "webhooks":[{"url":"http://127.0.0.1:1/pusher/webhooks",
-                      "event_types":["channel_occupied","channel_vacated"]}]}
-    ]"#;
-    Arc::new(StaticFileAppManager::from_json(raw).expect("apps json must parse"))
+         "webhooks":[{{"url":"http://127.0.0.1:1/pusher/webhooks",
+                      "event_types":{event_types}}}]}}]"#
+    );
+    Arc::new(StaticFileAppManager::from_json(&raw).expect("apps json must parse"))
 }
 
 /// A real webhook dispatcher backed by a `RecordingTransport`, so the bridge's
@@ -106,6 +112,27 @@ async fn count_webhook(transport: &RecordingTransport, name: &str) -> usize {
         }
     }
     n
+}
+
+/// The `subscription_count` VALUES (in delivery order) recorded on a transport —
+/// the per-node observation for the count-webhook test below.
+async fn subscription_count_values(transport: &RecordingTransport) -> Vec<u64> {
+    let mut out = Vec::new();
+    for d in transport.recorded().await {
+        let v: Value = serde_json::from_str(&d.body).expect("webhook body must be JSON");
+        if let Some(events) = v.get("events").and_then(|e| e.as_array()) {
+            for e in events {
+                if e.get("name").and_then(|x| x.as_str()) == Some("subscription_count") {
+                    out.push(
+                        e.get("subscription_count")
+                            .and_then(|c| c.as_u64())
+                            .expect("subscription_count must be a JSON number"),
+                    );
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Register a fake subscriber for `(TEST_APP, channel)` on `local` (no sink installed
@@ -451,17 +478,16 @@ async fn cross_node_vacated_single_emit() {
         // PRECONDITION GATE (the actual fix for CI run 33303526290's zero-delivery
         // failure): wait until A's `channel_occupied` webhook (fired by A's
         // subscribe, the cluster 0→1 edge) has been DELIVERED by A's dispatcher
-        // before firing any unsubscribe. Webhook spec §5 coalesces a
-        // `channel_occupied` and a `channel_vacated` for the same channel that
-        // share ONE batch window — they cancel 1:1 and NEITHER is ever delivered
-        // (deterministic: coalesce([occupied, vacated]) == [] is a unit-tested
-        // spec rule). If node A wins the vacate-CAS while its occupied is still
-        // pending in the same 10ms window (exactly what a stalled runner's
-        // scheduler gap produces), the vacated would be cancelled away and NO
-        // budget would ever observe it. With the occupied DELIVERED, A's batch is
-        // flushed and empty, so whichever node later wins the vacate lands in a
-        // fresh batch and is delivered. This gates the test's precondition; it
-        // changes no assertion.
+        // before firing any unsubscribe. Historically this gated against the
+        // batch coalescer cancelling an occupied+vacated pair sharing one
+        // 10ms window; that coalescing was removed for Pusher parity (audit
+        // R12a — the doc's vacate delay + reconnect-only suppression implies
+        // BOTH sides of a create-and-vacate are delivered), so the cancellation
+        // hazard is gone. The gate is kept as belt-and-suspenders: with the
+        // occupied DELIVERED, A's batch is flushed and empty, so whichever node
+        // later wins the vacate lands in a fresh batch — isolating the
+        // exactly-once assertion from dispatcher window timing entirely. This
+        // gates the test's precondition; it changes no assertion.
         assert!(
             wait_until(WEBHOOK_CHAIN_BUDGET, || async {
                 count_webhook(&node_a.transport, "channel_occupied").await >= 1
@@ -513,6 +539,143 @@ async fn cross_node_vacated_single_emit() {
             vac_a + vac_b,
             1,
             "channel_vacated must fire EXACTLY ONCE cluster-wide (A={vac_a}, B={vac_b})"
+        );
+
+        drop(node_a);
+        drop(node_b);
+    })
+    .await;
+}
+
+/// Test D — `subscription_count` WEBHOOK on the cluster path (Task 2.5 / audit
+/// R6; verified against https://pusher.com/docs/channels/server_api/webhooks/,
+/// 2026-08-30: "Channels will send a subscription_count webhook whenever a new
+/// client subscribes or unsubscribes to a channel"). The bridge owns the
+/// cluster-authoritative count (Task 0.2), so the webhook fires from the SAME
+/// `ClusterCmd::Subscribe` / `Unsubscribe` arms that broadcast the count —
+/// emitted on the node whose bridge computed the count, never duplicated. With
+/// one member per node: A subscribes → A's transport sees count 1; B subscribes
+/// → B's transport sees the CLUSTER count 2; B unsubscribes → B sees 1; A
+/// unsubscribes (cluster 1→0) → NO count webhook anywhere (the arm's `count > 0`
+/// guard — `channel_vacated` is the vacancy signal), and `channel_vacated`
+/// fires exactly once cluster-wide.
+#[tokio::test]
+async fn cluster_subscription_count_webhook_follows_bridge_owned_counts() {
+    with_timeout(async {
+        let prefix = random_prefix();
+        let apps = apps_manager_with_event_types(
+            r#"["channel_occupied","channel_vacated","subscription_count"]"#,
+        );
+        let node_a = start_node(&prefix, apps.clone());
+        let node_b = start_node(&prefix, apps.clone());
+
+        let channel = "count-webhook-chan";
+
+        // A subscribes (cluster 0→1): A's bridge owns the edge → A's transport
+        // gets subscription_count == 1 (B's gets nothing).
+        let (sid_a, ca, mailbox_a, _rx_a) = fake_subscriber(&node_a.local, channel).await;
+        assert_eq!(ca, 1);
+        node_a.bridge.handle().subscribe(
+            Arc::from(TEST_APP),
+            Arc::from(channel),
+            sid_a,
+            mailbox_a,
+            true,
+        );
+        assert!(
+            wait_until(WEBHOOK_CHAIN_BUDGET, || async {
+                subscription_count_values(&node_a.transport).await == vec![1]
+            })
+            .await,
+            "A's bridge must emit the subscription_count webhook with the cluster count 1"
+        );
+        assert_eq!(
+            subscription_count_values(&node_b.transport).await,
+            Vec::<u64>::new(),
+            "no count webhook on B for A's edge"
+        );
+
+        // B subscribes (cluster 1→2): B's bridge computed the authoritative
+        // CLUSTER count → B's transport gets 2 (not B's node-local 1).
+        let (sid_b, cb, mailbox_b, _rx_b) = fake_subscriber(&node_b.local, channel).await;
+        assert_eq!(cb, 1, "B first node-local subscriber → its local count 1");
+        node_b.bridge.handle().subscribe(
+            Arc::from(TEST_APP),
+            Arc::from(channel),
+            sid_b,
+            mailbox_b,
+            true,
+        );
+        assert!(
+            wait_until(WEBHOOK_CHAIN_BUDGET, || async {
+                subscription_count_values(&node_b.transport).await == vec![2]
+            })
+            .await,
+            "B's bridge must emit the subscription_count webhook with the CLUSTER count 2"
+        );
+
+        // B unsubscribes (cluster 2→1): B's Unsubscribe arm owns the remaining
+        // count → B's transport appends 1.
+        let un_b = node_b.local.unsubscribe(TEST_APP, channel, &sid_b).await;
+        node_b.bridge.handle().unsubscribe(
+            Arc::from(TEST_APP),
+            Arc::from(channel),
+            sid_b,
+            un_b.subscription_count == 0,
+        );
+        assert!(
+            wait_until(WEBHOOK_CHAIN_BUDGET, || async {
+                subscription_count_values(&node_b.transport).await == vec![2, 1]
+            })
+            .await,
+            "B's bridge must emit the remaining cluster count 1 on unsubscribe"
+        );
+
+        // A unsubscribes (cluster 1→0): count 0 → NO count webhook anywhere; the
+        // vacate-CAS winner (A) fires channel_vacated exactly once instead.
+        let un_a = node_a.local.unsubscribe(TEST_APP, channel, &sid_a).await;
+        node_a.bridge.handle().unsubscribe(
+            Arc::from(TEST_APP),
+            Arc::from(channel),
+            sid_a,
+            un_a.subscription_count == 0,
+        );
+        assert!(
+            wait_until(WEBHOOK_CHAIN_BUDGET, || async {
+                count_webhook(&node_a.transport, "channel_vacated").await
+                    + count_webhook(&node_b.transport, "channel_vacated").await
+                    >= 1
+            })
+            .await,
+            "channel_vacated must fire on the cluster 1→0 edge"
+        );
+        // Duplicate-exposure window: an illegal extra count emit (or a second
+        // vacated) rides the same chain — hold, then pin the final picture.
+        tokio::time::sleep(DUPLICATE_EXPOSURE_WINDOW).await;
+        assert_eq!(
+            subscription_count_values(&node_a.transport).await,
+            vec![1],
+            "A's count webhooks: exactly one, with the cluster count 1"
+        );
+        assert_eq!(
+            subscription_count_values(&node_b.transport).await,
+            vec![2, 1],
+            "B's count webhooks: cluster counts 2 then 1"
+        );
+        assert!(
+            !subscription_count_values(&node_a.transport)
+                .await
+                .into_iter()
+                .chain(subscription_count_values(&node_b.transport).await)
+                .any(|c| c == 0),
+            "no zero-count webhook on the vacate edge (count > 0 guard)"
+        );
+        let vac_a = count_webhook(&node_a.transport, "channel_vacated").await;
+        let vac_b = count_webhook(&node_b.transport, "channel_vacated").await;
+        assert_eq!(
+            vac_a + vac_b,
+            1,
+            "channel_vacated exactly once cluster-wide"
         );
 
         drop(node_a);

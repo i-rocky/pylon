@@ -132,11 +132,11 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl AppManager for Mock {
-        async fn by_id(&self, _: &str) -> Result<Option<std::sync::Arc<App>>, AppLookupError> {
+        async fn by_id(&self, _: &str) -> Result<crate::app::AppLookup, AppLookupError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.app.clone())
+            Ok(crate::app::AppLookup::from(self.app.clone()))
         }
-        async fn by_key(&self, k: &str) -> Result<Option<std::sync::Arc<App>>, AppLookupError> {
+        async fn by_key(&self, k: &str) -> Result<crate::app::AppLookup, AppLookupError> {
             self.by_id(k).await
         }
     }
@@ -196,7 +196,9 @@ mod tests {
         let inv_a = AppInvalidator::spawn(&redis_url(), purger_a).await.unwrap();
 
         // warm node B's cache (driver call 1), then invalidate from node A
-        assert_eq!(cache_b.by_id("a").await.unwrap().unwrap().key, "k");
+        assert!(
+            matches!(&cache_b.by_id("a").await.unwrap(), crate::app::AppLookup::Found(a) if a.key == "k")
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         inv_a
             .publish("a", "k", InvalidateAction::Refresh)
@@ -213,7 +215,9 @@ mod tests {
         let calls_before = calls.load(Ordering::SeqCst);
         if calls_before < 2 {
             // eviction not yet detected by probe; do re-fetch here as the binding assertion
-            assert_eq!(cache_b.by_id("a").await.unwrap().unwrap().key, "k");
+            assert!(
+                matches!(&cache_b.by_id("a").await.unwrap(), crate::app::AppLookup::Found(a) if a.key == "k")
+            );
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 2,
@@ -278,7 +282,9 @@ mod tests {
         let _inv_b = AppInvalidator::spawn(&redis_url(), purger_b).await.unwrap();
 
         // Warm node B's cache.
-        assert_eq!(cache_b.by_id("a").await.unwrap().unwrap().key, "k");
+        assert!(
+            matches!(&cache_b.by_id("a").await.unwrap(), crate::app::AppLookup::Found(a) if a.key == "k")
+        );
         let warmed = calls.load(Ordering::SeqCst);
 
         // node A publishes a REMOVE.

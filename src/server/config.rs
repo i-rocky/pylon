@@ -58,8 +58,20 @@ pub struct ServerConfig {
     pub max_watchlist_size: usize,
     pub webhook_batch_ms: u64,
     pub webhook_timeout_ms: u64,
-    pub webhook_max_retries: u32,
-    pub webhook_retry_base_ms: u64,
+    /// Exponential-backoff base for webhook retries: the delay after the first
+    /// failed attempt is this long, doubling each attempt up to
+    /// [`ServerConfig::webhook_backoff_cap_ms`]. `PYLON_WEBHOOK_BACKOFF_BASE_MS`
+    /// (default 1000). Replaces the deprecated `webhook_retry_base_ms`.
+    pub webhook_backoff_base_ms: u64,
+    /// Upper bound (ms) for each webhook retry backoff delay (default 60000).
+    /// `PYLON_WEBHOOK_BACKOFF_CAP_MS`.
+    pub webhook_backoff_cap_ms: u64,
+    /// Total webhook retry budget (ms): a delivery that has not received a 2xx
+    /// by the time this much elapsed time (attempts + backoffs) has passed is
+    /// dropped. Pusher parity — Channels "will retry sending the webhook, with
+    /// exponential backoff, for 5 minutes" on any non-2xx. `0` disables retries
+    /// (single attempt). `PYLON_WEBHOOK_RETRY_BUDGET_MS` (default 300000).
+    pub webhook_retry_budget_ms: u64,
     pub webhook_max_concurrency: usize,
     pub max_channel_name_length: usize,
     pub max_event_name_length: usize,
@@ -204,8 +216,9 @@ impl Default for ServerConfig {
             max_watchlist_size: 100,
             webhook_batch_ms: 50,
             webhook_timeout_ms: 5000,
-            webhook_max_retries: 3,
-            webhook_retry_base_ms: 100,
+            webhook_backoff_base_ms: 1000,
+            webhook_backoff_cap_ms: 60000,
+            webhook_retry_budget_ms: 300000,
             webhook_max_concurrency: 100,
             max_channel_name_length: 164,
             max_event_name_length: 200,
@@ -365,14 +378,40 @@ impl ServerConfig {
                 c.webhook_timeout_ms = p;
             }
         }
-        if let Ok(v) = std::env::var("PYLON_WEBHOOK_MAX_RETRIES") {
-            if let Ok(p) = v.parse() {
-                c.webhook_max_retries = p;
-            }
-        }
+        // Deprecated webhook retry knobs (kept for one release). Parsed FIRST so
+        // the canonical `PYLON_WEBHOOK_BACKOFF_BASE_MS` wins when both are set;
+        // `PYLON_WEBHOOK_MAX_RETRIES` has no successor (retries are bounded by
+        // the total-time budget now, not by an attempt count) and is ignored.
         if let Ok(v) = std::env::var("PYLON_WEBHOOK_RETRY_BASE_MS") {
             if let Ok(p) = v.parse() {
-                c.webhook_retry_base_ms = p;
+                c.webhook_backoff_base_ms = p;
+            }
+            tracing::warn!(
+                value = %v,
+                "PYLON_WEBHOOK_RETRY_BASE_MS is deprecated; use PYLON_WEBHOOK_BACKOFF_BASE_MS \
+                 (alias honored this release)"
+            );
+        }
+        if let Ok(v) = std::env::var("PYLON_WEBHOOK_MAX_RETRIES") {
+            tracing::warn!(
+                value = %v,
+                "PYLON_WEBHOOK_MAX_RETRIES is deprecated and ignored; webhook retries are now \
+                 bounded by PYLON_WEBHOOK_RETRY_BUDGET_MS (total time, not attempt count)"
+            );
+        }
+        if let Ok(v) = std::env::var("PYLON_WEBHOOK_BACKOFF_BASE_MS") {
+            if let Ok(p) = v.parse() {
+                c.webhook_backoff_base_ms = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_WEBHOOK_BACKOFF_CAP_MS") {
+            if let Ok(p) = v.parse() {
+                c.webhook_backoff_cap_ms = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_WEBHOOK_RETRY_BUDGET_MS") {
+            if let Ok(p) = v.parse() {
+                c.webhook_retry_budget_ms = p;
             }
         }
         if let Ok(v) = std::env::var("PYLON_WEBHOOK_MAX_CONCURRENCY") {
@@ -645,11 +684,13 @@ mod tests {
         assert_eq!(c.max_client_events_per_second, 10);
         assert_eq!(c.max_presence_user_id_length, 128);
         assert_eq!(c.max_presence_user_info_bytes, 1024);
-        // webhook tunables (spec §6)
+        // webhook tunables (spec §6 + Pusher retry parity: exponential backoff
+        // 1s doubling to a 60s cap, for a ~5-minute total budget).
         assert_eq!(c.webhook_batch_ms, 50);
         assert_eq!(c.webhook_timeout_ms, 5000);
-        assert_eq!(c.webhook_max_retries, 3);
-        assert_eq!(c.webhook_retry_base_ms, 100);
+        assert_eq!(c.webhook_backoff_base_ms, 1000);
+        assert_eq!(c.webhook_backoff_cap_ms, 60000);
+        assert_eq!(c.webhook_retry_budget_ms, 300000);
         assert_eq!(c.webhook_max_concurrency, 100);
         // adapter + redis tunables
         assert_eq!(c.adapter, "local");
@@ -693,6 +734,7 @@ mod tests {
 
     #[test]
     fn sp10_overload_env_overrides_apply() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("PYLON_MEMORY_BUDGET_BYTES", "67108864");
         std::env::set_var("PYLON_EXPECTED_CONNS_PER_WORKER", "1000");
         std::env::set_var("PYLON_PERCONN_QUEUE_MIN_BYTES", "4096");
@@ -715,6 +757,7 @@ mod tests {
 
     #[test]
     fn sp10_codel_psi_env_overrides_apply() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("PYLON_CODEL_TARGET_MS", "0"); // disables CoDel
         std::env::set_var("PYLON_CODEL_INTERVAL_MS", "250");
         std::env::set_var("PYLON_PSI_BACKSTOP", "false");
@@ -736,6 +779,7 @@ mod tests {
 
     #[test]
     fn max_conn_lifetime_env_overrides_apply() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Override …
         std::env::set_var("PYLON_MAX_CONN_LIFETIME_SECS", "3600");
         let c = ServerConfig::from_env();
@@ -759,6 +803,7 @@ mod tests {
 
     #[test]
     fn redis_env_overrides_apply() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("PYLON_ADAPTER", "redis");
         std::env::set_var("PYLON_REDIS_URL", "redis://10.0.0.1:6379");
         std::env::set_var("PYLON_REDIS_PREFIX", "mypylon");
@@ -827,6 +872,7 @@ mod tests {
 
     #[test]
     fn node_ceiling_env_overrides_apply() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("PYLON_MAX_CONNECTIONS", "1000");
         std::env::set_var("PYLON_EXPECTED_PER_CONN_BYTES", "4096");
         let c = ServerConfig::from_env();
@@ -855,6 +901,7 @@ mod tests {
 
     #[test]
     fn workers_env_override_applies() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("PYLON_WORKERS", "3");
         let c = ServerConfig::from_env();
         assert_eq!(c.workers, 3);
@@ -895,6 +942,7 @@ mod tests {
 
     #[test]
     fn tls_env_overrides_apply() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("PYLON_TLS_CERT", "/path/to/cert.pem");
         std::env::set_var("PYLON_TLS_KEY", "/path/to/key.pem");
         std::env::set_var("PYLON_TLS_CA", "/path/to/ca.pem");
@@ -925,29 +973,143 @@ mod tests {
         std::env::remove_var("PYLON_TLS_CA");
     }
 
+    /// Serializes tests that mutate `PYLON_*` env vars and read them back
+    /// through `from_env`. The process environment and tracing's callsite
+    /// interest cache are process-global, so parallel runs would race (a
+    /// foreign thread evaluating a warn! callsite under the no-op global
+    /// subscriber can cache it as disabled, dropping the event).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn webhook_env_overrides_apply() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Use a guarded set/remove to avoid cross-test env bleed.
         std::env::set_var("PYLON_WEBHOOK_BATCH_MS", "25");
         std::env::set_var("PYLON_WEBHOOK_TIMEOUT_MS", "1234");
-        std::env::set_var("PYLON_WEBHOOK_MAX_RETRIES", "7");
-        std::env::set_var("PYLON_WEBHOOK_RETRY_BASE_MS", "10");
+        std::env::set_var("PYLON_WEBHOOK_BACKOFF_BASE_MS", "10");
+        std::env::set_var("PYLON_WEBHOOK_BACKOFF_CAP_MS", "20");
+        std::env::set_var("PYLON_WEBHOOK_RETRY_BUDGET_MS", "30");
         std::env::set_var("PYLON_WEBHOOK_MAX_CONCURRENCY", "5");
         let c = ServerConfig::from_env();
         assert_eq!(c.webhook_batch_ms, 25);
         assert_eq!(c.webhook_timeout_ms, 1234);
-        assert_eq!(c.webhook_max_retries, 7);
-        assert_eq!(c.webhook_retry_base_ms, 10);
+        assert_eq!(c.webhook_backoff_base_ms, 10);
+        assert_eq!(c.webhook_backoff_cap_ms, 20);
+        assert_eq!(c.webhook_retry_budget_ms, 30);
         assert_eq!(c.webhook_max_concurrency, 5);
         std::env::remove_var("PYLON_WEBHOOK_BATCH_MS");
         std::env::remove_var("PYLON_WEBHOOK_TIMEOUT_MS");
-        std::env::remove_var("PYLON_WEBHOOK_MAX_RETRIES");
-        std::env::remove_var("PYLON_WEBHOOK_RETRY_BASE_MS");
+        std::env::remove_var("PYLON_WEBHOOK_BACKOFF_BASE_MS");
+        std::env::remove_var("PYLON_WEBHOOK_BACKOFF_CAP_MS");
+        std::env::remove_var("PYLON_WEBHOOK_RETRY_BUDGET_MS");
         std::env::remove_var("PYLON_WEBHOOK_MAX_CONCURRENCY");
+    }
+
+    /// Install a thread-local `tracing` subscriber that records every event's
+    /// `message` field into a shared buffer, so tests can assert that
+    /// deprecated env vars emit a warning. A hand-rolled subscriber (rather
+    /// than `fmt` + `MakeWriter`) keeps the interest protocol simple: events
+    /// are unconditionally enabled, so nothing is dropped by level filtering.
+    fn capture_warnings() -> (
+        std::sync::Arc<std::sync::Mutex<String>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        use std::sync::{Arc, Mutex};
+
+        struct CaptureSubscriber {
+            events: Arc<Mutex<String>>,
+        }
+
+        struct MessageVisitor<'a> {
+            out: &'a mut String,
+        }
+
+        impl tracing::field::Visit for MessageVisitor<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    use std::fmt::Write;
+                    let _ = write!(self.out, "{value:?} ");
+                }
+            }
+        }
+
+        impl tracing::Subscriber for CaptureSubscriber {
+            fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+
+            fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+            fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {
+            }
+
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut line = String::new();
+                event.record(&mut MessageVisitor { out: &mut line });
+                let mut events = self.events.lock().unwrap();
+                events.push_str(&line);
+                events.push('\n');
+            }
+
+            fn enter(&self, _span: &tracing::span::Id) {}
+
+            fn exit(&self, _span: &tracing::span::Id) {}
+        }
+
+        let buf = Arc::new(Mutex::new(String::new()));
+        let guard = tracing::subscriber::set_default(CaptureSubscriber {
+            events: buf.clone(),
+        });
+        (buf, guard)
+    }
+
+    #[test]
+    fn deprecated_webhook_retry_env_vars_alias_and_warn() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The deprecated alias still configures the new base delay…
+        std::env::set_var("PYLON_WEBHOOK_RETRY_BASE_MS", "250");
+        let (buf, _guard) = capture_warnings();
+        let c = ServerConfig::from_env();
+        assert_eq!(c.webhook_backoff_base_ms, 250);
+        // …and emits a deprecation warning naming the variable.
+        let logged = buf.lock().unwrap().clone();
+        assert!(
+            logged.contains("PYLON_WEBHOOK_RETRY_BASE_MS"),
+            "expected deprecation warning, got: {logged}"
+        );
+        std::env::remove_var("PYLON_WEBHOOK_RETRY_BASE_MS");
+
+        // MAX_RETRIES is ignored (budget-bounded retries now) but still warns.
+        std::env::set_var("PYLON_WEBHOOK_MAX_RETRIES", "7");
+        let (buf, _guard) = capture_warnings();
+        let c = ServerConfig::from_env();
+        assert_eq!(
+            c.webhook_retry_budget_ms, 300000,
+            "MAX_RETRIES must not alter the budget"
+        );
+        let logged = buf.lock().unwrap().clone();
+        assert!(
+            logged.contains("PYLON_WEBHOOK_MAX_RETRIES"),
+            "expected deprecation warning, got: {logged}"
+        );
+        std::env::remove_var("PYLON_WEBHOOK_MAX_RETRIES");
+
+        // When both the alias and the canonical var are set, canonical wins.
+        std::env::set_var("PYLON_WEBHOOK_RETRY_BASE_MS", "250");
+        std::env::set_var("PYLON_WEBHOOK_BACKOFF_BASE_MS", "500");
+        let c = ServerConfig::from_env();
+        assert_eq!(c.webhook_backoff_base_ms, 500);
+        std::env::remove_var("PYLON_WEBHOOK_RETRY_BASE_MS");
+        std::env::remove_var("PYLON_WEBHOOK_BACKOFF_BASE_MS");
     }
 
     #[test]
     fn app_sweep_interval_parses_from_env() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("PYLON_APP_SWEEP_INTERVAL", "30");
         let c = ServerConfig::from_env();
         assert_eq!(c.app_sweep_interval_secs, 30);

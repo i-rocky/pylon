@@ -21,6 +21,42 @@ pub enum RestAuthError {
     BadSignature,
 }
 
+/// The GENERIC 401 message for auth failures that must stay
+/// indistinguishable (R3 anti-enumeration pin): an unknown `auth_key` gets the
+/// exact same string as the REST layer's unknown-app path, so probing ids or
+/// keys learns nothing beyond "not valid for this app".
+pub const GENERIC_AUTH_FAILURE: &str = "invalid authentication";
+
+impl RestAuthError {
+    /// Map a verify failure to the 401 body message, distinguishing causes the
+    /// way the hosted API does (its troubleshooting docs quote `Timestamp
+    /// expired: Given timestamp … not within 600s of server time` and
+    /// `Invalid signature: Expected HMAC SHA256 hex digest` as real response
+    /// wording; the REST reference only promises "Authentication error:
+    /// response body will contain an explanation").
+    ///
+    /// `KeyMismatch` deliberately returns [`GENERIC_AUTH_FAILURE`]: a specific
+    /// message there would turn key-probing into a key↔app binding oracle.
+    /// [`Expired`] is the one message that needs the configured window (the
+    /// hosted default is 600s), so it takes `window_secs`.
+    pub fn message(&self, window_secs: u64) -> String {
+        match self {
+            RestAuthError::MissingParam => "Missing auth parameters".into(),
+            RestAuthError::BadVersion => "Invalid auth version".into(),
+            RestAuthError::KeyMismatch => GENERIC_AUTH_FAILURE.into(),
+            RestAuthError::Expired => {
+                format!(
+                    "Timestamp expired: Given timestamp not within {window_secs}s of server time"
+                )
+            }
+            RestAuthError::BadBodyMd5 => "Invalid body_md5".into(),
+            RestAuthError::BadSignature => {
+                "Invalid signature: Expected HMAC SHA256 hex digest".into()
+            }
+        }
+    }
+}
+
 /// The exact string that is HMAC-signed. `params` must already exclude
 /// `auth_signature`; a `BTreeMap` guarantees the keys are sorted.
 pub fn signing_string(method: &str, path: &str, params: &BTreeMap<String, String>) -> String {
@@ -293,9 +329,71 @@ mod tests {
                 &p,
                 b"",
                 1000,
-                600
+                600,
             ),
             Err(RestAuthError::BadSignature)
+        );
+    }
+
+    // ── R3: variant → 401 body message mapping ─────────────────────────────────
+
+    /// Every variant maps to its own pinned message (window 600 = the hosted
+    /// default and our config default).
+    #[test]
+    fn message_maps_every_variant_distinctly() {
+        assert_eq!(
+            RestAuthError::MissingParam.message(600),
+            "Missing auth parameters"
+        );
+        assert_eq!(
+            RestAuthError::BadVersion.message(600),
+            "Invalid auth version"
+        );
+        // Anti-enumeration: a wrong auth_key is the ONE cause that stays
+        // generic — same string the unknown-app path emits.
+        assert_eq!(
+            RestAuthError::KeyMismatch.message(600),
+            GENERIC_AUTH_FAILURE
+        );
+        assert_eq!(
+            RestAuthError::Expired.message(600),
+            "Timestamp expired: Given timestamp not within 600s of server time"
+        );
+        assert_eq!(RestAuthError::BadBodyMd5.message(600), "Invalid body_md5");
+        assert_eq!(
+            RestAuthError::BadSignature.message(600),
+            "Invalid signature: Expected HMAC SHA256 hex digest"
+        );
+    }
+
+    /// The timestamp message carries the CONFIGURED window, so a deployment
+    /// that widens the skew allowance does not lie about "600s".
+    #[test]
+    fn expired_message_carries_configured_window() {
+        assert_eq!(
+            RestAuthError::Expired.message(300),
+            "Timestamp expired: Given timestamp not within 300s of server time"
+        );
+    }
+
+    /// No two variants may collapse onto one message (that collapse is the bug
+    /// this mapping fixes).
+    #[test]
+    fn messages_are_pairwise_distinct() {
+        let all = [
+            RestAuthError::MissingParam,
+            RestAuthError::BadVersion,
+            RestAuthError::KeyMismatch,
+            RestAuthError::Expired,
+            RestAuthError::BadBodyMd5,
+            RestAuthError::BadSignature,
+        ]
+        .map(|e| e.message(600));
+        let unique: std::collections::HashSet<&str> = all.iter().map(String::as_str).collect();
+        assert_eq!(
+            unique.len(),
+            all.len(),
+            "messages must be distinct: {all:?}"
         );
     }
 }
