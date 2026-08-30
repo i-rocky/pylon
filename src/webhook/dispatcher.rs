@@ -50,7 +50,9 @@ pub struct WebhookDispatcher {
     /// (with `occupancy = None`) means fire immediately (local-adapter path).
     vacated_grace_ms: u64,
     /// Cluster occupancy lookup used to re-check the subscription_count before a
-    /// debounced vacated fires. `None` on the local-adapter path.
+    /// debounced vacated fires. `None` on the local-adapter path; if ever
+    /// combined with a grace window, the re-check is skipped and the vacated
+    /// fires after the grace (see `flush`).
     occupancy: Option<Arc<dyn OccupancySource>>,
 }
 
@@ -118,11 +120,19 @@ impl WebhookDispatcher {
     /// suppression is provided by the cluster-path vacated grace + occupancy
     /// recheck below.
     ///
-    /// On the cluster path (`vacated_grace_ms > 0` and `occupancy.is_some()`)
-    /// each surviving `channel_vacated` is NOT delivered inline; instead a
-    /// detached task sleeps `vacated_grace_ms`, re-checks the cluster
-    /// subscription_count, and fires only if the channel is still empty
-    /// (Task D1). All other survivors deliver inline exactly as before.
+    /// When `vacated_grace_ms > 0` each surviving `channel_vacated` is NOT
+    /// delivered inline; instead a detached task sleeps `vacated_grace_ms`,
+    /// re-checks the cluster subscription_count, and fires only if the channel
+    /// is still empty (Task D1). All other survivors deliver inline exactly as
+    /// before.
+    ///
+    /// The re-check needs an occupancy source. With `occupancy = None` (a
+    /// wiring the production paths never produce — grace is only ever passed
+    /// alongside a source) the re-check is SKIPPED and the vacated still fires
+    /// after the grace window: fire-without-re-check matches single-node
+    /// behavior, and an event delivered late-but-once beats a dropped webhook.
+    /// The misconfiguration is logged once per event as an `error!` instead of
+    /// panicking the dispatcher (G9).
     async fn flush(&self, batch: Vec<WebhookEvent>) {
         use std::collections::HashMap;
         let mut by_app: HashMap<String, Vec<WebhookEvent>> = HashMap::new();
@@ -130,7 +140,11 @@ impl WebhookDispatcher {
             by_app.entry(e.app().to_string()).or_default().push(e);
         }
 
-        let cluster = self.vacated_grace_ms > 0 && self.occupancy.is_some();
+        // Deferral engages on the grace window alone (the re-check additionally
+        // needs an occupancy source — see the spawned task below), so a
+        // grace-without-source wiring degrades gracefully instead of hitting a
+        // construction invariant.
+        let defer_vacated = self.vacated_grace_ms > 0;
 
         for (app_id, events) in by_app {
             // No coalescing — see the doc comment above (R12a: Pusher delivers
@@ -138,15 +152,16 @@ impl WebhookDispatcher {
             // belongs to the reconnect path, not the batch window).
             let survivors = events;
 
-            // On the cluster path, peel surviving vacated events off for the
-            // debounced grace+recheck; everything else delivers inline now.
-            let (deferred_vacated, immediate): (Vec<WebhookEvent>, Vec<WebhookEvent>) = if cluster {
-                survivors
-                    .into_iter()
-                    .partition(|e| matches!(e, WebhookEvent::ChannelVacated { .. }))
-            } else {
-                (Vec::new(), survivors)
-            };
+            // With a grace window configured, peel surviving vacated events off
+            // for the debounced grace+recheck; everything else delivers inline now.
+            let (deferred_vacated, immediate): (Vec<WebhookEvent>, Vec<WebhookEvent>) =
+                if defer_vacated {
+                    survivors
+                        .into_iter()
+                        .partition(|e| matches!(e, WebhookEvent::ChannelVacated { .. }))
+                } else {
+                    (Vec::new(), survivors)
+                };
 
             if !immediate.is_empty() {
                 let app = match self.apps.by_id(&app_id).await {
@@ -169,14 +184,16 @@ impl WebhookDispatcher {
                 }
             }
 
-            // Cluster path: spawn one detached grace+recheck task per surviving
+            // Grace-configured path: spawn one detached grace task per surviving
             // vacated event. It re-fetches the app at FIRE time (config may have
-            // changed) and re-times the envelope with the fire-time clock.
+            // changed) and re-times the envelope with the fire-time clock. The
+            // occupancy re-check runs only when a source is configured: with
+            // `None` the task logs one `error!` per event and fires after the
+            // grace WITHOUT the re-check (single-node parity) — deliberately not
+            // a panic and not a drop: an event delivered late-but-once beats a
+            // dropped webhook (G9).
             if !deferred_vacated.is_empty() {
-                let occupancy = self
-                    .occupancy
-                    .clone()
-                    .expect("cluster path implies occupancy is Some");
+                let occupancy = self.occupancy.clone();
                 for event in deferred_vacated {
                     let (app, channel) = match &event {
                         WebhookEvent::ChannelVacated { app, channel } => {
@@ -184,6 +201,15 @@ impl WebhookDispatcher {
                         }
                         _ => unreachable!("partitioned to ChannelVacated only"),
                     };
+                    if occupancy.is_none() {
+                        tracing::error!(
+                            app = %app,
+                            channel = %channel,
+                            grace_ms = self.vacated_grace_ms,
+                            "channel_vacated grace configured without an occupancy source; \
+                             firing after grace without the cluster re-check"
+                        );
+                    }
                     let apps = self.apps.clone();
                     let transport = self.transport.clone();
                     let clock = self.clock.clone();
@@ -191,15 +217,17 @@ impl WebhookDispatcher {
                     let grace = self.vacated_grace_ms;
                     tokio::spawn(async move {
                         tokio::time::sleep(Duration::from_millis(grace)).await;
-                        let count = occupancy.subscription_count(&app, &channel).await;
-                        if count != 0 {
-                            tracing::trace!(
-                                app = %app,
-                                channel = %channel,
-                                count,
-                                "channel re-occupied within grace; suppressing channel_vacated"
-                            );
-                            return;
+                        if let Some(occ) = occupancy.as_ref() {
+                            let count = occ.subscription_count(&app, &channel).await;
+                            if count != 0 {
+                                tracing::trace!(
+                                    app = %app,
+                                    channel = %channel,
+                                    count,
+                                    "channel re-occupied within grace; suppressing channel_vacated"
+                                );
+                                return;
+                            }
                         }
                         let resolved = match apps.by_id(&app).await {
                             Ok(crate::app::AppLookup::Found(a)) => a,
@@ -552,6 +580,60 @@ mod tests {
             0,
             "vacated suppressed when re-occupied within grace"
         );
+
+        drop(tx);
+        let _ = task.await;
+    }
+
+    /// Grace-configured but WITHOUT an occupancy source (a wiring the production
+    /// paths never produce — grace is only passed alongside a source): the
+    /// vacated must still dispatch — after the grace window, WITHOUT the
+    /// cluster re-check — rather than panicking on the missing source (G9).
+    /// Behavior choice: fire-without-re-check (single-node parity) over
+    /// dropping; an event delivered late-but-once beats a dropped webhook.
+    /// The old code `.expect`ed occupancy on this path, so this doubles as the
+    /// no-panic regression test. (No log-capture harness exists in this suite,
+    /// so the accompanying `error!` line is verified by inspection, not here.)
+    #[tokio::test(start_paused = true)]
+    async fn vacated_fires_after_grace_even_without_occupancy_source() {
+        let apps: Arc<dyn AppManager> = Arc::new(OneApp(vacated_app()));
+        let transport = Arc::new(RecordingTransport::new());
+
+        let (tx, rx) = mpsc::channel(64);
+        let dispatcher = WebhookDispatcher {
+            rx,
+            apps,
+            transport: transport.clone(),
+            clock: Arc::new(FixedClock(1700000000000)),
+            batch_ms: 50,
+            vacated_grace_ms: 3000,
+            occupancy: None,
+        };
+        let task = tokio::spawn(dispatcher.run());
+
+        tx.send(vac()).await.unwrap();
+        // Arm the trailing window before advancing time (harness ordering only).
+        tokio::task::yield_now().await;
+        // Past the 50ms batch window → flush defers the vacated behind the
+        // 3000ms grace (delivered LATE, not never — nothing fires yet).
+        tokio::time::advance(Duration::from_millis(60)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            transport.recorded().await.len(),
+            0,
+            "no fire before the grace window elapses"
+        );
+        // Elapse the grace → fires without the (source-less) re-check. No panic.
+        tokio::time::advance(Duration::from_millis(3001)).await;
+
+        let recorded = wait_for(&transport, 1).await;
+        assert_eq!(
+            recorded.len(),
+            1,
+            "vacated fires after grace even without an occupancy source"
+        );
+        let env: serde_json::Value = serde_json::from_str(&recorded[0].body).unwrap();
+        assert_eq!(env["events"][0]["name"], "channel_vacated");
 
         drop(tx);
         let _ = task.await;

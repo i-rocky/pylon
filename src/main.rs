@@ -32,28 +32,31 @@ static GLOBAL: dhat::Alloc = dhat::Alloc;
 /// `vacated_grace_ms` + `occupancy` enable the cluster-aware `channel_vacated` grace
 /// window (only the multi-node Redis paths pass them; the local paths pass `0` / `None`).
 /// Shared by every transport/adapter combination so the dispatcher is built identically.
+/// Fallible: a transport build failure (e.g. reqwest/TLS init — which happens even
+/// with zero webhooks configured) fails startup cleanly with the real error (G9).
 fn spawn_webhooks(
     config: &ServerConfig,
     apps: Arc<dyn AppManager>,
     vacated_grace_ms: u64,
     occupancy: Option<Arc<dyn OccupancySource>>,
-) -> WebhookHandle {
+) -> anyhow::Result<WebhookHandle> {
     let backoff_base_ms = config.webhook_backoff_base_ms;
     let backoff_cap_ms = config.webhook_backoff_cap_ms;
     let retry_budget_ms = config.webhook_retry_budget_ms;
     let timeout_ms = config.webhook_timeout_ms;
     let max_concurrency = config.webhook_max_concurrency;
-    pylon::webhook::spawn(
+    Ok(pylon::webhook::spawn(
         apps,
         move |metrics| {
-            Arc::new(HttpTransport::new(
+            HttpTransport::new(
                 backoff_base_ms,
                 backoff_cap_ms,
                 retry_budget_ms,
                 timeout_ms,
                 max_concurrency,
                 metrics,
-            )) as Arc<dyn WebhookTransport>
+            )
+            .map(|t| Arc::new(t) as Arc<dyn WebhookTransport>)
         },
         Arc::new(SystemClock),
         config.webhook_batch_ms,
@@ -61,7 +64,7 @@ fn spawn_webhooks(
         config.webhook_max_concurrency.saturating_mul(100).max(1024),
         vacated_grace_ms,
         occupancy,
-    )
+    )?)
 }
 
 #[tokio::main]
@@ -140,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
     // The single-node local path fires `channel_vacated` immediately (no grace
     // window, no occupancy source — those are the Redis multi-node path's, handled
     // in `run_redis_percore`).
-    let webhooks = spawn_webhooks(&config, apps.clone(), 0, None);
+    let webhooks = spawn_webhooks(&config, apps.clone(), 0, None)?;
 
     // Shared connection counters (the axum REST `AppState` and the percore
     // `DispatchEnv` mirror this type exactly).
@@ -327,7 +330,7 @@ async fn run_redis_percore(
         apps.clone(),
         config.webhook_vacated_grace_ms,
         occupancy,
-    );
+    )?;
 
     // Now the dispatcher exists: wire its handle into the bridge's drain loop AND start the
     // Redis sweeper with the SAME handle (so sweep-driven and command-driven vacated

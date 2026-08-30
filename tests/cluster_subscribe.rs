@@ -88,13 +88,16 @@ fn recording_webhooks(apps: Arc<dyn AppManager>) -> (WebhookHandle, RecordingTra
     let handle = pylon::webhook::spawn(
         apps,
         // RecordingTransport doesn't count outcomes; it ignores the metrics.
-        move |_metrics| Arc::new(recorded) as Arc<dyn WebhookTransport>,
+        move |_metrics| {
+            Ok::<_, std::convert::Infallible>(Arc::new(recorded) as Arc<dyn WebhookTransport>)
+        },
         Arc::new(SystemClock),
         10,   // 10ms batch window
         1024, // mailbox capacity
         0,    // vacated fires immediately (no cluster grace in this test)
         None, // no cluster occupancy source
-    );
+    )
+    .expect("recording transport factory is infallible");
     (handle, transport)
 }
 

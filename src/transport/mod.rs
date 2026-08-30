@@ -147,6 +147,31 @@ pub fn percore_total_inflight_bytes() -> u64 {
         .unwrap_or(0)
 }
 
+/// Lock the process-global percore metrics registry for the startup write in
+/// [`run_percore`], recovering from a poisoned lock instead of panicking (G9):
+/// a previous holder's panic leaves the data structurally valid (Vecs of
+/// atomics — at worst stale), registry writes don't need poisoning semantics,
+/// and startup must not die on a metrics registry. Mirrors the recovery in
+/// [`percore_metrics_snapshot`]. The `get_or_init` body is transient (an empty
+/// registry): the very first caller overwrites every field right after.
+fn lock_percore_registry_for_write() -> std::sync::MutexGuard<'static, PercoreRegistry> {
+    PERCORE_REGISTRY
+        .get_or_init(|| {
+            std::sync::Mutex::new(PercoreRegistry {
+                inflight_slots: Vec::new(),
+                worker_slots: Vec::new(),
+                accepted_slots: Vec::new(),
+                codel_dropped_slots: Vec::new(),
+                drophead_dropped_slots: Vec::new(),
+                mailbox_dropped_slots: Vec::new(),
+                budget_factor: Arc::new(AtomicU32::new(1000)),
+                worker_budget_bytes: 0,
+            })
+        })
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
 /// Run the per-core transport as the actual server.
 ///
 /// Takes the already-built shared pieces (the same ones `main`/`AppState`
@@ -398,23 +423,10 @@ pub fn run_percore(
 
     // Fill the global percore metrics registry. Overwrites any prior entry (safe:
     // `get_or_init` initialises the Mutex once; subsequent runs replace the inner
-    // value so re-runs in tests see fresh slots).
+    // value so re-runs in tests see fresh slots). The lock recovers from
+    // poisoning instead of panicking — see [`lock_percore_registry_for_write`].
     {
-        let mut g = PERCORE_REGISTRY
-            .get_or_init(|| {
-                std::sync::Mutex::new(PercoreRegistry {
-                    inflight_slots: Vec::new(),
-                    worker_slots: Vec::new(),
-                    accepted_slots: Vec::new(),
-                    codel_dropped_slots: Vec::new(),
-                    drophead_dropped_slots: Vec::new(),
-                    mailbox_dropped_slots: Vec::new(),
-                    budget_factor: budget_factor.clone(),
-                    worker_budget_bytes: per_worker_budget,
-                })
-            })
-            .lock()
-            .unwrap();
+        let mut g = lock_percore_registry_for_write();
         g.inflight_slots.clear();
         g.inflight_slots.extend(inflight_slots.iter().cloned());
         g.worker_slots.clear();
@@ -597,5 +609,47 @@ mod psi_tests {
             g = compute_factor(g, 0.0, threshold);
         }
         assert_eq!(g, 1000, "recovers to full budget");
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::{lock_percore_registry_for_write, percore_metrics_snapshot, PERCORE_REGISTRY};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+
+    /// G9: a panic while holding the registry mutex must not turn every later
+    /// metrics read/write into a worker-killing panic. Both the `/metrics`
+    /// reader and the startup writer recover the (still structurally valid)
+    /// data via `into_inner`. The registry is a process-global static, so this
+    /// test poisons it for the remainder of the test binary — safe because
+    /// every lock site now recovers.
+    #[test]
+    fn registry_recovers_from_lock_poisoning() {
+        // Ensure the OnceLock is initialized, then poison it: panic while the
+        // write guard is held.
+        drop(lock_percore_registry_for_write());
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _g = lock_percore_registry_for_write();
+            panic!("intentional: poison the percore registry lock");
+        }));
+        assert!(
+            PERCORE_REGISTRY.get().is_some_and(|m| m.is_poisoned()),
+            "precondition: the lock really is poisoned"
+        );
+
+        // Reader recovers: the /metrics snapshot still answers (no panic).
+        let snap = percore_metrics_snapshot();
+        assert!(snap.is_some(), "reader recovers from a poisoned registry");
+
+        // Writer recovers: a re-run of the startup install still works.
+        {
+            let mut g = lock_percore_registry_for_write();
+            g.inflight_slots.clear();
+            g.inflight_slots.push(Arc::new(AtomicU64::new(7)));
+        }
+        let snap = percore_metrics_snapshot().expect("reader still answers after re-install");
+        assert_eq!(snap.inflight, vec![7], "write landed despite the poison");
     }
 }

@@ -158,6 +158,12 @@ impl HttpTransport {
     /// `timeout_ms` is the per-attempt request timeout; `max_concurrency` caps
     /// simultaneous in-flight deliveries. `metrics` is the shared pipeline
     /// counter set; the spawned delivery task records each resolved outcome.
+    ///
+    /// Returns `Err` when the underlying reqwest client cannot be built (e.g. a
+    /// TLS-backend initialization failure). This runs at startup even when zero
+    /// webhooks are configured, so a build failure must fail startup cleanly
+    /// with a real error (propagated by the caller) rather than aborting the
+    /// process with a panic (G9).
     pub fn new(
         backoff_base_ms: u64,
         backoff_cap_ms: u64,
@@ -165,19 +171,18 @@ impl HttpTransport {
         timeout_ms: u64,
         max_concurrency: usize,
         metrics: Arc<WebhookMetrics>,
-    ) -> Self {
+    ) -> Result<Self, reqwest::Error> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(timeout_ms))
-            .build()
-            .expect("reqwest client builds");
-        Self::with_sender(
+            .build()?;
+        Ok(Self::with_sender(
             Arc::new(ReqwestSender { client }),
             backoff_base_ms,
             backoff_cap_ms,
             retry_budget_ms,
             max_concurrency,
             metrics,
-        )
+        ))
     }
 
     /// Test seam: build with an injectable [`AttemptSender`] so the retry
@@ -681,7 +686,8 @@ mod tests {
         let addr = spawn_mock(post(flaky_handler), calls.clone()).await;
         let metrics = Arc::new(WebhookMetrics::new(64));
         // base 1ms / cap 10ms / budget 5s so the test is fast.
-        let t = HttpTransport::new(1, 10, 5_000, 5_000, 10, metrics.clone());
+        let t = HttpTransport::new(1, 10, 5_000, 5_000, 10, metrics.clone())
+            .expect("reqwest client builds in tests");
         let d = build_signed_delivery(
             &format!("http://{addr}/wh"),
             "k",
@@ -709,7 +715,8 @@ mod tests {
         let addr = spawn_mock(post(reject_handler), calls.clone()).await;
         let metrics = Arc::new(WebhookMetrics::new(64));
         // Small budget (100ms) so the retry loop resolves quickly in real time.
-        let t = HttpTransport::new(1, 10, 100, 5_000, 10, metrics.clone());
+        let t = HttpTransport::new(1, 10, 100, 5_000, 10, metrics.clone())
+            .expect("reqwest client builds in tests");
         let d = build_signed_delivery(
             &format!("http://{addr}/wh"),
             "k",
@@ -762,6 +769,19 @@ mod tests {
             64,
             "hex sha256 is 64 chars"
         );
+    }
+
+    /// G9: `new` returns a Result instead of panicking on a client-build
+    /// failure (which runs at startup even with zero webhooks configured).
+    /// In a healthy environment the client builds and `new` is `Ok`. Making
+    /// reqwest's builder fail DETERMINISTICALLY (a TLS-backend init failure)
+    /// is not injectable without mocking reqwest — deliberately not done —
+    /// so the Err path itself is covered at the plumbing level in
+    /// `webhook::spawn`'s tests (a factory error propagates out of spawn).
+    #[test]
+    fn new_returns_ok_when_the_client_builds() {
+        let metrics = Arc::new(WebhookMetrics::new(64));
+        assert!(HttpTransport::new(1000, 60_000, 300_000, 5_000, 10, metrics).is_ok());
     }
 
     #[test]
