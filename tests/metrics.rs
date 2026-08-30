@@ -179,10 +179,13 @@ async fn metrics_per_app_gauges_reflect_subscription() {
         .await
         .unwrap();
 
-    // Connection count for the app should be >= 1.
+    // Exactly one connection is open at this point: `ws` is still held (never
+    // dropped), and it is the only connection this test opens against mapp1.
+    // The gauge is incremented in `finish_establish` before the
+    // connection_established frame is sent, so it is already 1 here.
     assert!(
-        body.contains(r#"pylon_connections{app="mapp1"}"#),
-        "pylon_connections for mapp1 must appear:\n{body}"
+        body.contains(r#"pylon_connections{app="mapp1"} 1"#),
+        "pylon_connections for mapp1 must be exactly 1:\n{body}"
     );
     // Channel should be occupied.
     assert!(
