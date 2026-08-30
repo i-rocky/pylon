@@ -26,7 +26,7 @@ labels**.
 |---|---|---|---|
 | `pylon_up` | gauge | — | Always `1`; confirms the process is alive and the scrape succeeded |
 
-#### Per-App (presence requires at least one active app)
+#### Per-App (emitted for each app with ≥1 tracked connection)
 
 | Series | Type | Labels | Description |
 |---|---|---|---|
