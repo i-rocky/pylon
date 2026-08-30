@@ -145,11 +145,20 @@ pub(super) async fn reap_user(pool: &Pool, keys: &Keys, app: &str, user_id: &str
     }
 
     // Cluster offline edge: DEL the (now-empty) hash, de-index, publish WatchOffline.
-    let _ = pool.next().del::<i64, _>(&usr).await;
-    let _ = pool
+    // Both stay best-effort (log-only on error): a failed SREM leaves the user indexed,
+    // so the next sweep's reap retries the DEL/SREM — and the empty `usr` hash is
+    // bounded by its whole-key TTL backstop from signin — so repeated failures
+    // self-heal on the next sweep.
+    if let Err(e) = pool.next().del::<i64, _>(&usr).await {
+        tracing::warn!(error = %e, app, user_id, "sweeper: DEL usr failed");
+    }
+    if let Err(e) = pool
         .next()
         .srem::<i64, _, _>(keys.users(app), user_id.to_string())
-        .await;
+        .await
+    {
+        tracing::warn!(error = %e, app, user_id, "sweeper: SREM users failed");
+    }
     publish(
         pool,
         &keys.watch(app, user_id),
