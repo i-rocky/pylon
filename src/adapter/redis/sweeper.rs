@@ -6,13 +6,19 @@
 //! is the cluster's garbage collector for those orphaned members: exactly one node
 //! at a time holds a short-lived Redis lease (`{prefix}:sweeplock`), scans every
 //! occupied channel, HDELs members whose `expireAt < now`, and — when that empties a
-//! channel — DELs the occ hash, de-indexes the channel, and fires `channel_vacated`
-//! (through the dispatcher's grace + cluster re-check, so a re-subscribe within the
-//! grace window suppresses the webhook).
+//! channel — vacates it via the atomic VACATE_LUA CAS (DEL the occ hash + de-index
+//! the channel + decide the emission right in ONE script) and fires
+//! `channel_vacated` only when this pass won the CAS (through the dispatcher's
+//! grace + cluster re-check, so a re-subscribe within the grace window suppresses
+//! the webhook). The CAS is what keeps the sweeper and a concurrent
+//! last-unsubscribe (UNSUBSCRIBE_LUA) from BOTH firing `channel_vacated` for one
+//! vacancy: the emission right belongs to whichever caller's SREM actually removed
+//! the `chans` entry, and Redis serializes scripts — exactly one winner.
 //!
 //! Every Redis error is logged and skipped; one failure must never abort the whole
 //! sweep. Nothing here panics or unwraps.
 
+use super::client::Scripts;
 use super::keys::Keys;
 use crate::webhook::event::WebhookEvent;
 use crate::webhook::WebhookHandle;
@@ -40,6 +46,7 @@ pub(crate) struct SweepReport {
 /// and sweep; otherwise yield (another node sweeps) and return `acquired = false`.
 pub(crate) async fn sweep_once(
     pool: &Pool,
+    scripts: &Scripts,
     keys: &Keys,
     node_id: &str,
     lease_ms: u64,
@@ -129,33 +136,38 @@ pub(crate) async fn sweep_once(
             if had_fresh_members {
                 continue;
             }
-            // `HLEN occ` is the authoritative post-reap count (also 0 when the key is
-            // gone). Skip the vacate only if a member somehow remains (a concurrent
-            // re-subscribe between our HGETALL and now).
-            let remaining: i64 = match pool.next().hlen(&occ).await {
-                Ok(n) => n,
+
+            // Vacate via the atomic VACATE_LUA CAS: "if HLEN occ == 0 → DEL occ +
+            // SREM chans; return whether THIS call's SREM removed the entry". The
+            // whole vacate DECISION+action is one script, so unlike the old
+            // HLEN→DEL→SREM round-trips it cannot straddle a concurrent
+            // last-unsubscribe's atomic UNSUBSCRIBE_LUA and see a chans-indexed
+            // channel whose occ is already gone (which double-fired
+            // channel_vacated). The webhook fires ONLY when this pass won the CAS
+            // (`won == 1`): if the last-unsubscribe already removed the chans entry,
+            // IT owns the single cluster-wide emission and this pass stays silent
+            // (Redis serializes scripts — exactly one winner in every interleaving).
+            let won: i64 = match scripts
+                .vacate
+                .evalsha_with_reload::<i64, _, _>(
+                    pool.next(),
+                    vec![occ, keys.chans(&app)],
+                    vec![channel.clone()],
+                )
+                .await
+            {
+                Ok(w) => w,
                 Err(e) => {
-                    tracing::warn!(error = %e, app, channel, "sweeper: HLEN occ failed; cannot confirm vacate");
+                    tracing::warn!(error = %e, app, channel, "sweeper: VACATE cas failed; skipping channel");
                     continue;
                 }
             };
-            if remaining != 0 {
+            if won != 1 {
+                // A member (re-)appeared, or another writer already vacated and
+                // already owns the emission right. Either way: no webhook here.
                 continue;
             }
 
-            // Vacate: DEL the occ hash (no-op if the TTL already removed it), de-index
-            // the channel, and fire channel_vacated (debounced + cluster re-checked, so
-            // a re-subscribe within the grace window suppresses the webhook).
-            if let Err(e) = pool.next().del::<i64, _>(&occ).await {
-                tracing::warn!(error = %e, app, channel, "sweeper: DEL empty occ failed");
-            }
-            if let Err(e) = pool
-                .next()
-                .srem::<i64, _, _>(keys.chans(&app), channel.clone())
-                .await
-            {
-                tracing::warn!(error = %e, app, channel, "sweeper: SREM chans failed");
-            }
             webhooks.enqueue(WebhookEvent::ChannelVacated {
                 app: app.clone(),
                 channel: channel.clone(),
@@ -289,10 +301,22 @@ pub(crate) async fn sweeper_loop(
     interval_secs: u64,
     webhooks: WebhookHandle,
 ) {
+    // Compiled once (pure local SHA-1 hashing, no Redis round-trip); reused by
+    // every pass for the atomic vacate CAS.
+    let scripts = Scripts::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
     loop {
         ticker.tick().await;
-        let report = sweep_once(&pool, &keys, &node_id, lease_ms, &webhooks, super::now_ms()).await;
+        let report = sweep_once(
+            &pool,
+            &scripts,
+            &keys,
+            &node_id,
+            lease_ms,
+            &webhooks,
+            super::now_ms(),
+        )
+        .await;
         if report.acquired && (report.reaped > 0 || !report.vacated.is_empty()) {
             tracing::debug!(
                 reaped = report.reaped,

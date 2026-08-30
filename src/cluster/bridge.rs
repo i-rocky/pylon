@@ -851,7 +851,11 @@ async fn handle_cmd(
                     )
                     .await;
             }
-            // Single cluster-wide channel_vacated on the cluster 1→0 edge.
+            // Single cluster-wide channel_vacated on the cluster 1→0 edge. `vacated`
+            // is the VACATE CAS verdict: true only when THIS unsubscribe's atomic
+            // SREM removed the channel from the `chans` index. If the sweeper's
+            // VACATE_LUA already removed the entry, it owns the emission and this
+            // node stays silent — exactly one channel_vacated per vacancy.
             if vacated && a.has_channel_vacated_webhooks {
                 if let Some(wh) = webhooks.get() {
                     wh.enqueue(WebhookEvent::ChannelVacated {
@@ -1052,7 +1056,8 @@ async fn handle_cmd(
                     }
                 }
             }
-            // Single cluster-wide channel_vacated on the cluster 1→0 edge.
+            // Single cluster-wide channel_vacated on the cluster 1→0 edge — the same
+            // VACATE CAS verdict as the Unsubscribe arm (only the SREM winner emits).
             if vacated && a.has_channel_vacated_webhooks {
                 if let Some(wh) = webhooks.get() {
                     wh.enqueue(WebhookEvent::ChannelVacated {

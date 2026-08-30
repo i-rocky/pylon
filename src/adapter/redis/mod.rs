@@ -362,6 +362,7 @@ impl RedisAdapter {
         let lease_ms = (self.cfg.sweep_interval_secs.max(1) * 1000 * 3).max(5000);
         let report = sweeper::sweep_once(
             &self.clients.pool,
+            &self.scripts,
             &self.keys,
             &self.node_id,
             lease_ms,
@@ -492,8 +493,14 @@ impl RedisAdapter {
     /// Cluster half of `unsubscribe`: remove cluster-wide membership (UNSUBSCRIBE_LUA) and
     /// tear down the node-local Redis `msg`-channel subscription on the node-local 1 → 0
     /// edge (`node_last`, computed by the caller as `out.subscription_count == 0`). Returns
-    /// the AUTHORITATIVE `(cluster_count, vacated)`; on Redis error returns `(0, false)` so
-    /// the caller keeps its node-local outcome.
+    /// the AUTHORITATIVE `(cluster_count, vacated)`, where `vacated` is the VACATE CAS
+    /// verdict: `true` only when THIS call's atomic SREM actually removed the channel from
+    /// the `chans` index — i.e. this caller owns the single cluster-wide
+    /// `channel_vacated` emission right. When the sweeper's VACATE_LUA won the index
+    /// removal instead, this returns `(0, false)` and the caller MUST stay silent (the
+    /// sweeper emits). Redis serializes the scripts, so exactly one of the two vacating
+    /// writers can ever win. On Redis error also returns `(0, false)` so the caller keeps
+    /// its node-local outcome.
     #[doc(hidden)]
     pub async fn cluster_unsubscribe(
         &self,
@@ -508,7 +515,7 @@ impl RedisAdapter {
             if let Err(e) = self.clients.sub.unsubscribe(msg_key.clone()).await {
                 tracing::warn!(
                     error = %e,
-                    channel = %msg_key,
+                    channel = &msg_key,
                     "failed to UNSUBSCRIBE from Redis msg channel on 1→0 edge"
                 );
             }
@@ -516,8 +523,9 @@ impl RedisAdapter {
 
         // Remove cluster-wide membership and read back the AUTHORITATIVE remaining
         // count. Atomic Lua: HDEL member, HLEN, and on the 1→0 cluster edge DEL the
-        // now-empty hash + de-index. On Redis error, report a zero count so the caller
-        // keeps its node-local outcome.
+        // now-empty hash + de-index, returning whether THIS call's SREM won the
+        // de-index (the vacate emission right). On Redis error, report a zero count
+        // so the caller keeps its node-local outcome.
         let occ = self.keys.occ(app, channel);
         let chans = self.keys.chans(app);
         let token = keys::member_token(&self.node_id, socket_id.as_str());
@@ -525,10 +533,14 @@ impl RedisAdapter {
         match self
             .scripts
             .unsubscribe
-            .evalsha_with_reload::<i64, _, _>(self.clients.pool.next(), vec![occ, chans], argv)
+            .evalsha_with_reload::<(i64, i64), _, _>(
+                self.clients.pool.next(),
+                vec![occ, chans],
+                argv,
+            )
             .await
         {
-            Ok(count) => (count as usize, count == 0),
+            Ok((count, won)) => (count as usize, won == 1),
             Err(e) => {
                 tracing::warn!(
                     error = %e,
@@ -943,9 +955,10 @@ impl Adapter for RedisAdapter {
         let node_last = out.subscription_count == 0;
 
         // Cluster half: the node-local msg-channel unsubscribe-on-last + UNSUBSCRIBE_LUA
-        // authoritative remaining count + vacated edge. On Redis error this returns the
-        // `(0, false)` sentinel — which a real success never produces (a real 1→0 success is
-        // `(0, true)`) — so we keep the node-local outcome only in that exact case.
+        // authoritative remaining count + vacate-CAS verdict. `(0, false)` is produced
+        // both on Redis error AND when the sweeper's VACATE_LUA already won the chans
+        // de-index (it owns the channel_vacated emission) — either way there is no
+        // cluster count to adopt, so we keep the node-local outcome in that exact case.
         let (count, vacated) = self
             .cluster_unsubscribe(app, channel, socket_id, node_last)
             .await;
