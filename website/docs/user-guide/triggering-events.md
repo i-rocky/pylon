@@ -116,6 +116,32 @@ Trigger a single named event on one or more channels.
 Encrypted channels (`private-encrypted-*`) must be targeted alone — mixing them with other channels
 in one call returns an error.
 
+##### Server-to-user channels (`#server-to-user-<user_id>`)
+
+Triggering an event on the reserved channel `#server-to-user-<user_id>` delivers it to **every
+live connection of that user** — the client must have authenticated via `pusher:signin`. The event
+is routed through the user registry (cluster-wide on the Redis adapter), is never cached, and
+`socket_id` exclusion does not apply to it (there is no originating socket among the recipient's
+connections).
+
+```bash
+# Same signing steps as the raw curl example below, with the reserved channel in the body:
+BODY='{"name":"invoice-paid","channel":"#server-to-user-42","data":"{\"amount\":99}"}'
+BODY_MD5=$(echo -n "$BODY" | md5sum | cut -d' ' -f1)
+QUERY="auth_key=${APP_KEY}&auth_timestamp=${TIMESTAMP}&auth_version=1.0&body_md5=${BODY_MD5}"
+SIGNATURE=$(echo -en "POST\n/apps/${APP_ID}/events\n${QUERY}" \
+  | openssl dgst -sha256 -hmac "$APP_SECRET" | cut -d' ' -f2)
+curl -s -X POST \
+  "http://${HOST}/apps/${APP_ID}/events?${QUERY}&auth_signature=${SIGNATURE}" \
+  -H "Content-Type: application/json" -d "$BODY"
+```
+
+On the client side the signed-in user's connections receive it as an ordinary channel event on
+`#server-to-user-<user_id>` — pusher-js surfaces it through its user-notification handling. A
+client may subscribe to **its own** `#server-to-user-<user_id>` channel (after signin) and gets a
+`subscription_succeeded`; subscribing to another user's channel — or any other `#`-prefixed name —
+is rejected non-fatally with `pusher:subscription_error` status `401`.
+
 ---
 
 #### `POST /apps/{app_id}/batch_events`

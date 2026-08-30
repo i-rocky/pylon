@@ -105,10 +105,27 @@ the two nodes and route traffic to whichever node responds healthy on `/ready`.
 
 ## Redis high availability
 
-For production, run Redis with at least one replica and use Redis Sentinel or
-Redis Cluster so that a primary failure does not take the cluster state offline.
-Pylon reconnects automatically on connection loss, so a Sentinel failover
-(typically 10–30 s) results in a brief degradation window rather than a hard outage.
+For production, run one of:
+
+- **Single instance** with a persistent volume — the simplest option, and a
+  fit for most deployments (Redis here is a coordination plane, not a data
+  plane).
+- **Primary + replica**, manually or Sentinel-promoted.
+
+Pylon reconnects automatically on connection loss, so a failover window
+(typically 10–30 s) results in a brief degradation rather than a hard outage.
+The event a failover subjects pylon to — Redis going away and coming back — is
+exercised on every push by the `redis_failover` regression suite in CI, which
+bounces a dedicated Redis container and asserts that cross-node delivery
+resumes automatically.
+
+!!! warning "Do NOT use Redis Cluster"
+    Pylon's membership and per-app-capacity Lua scripts operate on multiple
+    keys in one script (the per-channel occupancy hash plus the app-level
+    channel index; the `appconns` and `nodeconns:{node}` capacity hashes).
+    Those keys do not share a hash slot, so the scripts are **not
+    CROSSSLOT-safe** under Redis Cluster and would fail at runtime. Use a
+    single instance, a primary-replica pair, or Sentinel instead.
 
 !!! warning "Redis is a coordination plane, not a data plane"
     All WebSocket frames are delivered directly between pylon nodes and their
