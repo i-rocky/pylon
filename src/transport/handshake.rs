@@ -38,7 +38,20 @@ pub enum HeadResult {
     Bad(&'static str),
 }
 
-/// Parse the HTTP request head from `buf` (the bytes received so far).
+/// Parse the HTTP request head from `buf` (the bytes received so far), bounded
+/// by `max_head_bytes` (G3 slowloris hardening).
+///
+/// The cap bounds the HEAD — the start line + headers, i.e. everything up to
+/// the CRLFCRLF terminator — NOT the total buffer: a REST request's BODY is
+/// read into the same buffer and is legitimately large. The head is over-size
+/// iff no CRLFCRLF appears within the first `max_head_bytes` bytes, so BOTH a
+/// headerless dribble crossing the line AND a giant complete head whose
+/// terminator sits beyond the cap are [`HeadResult::Bad`] — checked before
+/// parsing, so it fires on the first read that crosses the line — and the
+/// worker closes the connection, capping the per-connection
+/// head-accumulation memory. A head whose terminator lies within the cap is
+/// honoured however many body bytes follow it. `0` disables the cap (no
+/// legitimate head comes close; the default 16384 is generous).
 ///
 /// A WS upgrade is: method `GET`, an `Upgrade: websocket` header
 /// (case-insensitive), a `Connection: Upgrade` header (case-insensitive, may be
@@ -50,7 +63,13 @@ pub enum HeadResult {
 /// a bad upgrade, not a REST request. Anything else complete (any non-GET
 /// method, or a plain GET without the upgrade header set) is
 /// [`HeadResult::Rest`]. An incomplete head is [`HeadResult::NeedMore`].
-pub fn read_head(buf: &[u8]) -> HeadResult {
+pub fn read_head(buf: &[u8], max_head_bytes: usize) -> HeadResult {
+    if max_head_bytes != 0 && buf.len() > max_head_bytes {
+        let head_within_cap = buf[..max_head_bytes].windows(4).any(|w| w == b"\r\n\r\n");
+        if !head_within_cap {
+            return HeadResult::Bad("request head too large");
+        }
+    }
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = httparse::Request::new(&mut headers);
 
@@ -191,6 +210,76 @@ mod tests {
         Sec-WebSocket-Version: 13\r\n\
         \r\n";
 
+    /// Head cap for the parse tests — far above any legitimate head, so the
+    /// cap never interferes with the parsing assertions.
+    const DEFAULT_TEST_HEAD_CAP: usize = 1 << 20;
+
+    /// G3: a headerless buffer that has grown past the cap is `Bad` (not
+    /// `NeedMore`) — the FIRST read crossing the line trips it, whether or not
+    /// the bytes so far parse as a partial head.
+    #[test]
+    fn head_over_the_cap_is_bad_even_when_incomplete() {
+        let dribble = vec![b'x'; 1025];
+        assert_eq!(
+            read_head(&dribble, 1024),
+            HeadResult::Bad("request head too large")
+        );
+        // Exactly AT the cap is still fine (the cap is exclusive: `>`).
+        assert_eq!(read_head(&dribble[..1024], 1024), HeadResult::NeedMore);
+    }
+
+    /// G3: `0` disables the cap — a giant headerless buffer stays `NeedMore`.
+    #[test]
+    fn head_cap_zero_disables_the_limit() {
+        let dribble = vec![b'x'; 64 * 1024];
+        assert_eq!(read_head(&dribble, 0), HeadResult::NeedMore);
+    }
+
+    /// G3: a COMPLETE head within the cap parses normally even when the cap is
+    /// tight — real handshakes are unaffected.
+    #[test]
+    fn real_upgrade_parses_under_a_tight_cap() {
+        assert_eq!(
+            read_head(WS_UPGRADE, WS_UPGRADE.len()),
+            HeadResult::WsUpgrade {
+                key: "dGhlIHNhbXBsZSBub25jZQ==".to_owned(),
+                path: "/app/app-key".to_owned(),
+            }
+        );
+    }
+
+    /// G3: the cap bounds the HEAD, not the buffer — a REST request whose small
+    /// head is followed by a huge body must still parse (regression pin for the
+    /// REST 413 body-limit path, whose 200 KiB body lands in the same buffer).
+    #[test]
+    fn large_rest_body_after_a_small_head_is_not_capped() {
+        let head = b"POST /apps/app/events HTTP/1.1\r\nHost: x\r\nContent-Length: 204800\r\n\r\n";
+        let mut buf = head.to_vec();
+        buf.extend_from_slice(vec![b'x'; 200 * 1024].as_slice());
+        assert_eq!(
+            read_head(&buf, 1024),
+            HeadResult::Rest {
+                consumed: head.len()
+            }
+        );
+    }
+
+    /// G3: a head whose TERMINATOR sits beyond the cap is over-size even though
+    /// it is otherwise well-formed — the giant-complete-head variant of the
+    /// slowloris.
+    #[test]
+    fn giant_complete_head_beyond_the_cap_is_bad() {
+        // A syntactically fine head: start line + one header with a huge value,
+        // terminator just past the 1024-byte cap.
+        let mut buf = b"POST /apps/app/events HTTP/1.1\r\nX-Pad: ".to_vec();
+        buf.extend(vec![b'x'; 1100]);
+        buf.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(
+            read_head(&buf, 1024),
+            HeadResult::Bad("request head too large")
+        );
+    }
+
     /// 1. RFC 6455 §1.3 canonical accept Known-Answer-Test.
     #[test]
     fn accept_response_rfc6455_kat() {
@@ -206,7 +295,7 @@ mod tests {
     #[test]
     fn parses_ws_upgrade() {
         assert_eq!(
-            read_head(WS_UPGRADE),
+            read_head(WS_UPGRADE, DEFAULT_TEST_HEAD_CAP),
             HeadResult::WsUpgrade {
                 key: "dGhlIHNhbXBsZSBub25jZQ==".to_owned(),
                 path: "/app/app-key".to_owned(),
@@ -219,7 +308,7 @@ mod tests {
     fn parses_rest_request() {
         let req = b"POST /apps/app/events HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n";
         assert_eq!(
-            read_head(req),
+            read_head(req, DEFAULT_TEST_HEAD_CAP),
             HeadResult::Rest {
                 consumed: req.len()
             }
@@ -240,7 +329,7 @@ mod tests {
             Sec-WebSocket-Version: 13\r\n\
             \r\n";
         assert_eq!(
-            read_head(req),
+            read_head(req, DEFAULT_TEST_HEAD_CAP),
             HeadResult::WsUpgrade {
                 key: "dGhlIHNhbXBsZSBub25jZQ==".to_owned(),
                 path: "/nope/?protocol=7".to_owned(),
@@ -255,7 +344,7 @@ mod tests {
     fn plain_get_off_app_path_is_rest() {
         let req = b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n";
         assert_eq!(
-            read_head(req),
+            read_head(req, DEFAULT_TEST_HEAD_CAP),
             HeadResult::Rest {
                 consumed: req.len()
             }
@@ -270,7 +359,10 @@ mod tests {
             Host: example.com\r\n\
             Upgrade: websocket\r\n\
             Connection: Upgrade\r\n";
-        assert_eq!(read_head(truncated), HeadResult::NeedMore);
+        assert_eq!(
+            read_head(truncated, DEFAULT_TEST_HEAD_CAP),
+            HeadResult::NeedMore
+        );
     }
 
     /// 5. `GET /app/` with a missing `Sec-WebSocket-Key` is a bad upgrade.
@@ -282,7 +374,10 @@ mod tests {
             Connection: Upgrade\r\n\
             Sec-WebSocket-Version: 13\r\n\
             \r\n";
-        assert_eq!(read_head(req), HeadResult::Bad("invalid websocket upgrade"));
+        assert_eq!(
+            read_head(req, DEFAULT_TEST_HEAD_CAP),
+            HeadResult::Bad("invalid websocket upgrade")
+        );
     }
 
     /// 6. Header names *and* values compare case-insensitively, and the
@@ -297,7 +392,7 @@ mod tests {
             Sec-WebSocket-Version: 13\r\n\
             \r\n";
         assert_eq!(
-            read_head(req),
+            read_head(req, DEFAULT_TEST_HEAD_CAP),
             HeadResult::WsUpgrade {
                 key: "dGhlIHNhbXBsZSBub25jZQ==".to_owned(),
                 path: "/app/app-key".to_owned(),

@@ -103,6 +103,8 @@ async fn spawn(activity_timeout: u32, pong_timeout: u32) -> Harness {
                 addr,
                 max_payload: 1 << 20,
                 max_message_bytes: 1 << 20,
+                max_head_bytes: 16_384,
+                handshake_timeout_ms: 10_000,
                 high_water: 1 << 20,
                 mode: Mode::Dispatch(env),
                 rest_handoff: None,

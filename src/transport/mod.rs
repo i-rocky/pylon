@@ -421,6 +421,9 @@ pub fn run_percore(
             // Reassembled-message cap (RFC 6455 §5.4): the per-message event
             // budget — tighter than the per-frame `max_payload` ceiling.
             max_message_bytes: config.max_event_payload_bytes,
+            // G3 (slowloris) hardening: request-head cap + handshake deadline.
+            max_head_bytes: config.max_head_bytes,
+            handshake_timeout_ms: config.handshake_timeout_ms,
             high_water,
             mode: Mode::Dispatch(env.clone()),
             rest_handoff: rest_handoff.clone(),

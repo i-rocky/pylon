@@ -189,6 +189,20 @@ pub struct WorkerConfig {
     /// is dropped (and the fragment accumulator reset) WITHOUT closing the
     /// connection; each individual fragment stays bounded by `max_payload`.
     pub max_message_bytes: usize,
+    /// G3 (slowloris): maximum accepted HTTP request-head size (bytes) — the
+    /// window `inbuf` may grow to while the head is incomplete. A head larger
+    /// than this is [`HeadResult::Bad`] and the connection closes, so a client
+    /// dribbling headerless bytes cannot grow the buffer (and the slab slot)
+    /// without bound. `0` disables the cap. Plumbed from
+    /// `ServerConfig::max_head_bytes` (`PYLON_MAX_HEAD_BYTES`, default 16384).
+    pub max_head_bytes: usize,
+    /// G3 (slowloris): absolute deadline (ms) from ACCEPT for a connection to
+    /// complete its handshake (head + TLS + WS upgrade + session establish).
+    /// On expiry the pre-session connection is closed and its slot reclaimed;
+    /// inbound dribble does NOT postpone it. `0` disables the deadline. Plumbed
+    /// from `ServerConfig::handshake_timeout_ms`
+    /// (`PYLON_HANDSHAKE_TIMEOUT_MS`, default 10000).
+    pub handshake_timeout_ms: u64,
     /// Per-connection outbound high-water mark (bytes) before backpressure-close.
     pub high_water: usize,
     /// Behaviour applied to inbound frames.
@@ -310,7 +324,9 @@ enum Fragment {
 /// `inbuf` is empty or tiny when the connection is idle (it only holds bytes
 /// that arrived mid-frame). During [`ConnState::Handshaking`] it doubles as the
 /// head-accumulation buffer until [`handshake::read_head`] returns something
-/// other than [`HeadResult::NeedMore`].
+/// other than [`HeadResult::NeedMore`]. Its growth while Handshaking is
+/// bounded by `WorkerConfig::max_head_bytes` (G3): past the cap `read_head`
+/// returns `Bad` and the connection closes.
 struct Entry {
     conn: Connection,
     inbuf: BytesMut,
@@ -725,7 +741,26 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
         for event in events.iter() {
             match event.token() {
                 LISTENER => {
-                    let n = accept_ready(&poll, &mut listener, &mut conns, &cfg, codel);
+                    // G3 (slowloris): the ABSOLUTE handshake deadline every new
+                    // connection is born with — accept time plus the configured
+                    // timeout. `None` when disabled (`0`) or on echo workers
+                    // (whose `due()` loop never runs). It lives on the wheel's
+                    // SEPARATE handshake side table, so inbound dribble (the
+                    // `touch` every readable event does) can never postpone it.
+                    let handshake_deadline = if liveness && cfg.handshake_timeout_ms > 0 {
+                        Some(now_ms.saturating_add(cfg.handshake_timeout_ms))
+                    } else {
+                        None
+                    };
+                    let n = accept_ready(
+                        &poll,
+                        &mut listener,
+                        &mut conns,
+                        &cfg,
+                        codel,
+                        &mut wheel,
+                        handshake_deadline,
+                    );
                     accepted_total += n;
                     if n > 0 {
                         if let Some(slot) = &accepted_slot {
@@ -1043,9 +1078,13 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             }
                             None => {
                                 // The connection vanished (or had no session):
-                                // drop it from the wheel so the entry doesn't
-                                // linger.
-                                wheel.remove(key);
+                                // drop its LIVENESS timer so the entry doesn't
+                                // linger — but keep any armed ABSOLUTE deadline
+                                // (handshake, and for parked conns the eventual
+                                // lifetime) intact: a pre-session connection
+                                // whose spurious idle timer fired here must
+                                // still be reaped by the handshake deadline.
+                                wheel.clear_liveness(key);
                             }
                         }
                     }
@@ -1095,6 +1134,42 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             &app_registry,
                             &node_conns,
                         );
+                        work = true;
+                    }
+                    Due::HandshakeTimeout(key) => {
+                        // G3 (slowloris) reap: the connection never completed
+                        // its handshake within `handshake_timeout_ms` of
+                        // accept. No WS session exists (maybe not even a 101),
+                        // so there is no protocol close to emit — tear the TCP
+                        // connection down through the normal `remove` path,
+                        // which reclaims the fd, the slab slot and the wheel
+                        // entries. Counters need no fixing here: BOTH
+                        // `node_conns` and the per-app `conn_counts` are taken
+                        // only in `finish_establish` (paired synchronously with
+                        // `session = Some(..)`), so a pre-session connection
+                        // holds none — `remove`'s `if let Some(session)` guard
+                        // correctly decrements nothing.
+                        let pre_session =
+                            conns.get(key).is_some_and(|entry| entry.session.is_none());
+                        if pre_session {
+                            remove(
+                                &poll,
+                                &mut conns,
+                                key,
+                                &mut local_subs,
+                                &mut sid_to_token,
+                                &mut wheel,
+                                &mut inflight_bytes,
+                                &conn_counts,
+                                &app_registry,
+                                &node_conns,
+                            );
+                        } else {
+                            // Established or gone (a stale timeline entry — the
+                            // establish path cleared the side table): nothing
+                            // to reap; just drop any lingering arm defensively.
+                            wheel.clear_handshake(key);
+                        }
                         work = true;
                     }
                 }
@@ -1308,12 +1383,22 @@ enum Action {
 /// Drain the listener's accept backlog, registering every accepted socket.
 /// Returns the number of connections accepted this call (for accept-distribution
 /// accounting).
+///
+/// G3 (slowloris): every accepted connection is born with an ABSOLUTE
+/// handshake deadline (`handshake_deadline`, computed by the caller from
+/// accept time + `handshake_timeout_ms`), armed on `wheel`'s handshake side
+/// table. A connection that never completes its head/TLS/WS handshake by then
+/// is reaped by the `Due::HandshakeTimeout` arm of the liveness loop — the fd
+/// and slab slot no longer leak. Inbound dribble arms only the liveness timer
+/// (`touch`), never this deadline. `None` disables the arming.
 fn accept_ready(
     poll: &Poll,
     listener: &mut TcpListener,
     conns: &mut slab::Slab<Entry>,
     cfg: &WorkerConfig,
     codel: crate::transport::conn::CodelParams,
+    wheel: &mut TimerWheel,
+    handshake_deadline: Option<u64>,
 ) -> u64 {
     let mut accepted = 0;
     loop {
@@ -1350,6 +1435,12 @@ fn accept_ready(
                     fragment: None,
                     pending_establish: None,
                 });
+                // G3: arm the handshake deadline AFTER the slot exists (the
+                // slab key is the wheel's ConnId). Cleared at session establish;
+                // fires (reap) otherwise.
+                if let Some(deadline_ms) = handshake_deadline {
+                    wheel.arm_handshake(key, deadline_ms);
+                }
                 accepted += 1;
             }
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -1451,7 +1542,7 @@ fn handle_handshake(
         DrainStatus::Ok | DrainStatus::NeedsWrite => {}
     }
 
-    match handshake::read_head(&entry.inbuf) {
+    match handshake::read_head(&entry.inbuf, cfg.max_head_bytes) {
         // No complete head yet. Reconcile poll interest with the TLS flight
         // state (G2): arms WRITABLE when a flight write blocked, clears it
         // once the flight is done.
@@ -1575,6 +1666,11 @@ fn handle_handshake(
                             .conn
                             .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
                         entry.session = Some(session);
+                        // Session established: the G3 handshake deadline has
+                        // served its purpose — clear it so the absolute
+                        // (activity-immune) reap can never fire on a live
+                        // session.
+                        wheel.clear_handshake(key);
                         // Session established: arm the ABSOLUTE
                         // max-connection-lifetime deadline (close 4202) from
                         // this moment. Activity on the connection never pushes
@@ -2407,6 +2503,10 @@ fn drain_resolved(
                     // The max-connection-lifetime clock also starts at THIS establish
                     // moment (the park is not part of the connection's life).
                     arm_lifetime(wheel, env, token, now_ns / 1_000_000);
+                    // G3: and the handshake deadline's job is done — the
+                    // session is established (mirrors the synchronous path's
+                    // clear at `entry.session = Some(..)` above).
+                    wheel.clear_handshake(token);
                 }
             }
             Err(reject) => {
@@ -2547,10 +2647,11 @@ fn flush_and_arm(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action {
 /// handshake (never pending writes) keeps its accept-time READABLE-only
 /// registration with zero extra syscalls.
 ///
-/// Task 3.3 (handshake deadline, not yet implemented) hooks HERE: a connection
-/// leaving this function with WRITABLE armed is precisely the one a
-/// stalled-handshake deadline must cover, so arm/re-arm that deadline wherever
-/// this arms interest.
+/// Task 3.3 (G3 handshake deadline) ultimately did NOT hook here: the
+/// slowloris deadline is ABSOLUTE from accept (armed once in
+/// [`accept_ready`], cleared at session establish), so a connection blocked
+/// in this function on a stalled TLS flight is covered by that accept-time
+/// arm — activity and interest churn never postpone it.
 fn arm_handshake_interest(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action {
     let token = entry.token;
     if entry.conn.tls_wants_write() || entry.conn.has_pending_writes() {
@@ -2976,6 +3077,8 @@ mod tests {
                     addr,
                     max_payload: 1 << 20,
                     max_message_bytes: 1 << 20,
+                    max_head_bytes: 16_384,
+                    handshake_timeout_ms: 10_000,
                     high_water: 1 << 20,
                     mode: Mode::Echo,
                     rest_handoff: None,
@@ -3204,6 +3307,8 @@ mod tests {
             addr: "127.0.0.1:0".parse().unwrap(),
             max_payload: 1 << 20,
             max_message_bytes: 1 << 20,
+            max_head_bytes: 16_384,
+            handshake_timeout_ms: 10_000,
             high_water: 1 << 20,
             mode: Mode::Echo,
             rest_handoff: None,

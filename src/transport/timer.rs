@@ -30,6 +30,15 @@
 //! which only rewrites the liveness timer — can never push it out: the lifetime
 //! is measured from establishment, not from last activity.
 //!
+//! Each connection can ALSO carry ONE absolute [`Kind::Handshake`] deadline,
+//! armed at ACCEPT via [`arm_handshake`](TimerWheel::arm_handshake): the
+//! slowloris reap — a connection that has not completed its handshake within
+//! `handshake_timeout_ms` of accept is closed and its slot reclaimed. Same
+//! side-table pattern as the lifetime deadline (so dribbled inbound bytes —
+//! which `touch` the liveness timer — can NEVER postpone it), cleared by
+//! [`clear_handshake`](TimerWheel::clear_handshake) the moment the session
+//! establishes.
+//!
 //! Time is injected (every method takes `now_ms`) so the unit test is fully
 //! deterministic. The worker feeds it the same monotonic clock it already
 //! computes for CoDel (the `worker_epoch` elapsed, in milliseconds).
@@ -55,6 +64,11 @@ pub enum Due {
     /// The connection reached its maximum lifetime (`established_at +
     /// max_conn_lifetime`): close with code 4202 ("Closed after inactivity").
     Close4202(ConnId),
+    /// A pre-session connection blew the handshake deadline (`accepted_at +
+    /// `handshake_timeout_ms`): close it and reclaim its slot. No WS session
+    /// exists, so the worker tears the TCP connection down without a close
+    /// frame.
+    HandshakeTimeout(ConnId),
 }
 
 /// Which deadline a connection is currently waiting on.
@@ -68,6 +82,11 @@ enum Kind {
     /// establishment; only ever set by [`TimerWheel::arm_lifetime`], never
     /// rescheduled by activity.
     Lifetime,
+    /// Pre-session handshake deadline — reap when it elapses. ABSOLUTE from
+    /// accept; only ever set by [`TimerWheel::arm_handshake`], never
+    /// rescheduled by activity, cleared by [`TimerWheel::clear_handshake`] at
+    /// session establish.
+    Handshake,
 }
 
 /// The connection's current (live) scheduled timer. A timeline entry is only
@@ -112,6 +131,12 @@ pub struct TimerWheel {
     /// of truth for `Kind::Lifetime` timeline entries. Never rewritten by
     /// `touch`/`mark_ping_sent` — the lifetime is not activity-relative.
     lifetime: HashMap<ConnId, u64>,
+    /// Each connection's armed pre-session handshake deadline (absolute ms,
+    /// from accept). The source of truth for `Kind::Handshake` timeline
+    /// entries. Never rewritten by `touch`/`mark_ping_sent` (dribbled bytes are
+    /// activity on the liveness timer only) — the deadline is absolute from
+    /// accept; cleared at session establish.
+    handshake: HashMap<ConnId, u64>,
 }
 
 impl TimerWheel {
@@ -130,6 +155,7 @@ impl TimerWheel {
             timeline: BTreeMap::new(),
             live: HashMap::new(),
             lifetime: HashMap::new(),
+            handshake: HashMap::new(),
         }
     }
 
@@ -166,6 +192,38 @@ impl TimerWheel {
         });
     }
 
+    /// Arm `conn`'s pre-session handshake deadline at the ABSOLUTE
+    /// `deadline_ms` (the worker passes `accepted_at + handshake_timeout_ms`).
+    /// Called ONCE per connection, at accept; nothing on the activity path
+    /// reschedules it (a dribbling slowloris `touch`es only the liveness
+    /// timer), so it always fires at exactly the armed deadline unless
+    /// [`clear_handshake`](Self::clear_handshake) runs first (session
+    /// establish) or the connection is [`remove`](Self::remove)d.
+    pub fn arm_handshake(&mut self, conn: ConnId, deadline_ms: u64) {
+        self.handshake.insert(conn, deadline_ms);
+        self.timeline.entry(deadline_ms).or_default().push(Slot {
+            conn,
+            kind: Kind::Handshake,
+        });
+    }
+
+    /// Clear `conn`'s armed handshake deadline (the session established within
+    /// the window). The stale timeline entry is skipped lazily by
+    /// [`due`](Self::due); only the side-table entry must go now so the
+    /// deadline cannot fire on an established connection.
+    pub fn clear_handshake(&mut self, conn: ConnId) {
+        self.handshake.remove(&conn);
+    }
+
+    /// Drop `conn`'s LIVENESS timer only (idle or pong), leaving any armed
+    /// absolute deadlines (lifetime, handshake) in place. Used by the worker's
+    /// `Due::Ping` path when it finds no session: the pre-session connection's
+    /// idle timer is spurious (only established sessions are pinged), but its
+    /// handshake deadline must survive so the slowloris reap still fires.
+    pub fn clear_liveness(&mut self, conn: ConnId) {
+        self.live.remove(&conn);
+    }
+
     /// Drop `conn` from the wheel entirely (on connection close, any reason).
     /// The stale timeline entries are reaped lazily by [`due`](Self::due); only
     /// the side-table entries must go now so a recycled slab token isn't matched
@@ -173,6 +231,7 @@ impl TimerWheel {
     pub fn remove(&mut self, conn: ConnId) {
         self.live.remove(&conn);
         self.lifetime.remove(&conn);
+        self.handshake.remove(&conn);
     }
 
     /// Advance the wheel to `now_ms` and return everything that has come due:
@@ -212,6 +271,15 @@ impl TimerWheel {
                     Kind::Lifetime => {
                         if self.lifetime.get(&slot.conn) == Some(&deadline_ms) {
                             out.push(Due::Close4202(slot.conn));
+                        }
+                    }
+                    // Same for the handshake deadline: honoured iff the side
+                    // table still arms this exact deadline (a
+                    // `clear_handshake` at establish or a `remove` at close
+                    // drops it).
+                    Kind::Handshake => {
+                        if self.handshake.get(&slot.conn) == Some(&deadline_ms) {
+                            out.push(Due::HandshakeTimeout(slot.conn));
                         }
                     }
                 }
@@ -355,5 +423,79 @@ mod tests {
             w.due(86_400_000).is_empty(),
             "removed conn's lifetime must not fire"
         );
+    }
+
+    // ── G3: pre-session handshake deadline ─────────────────────────────────────
+
+    #[test]
+    fn handshake_deadline_fires_at_accept_plus_timeout_despite_constant_dribble() {
+        let mut w = TimerWheel::new();
+        w.arm_handshake(4, 500); // absolute: 500ms after accept
+                                 // The slowloris keeps dribbling bytes — every touch re-arms the IDLE
+                                 // deadline but must NOT push the handshake deadline out.
+        for t in (0..500).step_by(50) {
+            w.touch(4, t);
+        }
+        assert!(
+            w.due(499).is_empty(),
+            "handshake deadline must not fire early"
+        );
+        assert_eq!(w.due(500), vec![Due::HandshakeTimeout(4)]);
+    }
+
+    #[test]
+    fn clear_handshake_at_establish_cancels_the_reap() {
+        let mut w = TimerWheel::new();
+        w.arm_handshake(4, 500);
+        w.clear_handshake(4); // session established within the window
+        assert!(
+            w.due(10_000).is_empty(),
+            "an established connection must never be reaped by the handshake deadline"
+        );
+    }
+
+    #[test]
+    fn remove_cancels_armed_handshake() {
+        let mut w = TimerWheel::new();
+        w.arm_handshake(5, 1_000);
+        w.remove(5);
+        // The timeline entry still sits there but the side table is empty, so
+        // nothing fires for the (possibly recycled) token.
+        assert!(w.due(2_000).is_empty());
+    }
+
+    #[test]
+    fn clear_liveness_keeps_the_handshake_deadline_armed() {
+        // A pre-session conn whose (spurious) idle timer fires loses ONLY that
+        // timer — its handshake deadline must survive so the reap still fires.
+        // (Config where activity_timeout < handshake_timeout, so the idle timer
+        // is the one that fires first on a dribbling conn.)
+        let mut w = TimerWheel::new();
+        w.touch(6, 0); // dribble armed an idle deadline at 120_000
+        w.arm_handshake(6, 200_000); // handshake deadline AFTER the idle cycle
+        assert_eq!(w.due(120_000), vec![Due::Ping(6)]); // spurious idle ping
+        w.clear_liveness(6); // the worker found no session → liveness-only clear
+        assert_eq!(
+            w.due(200_000),
+            vec![Due::HandshakeTimeout(6)],
+            "the handshake deadline must survive the liveness clear"
+        );
+    }
+
+    #[test]
+    fn handshake_deadline_coexists_with_liveness_and_lifetime_timers() {
+        let mut w = TimerWheel::new();
+        w.arm_handshake(7, 1_000);
+        w.touch(7, 0); // idle at 120_000
+                       // Establish before the handshake deadline (popped-but-skipped when the
+                       // wheel later sweeps past 1_000): liveness + lifetime live on after it.
+        w.clear_handshake(7);
+        w.arm_lifetime(7, 200_000);
+        assert_eq!(w.due(120_000), vec![Due::Ping(7)]);
+        w.mark_ping_sent(7, 120_000);
+        assert_eq!(w.due(150_000), vec![Due::Close4201(7)]);
+        assert_eq!(w.due(200_000), vec![Due::Close4202(7)]);
+        w.remove(7);
+        assert!(w.due(1_000_000).is_empty());
     }
 }

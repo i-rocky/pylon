@@ -44,6 +44,9 @@ struct Harness {
     port: u16,
     adapter: Arc<dyn Adapter>,
     conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>>,
+    /// The node-level live-connection counter handed to the worker's env —
+    /// exposed so tests can assert it nets to zero across reap paths.
+    node_conns: Arc<AtomicUsize>,
     app_registry: Arc<AppRegistry>,
     shutdown: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -85,6 +88,7 @@ async fn spawn_with_apps(config: ServerConfig, apps_json: &str) -> Harness {
     let app_registry = Arc::new(AppRegistry::new());
     let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry, app_registry.clone()));
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
+    let node_conns = Arc::new(AtomicUsize::new(0));
     let env = Arc::new(DispatchEnv {
         apps,
         adapter: adapter.clone(),
@@ -94,7 +98,7 @@ async fn spawn_with_apps(config: ServerConfig, apps_json: &str) -> Harness {
         max_conn_lifetime_secs: config.max_conn_lifetime_secs,
         strict_protocol: config.strict_protocol,
         conn_counts: conn_counts.clone(),
-        node_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        node_conns: node_conns.clone(),
         webhooks: pylon::webhook::WebhookHandle::null(),
         saturated: None,
         clustered: false,
@@ -114,6 +118,11 @@ async fn spawn_with_apps(config: ServerConfig, apps_json: &str) -> Harness {
                 addr,
                 max_payload: 1 << 20,
                 max_message_bytes: 1 << 20,
+                // G3 (slowloris) knobs: from the config so the env-var tests
+                // (`PYLON_MAX_HEAD_BYTES` / `PYLON_HANDSHAKE_TIMEOUT_MS`)
+                // reach the worker.
+                max_head_bytes: config.max_head_bytes,
+                handshake_timeout_ms: config.handshake_timeout_ms,
                 high_water: 1 << 20,
                 mode: Mode::Dispatch(env),
                 rest_handoff: None,
@@ -141,6 +150,7 @@ async fn spawn_with_apps(config: ServerConfig, apps_json: &str) -> Harness {
         port,
         adapter,
         conn_counts,
+        node_conns,
         app_registry,
         shutdown,
         handle: Some(handle),
@@ -305,6 +315,7 @@ async fn spawn_with_node_ceiling(max_connections: usize) -> Harness {
     let app_registry = Arc::new(AppRegistry::new());
     let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry, app_registry.clone()));
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
+    let node_conns = Arc::new(AtomicUsize::new(0));
     let env = Arc::new(DispatchEnv {
         apps,
         adapter: adapter.clone(),
@@ -316,7 +327,7 @@ async fn spawn_with_node_ceiling(max_connections: usize) -> Harness {
         max_conn_lifetime_secs: 0,
         strict_protocol: false,
         conn_counts: conn_counts.clone(),
-        node_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        node_conns: node_conns.clone(),
         webhooks: pylon::webhook::WebhookHandle::null(),
         saturated: None,
         clustered: false,
@@ -336,6 +347,8 @@ async fn spawn_with_node_ceiling(max_connections: usize) -> Harness {
                 addr,
                 max_payload: 1 << 20,
                 max_message_bytes: 1 << 20,
+                max_head_bytes: 16_384,
+                handshake_timeout_ms: 10_000,
                 high_water: 1 << 20,
                 mode: Mode::Dispatch(env),
                 rest_handoff: None,
@@ -362,6 +375,7 @@ async fn spawn_with_node_ceiling(max_connections: usize) -> Harness {
         port,
         adapter,
         conn_counts,
+        node_conns,
         app_registry,
         shutdown,
         handle: Some(handle),
@@ -515,6 +529,7 @@ async fn spawn_with_saturation_flag() -> (Harness, Arc<AtomicBool>) {
     ));
     let sat_flag = Arc::new(AtomicBool::new(false));
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
+    let node_conns = Arc::new(AtomicUsize::new(0));
     let env = Arc::new(DispatchEnv {
         apps,
         adapter: adapter.clone(),
@@ -526,7 +541,7 @@ async fn spawn_with_saturation_flag() -> (Harness, Arc<AtomicBool>) {
         max_conn_lifetime_secs: 0,
         strict_protocol: false,
         conn_counts: conn_counts.clone(),
-        node_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        node_conns: node_conns.clone(),
         webhooks: pylon::webhook::WebhookHandle::null(),
         saturated: Some(sat_flag.clone()),
         clustered: false,
@@ -546,6 +561,8 @@ async fn spawn_with_saturation_flag() -> (Harness, Arc<AtomicBool>) {
                 addr,
                 max_payload: 1 << 20,
                 max_message_bytes: 1 << 20,
+                max_head_bytes: 16_384,
+                handshake_timeout_ms: 10_000,
                 high_water: 1 << 20,
                 mode: Mode::Dispatch(env),
                 rest_handoff: None,
@@ -572,6 +589,7 @@ async fn spawn_with_saturation_flag() -> (Harness, Arc<AtomicBool>) {
         port,
         adapter,
         conn_counts,
+        node_conns,
         app_registry,
         shutdown,
         handle: Some(handle),
@@ -825,4 +843,177 @@ async fn max_conn_lifetime_zero_disables_the_close() {
         next_event_named(&mut ws, "pusher:pong").await["event"],
         "pusher:pong"
     );
+}
+
+// ── Scenario 9: G3 slowloris hardening (head cap + handshake deadline) ───────
+
+/// Open a RAW TCP connection to the worker (no WS handshake bytes sent).
+async fn raw_tcp(port: u16) -> tokio::net::TcpStream {
+    tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("raw tcp connect")
+}
+
+/// Wait until the server closes its side (read EOF or error), bounded by
+/// `budget`. Returns `Some(elapsed)` when the close was observed, `None` when
+/// the budget expired with the connection still open (the pre-fix behaviour).
+async fn wait_server_close(
+    rd: &mut tokio::net::tcp::OwnedReadHalf,
+    budget: Duration,
+) -> Option<std::time::Duration> {
+    use tokio::io::AsyncReadExt;
+    let start = std::time::Instant::now();
+    let mut buf = [0u8; 64];
+    let closed = tokio::time::timeout(budget, async {
+        loop {
+            match rd.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    closed.ok().map(|_| start.elapsed())
+}
+
+/// Pre-session connections never take any counter (both `node_conns` and the
+/// per-app `conn_counts` increment only in `finish_establish`); a reap that
+/// decremented what it never took would drift them. Pin the net-zero invariant
+/// on both reap paths.
+fn assert_counters_net_zero(h: &Harness) {
+    assert_eq!(
+        h.node_conns.load(Ordering::SeqCst),
+        0,
+        "node_conns must net to zero after the pre-session reap"
+    );
+    assert!(
+        h.conn_counts.is_empty(),
+        "conn_counts must hold no entries after the pre-session reap"
+    );
+}
+
+/// (a) A client dribbling HEADERLESS bytes slowly grows `inbuf` forever
+/// pre-fix. With the default 16 KiB head cap, the connection must be CLOSED
+/// once the accumulated head exceeds the cap — well within the bounded wait —
+/// and the counters must net to zero.
+#[tokio::test]
+async fn head_cap_closes_a_dribbling_slowloris() {
+    let h = spawn(ServerConfig::default()).await;
+    let (mut rd, mut wr) = raw_tcp(h.port).await.into_split();
+
+    // Dribble 32 KiB of headerless bytes in 1 KiB chunks (~650 ms total): the
+    // cap trips after ~17 chunks, long before the stream ends. If every chunk
+    // lands (pre-fix), HOLD the write side open — the only close the read side
+    // may then observe is the server's, never our own EOF.
+    let writer = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let chunk = [b'x'; 1024];
+        for _ in 0..32 {
+            if wr.write_all(&chunk).await.is_err() {
+                return; // server already closed — exactly what we want
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        futures_util::future::pending::<()>().await;
+    });
+
+    let closed = wait_server_close(&mut rd, Duration::from_secs(3)).await;
+    assert!(
+        closed.is_some(),
+        "server must close the connection once the head cap trips (pre-fix: unbounded buffer, close never comes)"
+    );
+    writer.abort();
+    let _ = writer.await;
+    tokio::time::sleep(Duration::from_millis(100)).await; // reap settles
+    assert_counters_net_zero(&h);
+}
+
+/// (b) A TCP connection that sends NOTHING never completes its handshake and
+/// (pre-fix) leaks its fd + slab slot forever. With
+/// `PYLON_HANDSHAKE_TIMEOUT_MS=500` the server must close it within ~1.5s.
+#[tokio::test]
+async fn handshake_timeout_reaps_a_silent_connection() {
+    std::env::set_var("PYLON_HANDSHAKE_TIMEOUT_MS", "500");
+    let _guard = EnvVarGuard("PYLON_HANDSHAKE_TIMEOUT_MS");
+    let h = spawn(ServerConfig::from_env()).await;
+
+    let (mut rd, _wr) = raw_tcp(h.port).await.into_split();
+    let start = std::time::Instant::now();
+    let closed = wait_server_close(&mut rd, Duration::from_millis(1500)).await;
+    assert!(
+        closed.is_some(),
+        "silent pre-session connection must be reaped within ~1.5s (pre-fix: leaked forever)"
+    );
+    assert!(
+        start.elapsed() >= Duration::from_millis(300),
+        "the reap must respect the 500ms deadline, not close instantly"
+    );
+    assert_counters_net_zero(&h);
+}
+
+/// (c) The slowloris limits are generous for real handshakes: under the same
+/// `PYLON_HANDSHAKE_TIMEOUT_MS=500` + `PYLON_MAX_HEAD_BYTES=1024` config, a
+/// normal WS connect still establishes, and stays established + responsive.
+#[tokio::test]
+async fn normal_connect_survives_the_slowloris_limits() {
+    std::env::set_var("PYLON_HANDSHAKE_TIMEOUT_MS", "500");
+    let _g_timeout = EnvVarGuard("PYLON_HANDSHAKE_TIMEOUT_MS");
+    std::env::set_var("PYLON_MAX_HEAD_BYTES", "1024");
+    let _g_head = EnvVarGuard("PYLON_MAX_HEAD_BYTES");
+    let h = spawn(ServerConfig::from_env()).await;
+
+    let mut ws = connect(h.port, "?protocol=7").await;
+    let sid = established_socket_id(&mut ws).await;
+    assert!(
+        sid.contains('.'),
+        "handshake must complete under the cap+deadline"
+    );
+
+    // Still established and responsive a second later (the deadline is
+    // pre-session only — it never touches a live session).
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    send_json(&mut ws, json!({ "event": "pusher:ping", "data": {} })).await;
+    assert_eq!(
+        next_event_named(&mut ws, "pusher:pong").await["event"],
+        "pusher:pong"
+    );
+}
+
+/// (d) The handshake deadline is ABSOLUTE from accept: dribbling one byte every
+/// 100ms for 1s (continuous activity) must NOT postpone the 500ms deadline —
+/// the connection closes at ~500ms anyway, unlike the idle timer.
+#[tokio::test]
+async fn handshake_deadline_is_not_postponed_by_activity() {
+    std::env::set_var("PYLON_HANDSHAKE_TIMEOUT_MS", "500");
+    let _guard = EnvVarGuard("PYLON_HANDSHAKE_TIMEOUT_MS");
+    let h = spawn(ServerConfig::from_env()).await;
+
+    let (mut rd, mut wr) = raw_tcp(h.port).await.into_split();
+    let start = std::time::Instant::now();
+    let writer = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        for _ in 0..10 {
+            if wr.write_all(b"x").await.is_err() {
+                return; // server closed mid-dribble — the expected outcome
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // All 1s of dribble landed (pre-fix): hold the write side open so the
+        // only close the read side can observe is the server's reap.
+        futures_util::future::pending::<()>().await;
+    });
+
+    let closed = wait_server_close(&mut rd, Duration::from_millis(1200)).await;
+    assert!(
+        closed.is_some(),
+        "connection must be reaped at the deadline despite constant dribble"
+    );
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "closed at {elapsed:?}; the deadline was postponed by activity (expected ~500ms)"
+    );
+    writer.abort();
+    let _ = writer.await;
+    assert_counters_net_zero(&h);
 }
