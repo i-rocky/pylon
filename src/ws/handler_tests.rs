@@ -368,7 +368,16 @@ async fn client_event_rejected_when_messaging_disabled() {
     })
     .await;
     match rx.try_recv().map(|b| *b) {
-        Ok(ServerEvent::ClientEventError { code, .. }) => assert_eq!(code, 4301),
+        Ok(ServerEvent::ClientEventError { code, message, .. }) => {
+            // 1.7 verification: hosted Pusher documents no code/message for this
+            // class (docs only say client events "must be enabled for the
+            // application") → 4301 kept deliberately; message is soketi parity.
+            assert_eq!(code, 4301);
+            assert_eq!(
+                message, "The app does not have client messaging enabled.",
+                "messaging-disabled message must stay byte-stable"
+            );
+        }
         other => panic!("expected 4301, got {other:?}"),
     }
 }
@@ -399,9 +408,21 @@ async fn client_event_oversize_payload_returns_4301() {
     .await;
     // Must receive pusher:error 4301 (was: silence)
     match rx.try_recv().map(|b| *b) {
-        Ok(ServerEvent::ClientEventError { code, channel, .. }) => {
+        Ok(ServerEvent::ClientEventError {
+            code,
+            channel,
+            message,
+        }) => {
+            // 1.7 verification: hosted Pusher documents no code/message for the
+            // oversize-data class (neither the protocol error table nor the
+            // client-events page lists one) → 4301 kept deliberately; message
+            // is Pylon's own and pinned byte-stable.
             assert_eq!(code, 4301, "oversize payload must return 4301");
             assert_eq!(channel, "private-x", "error frame must carry the channel");
+            assert_eq!(
+                message, "Client event rejected - the data is too large",
+                "oversize-payload message must stay byte-stable"
+            );
         }
         other => panic!("expected ClientEventError 4301, got {other:?}"),
     }
@@ -418,11 +439,19 @@ async fn client_event_messaging_disabled_error_carries_channel() {
     })
     .await;
     match rx.try_recv().map(|b| *b) {
-        Ok(ServerEvent::ClientEventError { code, channel, .. }) => {
+        Ok(ServerEvent::ClientEventError {
+            code,
+            channel,
+            message,
+        }) => {
             assert_eq!(code, 4301);
             assert_eq!(
                 channel, "private-x",
                 "messaging-disabled 4301 must carry channel"
+            );
+            assert_eq!(
+                message, "The app does not have client messaging enabled.",
+                "messaging-disabled message must stay byte-stable"
             );
         }
         other => panic!("expected ClientEventError with channel, got {other:?}"),
@@ -1714,10 +1743,20 @@ async fn client_event_oversize_name_returns_4301_and_does_not_broadcast() {
     // Sender must receive a 4301 ClientEventError.
     match rx_sender.try_recv().map(|b| *b) {
         Ok(ServerEvent::ClientEventError {
-            code, channel: ch, ..
+            code,
+            channel: ch,
+            message,
         }) => {
+            // 1.7 verification: hosted Pusher documents no code/message for the
+            // oversize-name class (the protocol page only requires the
+            // `client-` prefix) → 4301 kept deliberately; message is soketi
+            // parity with the default max_event_name_length of 200.
             assert_eq!(code, 4301, "oversize event name must return 4301 (P16)");
             assert_eq!(ch, channel, "error must carry the channel name");
+            assert_eq!(
+                message, "Event name is too long. Maximum allowed size is 200.",
+                "oversize-name message must stay byte-stable"
+            );
         }
         other => panic!("expected ClientEventError 4301 for oversize event name, got {other:?}"),
     }
@@ -1977,11 +2016,21 @@ async fn client_event_rate_limit_returns_4301_and_drops() {
     let mut rate_errors = 0;
     while let Ok(ev) = rx_sender.try_recv().map(|b| *b) {
         if let ServerEvent::ClientEventError {
-            code, channel: ch, ..
+            code,
+            channel: ch,
+            message,
         } = ev
         {
+            // 1.7 verification: hosted Pusher's protocol error table documents
+            // exactly one client-event code — "4301: Client event rejected due
+            // to rate limit" — so code AND message are pinned byte-identical
+            // to that row (no trailing period).
             assert_eq!(code, 4301, "rate-limit error must be code 4301");
             assert_eq!(ch, channel, "error must carry the channel name");
+            assert_eq!(
+                message, "Client event rejected due to rate limit",
+                "rate-limit message must match the documented 4301 row verbatim"
+            );
             rate_errors += 1;
         }
     }

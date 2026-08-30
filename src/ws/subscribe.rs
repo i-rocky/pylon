@@ -347,6 +347,44 @@ impl ConnectionContext {
         channel: String,
         data: Value,
     ) {
+        // ── Task 1.7: client-event rejection codes — verification vs hosted Pusher ──
+        //
+        // All four rejection paths below reuse code 4301. That was verified against
+        // live sources (2026-08-30), per class:
+        //
+        // 1. Client messaging disabled (app gate):
+        //    https://pusher.com/docs/channels/library_auth_reference/pusher-websockets-protocol/
+        //    documents no code for this class — the client-events page
+        //    (https://pusher.com/docs/channels/using_channels/events/) only says
+        //    "Client events must be enabled for the application." → 4301 KEPT
+        //    (deliberate, undocumented class); message is soketi parity
+        //    (soketi 1.x src/ws-handler.ts: "The app does not have client messaging enabled.").
+        //
+        // 2. Oversized event name (> max_event_name_length, default 200):
+        //    Neither the protocol page's error-codes table nor the client-events page
+        //    documents a code/message for this class (only the `client-` prefix rule).
+        //    → 4301 KEPT (deliberate, undocumented class); message is soketi parity
+        //    ("Event name is too long. Maximum allowed size is ${max}.").
+        //
+        // 3. Oversized payload (> max_event_payload_bytes, default 10 KiB):
+        //    No code/message documented for the WS path (the REST API page documents
+        //    a 413 HTTP error, which does not apply to in-band pusher:error frames).
+        //    → 4301 KEPT (deliberate, undocumented class); message is Pylon's own,
+        //    kept byte-stable.
+        //
+        // 4. Rate limit (>10 client events/sec/connection):
+        //    The protocol page's error-codes table documents exactly one
+        //    client-event code — "4301: Client event rejected due to rate limit" —
+        //    and the events page: "Publish no more than 10 messages per second per
+        //    client (connection). Any events triggered above this rate limit will be
+        //    rejected by our API." → 4301 with the documented message verbatim.
+        //
+        // Client tolerance (pusher-js master): in-band `pusher:error` frames are
+        // forwarded verbatim — src/core/connection/connection.ts:
+        //   case 'pusher:error': this.emit('error', { type: 'PusherError', data: pusherEvent.data })
+        // with no code-specific branching for 43xx (Protocol.getCloseAction only maps
+        // WebSocket CLOSE codes, and only during handshake/close), so any of these
+        // frames is surfaced to app error handlers without disconnecting.
         if !self.app.client_messages_enabled {
             self.send_self(ServerEvent::ClientEventError {
                 channel,
