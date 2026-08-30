@@ -222,6 +222,7 @@ pub fn run_percore(
         limits: config.limits(),
         activity_timeout: config.activity_timeout,
         pong_timeout: config.pong_timeout,
+        max_conn_lifetime_secs: config.max_conn_lifetime_secs,
         strict_protocol: config.strict_protocol,
         conn_counts,
         node_conns,

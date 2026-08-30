@@ -43,6 +43,14 @@ impl PusherError {
     pub fn backend_unavailable() -> Self {
         Self::new(4103, "application store temporarily unavailable")
     }
+    /// Max connection lifetime reached. Pusher closes connections that have
+    /// been established too long (currently 24h) with **4202** — the
+    /// "Closed after inactivity" close code in the reconnect-immediately band
+    /// (4200-4299). Message text is the exact close-code name from the Pusher
+    /// protocol page: https://pusher.com/docs/channels/library_auth_reference/pusher-websockets-protocol/
+    pub fn max_lifetime() -> Self {
+        Self::new(4202, "Closed after inactivity")
+    }
 }
 
 #[cfg(test)]
@@ -79,5 +87,13 @@ mod tests {
     fn backend_unavailable_carries_4103() {
         assert_eq!(PusherError::backend_unavailable().code, 4103);
         assert!(!PusherError::backend_unavailable().message.is_empty());
+    }
+
+    #[test]
+    fn max_lifetime_carries_4202_and_pusher_wording() {
+        let e = PusherError::max_lifetime();
+        assert_eq!(e.code, 4202);
+        // Exact close-code name from the official Pusher protocol page.
+        assert_eq!(e.message, "Closed after inactivity");
     }
 }

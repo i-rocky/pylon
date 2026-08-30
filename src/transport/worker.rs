@@ -104,6 +104,12 @@ pub struct DispatchEnv {
     /// before closing the connection with code `4201`. Drives this worker's
     /// [`TimerWheel`].
     pub pong_timeout: u32,
+    /// Maximum connection age in seconds: once a session has been established
+    /// for this long the worker closes the connection with code **4202**
+    /// ("Closed after inactivity", Pusher's 24h maximum connection lifetime —
+    /// reconnect-immediately band). Armed ONCE per session (absolute deadline in
+    /// the [`TimerWheel`]); activity never pushes it out. `0` disables.
+    pub max_conn_lifetime_secs: u64,
     pub strict_protocol: bool,
     /// Per-app live connection counters (shared with the rest of the server),
     /// mirroring `AppState::conn_counts`.
@@ -727,6 +733,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             &mailbox_waker,
                             &resolved_tx,
                             &mut next_gen,
+                            &mut wheel,
                         ) {
                             Action::Close => {
                                 remove(
@@ -947,6 +954,33 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         );
                         work = true;
                     }
+                    Due::Close4202(key) => {
+                        // Max connection lifetime reached: emit the in-band
+                        // `pusher:error` 4202 first, then the WS Close 4202
+                        // (same belt-and-suspenders convention as the drain
+                        // path's 4200), and tear the connection down through
+                        // the normal `remove` close path.
+                        queue_lifetime_error(&mut conns, key, now_ns);
+                        send_close_4202(&poll, &mut conns, key, now_ns);
+                        // INCREMENTAL INFLIGHT: mirror the 4201 arm — fold the
+                        // queued/flushed delta before `remove` subtracts the
+                        // connection's still-queued bytes.
+                        fold_delta(&mut conns, key, &mut inflight_bytes);
+                        fold_codel(&mut conns, key, &mut codel_dropped_total);
+                        remove(
+                            &poll,
+                            &mut conns,
+                            key,
+                            &mut local_subs,
+                            &mut sid_to_token,
+                            &mut wheel,
+                            &mut inflight_bytes,
+                            &conn_counts,
+                            &app_registry,
+                            &node_conns,
+                        );
+                        work = true;
+                    }
                 }
             }
         }
@@ -1047,6 +1081,56 @@ fn send_close_4200(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_n
         "Server is shutting down; please reconnect",
         now_ns,
     );
+}
+
+/// Max connection lifetime (Pusher parity, default 24h): send a WebSocket Close
+/// frame with code `4202` — "Closed after inactivity", the reconnect-immediately
+/// band. Message text is the exact close-code name from the Pusher protocol
+/// page (see [`crate::protocol::error::PusherError::max_lifetime`]). The caller
+/// is responsible for the subsequent `fold_delta` + `remove` (the `Due::Close4202`
+/// arm queues the in-band `pusher:error` 4202 first via [`queue_lifetime_error`]).
+fn send_close_4202(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) {
+    send_close_reply(
+        poll,
+        conns,
+        key,
+        4202,
+        crate::protocol::error::PusherError::max_lifetime()
+            .message
+            .as_str(),
+        now_ns,
+    );
+}
+
+/// Max connection lifetime: queue a `pusher:error` 4202 text frame onto `key`'s
+/// out-queue BEFORE the Close frame (the same belt-and-suspenders convention as
+/// [`queue_shutdown_error`]): `{"event":"pusher:error","data":{"code":4202,
+/// "message":"Closed after inactivity"}}`. No-op if the connection no longer
+/// exists — the Close frame alone still carries the code for pusher-js.
+fn queue_lifetime_error(conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) {
+    let Some(entry) = conns.get_mut(key) else {
+        return;
+    };
+    let error = crate::protocol::error::PusherError::max_lifetime();
+    // A lifetime close only ever fires on an ESTABLISHED session, but fall back
+    // to the raw-JSON form (as `queue_shutdown_error` does) for a conn whose
+    // session vanished between arming and firing.
+    let text = if let Some(session) = entry.session.as_ref() {
+        session.codec.encode(&ServerEvent::Error(error))
+    } else {
+        serde_json::json!({
+            "event": "pusher:error",
+            "data": { "code": error.code, "message": error.message }
+        })
+        .to_string()
+    };
+    let mut out = BytesMut::new();
+    frame::encode_text(&mut out, text.as_bytes());
+    let _ = entry
+        .conn
+        .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+    // No explicit flush here: the caller queues the Close frame next via
+    // `send_close_4202`, whose `flush_and_arm` flushes both frames together.
 }
 
 /// C2a drain: queue a `pusher:error` 4200 text frame onto `key`'s out-queue
@@ -1162,12 +1246,28 @@ fn accept_ready(
     accepted
 }
 
+/// Arm `key`'s max-connection-lifetime deadline in the wheel: ABSOLUTE at
+/// `now_ms + max_conn_lifetime_secs` (Pusher closes connections at a maximum
+/// age with code 4202). No-op when the lifetime is disabled (`0`). Called once
+/// per session, at establish; [`TimerWheel::touch`] on later activity re-arms
+/// only the liveness timer, never this deadline.
+fn arm_lifetime(wheel: &mut TimerWheel, env: &DispatchEnv, key: usize, now_ms: u64) {
+    if env.max_conn_lifetime_secs > 0 {
+        let deadline_ms = now_ms.saturating_add(env.max_conn_lifetime_secs.saturating_mul(1000));
+        wheel.arm_lifetime(key, deadline_ms);
+    }
+}
+
 /// Handle a readable event: either advance the handshake or process frames.
 ///
 /// `dirty_tx` + `mailbox_waker` are this worker's selective-drain notifier inputs;
 /// on handshake completion they are stamped (with this connection's slab `key` as
 /// the token) into the new session's `ctx.mailbox_notify`, so a later
 /// cross-connection `Mailbox::send` marks this connection dirty and wakes the worker.
+///
+/// `wheel` is the worker's liveness wheel: at handshake completion the new
+/// session's absolute max-connection-lifetime deadline is armed on it (the
+/// idle deadline is armed by the caller's `touch` on every readable).
 #[allow(clippy::too_many_arguments)]
 fn handle_readable(
     poll: &Poll,
@@ -1179,6 +1279,7 @@ fn handle_readable(
     mailbox_waker: &Arc<mio::Waker>,
     resolved_tx: &std::sync::mpsc::Sender<ResolvedApp>,
     next_gen: &mut u64,
+    wheel: &mut TimerWheel,
 ) -> Action {
     let entry = &mut conns[key];
     match entry.conn.state {
@@ -1192,6 +1293,7 @@ fn handle_readable(
             mailbox_waker,
             resolved_tx,
             next_gen,
+            wheel,
         ),
         ConnState::Open | ConnState::Closing => handle_frames(poll, entry, cfg, now_ns),
     }
@@ -1202,6 +1304,8 @@ fn handle_readable(
 /// `key` is this connection's slab token; `dirty_tx` + `mailbox_waker` are the
 /// worker's selective-drain notifier inputs, stamped (with `key`) into the new
 /// session's `ctx.mailbox_notify` so cross-connection sends wake the worker.
+/// `wheel` receives the new session's absolute max-connection-lifetime deadline
+/// at establish (see [`arm_lifetime`]).
 #[allow(clippy::too_many_arguments)]
 fn handle_handshake(
     poll: &Poll,
@@ -1213,6 +1317,7 @@ fn handle_handshake(
     mailbox_waker: &Arc<mio::Waker>,
     resolved_tx: &std::sync::mpsc::Sender<ResolvedApp>,
     next_gen: &mut u64,
+    wheel: &mut TimerWheel,
 ) -> Action {
     // Pull all available bytes into the head-accumulation buffer (`inbuf`).
     if drain_into(&mut entry.conn, &mut entry.inbuf) == ReadOutcome::Closed {
@@ -1335,6 +1440,11 @@ fn handle_handshake(
                             .conn
                             .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
                         entry.session = Some(session);
+                        // Session established: arm the ABSOLUTE
+                        // max-connection-lifetime deadline (close 4202) from
+                        // this moment. Activity on the connection never pushes
+                        // it out — only this establish instant sets it.
+                        arm_lifetime(wheel, env, key, now_ns / 1_000_000);
                     }
                     Err(reject) => {
                         queue_reject(entry, &reject, now_ns);
@@ -2145,6 +2255,9 @@ fn drain_resolved(
                     // so a resumed connection is ALWAYS liveness-monitored, and starts
                     // its idle clock at establish (`touch` reschedules — never duplicates).
                     wheel.touch(token, now_ns / 1_000_000);
+                    // The max-connection-lifetime clock also starts at THIS establish
+                    // moment (the park is not part of the connection's life).
+                    arm_lifetime(wheel, env, token, now_ns / 1_000_000);
                 }
             }
             Err(reject) => {

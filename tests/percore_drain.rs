@@ -87,6 +87,7 @@ async fn spawn_with_grace(grace_ms: u64) -> Harness {
         limits: config.limits(),
         activity_timeout: config.activity_timeout,
         pong_timeout: config.pong_timeout,
+        max_conn_lifetime_secs: 0, // lifetime close not under test here
         strict_protocol: config.strict_protocol,
         conn_counts: conn_counts.clone(),
         node_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),

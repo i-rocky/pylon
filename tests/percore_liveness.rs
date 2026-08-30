@@ -79,6 +79,8 @@ async fn spawn(activity_timeout: u32, pong_timeout: u32) -> Harness {
         limits: config.limits(),
         activity_timeout: config.activity_timeout,
         pong_timeout: config.pong_timeout,
+        // Liveness tests predate the lifetime close; keep it disabled.
+        max_conn_lifetime_secs: 0,
         strict_protocol: config.strict_protocol,
         conn_counts: Arc::new(Default::default()),
         node_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),

@@ -91,6 +91,7 @@ TLS configuration is covered in detail on the [TLS / SSL](tls.md) page.
 |---|---|---|
 | `PYLON_ACTIVITY_TIMEOUT` | `120` | Seconds of inactivity after which the server sends a `pusher:ping`. |
 | `PYLON_PONG_TIMEOUT` | `30` | Seconds the server waits for a `pusher:pong` reply before closing the connection. |
+| `PYLON_MAX_CONN_LIFETIME_SECS` | `86400` | Maximum connection age in seconds before the server closes the connection with code `4202` ("Closed after inactivity" — Pusher's 24-hour maximum connection lifetime; clients reconnect immediately). The deadline is absolute from connection establishment and is not reset by activity. Set `0` to disable. |
 | `PYLON_STRICT_PROTOCOL` | `false` | When `true`, reject any Pusher protocol violation instead of silently ignoring it. Set `1` or `true` to enable. |
 | `PYLON_MAX_CHANNEL_NAME_LENGTH` | `164` | Maximum allowed channel name length in bytes. |
 | `PYLON_MAX_EVENT_NAME_LENGTH` | `200` | Maximum allowed event name length in bytes. |

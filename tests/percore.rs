@@ -78,6 +78,7 @@ async fn spawn(config: ServerConfig) -> Harness {
         limits: config.limits(),
         activity_timeout: config.activity_timeout,
         pong_timeout: config.pong_timeout,
+        max_conn_lifetime_secs: config.max_conn_lifetime_secs,
         strict_protocol: config.strict_protocol,
         conn_counts: conn_counts.clone(),
         node_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -297,6 +298,9 @@ async fn spawn_with_node_ceiling(max_connections: usize) -> Harness {
         limits: ServerConfig::default().limits(),
         activity_timeout: 120,
         pong_timeout: 30,
+        // These harnesses predate the lifetime close; keep it disabled so their
+        // behaviour is unchanged (the default config wires 86400).
+        max_conn_lifetime_secs: 0,
         strict_protocol: false,
         conn_counts: conn_counts.clone(),
         node_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -504,6 +508,9 @@ async fn spawn_with_saturation_flag() -> (Harness, Arc<AtomicBool>) {
         limits: ServerConfig::default().limits(),
         activity_timeout: 120,
         pong_timeout: 30,
+        // These harnesses predate the lifetime close; keep it disabled so their
+        // behaviour is unchanged (the default config wires 86400).
+        max_conn_lifetime_secs: 0,
         strict_protocol: false,
         conn_counts: conn_counts.clone(),
         node_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -678,4 +685,121 @@ async fn unknown_app_key_still_errors_4001() {
     let h = spawn(ServerConfig::default()).await;
     let mut ws = connect_path(h.port, "/app/no-such-key?protocol=7").await;
     assert_rejected_with(&mut ws, 4001, "Could not find app by key").await;
+}
+
+// ── Scenario 8: max-connection-lifetime close 4202 ──────────────────────────
+
+/// RAII guard removing an env var on drop (even on panic), so a failing test
+/// can't leak `PYLON_MAX_CONN_LIFETIME_SECS` into later tests.
+struct EnvVarGuard(&'static str);
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        std::env::remove_var(self.0);
+    }
+}
+
+/// With `PYLON_MAX_CONN_LIFETIME_SECS=1`, an ESTABLISHED connection is closed
+/// with code **4202** ("Closed after inactivity", Pusher's reconnect-
+/// immediately band) within the lifetime deadline: first a `pusher:error` Text
+/// frame carrying the code, then a WS Close with the same code.
+///
+/// The client stays demonstrably ACTIVE (a `pusher:ping` every 200 ms) for the
+/// whole window: the lifetime deadline is ABSOLUTE from establishment and must
+/// NOT be pushed out by activity (unlike the idle-ping deadline, which every
+/// inbound frame re-arms).
+#[tokio::test]
+async fn max_conn_lifetime_closes_4202_even_when_active() {
+    std::env::set_var("PYLON_MAX_CONN_LIFETIME_SECS", "1");
+    let _guard = EnvVarGuard("PYLON_MAX_CONN_LIFETIME_SECS");
+    let h = spawn(ServerConfig::from_env()).await;
+
+    let mut ws = connect(h.port, "?protocol=7").await;
+    let _sid = established_socket_id(&mut ws).await;
+
+    // Keep the connection busy while the lifetime runs out.
+    let (mut sink, mut stream) = ws.split();
+    let pinger = tokio::spawn(async move {
+        for _ in 0..25 {
+            // 25 × 200ms = 5s of activity; breaks early once the server closes.
+            if sink
+                .send(Message::Text(
+                    r#"{"event":"pusher:ping","data":{}}"#.to_string(),
+                ))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+
+    // Within 5s of establish: a pusher:error Text frame with code 4202 (pong
+    // replies to our pings may interleave — skip them).
+    let err = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match stream.next().await {
+                Some(Ok(Message::Text(t))) => {
+                    let v: Value = serde_json::from_str(&t).unwrap();
+                    if v["event"] == "pusher:error" {
+                        return v;
+                    }
+                }
+                Some(Ok(Message::Close(_))) => panic!("WS Close arrived before pusher:error 4202"),
+                Some(Ok(_)) => {}
+                Some(Err(e)) => panic!("ws error before pusher:error 4202: {e}"),
+                None => panic!("stream ended before pusher:error 4202"),
+            }
+        }
+    })
+    .await
+    .expect("pusher:error 4202 within 5s of establish");
+    assert_eq!(err["event"], "pusher:error", "frame: {err}");
+    assert_eq!(err["data"]["code"], 4202, "frame: {err}");
+    assert_eq!(
+        err["data"]["message"], "Closed after inactivity",
+        "frame: {err}"
+    );
+
+    // Then the WS Close frame carries the same 4202 code.
+    let close_code = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match stream.next().await {
+                Some(Ok(Message::Close(Some(cf)))) => return Some(u16::from(cf.code)),
+                Some(Ok(Message::Close(None))) | None | Some(Err(_)) => return None,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await
+    .expect("close frame within 5s");
+    assert_eq!(close_code, Some(4202), "WS Close must carry code 4202");
+
+    let _ = pinger.await;
+}
+
+/// With `PYLON_MAX_CONN_LIFETIME_SECS=0` the lifetime close is DISABLED: an
+/// otherwise idle connection stays open well past the 1s lifetime used in the
+/// sibling test (here ≥3s) and remains responsive (a ping round-trips, and no
+/// 4202 close may arrive).
+#[tokio::test]
+async fn max_conn_lifetime_zero_disables_the_close() {
+    std::env::set_var("PYLON_MAX_CONN_LIFETIME_SECS", "0");
+    let _guard = EnvVarGuard("PYLON_MAX_CONN_LIFETIME_SECS");
+    let h = spawn(ServerConfig::from_env()).await;
+
+    let mut ws = connect(h.port, "?protocol=7").await;
+    let _sid = established_socket_id(&mut ws).await;
+
+    // Outlive the sibling test's 1s deadline 3× over with NO traffic at all.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Still open and responsive: the ping round-trips (next_json panics if a
+    // Close arrives instead — proving no 4202 was sent).
+    send_json(&mut ws, json!({ "event": "pusher:ping", "data": {} })).await;
+    assert_eq!(
+        next_event_named(&mut ws, "pusher:pong").await["event"],
+        "pusher:pong"
+    );
 }

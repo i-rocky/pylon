@@ -41,6 +41,12 @@ pub struct ServerConfig {
     pub port: u16,
     pub activity_timeout: u32,
     pub pong_timeout: u32,
+    /// Maximum connection age in seconds: a connection is closed with code
+    /// **4202** ("Closed after inactivity", Pusher's reconnect-immediately
+    /// band) once it has been established for this long, regardless of
+    /// activity. Mirrors Pusher's 24-hour maximum connection lifetime.
+    /// `0` disables the lifetime close. `PYLON_MAX_CONN_LIFETIME_SECS`.
+    pub max_conn_lifetime_secs: u64,
     pub strict_protocol: bool,
     pub apps_path: String,
     pub max_presence_members: usize,
@@ -186,6 +192,7 @@ impl Default for ServerConfig {
             port: 7000,
             activity_timeout: 120,
             pong_timeout: 30,
+            max_conn_lifetime_secs: 86_400,
             strict_protocol: false,
             apps_path: "apps.json".into(),
             max_presence_members: 100,
@@ -268,6 +275,11 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("PYLON_PONG_TIMEOUT") {
             if let Ok(p) = v.parse() {
                 c.pong_timeout = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_MAX_CONN_LIFETIME_SECS") {
+            if let Ok(p) = v.parse() {
+                c.max_conn_lifetime_secs = p;
             }
         }
         if let Ok(v) = std::env::var("PYLON_STRICT_PROTOCOL") {
@@ -618,6 +630,8 @@ mod tests {
         assert_eq!(c.port, 7000);
         assert_eq!(c.activity_timeout, 120);
         assert_eq!(c.pong_timeout, 30);
+        // Max connection lifetime: Pusher parity — 24h default, 0 = disabled.
+        assert_eq!(c.max_conn_lifetime_secs, 86_400);
         assert!(!c.strict_protocol);
         assert_eq!(c.max_presence_members, 100);
         assert_eq!(c.max_event_payload_bytes, 10_240);
@@ -718,6 +732,19 @@ mod tests {
         std::env::remove_var("PYLON_CODEL_INTERVAL_MS");
         std::env::remove_var("PYLON_PSI_BACKSTOP");
         std::env::remove_var("PYLON_PSI_THRESHOLD");
+    }
+
+    #[test]
+    fn max_conn_lifetime_env_overrides_apply() {
+        // Override …
+        std::env::set_var("PYLON_MAX_CONN_LIFETIME_SECS", "3600");
+        let c = ServerConfig::from_env();
+        assert_eq!(c.max_conn_lifetime_secs, 3600);
+        // … and the explicit disable value (0 = no lifetime close).
+        std::env::set_var("PYLON_MAX_CONN_LIFETIME_SECS", "0");
+        let c = ServerConfig::from_env();
+        assert_eq!(c.max_conn_lifetime_secs, 0);
+        std::env::remove_var("PYLON_MAX_CONN_LIFETIME_SECS");
     }
 
     #[test]
