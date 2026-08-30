@@ -647,6 +647,125 @@ async fn text_frame_while_fragment_open_closes_1002() {
     }
 }
 
+/// P1 pin (RFC 6455 §5.4): a Continuation frame with NO fragmented message
+/// open is a protocol violation — Close 1002, and nothing dispatched.
+#[tokio::test]
+async fn stray_continuation_with_no_fragment_open_closes_1002() {
+    let addr = spawn(ServerConfig::default()).await;
+    let mut ws = connect(addr, "?protocol=7").await;
+    let _ = established_socket_id(&mut ws).await;
+
+    // No fragment was opened; a FIN=1 Continuation out of nowhere.
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(b"garbage".to_vec(), WsOpCode::Data(WsData::Continue), true),
+    )
+    .await;
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        .await
+        .expect("a frame within 5s")
+        .expect("stream open");
+    match first {
+        Ok(Message::Close(Some(cf))) => assert_eq!(
+            u16::from(cf.code),
+            1002,
+            "expected close code 1002, got {}",
+            cf.code
+        ),
+        other => panic!("expected Close(1002) on stray Continuation, got {other:?}"),
+    }
+}
+
+/// P1 pin (RFC 6455 §5.4): a new Binary data frame arriving while a
+/// fragmented TEXT message is open is a protocol violation — Close 1002.
+#[tokio::test]
+async fn binary_frame_while_text_fragment_open_closes_1002() {
+    let addr = spawn(ServerConfig::default()).await;
+    let mut ws = connect(addr, "?protocol=7").await;
+    let _ = established_socket_id(&mut ws).await;
+
+    // Open a TEXT fragment...
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(
+            b"{\"event\":\"pusher:sub".to_vec(),
+            WsOpCode::Data(WsData::Text),
+            false,
+        ),
+    )
+    .await;
+    // ...then interleave a complete Binary frame instead of continuing.
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(
+            vec![0xDE, 0xAD, 0xBE, 0xEF],
+            WsOpCode::Data(WsData::Binary),
+            true,
+        ),
+    )
+    .await;
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        .await
+        .expect("a frame within 5s")
+        .expect("stream open");
+    match first {
+        Ok(Message::Close(Some(cf))) => assert_eq!(
+            u16::from(cf.code),
+            1002,
+            "expected close code 1002, got {}",
+            cf.code
+        ),
+        other => panic!("expected Close(1002) on interleaved Binary frame, got {other:?}"),
+    }
+}
+
+/// P1 / R14: a FRAGMENTED Binary message (Binary FIN=0 … Continuation, RFC
+/// 6455 §5.4) is ignored exactly like a lone Binary frame — binary is not
+/// part of the Pusher protocol, so it must neither kill the connection nor
+/// disturb the text protocol. After the fragmented binary completes, a
+/// normal text subscribe on the SAME connection must succeed.
+#[tokio::test]
+async fn fragmented_binary_is_ignored_and_connection_stays_usable() {
+    let addr = spawn(ServerConfig::default()).await;
+    let mut ws = connect(addr, "?protocol=7").await;
+    let _ = established_socket_id(&mut ws).await;
+
+    // A 3-frame fragmented binary: FIN=0 Binary, FIN=0 Continuation, FIN=1
+    // Continuation. Every frame is ignored (no close, no reply).
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(vec![1, 2, 3], WsOpCode::Data(WsData::Binary), false),
+    )
+    .await;
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(vec![4, 5, 6], WsOpCode::Data(WsData::Continue), false),
+    )
+    .await;
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(vec![7, 8], WsOpCode::Data(WsData::Continue), true),
+    )
+    .await;
+
+    // The binary noise must be silently ignored: no error/close frame first.
+    if let Some(v) = try_next_json_short(&mut ws).await {
+        panic!("fragmented binary must be ignored silently, got {v}");
+    }
+
+    // The connection is still alive and the fragment state was not wedged:
+    // a normal text subscribe succeeds.
+    send_json(
+        &mut ws,
+        json!({ "event": "pusher:subscribe", "data": { "channel": "bin-ign-ch" } }),
+    )
+    .await;
+    let frame = next_event_named(&mut ws, "pusher_internal:subscription_succeeded").await;
+    assert_eq!(frame["channel"], "bin-ign-ch");
+}
+
 // ── P2 parity tests — closing handshake (RFC 6455 §5.5.1) ───────────────────
 
 /// P2: on a client-initiated Close the server MUST echo a Close frame back

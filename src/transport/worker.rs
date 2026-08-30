@@ -258,6 +258,24 @@ struct Session {
     subs: HashSet<String>,
 }
 
+/// RFC 6455 §5.4: the in-progress fragmented message on this connection.
+///
+/// `Text` accumulates the payload of a fragmented TEXT message (the only data
+/// kind the Pusher protocol carries): Continuation frames append to it and the
+/// FIN=1 Continuation dispatches the assembled payload through the normal Text
+/// path, resetting this to `None`.
+///
+/// `Binary` marks an in-progress fragmented BINARY message. Binary is not part
+/// of the Pusher protocol — a lone Binary frame is silently ignored — so a
+/// fragmented one is ignored the same way: its Continuations are dropped until
+/// the FIN=1 Continuation completes the message, after which the state resets.
+/// The variant exists only so those Continuations are not mistaken for strays
+/// (which fail the connection per §5.4).
+enum Fragment {
+    Text(Vec<u8>),
+    Binary,
+}
+
 /// Per-connection slab entry: the [`Connection`] plus its read remainder and,
 /// for dispatch workers, the v7 [`Session`] built at handshake completion.
 ///
@@ -272,14 +290,12 @@ struct Entry {
     token: Token,
     /// v7 protocol state; `None` for echo workers and pre-handshake connections.
     session: Option<Session>,
-    /// RFC 6455 §5.4: in-progress fragmented text-message accumulator. `Some`
-    /// once a FIN=0 Text frame has opened a message; Continuation frames append
-    /// to it and the FIN=1 Continuation dispatches the assembled payload
-    /// through the normal Text path, resetting this to `None`. Also reset —
-    /// and the partial message dropped — when the assembled size would exceed
-    /// the per-message cap (`max_message_bytes`); the accumulator dies with
-    /// this `Entry` when the connection closes.
-    fragment: Option<Vec<u8>>,
+    /// RFC 6455 §5.4: in-progress fragmented message, `Some` once a FIN=0 Text
+    /// or Binary frame has opened one (see [`Fragment`]). Reset — and a partial
+    /// TEXT message dropped — when the assembled size would exceed the
+    /// per-message cap (`max_message_bytes`); the state dies with this `Entry`
+    /// when the connection closes.
+    fragment: Option<Fragment>,
     /// Phase 7: set while this connection is PARKED waiting on an offloaded app
     /// lookup (L1 miss). `Open` + `session: None` + `pending_establish: Some(..)`
     /// is the park state. Cleared (`take`) when its `ResolvedApp` arrives, or
@@ -1567,9 +1583,11 @@ fn echo_frames(poll: &Poll, entry: &mut Entry, frames: Vec<frame::Frame>, now_ns
 /// [`Entry::fragment`] before dispatch: a FIN=0 Text frame opens the
 /// accumulation, Continuation frames append (bounded by `max_message_bytes`),
 /// and the FIN=1 Continuation dispatches the assembled payload through the
-/// same path as an unfragmented Text frame. Control frames interleaved
-/// mid-fragment are handled in frame order, so a Ping between fragments is
-/// answered before the message completes (RFC 6455 §5.5.2).
+/// same path as an unfragmented Text frame. Fragmented BINARY messages are
+/// ignored frame-by-frame (binary is outside the Pusher protocol, like a lone
+/// Binary frame). Control frames interleaved mid-fragment are handled in
+/// frame order, so a Ping between fragments is answered before the message
+/// completes (RFC 6455 §5.5.2).
 fn dispatch_frames(
     poll: &Poll,
     entry: &mut Entry,
@@ -1580,10 +1598,21 @@ fn dispatch_frames(
     for f in frames {
         match f.opcode {
             // RFC 6455 §5.4: a fragmented message consists of one FIN=0 data
-            // frame followed by Continuation frames ONLY. Interleaving any new
-            // data frame (Text or Binary) with an open fragmented message is a
-            // protocol violation — fail the connection with Close 1002.
-            OpCode::Text | OpCode::Binary if entry.fragment.is_some() => {
+            // frame followed by Continuation frames ONLY. Interleaving a new
+            // data frame with an open fragmented TEXT message is a protocol
+            // violation — fail the connection with Close 1002. (A Binary frame
+            // interleaved with a text fragment falls here too; Binary frames
+            // while a BINARY fragment is open are ignored below — binary is
+            // outside the protocol and never fatal on its own.)
+            OpCode::Text if entry.fragment.is_some() => {
+                return close_fragment_violation(
+                    poll,
+                    entry,
+                    now_ns,
+                    "data frame interleaved with a fragmented message",
+                );
+            }
+            OpCode::Binary if matches!(entry.fragment, Some(Fragment::Text(_))) => {
                 return close_fragment_violation(
                     poll,
                     entry,
@@ -1596,7 +1625,7 @@ fn dispatch_frames(
                 // FIN=1 Continuation completes it. No cap check here — a lone
                 // first fragment is already bounded by the per-frame
                 // `max_payload`; the per-message cap fires on the next append.
-                entry.fragment = Some(f.payload.to_vec());
+                entry.fragment = Some(Fragment::Text(f.payload.to_vec()));
             }
             OpCode::Text => {
                 // A complete (unfragmented) message.
@@ -1604,13 +1633,24 @@ fn dispatch_frames(
                     return Action::Close;
                 }
             }
+            // Binary is not part of the Pusher protocol; ignore, never fatal.
+            // A FIN=0 Binary opens a message whose frames must all be ignored:
+            // mark the fragment state as [`Fragment::Binary`] so its
+            // Continuation frames (below) are dropped until the FIN=1
+            // Continuation completes it — instead of tripping the stray-
+            // Continuation guard.
+            OpCode::Binary => {
+                if !f.fin && entry.fragment.is_none() {
+                    entry.fragment = Some(Fragment::Binary);
+                }
+            }
             OpCode::Continuation => {
                 // RFC 6455 §5.4: a Continuation must follow an open fragmented
                 // message on this connection; a stray one is a protocol
                 // violation — fail the connection with Close 1002. (This also
-                // catches further fragments of a message already dropped for
-                // exceeding the cap below.)
-                let Some(mut buf) = entry.fragment.take() else {
+                // catches further fragments of a TEXT message already dropped
+                // for exceeding the cap below.)
+                let Some(fragment) = entry.fragment.take() else {
                     return close_fragment_violation(
                         poll,
                         entry,
@@ -1618,27 +1658,40 @@ fn dispatch_frames(
                         "continuation frame without a fragmented message",
                     );
                 };
-                // Per-message byte cap (`max_event_payload_bytes`): the same
-                // budget an unfragmented protocol message is held to. Oversize
-                // → drop the partial message AND reset the accumulator; the
-                // connection stays usable for the next well-formed message.
-                if buf.len().saturating_add(f.payload.len()) > max_message_bytes {
-                    tracing::trace!(
-                        assembled = buf.len() + f.payload.len(),
-                        max_message_bytes,
-                        "dropping oversize fragmented message"
-                    );
-                    continue; // `buf` dropped here; accumulator left reset (`None`).
-                }
-                buf.extend_from_slice(&f.payload);
-                if f.fin {
-                    // Message complete: dispatch the assembled payload through
-                    // the normal Text path (`fragment` stays `None`).
-                    if dispatch_text_message(entry, &buf) == Action::Close {
-                        return Action::Close;
+                match fragment {
+                    // Continuation of an ignored fragmented Binary: drop the
+                    // payload and stay in ignore-mode until FIN=1 completes it.
+                    Fragment::Binary => {
+                        if !f.fin {
+                            entry.fragment = Some(Fragment::Binary);
+                        }
                     }
-                } else {
-                    entry.fragment = Some(buf); // still open — keep accumulating.
+                    Fragment::Text(mut buf) => {
+                        // Per-message byte cap (`max_event_payload_bytes`): the
+                        // same budget an unfragmented protocol message is held
+                        // to. Oversize → drop the partial message AND reset the
+                        // accumulator; the connection stays usable for the next
+                        // well-formed message.
+                        if buf.len().saturating_add(f.payload.len()) > max_message_bytes {
+                            tracing::trace!(
+                                assembled = buf.len() + f.payload.len(),
+                                max_message_bytes,
+                                "dropping oversize fragmented message"
+                            );
+                            continue; // `buf` dropped here; accumulator left reset (`None`).
+                        }
+                        buf.extend_from_slice(&f.payload);
+                        if f.fin {
+                            // Message complete: dispatch the assembled payload
+                            // through the normal Text path (`fragment` stays
+                            // `None`).
+                            if dispatch_text_message(entry, &buf) == Action::Close {
+                                return Action::Close;
+                            }
+                        } else {
+                            entry.fragment = Some(Fragment::Text(buf)); // still open
+                        }
+                    }
                 }
             }
             OpCode::Ping => {
@@ -1657,9 +1710,6 @@ fn dispatch_frames(
                 }
             }
             OpCode::Pong => {}
-            // Binary is not part of the Pusher protocol; ignore (an open
-            // fragment was already failed by the guard arm above).
-            OpCode::Binary => {}
             // RFC 6455 §5.5.1: a client-initiated Close completes the closing
             // handshake — echo a Close frame (flushed before teardown, which
             // `remove()` does not do) carrying the client's code when present.
