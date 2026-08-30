@@ -737,13 +737,12 @@ async fn overload_total_inflight_stays_within_budget() {
 }
 
 /// Task 3.1 (finding G1) — NO BUSY-SPIN ON A BACKPRESSURED CONNECTION, AND NO
-/// LOSS. One subscriber whose socket can absorb almost nothing (client-side
-/// `SO_RCVBUF` shrunk via socket2 — the integration-test analogue of the
-/// `pair_tiny_sndbuf` unit-test trick, applied to the end of the pair the test
-/// can reach) subscribes to a channel and then STOPS READING. The publisher
-/// floods until the worker holds queued bytes for it
-/// (`percore_total_inflight_bytes() > 0`): the connection is backpressured
-/// with a non-empty out-queue. Then all work stops.
+/// LOSS. One subscriber on a plain connection subscribes to a channel and then
+/// STOPS READING. The publisher floods ADAPTIVELY — publishing until the
+/// worker actually holds queued bytes for that connection
+/// (`percore_total_inflight_bytes() > 0`, self-sizing to whatever this
+/// runner's kernel buffers absorb) — so the connection is backpressured with a
+/// non-empty out-queue. Then all work stops.
 ///
 /// `mio` is level-triggered: a connection with a full send buffer produces NO
 /// writable event, so a loop that polls 0 ms whenever `inflight_bytes > 0` —
@@ -777,20 +776,29 @@ async fn backpressured_connection_does_not_spin_and_backlog_survives() {
         codel_target_ms: 0,
         ..base_config(free_port())
     };
-    // ≈ 8.3 KiB per frame × 400 ≈ 3.3 MiB — far past the shrunk receive
-    // buffer + the server's send buffer, so the server's flush MUST WouldBlock
-    // and leave the bulk queued; far under the 8 MiB per-conn cap, so drop-head
-    // never fires and the whole backlog must survive to be delivered.
-    const N_PUB: u64 = 400;
+    // ≈ 8.3 KiB per frame. The flood VOLUME is adaptive (stop at the first
+    // observed backpressure — see the loop below), so no fixed byte budget
+    // has to guess the runner's kernel buffer sizes. The only hard bound:
+    // MAX_PUB × 8.3 KiB ≈ 6.6 MiB stays under the 8 MiB per-conn cap, so
+    // drop-head can never fire and every published frame must survive to be
+    // delivered — while still covering kernel absorptions up to ~6 MiB
+    // (server send autotune ceiling is 4 MiB on stock Linux).
+    const MAX_PUB: u64 = 800;
     let pad = "z".repeat(8192);
+    // This test's own wall (wider than the file-wide `WALL`): on a slow
+    // 2-core runner the adaptive flood alone can take ~10 s, and the bounded
+    // drain deadline below is 30 s — the wall must never be what fires (that
+    // would mask the real, better-diagnosed assertions).
+    const SPIN_WALL: Duration = Duration::from_secs(90);
 
-    let result = tokio::time::timeout(WALL, async {
+    let result = tokio::time::timeout(SPIN_WALL, async {
         let h = spawn_with(config).await;
         let channel = "spin-chan";
 
-        // ── The backpressured subscriber: tiny receive buffer, never read
-        //    after the subscription ack. ─────────────────────────────────────
-        let mut slow = connect_tiny_rcvbuf(h.port).await;
+        // ── The backpressured subscriber: a plain connection that simply
+        //    never reads after the subscription ack. Backpressure is provoked
+        //    by flood volume, not by socket surgery. ────────────────────────
+        let mut slow = connect_plain(h.port).await;
         let est = next_json_raw(&mut slow).await;
         assert_eq!(est["event"], "pusher:connection_established");
         slow.send(Message::Text(
@@ -805,17 +813,39 @@ async fn backpressured_connection_does_not_spin_and_backlog_survives() {
         let succ = next_json_raw(&mut slow).await;
         assert_eq!(succ["event"], "pusher_internal:subscription_succeeded");
 
-        // ── Flood until the worker holds queued bytes for the connection. ──
+        // ── Flood ADAPTIVELY: publish until the worker actually holds queued
+        //    bytes for this connection, then STOP IMMEDIATELY. The flood
+        //    volume self-sizes to the runner's kernel buffers instead of
+        //    guessing them (a fixed multi-MiB flood wastes minutes draining
+        //    back through the pinned window on Linux — CI run 33334731440
+        //    failed exactly that way at 400 frames — while a small fixed one
+        //    may never back up a big-buffered runner at all).
         let client = reqwest::Client::new();
-        let mut inflight_seen: u64 = 0;
-        for seq in 1..=N_PUB {
-            let status = publish_seq(h.port, &client, channel, seq, &pad).await;
+        let mut published: u64 = 0;
+        loop {
+            published += 1;
+            let status = publish_seq(h.port, &client, channel, published, &pad).await;
             assert_eq!(status, 200, "flood publish must be accepted (no shed here)");
-            inflight_seen = inflight_seen.max(pylon::transport::percore_total_inflight_bytes());
+            // Give the worker a loop iteration to drain its broadcast inbox,
+            // flush, and mirror the POST-flush queue depth into the hook. A
+            // positive sample therefore means bytes SURVIVED a flush attempt
+            // (a true WouldBlock residue), not a mid-iteration transient —
+            // and with the client never reading again, that residue is
+            // sticky for the rest of the test.
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            if pylon::transport::percore_total_inflight_bytes() > 0 {
+                break;
+            }
+            assert!(
+                published < MAX_PUB,
+                "published {published} frames without ever backing the subscriber \
+                 up; backpressure path not exercised on this runner"
+            );
         }
         assert!(
-            inflight_seen > 0,
-            "flood never backed the subscriber up; backpressure path not exercised"
+            published >= 8,
+            "backed up after only {published} frames; the flood was too small to \
+             exercise the backpressure path meaningfully"
         );
 
         // ── QUIET WINDOW: no more publishes; the only live connection is the
@@ -843,38 +873,95 @@ async fn backpressured_connection_does_not_spin_and_backlog_survives() {
 
         // ── NO LOSS: drain the client. Writable events wake the loop and the
         //    whole backlog flushes — every frame, in order, inflight → 0. ────
+        //
+        // RATE NOTE (why this test never pins the client's receive window):
+        // an earlier revision shrank `SO_RCVBUF` to a few KiB so backpressure
+        // needed only a small flood — but on Linux that also throttles the
+        // drain to ~8.3 KiB per writable edge, each edge floor-priced by
+        // delayed-ACK / zero-window-probe timers (~205 ms/frame,
+        // curve-measured in a 2-CPU Linux container: linear, CONTINUOUS; CI
+        // run 33334731440 failed exactly that way — 75 of 400 frames in the
+        // 15 s deadline, ~200 ms/frame, no stalls), and the window cannot be
+        // reliably reopened afterwards (explicit `SO_RCVBUF` disables receive
+        // autotuning; the scale is fixed at handshake time). That is a rate
+        // bound of the harness's tiny window, NOT a worker bug: broken
+        // WRITABLE arming would deliver NOTHING further (no other path
+        // flushes a backpressured connection), yet frames kept arriving via
+        // edges in both environments. With a full-size window the drain runs
+        // at kernel speed and only rides the wake-on-writable path under
+        // test.
+        //
+        // Delivery is CURVE-INSTRUMENTED (elapsed-ms vs cumulative frames, plus
+        // the worst inter-frame gap) so a slow/failed drain reports its shape:
+        // continuous-but-slow vs stalled/stepwise.
+        let drain_started = Instant::now();
         let mut got: Vec<u64> = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut curve: Vec<(u128, usize)> = Vec::new();
+        let mut max_gap = Duration::ZERO;
+        let mut last_frame_at = drain_started;
+        // Downsampled curve view (every 10th sample + the last) keeps the
+        // shape readable in logs.
+        let curve_view = |curve: &[(u128, usize)]| -> Vec<(u128, usize)> {
+            curve
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| i % 10 == 0)
+                .map(|(_, s)| *s)
+                .chain(curve.last().copied())
+                .collect()
+        };
+        // Generous but bounded: with a full-size window the drain measures
+        // tens of ms unstarved and well under ~2 s on a slow runner — 30 s
+        // only ever pays out on a real failure, and the 3 s per-read floor
+        // absorbs a stalled scheduler slice without mistaking it for a
+        // finished drain.
+        let deadline = drain_started + Duration::from_secs(30);
         loop {
-            match tokio::time::timeout(Duration::from_millis(1_000), slow.next()).await {
+            match tokio::time::timeout(Duration::from_millis(3_000), slow.next()).await {
                 Ok(Some(Ok(Message::Text(t)))) => {
                     let v: Value = serde_json::from_str(&t).unwrap();
                     if v["event"] == "flood" {
+                        let now = Instant::now();
+                        max_gap = max_gap.max(now - last_frame_at);
+                        last_frame_at = now;
                         got.push(seq_of(v["data"].as_str().unwrap()));
+                        curve.push(((now - drain_started).as_millis(), got.len()));
                     }
                 }
                 Ok(Some(Ok(_))) => {}
                 Ok(Some(Err(e))) => panic!("backlog drain read failed: {e}"),
                 Ok(None) => break, // server closed the stream
-                Err(_) => break,   // 1s of silence: backlog fully drained
+                Err(_) => break,   // 3s of silence: backlog fully drained
             }
-            if got.len() == N_PUB as usize {
+            if got.len() == published as usize {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "backlog did not fully drain in time; got {} of {N_PUB} frames",
-                got.len()
+                "backlog did not fully drain in time; got {} of {published} frames in {:?} \
+                 (max inter-frame gap {:?}); delivery curve (elapsed_ms, frames): {:?}",
+                got.len(),
+                drain_started.elapsed(),
+                max_gap,
+                curve_view(&curve),
             );
         }
-        let expected: Vec<u64> = (1..=N_PUB).collect();
+        println!(
+            "drain curve (backed up after {published} published frames): {} frames in {:?} \
+             (max inter-frame gap {:?}); samples (elapsed_ms, frames): {:?}",
+            got.len(),
+            drain_started.elapsed(),
+            max_gap,
+            curve_view(&curve)
+        );
+        let expected: Vec<u64> = (1..=published).collect();
         assert_eq!(
             got, expected,
             "the whole backlog must be delivered in order after the drain"
         );
         // And nothing remains queued anywhere on the worker.
         let mut inflight_zero = false;
-        for _ in 0..100 {
+        for _ in 0..200 {
             if pylon::transport::percore_total_inflight_bytes() == 0 {
                 inflight_zero = true;
                 break;
@@ -893,19 +980,17 @@ async fn backpressured_connection_does_not_spin_and_backlog_survives() {
     result.expect("busy-spin test did not complete within the wall");
 }
 
-/// Connect a WebSocket client over a TCP socket whose `SO_RCVBUF` has been
-/// shrunk to a few KiB — the client kernel can then buffer almost nothing, so
-/// a server that keeps writing to a client that never reads backpressures
-/// after a handful of frames. (The server end's `SO_SNDBUF` is owned by the
-/// worker and unreachable from the test; shrinking the receive side pins the
-/// total absorbable bytes just as tightly.)
-async fn connect_tiny_rcvbuf(
-    port: u16,
-) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+/// Connect a plain WebSocket client. The receive buffer is deliberately left
+/// at kernel defaults: the flood phase provokes backpressure by VOLUME (the
+/// adaptive loop publishes until the worker queue is non-empty), not by
+/// pinning the window, and the drain phase then runs at full window speed on
+/// every kernel. (An earlier revision shrank `SO_RCVBUF` to force backpressure
+/// cheaply — but on Linux that also throttles the drain to ~8.3 KiB per
+/// writable edge at ~200 ms each, and the window cannot be reliably reopened
+/// afterwards: explicit `SO_RCVBUF` disables receive autotuning, and the
+/// window scale is fixed at handshake time. See the drain-phase note.)
+async fn connect_plain(port: u16) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
     let std_stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-    socket2::SockRef::from(&std_stream)
-        .set_recv_buffer_size(4 * 1024)
-        .unwrap();
     std_stream.set_nonblocking(true).unwrap();
     let stream = tokio::net::TcpStream::from_std(std_stream).unwrap();
     let url = format!("ws://127.0.0.1:{port}/app/{KEY}?protocol=7");
@@ -920,7 +1005,7 @@ async fn connect_tiny_rcvbuf(
 }
 
 /// `next_json` for the raw (non-`MaybeTlsStream`) client returned by
-/// [`connect_tiny_rcvbuf`]. Reads the next Text frame as JSON, 5s wall.
+/// [`connect_big_rcvbuf`]. Reads the next Text frame as JSON, 5s wall.
 async fn next_json_raw<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
