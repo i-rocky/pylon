@@ -60,6 +60,60 @@ fn wants(info: Option<&str>, attr: &str) -> bool {
     info.is_some_and(|s| s.split(',').any(|a| a.trim() == attr))
 }
 
+/// R9 — Pusher REST doc (General): "For POST requests, parameters MAY be
+/// submitted in the query string but SHOULD be submitted in the POST body as a
+/// JSON hash". After parsing the JSON body, any top-level trigger field the
+/// body does NOT carry falls back to the query map (already URL-decoded by
+/// axum's `Query` extractor); on conflict the body always wins.
+///
+/// `data` is byte-identical either way: the query value `data=%22hi%22` decodes
+/// to the string `"hi"` (quotes included) — exactly the string the body form
+/// `{"data":"\"hi\""}` carries — so both sources feed the same
+/// [`TriggerBody::data`] and downstream validation/delivery unchanged.
+///
+/// Scope notes:
+/// - `channels` accepts a single plain `channels=<name>` query value as a
+///   one-element list. The doc's repeated `channels[]=a&channels[]=b` form is
+///   NOT supported: the query map collapses duplicate keys (last wins), which
+///   would silently DROP channels — a multi-channel trigger must use the body.
+/// - `/batch_events` deliberately has NO fallback (see `post_batch`): its sole
+///   parameter `batch` is an array of event objects with no documented
+///   query-string representation — the doc's arrays-in-query note
+///   (`channels[]=…`) appears only under the single trigger endpoint.
+fn merged_trigger_body(
+    body: &[u8],
+    params: &HashMap<String, String>,
+) -> Result<TriggerBody, RestError> {
+    // An all-query trigger sends an empty body; treat it as `{}` so every field
+    // can come from the query map.
+    let mut root: Value = if body.is_empty() {
+        Value::Object(Map::new())
+    } else {
+        serde_json::from_slice(body).map_err(|_| RestError::bad_request("invalid request body"))?
+    };
+    {
+        let Some(obj) = root.as_object_mut() else {
+            return Err(RestError::bad_request("invalid request body"));
+        };
+        for key in ["name", "data", "channel", "socket_id", "info"] {
+            if !obj.contains_key(key) {
+                if let Some(v) = params.get(key) {
+                    obj.insert(key.to_string(), Value::String(v.clone()));
+                }
+            }
+        }
+        if !obj.contains_key("channels") {
+            if let Some(c) = params.get("channels") {
+                obj.insert(
+                    "channels".to_string(),
+                    Value::Array(vec![Value::String(c.clone())]),
+                );
+            }
+        }
+    }
+    serde_json::from_value(root).map_err(|_| RestError::bad_request("invalid request body"))
+}
+
 /// Broadcast one event string to a channel, excluding `socket_id` if present.
 async fn deliver(
     state: &AppState,
@@ -174,8 +228,7 @@ pub async fn post_events(
     if state.is_saturated() {
         return Err(RestError::service_unavailable("Server overloaded"));
     }
-    let t: TriggerBody = serde_json::from_slice(&body)
-        .map_err(|_| RestError::bad_request("invalid request body"))?;
+    let t: TriggerBody = merged_trigger_body(&body, &params)?;
     if t.data.len() > state.config.max_event_payload_bytes {
         return Err(RestError::payload_too_large("Event message over 10k"));
     }
@@ -260,6 +313,11 @@ pub async fn post_batch(
     if state.is_saturated() {
         return Err(RestError::service_unavailable("Server overloaded"));
     }
+    // NB (R9): unlike `post_events`, there is NO query-string fallback here —
+    // `batch` is an array of event objects with no documented query encoding
+    // (the doc's `channels[]=` note covers only the single trigger endpoint),
+    // so the JSON body is the sole source. Pinned by
+    // `rest_batch_events_empty_body_still_400`.
     let b: BatchBody = serde_json::from_slice(&body)
         .map_err(|_| RestError::bad_request("invalid request body"))?;
     if b.batch.is_empty() || b.batch.len() > state.config.max_batch_events {
@@ -329,5 +387,64 @@ mod tests {
         assert!(wants(Some("subscription_count"), "subscription_count"));
         assert!(!wants(Some("user_count"), "subscription_count"));
         assert!(!wants(None, "user_count"));
+    }
+
+    fn q(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    /// R9: empty body + trigger fields in the query map parses fully from the
+    /// query (the `%22hi%22` wire form is ALREADY decoded by the extractor, so
+    /// `data` arrives as the quoted string, matching the body form).
+    #[test]
+    fn merged_trigger_body_fills_from_query_when_body_empty() {
+        let params = q(&[
+            ("name", "qse"),
+            ("channel", "qc"),
+            ("data", "\"hi\""),
+            ("socket_id", "1234.5678"),
+            ("info", "user_count"),
+        ]);
+        let t = merged_trigger_body(b"", &params).unwrap();
+        assert_eq!(t.name, "qse");
+        assert_eq!(t.channel.as_deref(), Some("qc"));
+        assert_eq!(t.data, "\"hi\"");
+        assert_eq!(t.socket_id.as_deref(), Some("1234.5678"));
+        assert_eq!(t.info.as_deref(), Some("user_count"));
+        assert!(t.channels.is_none());
+    }
+
+    /// R9 precedence: fields present in the body win; the query fills only the
+    /// absent ones.
+    #[test]
+    fn merged_trigger_body_body_wins_on_conflict() {
+        let body = br#"{"name":"ev","data":"{}","channel":"body-ch"}"#;
+        let params = q(&[("channel", "query-ch"), ("name", "query-name")]);
+        let t = merged_trigger_body(body, &params).unwrap();
+        assert_eq!(t.name, "ev");
+        assert_eq!(t.channel.as_deref(), Some("body-ch"));
+    }
+
+    /// A plain `channels=<name>` query value becomes a one-element list; the
+    /// doc's repeated `channels[]=` form is unsupported (duplicate keys collapse
+    /// in the query map — see the handler note).
+    #[test]
+    fn merged_trigger_body_query_channels_becomes_single_element_list() {
+        let params = q(&[("name", "e"), ("data", "1"), ("channels", "solo")]);
+        let t = merged_trigger_body(b"", &params).unwrap();
+        assert_eq!(t.channels.as_deref(), Some(&["solo".to_string()][..]));
+    }
+
+    /// Neither body nor query carries the required fields → the same 400 the
+    /// invalid-body path has always produced.
+    #[test]
+    fn merged_trigger_body_missing_fields_is_400() {
+        assert!(merged_trigger_body(b"", &HashMap::new()).is_err());
+        assert!(merged_trigger_body(b"definitely not json", &HashMap::new()).is_err());
+        // Valid JSON but not an object (and no query rescue possible).
+        assert!(merged_trigger_body(b"[1,2]", &HashMap::new()).is_err());
     }
 }

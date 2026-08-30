@@ -699,6 +699,121 @@ async fn rest_batch_events_delivers_to_two_channels() {
     assert_eq!(got.get("room-b").map(String::as_str), Some("ev-b"));
 }
 
+// ── R9 parity tests — POST trigger params MAY go in the query string ─────────
+//
+// Pusher REST doc (https://pusher.com/docs/channels/library_auth_reference/
+// rest-api/), General section: "For POST requests, parameters MAY be submitted
+// in the query string but SHOULD be submitted in the POST body as a JSON hash
+// (while setting Content-Type:application/json)." The trigger endpoint adds:
+// "NOTE: For POST requests, we recommend including parameters in the JSON body.
+// If using the query string, send arrays as channels[]=channel1&channels[]=
+// channel2". Pylon previously read trigger fields ONLY from the JSON body, so a
+// query-string-encoded trigger was rejected with 400.
+
+/// R9: a fully query-string-encoded trigger with an EMPTY body → 200 `{}` and
+/// the subscriber receives the event. Auth params and trigger params share the
+/// query string, so the signature covers the trigger fields too (body_md5 is
+/// simply absent — there is no body). Pusher SDKs sign the DECODED `k=v` pairs
+/// and percent-encode only on the wire: `data=%22hi%22` decodes to the string
+/// `"hi"` (quotes included) — exactly the string the body form
+/// `{"data":"\"hi\""}` carries — so the two paths must be byte-identical.
+#[tokio::test]
+async fn rest_trigger_all_params_in_query_string_is_200() {
+    let addr = spawn().await;
+    let mut ws = connect_ws(addr).await;
+    let _ = next_json(&mut ws).await; // established
+    subscribe_public(&mut ws, "qc").await;
+
+    // Sign over the DECODED values; empty body → no body_md5 param.
+    let q = signed_query(
+        "POST",
+        "/apps/app1/events",
+        b"",
+        &[("name", "qse"), ("channel", "qc"), ("data", "\"hi\"")],
+    );
+    // Percent-encode the wire form of `data` only (the signature, computed over
+    // the decoded value, is untouched) — mimics what a Pusher SDK sends.
+    let q = set_query_param(&q, "data", "%22hi%22");
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v, json!({}));
+
+    let frame = next_json(&mut ws).await;
+    assert_eq!(frame["event"], "qse");
+    assert_eq!(frame["channel"], "qc");
+    // Delivered verbatim: the data string is `"hi"` WITH the quotes.
+    assert_eq!(frame["data"], "\"hi\"");
+}
+
+/// R9 precedence pin: when the body and the query string both carry a field,
+/// the BODY's value wins (the doc's SHOULD form beats its MAY form). Body
+/// `channel=body-ch` + query `channel=query-ch` → the event goes to body-ch
+/// under the body's event name; the query channel hears nothing.
+#[tokio::test]
+async fn rest_trigger_body_field_beats_query_field() {
+    let addr = spawn().await;
+    let mut body_ws = connect_ws(addr).await;
+    let _ = next_json(&mut body_ws).await; // established
+    subscribe_public(&mut body_ws, "body-ch").await;
+    let mut query_ws = connect_ws(addr).await;
+    let _ = next_json(&mut query_ws).await; // established
+    subscribe_public(&mut query_ws, "query-ch").await;
+
+    let body = json!({"name":"ev","data":"{}","channel":"body-ch"}).to_string();
+    let q = signed_query(
+        "POST",
+        "/apps/app1/events",
+        body.as_bytes(),
+        &[("channel", "query-ch"), ("name", "query-name")],
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The event lands on the BODY's channel under the BODY's event name.
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(2), next_json(&mut body_ws))
+        .await
+        .expect("body channel must receive the event");
+    assert_eq!(frame["channel"], "body-ch");
+    assert_eq!(frame["event"], "ev");
+
+    // The query-string channel must NOT receive anything (body won).
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            next_json(&mut query_ws)
+        )
+        .await
+        .is_err(),
+        "query-string channel must not receive the event when the body carries the field"
+    );
+}
+
+/// R9 scope pin: batch_events takes NO query fallback. Its sole parameter
+/// `batch` is an array of event objects with no documented query-string
+/// representation (the doc's only arrays-in-query note — `channels[]=…` —
+/// appears under the single trigger endpoint), so an empty body stays a 400.
+#[tokio::test]
+async fn rest_batch_events_empty_body_still_400() {
+    let addr = spawn().await;
+    let q = signed_query("POST", "/apps/app1/batch_events", b"", &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/batch_events?{q}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
 #[tokio::test]
 async fn rest_get_channels_lists_occupied_channel() {
     let addr = spawn().await;
