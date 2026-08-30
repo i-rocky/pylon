@@ -15,12 +15,16 @@
 //! entries that have actually expired, never every connection.
 //!
 //! Rescheduling (a [`touch`](TimerWheel::touch) on inbound activity, or a
-//! [`mark_ping_sent`](TimerWheel::mark_ping_sent) after emitting a ping) leaves
-//! the old timeline entry in place and is reconciled lazily: when `due` pops a
-//! deadline it checks the side table and discards the entry if the connection
-//! has since been rescheduled past it. A `touch` arriving while a ping is
-//! outstanding therefore *cancels* the pending `4201` close — any inbound frame
-//! is liveness activity that clears the pong deadline.
+//! [`mark_ping_sent`](TimerWheel::mark_ping_sent) after emitting a ping)
+//! EAGERLY removes the superseded timeline entry: without that, a chatty
+//! connection (say 100 msg/s) accrues ~12,000 stale buckets before `due`
+//! sweeps past their deadlines an `activity_timeout` (120 s) later — tens of
+//! MB of dead entries per connection. With the eager removal the timeline
+//! holds at most one liveness slot, one lifetime slot and one handshake slot
+//! per connection; `due` still validates every popped entry against the side
+//! tables as defense in depth. A `touch` arriving while a ping is outstanding
+//! *cancels* the pending `4201` close — any inbound frame is liveness activity
+//! that clears the pong deadline.
 //!
 //! Besides the (activity-relative) liveness timer, each connection can carry ONE
 //! absolute [`Kind::Lifetime`] deadline, armed once at session establish via
@@ -72,7 +76,7 @@ pub enum Due {
 }
 
 /// Which deadline a connection is currently waiting on.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     /// Idle deadline — fire a ping when it elapses.
     Idle,
@@ -117,15 +121,16 @@ pub struct TimerWheel {
     /// Pong timeout in ms (`pong_timeout` seconds).
     pong_timeout_ms: u64,
     /// Absolute deadline (ms) → the connections scheduled to expire then. A
-    /// connection can appear under multiple deadlines after a reschedule; the
-    /// side tables ([`live`](Self::live) / [`lifetime`](Self::lifetime))
-    /// disambiguate the current ones. A `Vec` (not a set) is fine: a
+    /// connection appears under at most one deadline PER KIND (liveness,
+    /// lifetime, handshake) at a time: re-arms and teardown eagerly scrub the
+    /// superseded slot, so no stale entries linger for
+    /// [`due`](Self::due) to skip. A `Vec` (not a set) is fine: a
     /// `(connection, kind)` pair is inserted under a deadline at most once per
     /// schedule call.
     timeline: BTreeMap<u64, Vec<Slot>>,
     /// Each connection's *current* liveness timer (idle or pong). The source of
     /// truth for `Kind::Idle`/`Kind::Pong` timeline entries; the timeline is an
-    /// index into it that may carry stale (superseded) entries.
+    /// index into it that is kept slot-exact by the eager scrub on re-arm.
     live: HashMap<ConnId, Timer>,
     /// Each connection's armed max-lifetime deadline (absolute ms). The source
     /// of truth for `Kind::Lifetime` timeline entries. Never rewritten by
@@ -185,7 +190,12 @@ impl TimerWheel {
     /// exactly the armed deadline. A connection without a lifetime configured
     /// is simply never armed.
     pub fn arm_lifetime(&mut self, conn: ConnId, deadline_ms: u64) {
-        self.lifetime.insert(conn, deadline_ms);
+        // Defensive: a re-arm replaces the previous slot instead of stranding
+        // it (the method is documented once-per-session, but the wheel must
+        // not bloat if a caller ever disobeys).
+        if let Some(old) = self.lifetime.insert(conn, deadline_ms) {
+            self.scrub(conn, old, Kind::Lifetime);
+        }
         self.timeline.entry(deadline_ms).or_default().push(Slot {
             conn,
             kind: Kind::Lifetime,
@@ -200,7 +210,10 @@ impl TimerWheel {
     /// [`clear_handshake`](Self::clear_handshake) runs first (session
     /// establish) or the connection is [`remove`](Self::remove)d.
     pub fn arm_handshake(&mut self, conn: ConnId, deadline_ms: u64) {
-        self.handshake.insert(conn, deadline_ms);
+        // Defensive: same replace-don't-strand rule as `arm_lifetime`.
+        if let Some(old) = self.handshake.insert(conn, deadline_ms) {
+            self.scrub(conn, old, Kind::Handshake);
+        }
         self.timeline.entry(deadline_ms).or_default().push(Slot {
             conn,
             kind: Kind::Handshake,
@@ -208,11 +221,13 @@ impl TimerWheel {
     }
 
     /// Clear `conn`'s armed handshake deadline (the session established within
-    /// the window). The stale timeline entry is skipped lazily by
-    /// [`due`](Self::due); only the side-table entry must go now so the
-    /// deadline cannot fire on an established connection.
+    /// the window): drops BOTH the side-table entry and its timeline slot, so
+    /// the deadline cannot fire on an established connection and nothing
+    /// lingers for [`due`](Self::due) to sweep later.
     pub fn clear_handshake(&mut self, conn: ConnId) {
-        self.handshake.remove(&conn);
+        if let Some(deadline_ms) = self.handshake.remove(&conn) {
+            self.scrub(conn, deadline_ms, Kind::Handshake);
+        }
     }
 
     /// Drop `conn`'s LIVENESS timer only (idle or pong), leaving any armed
@@ -220,26 +235,37 @@ impl TimerWheel {
     /// `Due::Ping` path when it finds no session: the pre-session connection's
     /// idle timer is spurious (only established sessions are pinged), but its
     /// handshake deadline must survive so the slowloris reap still fires.
+    /// The liveness timeline slot is scrubbed, not left for a lazy skip.
     pub fn clear_liveness(&mut self, conn: ConnId) {
-        self.live.remove(&conn);
+        if let Some(t) = self.live.remove(&conn) {
+            self.scrub(conn, t.deadline_ms, t.kind);
+        }
     }
 
-    /// Drop `conn` from the wheel entirely (on connection close, any reason).
-    /// The stale timeline entries are reaped lazily by [`due`](Self::due); only
-    /// the side-table entries must go now so a recycled slab token isn't matched
-    /// against an old timer.
+    /// Drop `conn` from the wheel entirely (on connection close, any reason):
+    /// every side-table entry AND every timeline slot goes now, so a recycled
+    /// slab token is never matched against an old timer and no slot lingers
+    /// at a possibly 24 h-out lifetime deadline.
     pub fn remove(&mut self, conn: ConnId) {
-        self.live.remove(&conn);
-        self.lifetime.remove(&conn);
-        self.handshake.remove(&conn);
+        if let Some(t) = self.live.remove(&conn) {
+            self.scrub(conn, t.deadline_ms, t.kind);
+        }
+        if let Some(deadline_ms) = self.lifetime.remove(&conn) {
+            self.scrub(conn, deadline_ms, Kind::Lifetime);
+        }
+        if let Some(deadline_ms) = self.handshake.remove(&conn) {
+            self.scrub(conn, deadline_ms, Kind::Handshake);
+        }
     }
 
     /// Advance the wheel to `now_ms` and return everything that has come due:
     /// `Due::Ping` for each idle-expired connection, `Due::Close4201` for each
     /// pong-timed-out connection, `Due::Close4202` for each lifetime-expired
     /// connection. Pops every timeline bucket at or before `now_ms` and
-    /// validates each entry against its kind's side table, discarding
-    /// superseded entries. `O(due-count + popped-stale)`, never `O(N-conns)`.
+    /// validates each entry against its kind's side table — defense in depth:
+    /// the eager scrub on re-arm/teardown already keeps the timeline free of
+    /// superseded entries, and the validation would discard any that slipped
+    /// through. `O(due-count)`, never `O(N-conns)`.
     pub fn due(&mut self, now_ms: u64) -> Vec<Due> {
         let mut out = Vec::new();
         // Pop every bucket whose deadline has elapsed. `split_off(&(now+1))`
@@ -289,20 +315,64 @@ impl TimerWheel {
     }
 
     /// (Re)schedule `conn`'s liveness timer to fire at `deadline_ms` with
-    /// `kind`, updating the side table and inserting a fresh timeline entry. The
-    /// old timeline entry (if any) is left to be skipped lazily by [`due`](Self::due).
+    /// `kind`: scrub the superseded timeline entry (G6 — re-arms must not
+    /// accrue stale buckets for [`due`](Self::due) to skip up to
+    /// `activity_timeout` later), then update the side table and insert the
+    /// fresh timeline entry.
     fn schedule(&mut self, conn: ConnId, deadline_ms: u64, kind: Kind) {
+        let superseded = self.live.get(&conn).copied();
+        if let Some(old) = superseded {
+            self.scrub(conn, old.deadline_ms, old.kind);
+        }
         self.live.insert(conn, Timer { deadline_ms, kind });
         self.timeline
             .entry(deadline_ms)
             .or_default()
             .push(Slot { conn, kind });
     }
+
+    /// Eagerly remove `conn`'s `kind` timeline entry at `deadline_ms` (and the
+    /// bucket itself once empty). Called on every re-arm and every teardown
+    /// path, so the timeline never carries an entry the side tables would
+    /// only lazily discard — a chatty connection holds exactly one liveness
+    /// slot, an early disconnect leaves nothing parked at its (possibly
+    /// 24 h-out) lifetime/handshake deadline.
+    fn scrub(&mut self, conn: ConnId, deadline_ms: u64, kind: Kind) {
+        if let std::collections::btree_map::Entry::Occupied(mut bucket) =
+            self.timeline.entry(deadline_ms)
+        {
+            bucket
+                .get_mut()
+                .retain(|s| !(s.conn == conn && s.kind == kind));
+            if bucket.get().is_empty() {
+                bucket.remove();
+            }
+        }
+    }
 }
 
 impl Default for TimerWheel {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── test-only introspection ─────────────────────────────────────────────────
+impl TimerWheel {
+    /// Number of distinct deadline buckets currently in the timeline. Pins the
+    /// no-stale-bloat invariant (G6): a repeatedly re-armed connection must
+    /// keep this O(1), not grow one bucket per `touch`.
+    #[cfg(test)]
+    fn bucket_count(&self) -> usize {
+        self.timeline.len()
+    }
+
+    /// Total timeline slot entries across all buckets. At rest this must equal
+    /// `live.len() + lifetime.len() + handshake.len()` — every slot backed by
+    /// a side-table entry, no strays.
+    #[cfg(test)]
+    fn slot_count(&self) -> usize {
+        self.timeline.values().map(Vec::len).sum()
     }
 }
 
@@ -336,8 +406,8 @@ mod tests {
         let mut w = TimerWheel::new();
         w.touch(3, 0);
         w.remove(3);
-        // The idle deadline still sits in the timeline but the connection is
-        // gone, so nothing fires.
+        // The connection is gone and its timeline slot was scrubbed, so
+        // nothing fires.
         assert!(w.due(200_000).is_empty());
     }
 
@@ -403,8 +473,8 @@ mod tests {
         let mut w = TimerWheel::new();
         w.arm_lifetime(5, 1_000);
         w.remove(5);
-        // The lifetime entry still sits in the timeline but the connection is
-        // gone, so nothing fires.
+        // The connection is gone and the lifetime entry was scrubbed with it,
+        // so nothing fires.
         assert!(w.due(2_000).is_empty());
     }
 
@@ -459,8 +529,8 @@ mod tests {
         let mut w = TimerWheel::new();
         w.arm_handshake(5, 1_000);
         w.remove(5);
-        // The timeline entry still sits there but the side table is empty, so
-        // nothing fires for the (possibly recycled) token.
+        // The side table and the timeline entry are both gone, so nothing
+        // fires for the (possibly recycled) token.
         assert!(w.due(2_000).is_empty());
     }
 
@@ -476,6 +546,11 @@ mod tests {
         assert_eq!(w.due(120_000), vec![Due::Ping(6)]); // spurious idle ping
         w.clear_liveness(6); // the worker found no session → liveness-only clear
         assert_eq!(
+            w.bucket_count(),
+            1,
+            "clear_liveness scrubs its own slot; only the handshake bucket remains"
+        );
+        assert_eq!(
             w.due(200_000),
             vec![Due::HandshakeTimeout(6)],
             "the handshake deadline must survive the liveness clear"
@@ -487,8 +562,9 @@ mod tests {
         let mut w = TimerWheel::new();
         w.arm_handshake(7, 1_000);
         w.touch(7, 0); // idle at 120_000
-                       // Establish before the handshake deadline (popped-but-skipped when the
-                       // wheel later sweeps past 1_000): liveness + lifetime live on after it.
+                       // Establish before the handshake deadline (the 1_000 slot is
+                       // scrubbed, so the wheel never even pops it): liveness +
+                       // lifetime live on after it.
         w.clear_handshake(7);
         w.arm_lifetime(7, 200_000);
         assert_eq!(w.due(120_000), vec![Due::Ping(7)]);
@@ -497,5 +573,153 @@ mod tests {
         assert_eq!(w.due(200_000), vec![Due::Close4202(7)]);
         w.remove(7);
         assert!(w.due(1_000_000).is_empty());
+    }
+
+    // ── G6: no stale-bucket bloat on re-arm / teardown ────────────────────────
+
+    #[test]
+    fn chatty_connection_does_not_accrue_stale_buckets() {
+        // Every touch re-arms the idle deadline; the superseded timeline entry
+        // must be dropped AT the re-arm, not left for `due` to lazily skip up
+        // to activity_timeout (120 s) later. Without the eager removal a
+        // 100 msg/s connection accrues ~12,000 dead slots — tens of MB per
+        // chatty connection — before the sweep reaps them.
+        let mut w = TimerWheel::new();
+        w.touch(1, 0);
+        for i in 1..=1_000u64 {
+            w.touch(1, i * 100); // advancing activity → advancing deadlines
+            assert!(
+                w.bucket_count() <= 2,
+                "touch #{i} left {} buckets — stale entries not reaped on re-arm",
+                w.bucket_count()
+            );
+            assert_eq!(w.slot_count(), 1, "exactly one live slot expected");
+        }
+        assert_eq!(w.bucket_count(), 1);
+        // The single surviving entry is the CURRENT deadline: the ping fires
+        // exactly activity_timeout after the last touch, and the bucket pops.
+        assert_eq!(w.due(100_000 + 120_000), vec![Due::Ping(1)]);
+        assert_eq!(w.bucket_count(), 0);
+    }
+
+    #[test]
+    fn chatty_connection_with_ping_cycles_does_not_accrue_stale_buckets() {
+        // Same invariant across Idle↔Pong kind transitions: a
+        // `mark_ping_sent` supersedes an armed idle deadline, and a late-but-
+        // timely pong supersedes the pong deadline — the superseded slots must
+        // go, not linger.
+        let mut w = TimerWheel::new();
+        w.touch(2, 0);
+        let mut now = 0u64;
+        for cycle in 0..50u64 {
+            assert_eq!(w.due(now + 120_000), vec![Due::Ping(2)], "cycle {cycle}");
+            assert_eq!(w.slot_count(), 0, "pop must empty the timeline");
+            w.mark_ping_sent(2, now + 120_000);
+            assert_eq!(w.slot_count(), 1);
+            now += 125_000; // pong arrives late but in time
+            w.touch(2, now);
+            assert_eq!(w.slot_count(), 1, "pong must replace, not append");
+            now += 5_000;
+        }
+        assert_eq!(w.bucket_count(), 1);
+    }
+
+    #[test]
+    fn remove_scrubs_every_timeline_slot_immediately() {
+        // Task 1.5 review noted stale lifetime slots linger to the full
+        // lifetime on early disconnect: a conn armed for the default 24 h that
+        // disconnects after 1 s must NOT park a timeline slot for 24 h.
+        let mut w = TimerWheel::new();
+        w.touch(5, 0);
+        w.arm_lifetime(5, 86_400_000); // 24 h out
+        w.arm_handshake(5, 30_000); // (pre-session dribble conn also reaped-armed)
+        assert_eq!(w.bucket_count(), 3);
+        w.remove(5);
+        assert_eq!(
+            w.bucket_count(),
+            0,
+            "remove must scrub every timeline slot eagerly"
+        );
+        assert!(w.live.is_empty());
+        assert!(w.lifetime.is_empty());
+        assert!(w.handshake.is_empty());
+        // Nothing ever fires for the (possibly recycled) token.
+        assert!(w.due(u64::MAX / 2).is_empty());
+    }
+
+    #[test]
+    fn clear_handshake_scrubs_the_timeline_slot_too() {
+        // Early establish clears BOTH the side table and the timeline slot: no
+        // lingering reap entry for `due` to skip a handshake_timeout later.
+        let mut w = TimerWheel::new();
+        w.arm_handshake(4, 30_000);
+        assert_eq!(w.bucket_count(), 1);
+        w.clear_handshake(4);
+        assert_eq!(w.bucket_count(), 0);
+        assert!(w.handshake.is_empty());
+        assert!(w.due(1_000_000).is_empty());
+    }
+
+    #[test]
+    fn re_armed_lifetime_replaces_its_timeline_slot() {
+        // arm_lifetime is documented once-per-session, but a defensive re-arm
+        // must replace the previous slot, not strand it.
+        let mut w = TimerWheel::new();
+        w.arm_lifetime(8, 1_000);
+        w.arm_lifetime(8, 2_000);
+        assert_eq!(w.bucket_count(), 1);
+        assert!(
+            w.due(1_500).is_empty(),
+            "the re-armed-away deadline must not fire"
+        );
+        assert_eq!(w.due(2_000), vec![Due::Close4202(8)]);
+    }
+
+    #[test]
+    fn timeline_slots_are_exactly_the_armed_timers() {
+        // Global invariant at rest: every timeline slot is the connection's
+        // CURRENT timer of its kind (one liveness + at most one lifetime + at
+        // most one handshake per connection), and every armed timer has its
+        // slot — a mixed workload of re-arms, establishes and disconnects
+        // leaves no strays and no unbacked arms.
+        let mut w = TimerWheel::new();
+        for conn in 0..30usize {
+            w.touch(conn, (conn * 7) as u64);
+            if conn % 3 == 0 {
+                w.arm_lifetime(conn, 500_000 + conn as u64);
+            }
+            if conn % 4 != 0 {
+                w.arm_handshake(conn, 400_000 + conn as u64);
+            }
+            if conn % 2 == 0 {
+                w.remove(conn); // early disconnect mid-flight
+            } else {
+                for k in 1..=20u64 {
+                    w.touch(conn, (conn * 7) as u64 + k * 13); // stays chatty
+                }
+            }
+        }
+        assert_eq!(
+            w.slot_count(),
+            w.live.len() + w.lifetime.len() + w.handshake.len(),
+            "every timeline slot must be backed by a side-table entry"
+        );
+        for (deadline, slots) in &w.timeline {
+            for s in slots {
+                match s.kind {
+                    Kind::Idle | Kind::Pong => {
+                        let t = w.live[&s.conn];
+                        assert_eq!(t.deadline_ms, *deadline);
+                        assert_eq!(t.kind, s.kind);
+                    }
+                    Kind::Lifetime => assert_eq!(w.lifetime[&s.conn], *deadline),
+                    Kind::Handshake => assert_eq!(w.handshake[&s.conn], *deadline),
+                }
+            }
+        }
+        // The survivors fire exactly at their current deadlines: odd conns
+        // last touched at conn*7 + 260, so every idle deadline ≤ 120_463.
+        let expected: Vec<Due> = (1..30).filter(|c| c % 2 == 1).map(Due::Ping).collect();
+        assert_eq!(w.due(121_000), expected);
     }
 }

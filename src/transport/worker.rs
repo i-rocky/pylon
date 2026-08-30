@@ -1187,9 +1187,11 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                 &node_conns,
                             );
                         } else {
-                            // Established or gone (a stale timeline entry — the
-                            // establish path cleared the side table): nothing
-                            // to reap; just drop any lingering arm defensively.
+                            // Established or gone: with the wheel's eager
+                            // scrub the stale-entry case cannot arise (the
+                            // establish path removed the side-table entry AND
+                            // its timeline slot), but keep the defensive
+                            // clear — a no-op when nothing is armed.
                             wheel.clear_handshake(key);
                         }
                         work = true;
