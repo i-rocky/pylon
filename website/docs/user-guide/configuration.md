@@ -137,6 +137,9 @@ a specific workload.
 |---|---|---|
 | `PYLON_MEMORY_BUDGET_BYTES` | `0` | Total memory budget in bytes for the transport layer. `0` = auto (derived from cgroup/host memory using the `max(1.5 GiB, 7%)` reserve formula). |
 | `PYLON_MEMORY_BUDGET_FRACTION` | `0.0` | Memory budget as a fraction of effective host memory (0.0–1.0). Applied when `PYLON_MEMORY_BUDGET_BYTES` is `0`. `0.0` = use the built-in reserve formula. |
+| `PYLON_MAX_CONNECTIONS` | `0` | Node-wide ceiling on simultaneous connections across all apps. Connections beyond it are closed with WebSocket code `4100`. `0` = auto-derive from the memory budget (`budget / PYLON_EXPECTED_PER_CONN_BYTES`). |
+| `PYLON_EXPECTED_PER_CONN_BYTES` | `8192` | Expected per-connection memory footprint (bytes), used to auto-derive `PYLON_MAX_CONNECTIONS` when it is `0`. |
+| `PYLON_MAILBOX_CAPACITY` | `256` | Capacity (frames) of each connection's inbound mailbox — the bounded channel used for direct sends (presence rosters, `member_added`/`member_removed`, user-targeted events, watchlist notifications, cluster deliveries). When full, a frame is silently dropped and `pylon_mailbox_dropped_total` increments. Must be `> 0`. |
 | `PYLON_EXPECTED_CONNS_PER_WORKER` | `50000` | Expected concurrent connections per worker thread, used to derive the per-connection out-queue cap. |
 | `PYLON_PERCONN_QUEUE_MIN_BYTES` | `262144` | Lower clamp for the per-connection outbound queue cap (bytes). Default 256 KiB. |
 | `PYLON_PERCONN_QUEUE_MAX_BYTES` | `8388608` | Upper clamp for the per-connection outbound queue cap (bytes). Default 8 MiB. |

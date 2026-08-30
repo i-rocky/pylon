@@ -42,10 +42,11 @@ labels**.
 | `pylon_broadcast_dropped_total` | counter | `worker` | Broadcasts dropped because the worker hand-off channel was full |
 | `pylon_codel_dropped_total` | counter | `worker` | Frames discarded by the CoDel staleness check (stale frames removed from the queue before sending) |
 | `pylon_drophead_dropped_total` | counter | `worker` | Frames evicted by the per-connection drop-head queue: when a slow consumer's outbound queue is at its byte cap, the oldest queued frames are dropped to make room for newer ones (freshest-wins) |
+| `pylon_mailbox_dropped_total` | counter | `worker` | Frames dropped because a connection's inbound mailbox (the bounded direct-send channel for presence rosters, member events, user-targeted sends, watchlist notifications, cluster deliveries) was full when a producer tried to enqueue |
 | `pylon_inflight_bytes` | gauge | `worker` | Bytes currently queued in each worker's outbound buffer |
 | `pylon_inflight_bytes_sum` | gauge | — | Sum of `pylon_inflight_bytes` across all workers |
 | `pylon_worker_budget_bytes` | gauge | — | Per-worker memory budget in bytes |
-| `pylon_budget_factor` | gauge | — | PSI memory-pressure budget factor (0.0–1.0); drops toward 0 as workers approach their memory budget |
+| `pylon_budget_factor` | gauge | — | PSI memory-pressure budget factor. A background loop polls kernel memory pressure (`full avg10`) once per second; above `PYLON_PSI_THRESHOLD` (default 15%) each worker's effective budget shrinks toward a 0.8 floor and recovers toward 1.0 when pressure clears. Steady-state range is **0.8–1.0** — a sustained value below 0.9 indicates real memory pressure, not queue backlog |
 | `pylon_saturation_flag` | gauge | — | `1` if the broadcast pipeline is saturated, `0` otherwise; omitted when the saturation monitor is not running |
 
 #### Webhook Pipeline
@@ -92,13 +93,17 @@ Import the series above into Grafana dashboards. Useful panel ideas:
 - **Connection density**: `pylon_connections{app="…"}` per app, plus
   `sum(pylon_inflight_bytes_sum)` for buffer pressure.
 - **Drop rates**: rate of `pylon_broadcast_dropped_total`,
-  `pylon_codel_dropped_total`, and `pylon_drophead_dropped_total` — non-zero
-  values indicate backpressure (drop-head evictions mean slow consumers are
-  losing their oldest queued frames).
+  `pylon_codel_dropped_total`, `pylon_drophead_dropped_total`, and
+  `pylon_mailbox_dropped_total` — non-zero values indicate backpressure
+  (drop-head evictions mean slow consumers are losing their oldest queued
+  frames; mailbox drops mean direct sends to a connection overran its
+  inbound mailbox).
 - **Webhook health**: `pylon_webhook_dropped_total` rate and
   `pylon_webhook_queue_depth` — rising queue depth signals a slow upstream.
 - **Redis health**: `pylon_redis_connected` as a status panel; alert on `< 1`.
-- **Memory pressure**: `pylon_budget_factor` — alert when it drops below 0.2.
+- **Memory pressure**: `pylon_budget_factor` — alert when sustained below 0.9
+  (the factor only ever ranges 0.8–1.0; it tracks kernel PSI memory pressure,
+  not queue depth).
 
 ---
 

@@ -123,8 +123,11 @@ interfaces or IP aliases.
 
 ### Workers
 
-Pylon auto-detects the number of CPU cores and starts one Tokio worker per
-core. Set `PYLON_WORKERS` to override:
+Pylon auto-detects the number of CPU cores and starts one **pinned OS thread
+per core, each running its own `mio` event loop** with its own
+`SO_REUSEPORT` listener (the kernel shards accepts across them). Tokio drives
+only the control plane — the REST API, webhooks, and the Redis adapter — not
+the WebSocket hot path. Set `PYLON_WORKERS` to override:
 
 ```bash
 PYLON_WORKERS=8 pylon
@@ -144,19 +147,30 @@ Override the budget with environment variables:
 | `PYLON_MEMORY_BUDGET_FRACTION` | auto | Budget as a fraction of effective (host/cgroup) memory, range 0.0–1.0; if `PYLON_MEMORY_BUDGET_BYTES` is also set it takes precedence |
 | `PYLON_MEMORY_BUDGET_BYTES` | — | Total budget across all workers in bytes (takes precedence over `PYLON_MEMORY_BUDGET_FRACTION`) |
 
-When a worker's inflight queue approaches its budget, pylon applies backpressure
-and the `pylon_budget_factor` metric drops toward 0.
+When a worker's inflight queue approaches its budget, pylon applies
+backpressure (per-connection drop-head eviction and CoDel drops) and sheds new
+subscriptions and client events. The `pylon_budget_factor` metric reflects
+**kernel memory pressure** (PSI `full avg10`), not queue utilisation: a
+background loop polls PSI once a second and scales each worker's effective
+budget down toward a `0.8` floor while pressure exceeds
+`PYLON_PSI_THRESHOLD` (default 15%), ramping back toward `1.0` when it
+clears — so the metric's steady-state range is **0.8–1.0**, and a sustained
+value below `0.9` means the host is genuinely under memory pressure.
 
 ### Per-App Connection Cap
 
-Set a per-app connection ceiling in your app configuration:
+Set a per-app connection ceiling in your app configuration (`apps.json` —
+the same file `PYLON_APPS_PATH` points at):
 
-```toml
-[[apps]]
-id = "my-app"
-key = "…"
-secret = "…"
-capacity = 10000   # max concurrent WebSocket connections for this app
+```json
+[
+  {
+    "id": "my-app",
+    "key": "…",
+    "secret": "…",
+    "capacity": 10000
+  }
+]
 ```
 
 Connections beyond `capacity` are closed with Pusher error **4004** (over
@@ -180,9 +194,13 @@ Pylon supports zero-dropped-message restarts when used with a process manager:
 ```bash
 # systemd rolling restart
 systemctl restart pylon
-# or for zero-downtime with socket activation / multiple instances:
-systemctl reload pylon
 ```
+
+The unit ships no `ExecReload`, so there is no `systemctl reload` — restart is
+the supported operation. Pylon's two-phase drain (503 on `/ready`, then a
+bounded 4200 close) is what makes the restart rolling rather than dropped;
+for zero-downtime at the front, run multiple instances behind a load balancer
+that health-checks `/ready` and restart them one at a time.
 
 Set `PYLON_SHUTDOWN_GRACE_MS` to allow enough time for your clients to
 reconnect before the old process exits. Pusher.js will reconnect immediately on
