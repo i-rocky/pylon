@@ -123,6 +123,7 @@ async fn spawn_configured(apps_json: &str, with: impl FnOnce(&mut ServerConfig))
             // Single-node (not clustered).
             false,
             None,
+            None,
             worker_runtime,
         );
     });

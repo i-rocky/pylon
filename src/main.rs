@@ -255,6 +255,8 @@ async fn main() -> anyhow::Result<()> {
             // its own harness (`run_redis_percore`); this standalone `main` percore
             // path is not clustered.
             false,
+            // Not clustered ⇒ no cluster-wide capacity admission handle.
+            None,
             tls,
             worker_runtime,
         )
@@ -426,6 +428,10 @@ async fn run_redis_percore(
     let worker_shutdown = shutdown.clone();
     let worker_config = config.clone();
     let worker_local = local.clone();
+    // Task 4.2 (D2): a clone of the bridge handle for the worker's cluster-wide
+    // per-app capacity admission. Cloned BEFORE the move-closure so `bridge`
+    // itself stays alive here until after the worker joins.
+    let worker_cluster = bridge.handle();
     // Phase 7: capture the runtime handle here (async context) before spawn_blocking.
     let worker_runtime = tokio::runtime::Handle::current();
     let worker = tokio::task::spawn_blocking(move || {
@@ -442,6 +448,8 @@ async fn run_redis_percore(
             Some(worker_local),
             // This IS a clustered node: defer the single-emit cluster edges.
             true,
+            // …and gate per-app capacity cluster-wide via the bridge.
+            Some(worker_cluster),
             tls,
             worker_runtime,
         )

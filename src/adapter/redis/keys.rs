@@ -7,6 +7,8 @@
 //! different slots — fine on a single instance, but a known constraint to resolve
 //! (e.g. co-locating or de-atomizing the `chans` index write) when Cluster mode
 //! lands. Do not assume cross-key scripts here are CROSSSLOT-safe under Cluster.
+//! The per-app capacity scripts span the SAME constraint: `ADMIT_APP_LUA` /
+//! `RELEASE_APP_LUA` touch `appconns` + `nodeconns:{node}` in one script.
 
 /// Builds Redis keys for all Pylon data structures under a given prefix.
 #[derive(Clone)]
@@ -97,6 +99,27 @@ impl Keys {
     pub fn watch(&self, app: &str, user_id: &str) -> String {
         format!("{}:watch:{}:{{{}}}", self.prefix, app, user_id)
     }
+
+    /// Per-app CLUSTER connection counts: HASH app → count of live connections
+    /// across every node. The `ADMIT_APP_LUA` capacity check reads this hash;
+    /// admissions/releases keep it exact. No TTL — correctness is maintained by
+    /// the admit/release scripts and the sweeper's dead-node reclaim.
+    pub fn appconns(&self) -> String {
+        format!("{}:appconns", self.prefix)
+    }
+
+    /// Per-NODE per-app connection counts: HASH app → count of THIS node's live
+    /// connections. Lets `RELEASE_APP_LUA` floor-0 without stealing another
+    /// node's units, and the sweeper subtract a dead node's exact contribution
+    /// from `appconns`. Whole-key TTL refreshed by the node heartbeat + each
+    /// admission (see [`RedisConfig::node_conns_ttl_secs`]), sized to outlive the
+    /// node-liveness key so the sweeper always reclaims before the backstop
+    /// expires the hash.
+    ///
+    /// [`RedisConfig::node_conns_ttl_secs`]: crate::adapter::redis::RedisConfig::node_conns_ttl_secs
+    pub fn nodeconns(&self, node_id: &str) -> String {
+        format!("{}:nodeconns:{}", self.prefix, node_id)
+    }
 }
 
 /// Composite token uniquely identifying one socket connection across the cluster.
@@ -135,6 +158,8 @@ mod tests {
         assert_eq!(k.users("app1"), "pylon:users:app1");
         assert_eq!(k.usermsg("app1", "u7"), "pylon:usermsg:app1:{u7}");
         assert_eq!(k.watch("app1", "u7"), "pylon:watch:app1:{u7}");
+        assert_eq!(k.appconns(), "pylon:appconns");
+        assert_eq!(k.nodeconns("n1"), "pylon:nodeconns:n1");
     }
     #[test]
     fn member_token_is_node_and_socket() {

@@ -116,6 +116,7 @@ async fn spawn_slow(delay: Duration) -> Harness {
         webhooks: pylon::webhook::WebhookHandle::null(),
         saturated: None,
         clustered: false,
+        cluster: None,
         max_connections: 0,
         mailbox_capacity: 256,
         app_registry: app_registry.clone(),

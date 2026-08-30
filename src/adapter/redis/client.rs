@@ -188,6 +188,73 @@ if conn <= 0 then redis.call('DEL', KEYS[1]); redis.call('SREM', KEYS[2], ARGV[2
 return conn
 "#;
 
+/// APP ADMIT (Task 4.2 / finding D2): the cluster-wide per-app capacity gate.
+/// Atomically checks the CLUSTER count (`appconns`) against the app's capacity
+/// and, when there is room, takes one unit there AND on the admitting node's
+/// own per-app hash (which also re-arms that hash's TTL backstop). Returns `1`
+/// when admitted, `0` when the app is at capacity (no state changed).
+/// `capacity <= 0` means unlimited: the check is skipped but the unit is still
+/// recorded, so every admitted connection has exactly one matching release.
+///
+/// `KEYS[1]` = appconns hash, `KEYS[2]` = nodeconns:{node} hash.
+/// `ARGV[1]` = app_id, `ARGV[2]` = capacity, `ARGV[3]` = nodeconns ttl_secs.
+const ADMIT_APP_LUA: &str = r#"
+local cap = tonumber(ARGV[2])
+if cap ~= nil and cap > 0 then
+  local cur = tonumber(redis.call('HGET', KEYS[1], ARGV[1]) or '0')
+  if cur >= cap then return 0 end
+end
+redis.call('HINCRBY', KEYS[1], ARGV[1], 1)
+redis.call('HINCRBY', KEYS[2], ARGV[1], 1)
+redis.call('EXPIRE', KEYS[2], ARGV[3])
+return 1
+"#;
+
+/// APP RELEASE (Task 4.2 / finding D2): floor-0 give-back of one unit on both
+/// the node's per-app hash and the cluster total — never negative. NODE-GUARDED:
+/// the cluster total is decremented only when this node actually held a unit, so
+/// a phantom release (e.g. an admission that failed open, or a capacity config
+/// that changed between establish and close) can never steal a unit another node
+/// legitimately holds. Fields that reach 0 are HDEL'd so the hashes stay tidy.
+/// Returns the remaining cluster total for the app.
+///
+/// `KEYS[1]` = appconns hash, `KEYS[2]` = nodeconns:{node} hash.
+/// `ARGV[1]` = app_id.
+const RELEASE_APP_LUA: &str = r#"
+local node = redis.call('HINCRBY', KEYS[2], ARGV[1], -1)
+if node < 0 then
+  redis.call('HDEL', KEYS[2], ARGV[1])
+  return 0
+end
+if node == 0 then redis.call('HDEL', KEYS[2], ARGV[1]) end
+local total = redis.call('HINCRBY', KEYS[1], ARGV[1], -1)
+if total <= 0 then redis.call('HDEL', KEYS[1], ARGV[1]) end
+return total
+"#;
+
+/// DEAD-NODE RECLAIM (Task 4.2 / finding D2, run by the sweeper): subtract a
+/// dead node's per-app counts from the cluster totals, floored at 0 per app
+/// (never negative), then delete the dead node's hash. One script = the whole
+/// read-subtract-delete decision is atomic, so it cannot straddle a concurrent
+/// admission. Returns the number of apps reclaimed.
+///
+/// `KEYS[1]` = appconns hash, `KEYS[2]` = nodeconns:{dead_node} hash.
+const RECLAIM_NODE_LUA: &str = r#"
+local counts = redis.call('HGETALL', KEYS[2])
+for i = 1, #counts, 2 do
+  local app = counts[i]
+  local n = tonumber(counts[i + 1]) or 0
+  local total = tonumber(redis.call('HGET', KEYS[1], app) or '0')
+  if total <= n then
+    redis.call('HDEL', KEYS[1], app)
+  else
+    redis.call('HINCRBY', KEYS[1], app, -n)
+  end
+end
+redis.call('DEL', KEYS[2])
+return math.floor(#counts / 2)
+"#;
+
 /// The membership/presence Lua scripts, compiled (SHA-1 hashed) at adapter build
 /// time. `Script::from_lua` is purely local — no Redis round-trip — and the scripts
 /// are loaded lazily on first use via `evalsha_with_reload`'s NOSCRIPT fallback.
@@ -207,6 +274,14 @@ pub struct Scripts {
     pub user_signin: Script,
     /// Records a user signout and returns the user's remaining cluster connection count.
     pub user_signout: Script,
+    /// Cluster-wide per-app capacity gate: returns 1 when admitted (unit taken
+    /// on both hashes), 0 when the app is at capacity.
+    pub admit_app: Script,
+    /// Floor-0, node-guarded give-back of one per-app unit on both hashes.
+    pub release_app: Script,
+    /// Sweeper's dead-node reclaim: subtracts a dead node's per-app counts from
+    /// the cluster totals (floored at 0) and deletes its hash.
+    pub reclaim_node: Script,
 }
 
 impl Scripts {
@@ -220,6 +295,9 @@ impl Scripts {
             presence_leave: Script::from_lua(PRESENCE_LEAVE_LUA),
             user_signin: Script::from_lua(USER_SIGNIN_LUA),
             user_signout: Script::from_lua(USER_SIGNOUT_LUA),
+            admit_app: Script::from_lua(ADMIT_APP_LUA),
+            release_app: Script::from_lua(RELEASE_APP_LUA),
+            reclaim_node: Script::from_lua(RECLAIM_NODE_LUA),
         }
     }
 }
@@ -253,5 +331,13 @@ mod tests {
         let s = Scripts::new();
         assert_ne!(s.vacate.sha1(), s.unsubscribe.sha1());
         assert_ne!(s.vacate.sha1(), s.subscribe.sha1());
+    }
+
+    #[test]
+    fn scripts_compile_including_app_capacity() {
+        let s = Scripts::new();
+        assert_ne!(s.admit_app.sha1(), s.release_app.sha1());
+        assert_ne!(s.admit_app.sha1(), s.reclaim_node.sha1());
+        assert_ne!(s.admit_app.sha1(), s.subscribe.sha1());
     }
 }

@@ -113,6 +113,12 @@ async fn heartbeat_loop(
 /// and `SADD nodes node_id`. A dead node simply stops ticking — its `node` key TTL-
 /// expires, and the sweeper's dead-node prune removes it from the `nodes` set.
 ///
+/// It also refreshes this node's `nodeconns:{node_id}` TTL (Task 4.2): a live node
+/// holding connections must never let its per-app capacity hash expire, or its
+/// close-time releases would floor-0 as phantoms and the cluster total would leak.
+/// The TTL sizing is [`RedisConfig::node_conns_ttl_secs`] — long enough that the
+/// sweeper reclaims a dead node BEFORE the backstop expires it.
+///
 /// One Redis error is logged and skipped, never fatal — the loop runs for the
 /// adapter's lifetime.
 ///
@@ -124,10 +130,11 @@ async fn node_heartbeat_loop(
     keys: keys::Keys,
     node_id: String,
     interval_secs: u64,
+    ttl_secs: u64,
     connected: Option<Arc<AtomicBool>>,
 ) {
     let interval = interval_secs.max(1);
-    let ttl_secs = (3 * interval) as i64;
+    let ttl = (3 * interval) as i64;
     let mut ticker = tokio::time::interval(Duration::from_secs(interval));
     loop {
         ticker.tick().await;
@@ -137,7 +144,7 @@ async fn node_heartbeat_loop(
             .set::<(), _, _>(
                 &node_key,
                 "1",
-                Some(fred::types::Expiration::EX(ttl_secs)),
+                Some(fred::types::Expiration::EX(ttl)),
                 None,
                 false,
             )
@@ -159,6 +166,17 @@ async fn node_heartbeat_loop(
             }
             tracing::warn!(error = %e, node_id, "redis node heartbeat SADD nodes failed; skipping this tick");
             continue;
+        }
+        // Task 4.2: re-arm this node's per-app capacity hash TTL. `EXPIRE` on a
+        // missing key (a node with no connections yet) is a harmless no-op; a
+        // failure here only shortens the backstop window, so it is logged and
+        // retried next tick rather than failing the whole heartbeat.
+        if let Err(e) = pool
+            .next()
+            .expire::<(), _>(keys.nodeconns(&node_id), ttl_secs as i64, None)
+            .await
+        {
+            tracing::warn!(error = %e, node_id, "redis nodeconns TTL refresh failed; retrying next tick");
         }
         // Both ops succeeded: mark connected.
         if let Some(ref c) = connected {
@@ -190,6 +208,19 @@ impl RedisConfig {
             webhook_vacated_grace_ms: cfg.webhook_vacated_grace_ms,
             sharded_pubsub: cfg.redis_sharded_pubsub,
         }
+    }
+
+    /// TTL (secs) of a node's `nodeconns:{node_id}` hash — the per-app capacity
+    /// counts the sweeper needs to reclaim when the node dies. It is refreshed
+    /// by the node heartbeat and by every admission, so a LIVE node never lets
+    /// it expire; for a dead one it is the GC backstop. Sizing: the sweeper can
+    /// only reclaim a node once (a) its `node:{id}` liveness key has TTL-expired
+    /// (`3 × heartbeat` after the last beat) and (b) the sweep lease the dead
+    /// node may still hold has expired (`max(3 × sweep, 5s)`) plus one tick —
+    /// so the backstop must outlive `3×hb + max(3×sweep,5) + sweep`.
+    /// `4×hb + 4×sweep + 5` covers that worst case with ≥ one heartbeat of slack.
+    pub(crate) fn node_conns_ttl_secs(&self) -> u64 {
+        4 * self.node_heartbeat_secs.max(1) + 4 * self.sweep_interval_secs.max(1) + 5
     }
 }
 
@@ -313,8 +344,17 @@ impl RedisAdapter {
         let nh_keys = keys.clone();
         let nh_node = node_id.clone();
         let nh_interval = redis_cfg.node_heartbeat_secs;
+        let nh_conns_ttl = redis_cfg.node_conns_ttl_secs();
         let node_heartbeat_handle = tokio::spawn(async move {
-            node_heartbeat_loop(nh_pool, nh_keys, nh_node, nh_interval, redis_connected).await
+            node_heartbeat_loop(
+                nh_pool,
+                nh_keys,
+                nh_node,
+                nh_interval,
+                nh_conns_ttl,
+                redis_connected,
+            )
+            .await
         });
 
         Ok(Self {
@@ -865,6 +905,60 @@ impl RedisAdapter {
             {
                 tracing::warn!(error = %e, app, user = %u, "failed to UNSUBSCRIBE watch channel");
             }
+        }
+    }
+
+    /// Cluster-wide per-app capacity admission (Task 4.2 / finding D2). Runs
+    /// `ADMIT_APP_LUA`: atomically reject when the app is at `capacity`
+    /// (`Some(false)`, no state changed) or take one unit on the cluster total
+    /// AND this node's per-app hash (`Some(true)`). Any Redis error FAILS OPEN
+    /// (`None`, no state changed) — a Redis blip must not lock clients out of a
+    /// node whose local checks already passed; the floor-0, node-guarded
+    /// [`RELEASE_APP_LUA`] makes the matching close-side release a no-op, so a
+    /// fail-open admission leaves the counts consistent. Called by the bridge's
+    /// `ClusterCmd::AdmitApp` arm on the worker's behalf.
+    #[doc(hidden)]
+    pub async fn cluster_admit_app(&self, app: &str, capacity: u32) -> Option<bool> {
+        let ttl = self.cfg.node_conns_ttl_secs();
+        match self
+            .scripts
+            .admit_app
+            .evalsha_with_reload::<i64, _, _>(
+                self.clients.pool.next(),
+                vec![self.keys.appconns(), self.keys.nodeconns(&self.node_id)],
+                vec![app.to_string(), capacity.to_string(), ttl.to_string()],
+            )
+            .await
+        {
+            Ok(1) => Some(true),
+            Ok(_) => Some(false),
+            Err(e) => {
+                tracing::warn!(error = %e, app, "redis app admission script failed; failing open");
+                None
+            }
+        }
+    }
+
+    /// Cluster-wide per-app capacity release (Task 4.2 / finding D2): the
+    /// floor-0, node-guarded give-back of one unit (see [`RELEASE_APP_LUA`]).
+    /// Best-effort like the bridge's other commands — a dropped release leaks
+    /// at most one unit, and the sweeper reclaims the residue when the node
+    /// dies. Called by the bridge's `ClusterCmd::ReleaseApp` arm.
+    ///
+    /// [`RELEASE_APP_LUA`]: crate::adapter::redis::client::RELEASE_APP_LUA
+    #[doc(hidden)]
+    pub async fn cluster_release_app(&self, app: &str) {
+        if let Err(e) = self
+            .scripts
+            .release_app
+            .evalsha_with_reload::<i64, _, _>(
+                self.clients.pool.next(),
+                vec![self.keys.appconns(), self.keys.nodeconns(&self.node_id)],
+                vec![app.to_string()],
+            )
+            .await
+        {
+            tracing::warn!(error = %e, app, "redis app release script failed; sweeper will reclaim");
         }
     }
 

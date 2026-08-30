@@ -218,8 +218,24 @@ The `capacity` field sets a hard ceiling on concurrent WebSocket connections for
 When a new connection would push the count over the limit, Pylon sends a WebSocket close frame
 with code **4004** (capacity exceeded) and refuses the connection.
 
-This limit is enforced cluster-wide when using the Redis adapter — each node checks the
-cluster-level count, not just its local count.
+In single-node mode the limit is enforced by that node's local connection count for the app.
+With the Redis adapter the limit is enforced **cluster-wide**: after the fast node-local check
+passes, the admission decision is completed in Redis — an atomic check-and-increment against a
+per-app cluster counter (`{prefix}:appconns`) shared by every node — so N nodes jointly hold
+the app to `capacity` connections, not `N × capacity`.
+
+Two operational notes for clustered deployments:
+
+* **Bridge fail-open.** The Redis admission runs on the node's cluster bridge. If that bridge is
+  momentarily unavailable (channel saturated, bridge stalled, or a transient Redis error), the
+  connection is **admitted anyway** rather than locked out — during such a blip each node falls
+  back to enforcing its local count only, so the cluster-wide ceiling may be exceeded by up to
+  the blip's worth of admissions.
+* **Crashed nodes.** A node that dies without closing its connections still holds its capacity
+  units in Redis until the sweeper reclaims them. Reclaim timing is heartbeat-based: once the
+  dead node's heartbeat key expires (`3 × PYLON_REDIS_NODE_HEARTBEAT` after its last beat)
+  the sweeper frees its counts within a sweep interval (`PYLON_REDIS_SWEEP_INTERVAL`). With
+  the defaults (5s heartbeat, 10s sweep) that is roughly 15–25 seconds.
 
 Set `capacity` to `0` to disable the limit (unrestricted). For most production deployments,
 sizing capacity to match your expected peak concurrent users plus a comfortable headroom is

@@ -221,6 +221,12 @@ pub fn run_percore(
     // node keeps the node-local handler emits. Stamped onto every connection's
     // `ConnectionContext` via the shared `DispatchEnv`.
     clustered: bool,
+    // Task 4.2 (finding D2): the node's cluster bridge handle, for CLUSTER-WIDE
+    // per-app capacity admission. `Some` only on a clustered node (the same
+    // wiring that passes `clustered = true`); `None` ⇒ the per-app `capacity`
+    // check stays purely node-local. The worker blocks on this handle — bounded
+    // by its reply timeout — ONLY for the capacity verdict at establish.
+    cluster: Option<crate::cluster::bridge::ClusterHandle>,
     // Optional rustls TLS server config. `Some` ⇒ every accepted TCP connection
     // is wrapped with a TLS server-side handshake before the WS upgrade;
     // `None` ⇒ plain TCP (no TLS).
@@ -267,6 +273,7 @@ pub fn run_percore(
         webhooks,
         saturated: saturated_flag,
         clustered,
+        cluster,
         // Node ceiling: explicit override or auto-derived from memory budget.
         // `0` = unlimited (no ceiling check).
         max_connections: config.resolved_max_connections(budget),

@@ -17,6 +17,12 @@
 //!
 //! Every Redis error is logged and skipped; one failure must never abort the whole
 //! sweep. Nothing here panics or unwraps.
+//!
+//! Task 4.2 (finding D2) adds a second reclaim duty: a dead node's per-app
+//! capacity counts (`nodeconns:{node}`) are subtracted from the cluster totals
+//! (`appconns`, floored at 0) and the hash deleted, in the SAME dead-node prune
+//! pass — so capacity held by a crashed node frees within a heartbeat window
+//! instead of leaking until a manual flush.
 
 use super::client::Scripts;
 use super::keys::Keys;
@@ -214,6 +220,15 @@ pub(crate) async fn sweep_once(
 
     // Secondary: prune dead nodes from the nodes set (their `node` key TTL-expired).
     // Member reaping above is the real cleanup; this just keeps the set tidy.
+    // Task 4.2 (finding D2): BEFORE forgetting a dead node, RECLAIM its per-app
+    // capacity counts — RECLAIM_NODE_LUA atomically subtracts each app's count on
+    // the dead node's `nodeconns` hash from the cluster `appconns` total (floored
+    // at 0), then deletes the hash. Without this, a crashed node's held capacity
+    // units would leak forever (a release can only come from the node itself).
+    // Order matters: the reclaim MUST precede the SREM — once the id leaves the
+    // `nodes` set, nothing enumerates its hash again (the hash's TTL backstop is
+    // then the only GC). Still under the sweep lease, so exactly one node
+    // reclaims per dead node.
     let nodes: Vec<String> = match pool.next().smembers(keys.nodes()).await {
         Ok(n) => n,
         Err(e) => {
@@ -224,6 +239,34 @@ pub(crate) async fn sweep_once(
     for node in nodes {
         match pool.next().exists::<i64, _>(keys.node(&node)).await {
             Ok(0) => {
+                // Dead: reclaim its capacity counts from the cluster totals.
+                match scripts
+                    .reclaim_node
+                    .evalsha_with_reload::<i64, _, _>(
+                        pool.next(),
+                        vec![keys.appconns(), keys.nodeconns(&node)],
+                        Vec::<String>::new(),
+                    )
+                    .await
+                {
+                    Ok(reclaimed) => {
+                        if reclaimed > 0 {
+                            tracing::debug!(
+                                node,
+                                apps = reclaimed,
+                                "sweeper: reclaimed dead node's per-app capacity counts"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // Log + STILL prune: the hash's TTL backstop eventually
+                        // removes the residue, and re-running the sweep would retry
+                        // a reclaim whose subtract is idempotent-ish (floored at 0)
+                        // — but the set entry is the enumeration source, so keep
+                        // the set tidy exactly like the pre-capacity behavior.
+                        tracing::warn!(error = %e, node, "sweeper: dead-node capacity reclaim failed; relying on TTL backstop");
+                    }
+                }
                 if let Err(e) = pool
                     .next()
                     .srem::<i64, _, _>(keys.nodes(), node.clone())

@@ -146,6 +146,7 @@ async fn spawn_tls_server(cert_path: &std::path::Path, key_path: &std::path::Pat
             worker_shutdown,
             local_for_sink,
             false,
+            None,
             tls,
             worker_runtime,
         );
@@ -508,6 +509,7 @@ async fn spawn_tls_server_large(
             worker_shutdown,
             local_for_sink,
             false,
+            None,
             tls,
             worker_runtime,
         );

@@ -184,6 +184,7 @@ pub async fn spawn_percore(spec: SpawnSpec) -> SocketAddr {
             // `spawn_percore_cluster`, which passes `true`).
             false,
             None,
+            None,
             worker_runtime,
         );
     });
@@ -268,6 +269,18 @@ pub async fn spawn_percore_cluster_with(
     prefix: &str,
     with: impl FnOnce(&mut ServerConfig),
 ) -> (SocketAddr, ClusterNodeGuard) {
+    spawn_percore_cluster_with_apps(prefix, APPS, with).await
+}
+
+/// As [`spawn_percore_cluster_with`] but also lets the caller supply the apps
+/// JSON (same shape as [`APPS`]) — e.g. `cluster_capacity` builds a capacity-1
+/// app so the CLUSTER-WIDE per-app connection cap can be hit across two nodes.
+/// Both nodes of a test must pass the SAME json so they resolve the same app.
+pub async fn spawn_percore_cluster_with_apps(
+    prefix: &str,
+    apps_json: &str,
+    with: impl FnOnce(&mut ServerConfig),
+) -> (SocketAddr, ClusterNodeGuard) {
     // The single shared LocalAdapter: the bridge's RedisAdapter shares it (so the
     // pub/sub recv loop's `local.broadcast(Raw)` shards remote frames to this
     // node's workers), the REST plane reads the saturation flag off it, and the
@@ -296,7 +309,7 @@ pub async fn spawn_percore_cluster_with(
     config.port = port;
     config.workers = 1;
 
-    let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
+    let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(apps_json).unwrap());
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
     let webhooks = WebhookHandle::null();
 
@@ -339,6 +352,10 @@ pub async fn spawn_percore_cluster_with(
     let worker_apps = apps.clone();
     let worker_webhooks = webhooks.clone();
     let worker_local = local.clone();
+    // Task 4.2 (D2): a clone of the bridge handle for the worker's cluster-wide
+    // per-app capacity admission (admit at establish, release at close). Cloned
+    // BEFORE the move-closure so `bridge` itself stays here for the guard.
+    let worker_cluster = bridge.handle();
     // Phase 7: capture the runtime handle here (async context) before spawning.
     let worker_runtime = tokio::runtime::Handle::current();
     let worker = std::thread::spawn(move || {
@@ -355,6 +372,7 @@ pub async fn spawn_percore_cluster_with(
             Some(worker_local),
             // This IS a clustered node: defer the single-emit cluster edges.
             true,
+            Some(worker_cluster),
             None,
             worker_runtime,
         );

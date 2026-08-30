@@ -59,6 +59,16 @@ impl Default for ClusterMetrics {
 /// normal burst — ever overflows it.
 const CMD_CHANNEL_CAPACITY: usize = 8192;
 
+/// How long [`ClusterHandle::admit_app`] blocks the calling worker for the
+/// bridge's capacity verdict before failing open (Task 4.2). The verdict is one
+/// Redis round trip on the bridge's drain loop; a healthy bridge answers in
+/// single-digit milliseconds. The bound exists for the DEGRADED case: a worker
+/// must never block indefinitely on a stalled bridge — after it elapses the
+/// connection is admitted (fail-open) exactly as if the channel had been full.
+/// Worst case, a stalled bridge adds this much latency to each new connection's
+/// establish on that node (comfortably inside the 10s default handshake budget).
+const ADMIT_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
+
 /// A cross-node coordination command a percore worker fires at the bridge.
 ///
 /// Today: [`Publish`](ClusterCmd::Publish) (the broadcast fan-out),
@@ -180,6 +190,25 @@ pub enum ClusterCmd {
         socket_id: SocketId,
         no_longer_watched: Vec<String>,
     },
+    /// Cluster-wide per-app capacity ADMISSION (Task 4.2 / finding D2): run
+    /// `ADMIT_APP_LUA` on the bridge's RedisAdapter and hand the verdict back
+    /// over `reply`. Unlike the fire-and-forget commands, this one is
+    /// REQUEST-RESPONSE: the calling worker blocks (bounded by
+    /// [`ADMIT_REPLY_TIMEOUT`]) because the establish must not proceed until the
+    /// cluster-wide decision is known. The reply carries the adapter's verdict:
+    /// `Some(true)` = admitted (a unit was taken in Redis), `Some(false)` = at
+    /// capacity (no state changed), `None` = Redis errored → FAIL OPEN (no state
+    /// changed). Maps to [`RedisAdapter::cluster_admit_app`].
+    AdmitApp {
+        app: Arc<str>,
+        capacity: u32,
+        reply: std::sync::mpsc::SyncSender<Option<bool>>,
+    },
+    /// Cluster-wide per-app capacity RELEASE (Task 4.2): the floor-0, node-guarded
+    /// give-back of one unit (`RELEASE_APP_LUA`) for a connection that closed.
+    /// Fire-and-forget exactly like the other close-time commands. Maps to
+    /// [`RedisAdapter::cluster_release_app`].
+    ReleaseApp { app: Arc<str> },
 }
 
 /// Cheap-clone handle a percore worker uses to fire [`ClusterCmd`]s at the bridge. `Send +
@@ -454,6 +483,75 @@ impl ClusterHandle {
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("cluster bridge gone; dropping cross-node unwatch");
+            }
+        }
+    }
+
+    /// Cluster-wide per-app capacity ADMISSION (Task 4.2 / finding D2). Unlike the
+    /// fire-and-forget commands, this one needs the bridge's VERDICT before the
+    /// caller may proceed, so it sends the command and then blocks — bounded by
+    /// [`ADMIT_REPLY_TIMEOUT`] — for the reply:
+    ///
+    /// * `Some(true)` — admitted; one unit was taken on the cluster total
+    ///   (`appconns`) and this node's per-app hash. The caller MUST release it
+    ///   ([`release_app`](ClusterHandle::release_app)) when the connection closes.
+    /// * `Some(false)` — the app is at `capacity` cluster-wide; reject exactly like
+    ///   the node-local check (no state changed).
+    /// * `None` — the bridge is UNAVAILABLE (channel full/closed, the verdict did
+    ///   not arrive in time, or Redis errored): FAIL OPEN — admit. A degraded
+    ///   bridge must not lock clients out of a node whose local checks passed, and
+    ///   no unit was taken, so the close-side release (floor-0, node-guarded) is a
+    ///   harmless no-op. Logged at debug because it is the expected degradation,
+    ///   not an error.
+    ///
+    /// The command still rides the SAME bounded channel as everything else (the
+    /// try_send never blocks the worker); only the reply wait blocks, and it is
+    /// the one deliberate exception to "the worker must never block on the
+    /// bridge" — capacity admission cannot be fire-and-forget.
+    pub fn admit_app(&self, app: &str, capacity: u32) -> Option<bool> {
+        let (reply, rx) = std::sync::mpsc::sync_channel::<Option<bool>>(1);
+        let cmd = ClusterCmd::AdmitApp {
+            app: Arc::from(app),
+            capacity,
+            reply,
+        };
+        if let Err(e) = self.tx.try_send(cmd) {
+            self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(error = %e, "cluster bridge unavailable; app admission failing open");
+            return None;
+        }
+        match rx.recv_timeout(ADMIT_REPLY_TIMEOUT) {
+            Ok(verdict) => verdict,
+            Err(_) => {
+                // Timeout (or the bridge dropped the reply sender without
+                // answering): fail open. If the bridge is merely SLOW it may
+                // still execute the admit after this returns — the unit it takes
+                // is given back by this connection's close-side release, so the
+                // books stay balanced either way.
+                tracing::debug!("cluster bridge verdict timed out; app admission failing open");
+                None
+            }
+        }
+    }
+
+    /// Cluster-wide per-app capacity RELEASE for a closing connection. Fire-and-forget,
+    /// drop-on-full/closed exactly like [`publish`](ClusterHandle::publish): a dropped
+    /// release leaks at most one capacity unit until the sweeper reclaims it when this
+    /// node dies, and the script itself floors at 0 — never negative, never stealing
+    /// another node's units.
+    pub fn release_app(&self, app: &str) {
+        let cmd = ClusterCmd::ReleaseApp {
+            app: Arc::from(app),
+        };
+        match self.tx.try_send(cmd) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!("cluster bridge channel full; dropping app capacity release");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!("cluster bridge gone; dropping app capacity release");
             }
         }
     }
@@ -1166,6 +1264,24 @@ async fn handle_cmd(
             // UNSUBSCRIBE the per-user watch Redis channels for the users whose node-local
             // watcher set just went 1→0 here.
             adapter.cluster_unwatch(&app, &no_longer_watched).await;
+        }
+        ClusterCmd::AdmitApp {
+            app,
+            capacity,
+            reply,
+        } => {
+            // Cluster-wide per-app capacity verdict (ADMIT_APP_LUA): check the
+            // cluster count and take a unit atomically. The worker is blocked
+            // (bounded) on `reply`, so answer FIRST-class: a dropped reply (the
+            // worker timed out first) is a harmless no-op — the worker already
+            // failed open, and if this verdict takes a unit the connection's
+            // close-side release gives it back.
+            let verdict = adapter.cluster_admit_app(&app, capacity).await;
+            let _ = reply.send(verdict);
+        }
+        ClusterCmd::ReleaseApp { app } => {
+            // Floor-0, node-guarded give-back of one per-app capacity unit.
+            adapter.cluster_release_app(&app).await;
         }
     }
 }
