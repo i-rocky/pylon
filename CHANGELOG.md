@@ -74,3 +74,35 @@ pre-1.0 and versions track `Cargo.toml`.
   failure) — undocumented by hosted Pusher, unread by pusher-js from server frames.
 - Per-connection subscription cap stays at 200 — hosted Pusher documents no such
   limit; now documented as a deliberate pylon resource guard.
+
+### Phase 2 — REST / webhook parity (audit remediation)
+
+#### Fixed
+- **Disabled apps now return REST 403** (was 401 — the audit's major REST deviation):
+  `AppLookup {Found, Disabled, NotFound}` threaded through every app store (static/
+  SQL/Mongo) and both cache tiers; unknown apps keep the generic 401
+  (anti-enumeration); WS key lookups keep 4001.
+- **Webhook retries now run ~5 minutes with capped exponential backoff** (was ~0.7s —
+  the audit's major webhook deviation) and retry **all non-2xx** responses per the
+  Pusher doc; concurrency permits are held per attempt (a dead endpoint can no longer
+  starve healthy ones). `PYLON_WEBHOOK_BACKOFF_BASE_MS/CAP_MS/RETRY_BUDGET_MS` knobs;
+  `PYLON_WEBHOOK_RETRY_BASE_MS` and `PYLON_WEBHOOK_MAX_RETRIES` deprecated.
+- **Create-and-vacate in one batch window delivers BOTH webhooks** (audit R12a): the
+  occupied+vacated pair cancellation was removed — the hosted doc scopes delay/
+  suppression to vacated/member_removed on reconnect only; occupied is never
+  cancelled.
+- **REST errors are JSON bodies `{"error","status"}`** incl. the router 404 fallback
+  and a JSON 405 via axum's router-wide method-not-allowed fallback.
+- **Distinct auth-failure messages** (timestamp/signature/version/params); the
+  unknown-key path stays byte-identical to the unknown-app message.
+- **Inapplicable `info` attributes now 400** on both channel endpoints, per the
+  doc's applicability matrix (the working collection `subscription_count` stays).
+
+#### Added
+- **`subscription_count` webhook event** (doc-verified): `{name, channel,
+  subscription_count}`, two-toggle gating (app setting + webhook event_types),
+  bridge-owned cluster counts.
+- **`cache` info attribute** on `GET /channels/{name}`: `{data, ttl}` or null, TTL-
+  aware through local and Redis adapters.
+- **POST trigger params accepted from the query string** (body wins; batch excluded
+  per the doc).
