@@ -8,8 +8,9 @@
 //!
 //! Like `redis_cluster.rs` it talks to a REAL Redis (`PYLON_TEST_REDIS_URL`, default
 //! `redis://127.0.0.1:6390`) and isolates every run behind a random key prefix — it NEVER
-//! issues FLUSHALL/FLUSHDB. If Redis is unreachable the test SKIPS (prints + returns)
-//! rather than failing, so the gate stays green where no test Redis is available.
+//! issues FLUSHALL/FLUSHDB. It FAILS LOUD if Redis is unreachable (an explicit assert, the
+//! same convention as `redis_cluster.rs`) — there is no silent skip: a dead test Redis
+//! must fail the gate, not quietly void this suite.
 //!
 //! [`ClusterBridge`]: pylon::cluster::bridge::ClusterBridge
 //! [`ClusterHandle`]: pylon::cluster::bridge::ClusterHandle
@@ -55,8 +56,8 @@ fn redis_host_port() -> String {
         .to_string()
 }
 
-/// Whether the test Redis accepts a TCP connection. The bridge would `Err` on an
-/// unreachable Redis; we skip instead so the gate is green where no Redis is provisioned.
+/// Whether the test Redis accepts a TCP connection. Used to FAIL LOUD (assert) when
+/// Redis is unreachable — matching `redis_cluster.rs`, there is no silent skip.
 fn redis_reachable() -> bool {
     use std::net::ToSocketAddrs;
     match redis_host_port()
@@ -71,13 +72,10 @@ fn redis_reachable() -> bool {
 
 #[tokio::test]
 async fn cluster_bridge_starts_clones_publishes_and_drops_cleanly() {
-    if !redis_reachable() {
-        eprintln!(
-            "skipping cluster_bridge test: test Redis at {} is unreachable",
-            redis_host_port()
-        );
-        return;
-    }
+    assert!(
+        redis_reachable(),
+        "cluster_bridge requires Redis; set PYLON_TEST_REDIS_URL (default redis://127.0.0.1:6390) — refusing to silently pass"
+    );
 
     // The whole body is bounded so a wedged Redis or a hung shutdown fails the test fast
     // instead of stalling CI. The bridge runs on its OWN runtime thread, so this outer

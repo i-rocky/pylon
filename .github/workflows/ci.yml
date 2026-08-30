@@ -26,10 +26,49 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 5
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: pylon
+          MYSQL_DATABASE: pylon_test
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h127.0.0.1 -ppylon"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: pylon
+          POSTGRES_DB: pylon_test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d pylon_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+      mongo:
+        image: mongo:7
+        ports:
+          - 27018:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ ping: 1 })'"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
     env:
       # Clustering/Redis-backed integration tests point at the service container.
       # Tests isolate themselves with random key prefixes.
       PYLON_TEST_REDIS_URL: redis://127.0.0.1:6379
+      # DB-backed AppManager suites point at their service containers on the
+      # tests' documented default ports; each suite applies its own schema and
+      # isolates its rows with a UUID prefix.
+      PYLON_TEST_MYSQL_URL: mysql://root:pylon@127.0.0.1:3307/pylon_test
+      PYLON_TEST_POSTGRES_URL: postgres://postgres:pylon@127.0.0.1:5433/pylon_test
+      PYLON_TEST_MONGO_URL: mongodb://127.0.0.1:27018/pylon_test
     steps:
       - uses: actions/checkout@v6
 
@@ -52,22 +91,78 @@ jobs:
       - name: Test (unit + integration)
         run: |
           cargo test --locked --lib \
-            --test health --test integration --test metrics \
+            --test admin --test health --test integration --test metrics \
             --test percore --test percore_drain --test percore_liveness \
-            --test percore_multiworker --test percore_overload \
-            --test percore_selective_drain \
+            --test percore_multiworker --test percore_nonblocking_establish \
+            --test percore_overload --test percore_selective_drain \
             --test rest --test signin --test tls --test watchlist --test webhooks \
             -- --test-threads=1
 
-      # Cross-node cluster / Redis tests: validated locally, but they assert on
-      # short Redis round-trip timing windows that race on the shared CI Redis
-      # service. Run them for visibility, but don't block the build on a flake.
-      - name: Test (cluster / Redis — non-blocking)
-        continue-on-error: true
+      # Cross-node cluster / Redis tests (real Redis service container, random
+      # key prefixes per run). The former flake sources are fixed: the vacate-CAS
+      # in the sweeper/unsubscribe path (no duplicate channel_vacated) and
+      # event-based waits in the suites (no wall-clock timing windows), so this
+      # step is blocking. `--no-fail-fast` so every suite reports its result
+      # instead of halting at the first failing binary.
+      - name: Test (cluster / Redis)
         run: |
-          cargo test --locked \
+          cargo test --locked --no-fail-fast \
             --test cluster_bridge --test cluster_subscribe \
             --test percore_cluster --test percore_cluster_cache \
             --test percore_cluster_presence --test percore_cluster_user \
             --test redis_cluster \
             -- --test-threads=1
+
+      # DB-backed AppManager backends (MySQL/Postgres/Mongo service containers).
+      # Each suite is fail-loud against its PYLON_TEST_*_URL DSN and self-initializes:
+      # the SQL suites run the deploy/db DDL (CREATE TABLE IF NOT EXISTS), and all
+      # three isolate their rows/docs with a UUID prefix. `--no-fail-fast` so every
+      # backend reports its result.
+      - name: Test (app-manager backends)
+        run: |
+          cargo test --locked --no-fail-fast \
+            --test mongo_app_manager --test mysql_app_manager --test postgres_app_manager \
+            -- --test-threads=1
+
+  # Redis failover/self-heal regression: proves cross-node delivery (A → Redis →
+  # B) RESUMES after `docker restart` of the Redis container (Fred reconnects +
+  # resubscribes; B's receive loop survives). The suite bounces its Redis BY
+  # NAME via the Docker CLI, so it gets a dedicated throwaway container — never
+  # the `check` job's shared redis:7 service the cluster suites ride on (GitHub
+  # assigns service containers unpredictable names anyway, so the container is
+  # spawned in-step under a fixed name the test can restart/exec). Blocking.
+  failover:
+    name: redis failover
+    runs-on: ubuntu-22.04
+    env:
+      # Opt-in gate for the suite, plus the dedicated bounceable container's URL
+      # and name (port 6391 — mirrors the documented local-dev throwaway).
+      PYLON_TEST_REDIS_FAILOVER: "1"
+      PYLON_TEST_REDIS_URL: redis://127.0.0.1:6391
+      PYLON_TEST_REDIS_FAILOVER_CONTAINER: pylon-test-redis-failover
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Start dedicated Redis (bounceable)
+        run: |
+          docker run -d --name pylon-test-redis-failover -p 6391:6379 redis:7
+          for i in $(seq 1 30); do
+            if docker exec pylon-test-redis-failover redis-cli ping | grep -q PONG; then
+              break
+            fi
+            sleep 1
+          done
+          # Fail loud if Redis never came up within the bounded loop above.
+          docker exec pylon-test-redis-failover redis-cli ping | grep -q PONG
+
+      # Serial (`--test-threads=1`): the test bounces Redis mid-run. `--nocapture`
+      # so the log proves the suite EXECUTED — the opt-in gate skips via an early
+      # return, which would otherwise still report "1 passed".
+      - name: Test (redis failover)
+        run: cargo test --locked --test redis_failover -- --test-threads=1 --nocapture

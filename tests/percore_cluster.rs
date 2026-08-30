@@ -24,9 +24,10 @@
 mod common;
 
 use common::{
-    connect, established_socket_id, next_event_named, next_json, send_json, spawn_percore_cluster,
-    Ws, KEY, SECRET,
+    connect, established_socket_id, next_event_named, next_json_within, send_json,
+    spawn_percore_cluster, wait_pubsub_subscribers, Ws, KEY, SECRET,
 };
+use pylon::adapter::redis::keys::Keys;
 use pylon::auth::signature::{hmac_sha256_hex, md5_hex};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -123,9 +124,15 @@ async fn cross_node_broadcast_reaches_both_nodes() {
     let mut ws_a = connect_and_subscribe(addr_a, channel).await;
     let mut ws_b = connect_and_subscribe(addr_b, channel).await;
 
-    // Give B's node-local 0→1 edge a moment to drive the bridge's Redis SUBSCRIBE so
-    // the published frame isn't lost (bounded; the assertions below time out anyway).
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Gate the publish on the OBSERVABLE "both nodes' bridges finished their Redis
+    // SUBSCRIBE of the channel's msg key" (PUBSUB NUMSUB == 2: one subscriber
+    // connection per node). A publish that races a still-in-flight SUBSCRIBE is
+    // silently LOST by pub/sub — the old fixed 300ms sleep was a guess at this.
+    let msg_key = Keys::new(&prefix).msg(APP_ID, channel);
+    assert!(
+        wait_pubsub_subscribers(&msg_key, 2, Duration::from_secs(5)).await,
+        "both nodes' bridges must SUBSCRIBE {msg_key} before the cross-node publish"
+    );
 
     // Publish a distinctive event to the channel via node A's REST endpoint.
     let payload = "{\"hello\":\"cluster\"}";
@@ -150,11 +157,13 @@ async fn cross_node_broadcast_reaches_both_nodes() {
     );
 }
 
-/// Read frames from `ws` (timeout-bounded per frame) until a
-/// `pusher_internal:subscription_count` frame reports `want`, or `deadline`
-/// elapses. Returns whether the wanted count was observed. Tolerates interleaved
-/// frames and earlier (smaller) counts — cross-node count updates arrive after a
-/// Redis round-trip, so this polls rather than asserting on the first frame.
+/// Read frames from `ws` until a `pusher_internal:subscription_count` frame reports
+/// `want`, or `deadline` elapses. Returns whether the wanted count was observed.
+/// Tolerates interleaved frames and earlier (smaller) counts — cross-node count
+/// updates arrive after a Redis round-trip, so this polls rather than asserting on
+/// the first frame. Each read is bounded by the REMAINING budget via
+/// `next_json_within` (a non-panicking read): racing `next_json` itself against an
+/// equal-length outer timeout let `next_json`'s INTERNAL 5s panic win the tie.
 async fn await_subscription_count(
     ws: &mut Ws,
     channel: &str,
@@ -163,12 +172,10 @@ async fn await_subscription_count(
 ) -> bool {
     let stop = tokio::time::Instant::now() + deadline;
     while tokio::time::Instant::now() < stop {
-        // Bounded read; `next_json` panics on a hard timeout, so race it against the
-        // remaining budget and treat an elapsed budget as "not yet / no more frames".
         let remaining = stop.saturating_duration_since(tokio::time::Instant::now());
-        let frame = match tokio::time::timeout(remaining, next_json(ws)).await {
-            Ok(f) => f,
-            Err(_) => return false,
+        let frame = match next_json_within(ws, remaining).await {
+            Some(f) => f,
+            None => return false,
         };
         if frame["event"] == "pusher_internal:subscription_count" && frame["channel"] == channel {
             // `data` is a JSON-encoded STRING: { "subscription_count": N }.

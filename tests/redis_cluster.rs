@@ -10,7 +10,7 @@
 
 use fred::prelude::*;
 use pylon::adapter::redis::keys::Keys;
-use pylon::adapter::redis::{client::RedisClients, RedisAdapter};
+use pylon::adapter::redis::{client::RedisClients, client::Scripts, RedisAdapter};
 use pylon::adapter::Adapter;
 use pylon::channel::cache::CachedEvent;
 use pylon::connection::handle::ConnectionHandle;
@@ -134,9 +134,13 @@ async fn smoke_connectivity() {
         .expect("PUBLISH must succeed");
 
     // Receive, with a hard timeout so a broken stream fails instead of hanging.
-    let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+    // Generous-but-bounded: the loopback round trip is sub-millisecond (p99
+    // well under 10ms), but a loaded runner can stall the runtime far past
+    // that — the old 2s window was observed to flake ~1/13 full-sequence runs
+    // while never failing solo. Same semantics: the message MUST arrive.
+    let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
-        .expect("must receive the published message within 2s")
+        .expect("must receive the published message within 5s")
         .expect("broadcast receiver must yield a message");
 
     assert_eq!(msg.channel.to_string(), channel);
@@ -1705,4 +1709,173 @@ async fn purge_app_closes_connections_and_removes_from_redis_apps_set() {
     })
     .await
     .expect("purge_app Redis test must not hang (Redis up?)");
+}
+
+// ---------------------------------------------------------------------------
+// Vacate CAS (duplicate channel_vacated regression).
+//
+// The `channel_vacated` emission right belongs to whichever caller's atomic
+// operation actually removed the channel from the `chans` index (its SREM
+// returned 1). Two writers can reach the vacate decision concurrently — the
+// last-unsubscribe (UNSUBSCRIBE_LUA, driven by the bridge) and the sweeper's
+// orphan reclaim (VACATE_LUA) — and before the CAS they could BOTH fire the
+// webhook for one vacancy (observed as a flaky double `channel_vacated` in
+// `cluster_subscribe::cross_node_vacated_single_emit`). These tests drive the
+// two scripts DIRECTLY, in BOTH orderings of the race, and assert exactly one
+// winner each — deterministic where the full-system straddle is not.
+// ---------------------------------------------------------------------------
+
+/// Run the sweeper's VACATE_LUA for `channel`; returns `won` (1 iff THIS call's
+/// SREM removed the channel from the `chans` index).
+async fn run_vacate(
+    scripts: &Scripts,
+    pool: &fred::clients::Pool,
+    keys: &Keys,
+    channel: &str,
+) -> i64 {
+    scripts
+        .vacate
+        .evalsha_with_reload::<i64, _, _>(
+            pool.next(),
+            vec![keys.occ(TEST_APP, channel), keys.chans(TEST_APP)],
+            vec![channel.to_string()],
+        )
+        .await
+        .expect("VACATE_LUA must eval")
+}
+
+/// Run the bridge's UNSUBSCRIBE_LUA for `token`; returns `(remaining, won)`
+/// (`won` iff THIS call removed the channel from the `chans` index).
+async fn run_unsubscribe(
+    scripts: &Scripts,
+    pool: &fred::clients::Pool,
+    keys: &Keys,
+    channel: &str,
+    token: &str,
+) -> (i64, i64) {
+    scripts
+        .unsubscribe
+        .evalsha_with_reload::<(i64, i64), _, _>(
+            pool.next(),
+            vec![keys.occ(TEST_APP, channel), keys.chans(TEST_APP)],
+            vec![token.to_string(), channel.to_string()],
+        )
+        .await
+        .expect("UNSUBSCRIBE_LUA must eval")
+}
+
+/// Ordering 1 — the last-unsubscribe wins, the sweeper's later orphan reclaim
+/// must stay silent. Two members in `occ`, the channel indexed in `chans`; the
+/// last unsubscribe empties `occ` and its SREM removes the `chans` entry
+/// (`won == 1`); the sweeper's VACATE_LUA then finds the entry already gone
+/// (`won == 0`) — exactly one emission right in total.
+#[tokio::test]
+async fn vacate_cas_unsubscribe_first_sweep_silent() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let scripts = Scripts::new();
+        let clients = RedisClients::connect(&test_redis_url(), 2)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let channel = format!("cas-room-{}", Uuid::new_v4());
+
+        // Seed the state two subscribed members produce: occ with 2 tokens,
+        // the channel indexed in chans (SUBSCRIBE_LUA SADDs on the 0→1 edge).
+        let occ = keys.occ(TEST_APP, &channel);
+        let chans = keys.chans(TEST_APP);
+        let pool = clients.pool.next();
+        let _: () = pool.hset(occ.clone(), ("n1:s1", 1)).await.expect("hset");
+        let _: () = pool.hset(occ.clone(), ("n2:s2", 1)).await.expect("hset");
+        let _: () = pool
+            .sadd(chans.clone(), channel.clone())
+            .await
+            .expect("sadd");
+
+        // Not-last unsubscribe: one member remains → no vacate branch at all.
+        let (count, won) = run_unsubscribe(&scripts, &clients.pool, &keys, &channel, "n1:s1").await;
+        assert_eq!(
+            (count, won),
+            (1, 0),
+            "non-last unsubscribe: count 1, no emission right"
+        );
+
+        // LAST unsubscribe: empties occ, SREM removes the chans entry → WINS.
+        let (count, won) = run_unsubscribe(&scripts, &clients.pool, &keys, &channel, "n2:s2").await;
+        assert_eq!(
+            (count, won),
+            (0, 1),
+            "last unsubscribe must WIN the vacate emission right"
+        );
+
+        // The sweeper's later orphan reclaim finds the chans entry gone → silent.
+        let won = run_vacate(&scripts, &clients.pool, &keys, &channel).await;
+        assert_eq!(
+            won, 0,
+            "the sweeper must NOT win after the unsubscribe already vacated"
+        );
+
+        // And the Redis state is fully reclaimed either way.
+        let remaining: i64 = clients.pool.next().hlen(&occ).await.expect("hlen");
+        assert_eq!(remaining, 0, "occ must be gone");
+        let member: bool = clients
+            .pool
+            .next()
+            .sismember(chans.clone(), channel.clone())
+            .await
+            .expect("sismember");
+        assert!(!member, "chans must not list the vacated channel");
+    })
+    .await
+    .expect("vacate CAS ordering-1 test must not hang (Redis up?)");
+}
+
+/// Ordering 2 — the sweeper wins the straddle, the later last-unsubscribe must
+/// stay silent. The sweeper observes the post-unsubscribe straddle state
+/// (`chans` still lists the channel, `occ` already empty/gone) and its VACATE_LUA
+/// SREM removes the entry (`won == 1`); the bridge's late UNSUBSCRIBE_LUA —
+/// whose HDEL no-ops on the gone hash — finds `SREM == 0` and reports
+/// `won == 0`, so the bridge suppresses its `channel_vacated`. Exactly one
+/// emission right in total, in the ordering that used to double-fire.
+#[tokio::test]
+async fn vacate_cas_sweep_first_unsubscribe_silent() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let scripts = Scripts::new();
+        let clients = RedisClients::connect(&test_redis_url(), 2)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let channel = format!("cas-room-{}", Uuid::new_v4());
+
+        // Seed the STRADDLE state: the channel still indexed in chans, but occ
+        // already emptied by the (atomic) unsubscribe — exactly what the
+        // sweeper's non-atomic SMEMBERS→HGETALL view can observe mid-vacate.
+        let chans = keys.chans(TEST_APP);
+        let _: () = clients
+            .pool
+            .next()
+            .sadd(chans.clone(), channel.clone())
+            .await
+            .expect("sadd");
+
+        // The sweeper's atomic vacate: occ empty/gone → DEL (no-op) → SREM
+        // removes the entry → the sweeper WINS the emission right.
+        let won = run_vacate(&scripts, &clients.pool, &keys, &channel).await;
+        assert_eq!(
+            won, 1,
+            "the sweeper must WIN the vacate emission right in the straddle"
+        );
+
+        // The bridge's late last-unsubscribe: HDEL no-ops, HLEN 0, but its SREM
+        // removes nothing → won == 0 → the bridge stays silent.
+        let (count, won) = run_unsubscribe(&scripts, &clients.pool, &keys, &channel, "n1:s1").await;
+        assert_eq!(
+            (count, won),
+            (0, 0),
+            "a late unsubscribe must NOT win after the sweeper already vacated"
+        );
+    })
+    .await
+    .expect("vacate CAS ordering-2 test must not hang (Redis up?)");
 }

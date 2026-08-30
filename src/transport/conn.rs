@@ -1209,13 +1209,17 @@ mod tests {
         Arc::from(vec![tag; 10].into_boxed_slice())
     }
 
-    /// Drain every byte currently readable on the non-blocking peer, recording the
-    /// first byte (tag) of each 10-byte frame received.
-    fn drain_tags(peer: &mut StdTcpStream, into: &mut Vec<u8>) {
-        let mut chunk = [0u8; 4096];
-        loop {
+    /// Drain the peer until exactly `expected` tags have been received in total
+    /// (cumulative). Retries on WouldBlock — macOS loopback delivers writes
+    /// asynchronously, so a byte written by `flush` may not be readable on the
+    /// peer until a later scheduler turn. Panics with a clear message after a
+    /// 2 s deadline so a real delivery bug still fails the test loudly.
+    fn drain_tags_until(peer: &mut StdTcpStream, into: &mut Vec<u8>, expected: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while into.len() < expected {
+            let mut chunk = [0u8; 4096];
             match peer.read(&mut chunk) {
-                Ok(0) => break,
+                Ok(0) => {}
                 Ok(n) => {
                     // Frames are a fixed 10 bytes; record each frame's tag byte.
                     let mut i = 0;
@@ -1224,8 +1228,16 @@ mod tests {
                         i += 10;
                     }
                 }
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {}
                 Err(e) => panic!("peer read failed: {e}"),
+            }
+            if into.len() < expected {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for tags: expected {expected}, got {}",
+                    into.len()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
     }
@@ -1252,7 +1264,7 @@ mod tests {
             let enqueue = now.saturating_sub(1_000_000); // sojourn = 1 ms
             assert_eq!(c.queue(small(k), enqueue), 0);
             assert_eq!(c.flush(now), WriteStatus::Drained);
-            drain_tags(&mut peer, &mut got);
+            drain_tags_until(&mut peer, &mut got, k as usize + 1);
         }
 
         assert_eq!(c.codel_dropped(), 0, "no fresh frame should be dropped");
@@ -1284,7 +1296,7 @@ mod tests {
             let enqueue = now - 6_000_000; // sojourn = 6 ms for every frame
             assert_eq!(c.queue(small(k), enqueue), 0);
             assert_eq!(c.flush(now), WriteStatus::Drained);
-            drain_tags(&mut peer, &mut got);
+            drain_tags_until(&mut peer, &mut got, k as usize + 1);
         }
         // All 6-ms-sojourn frames were sent (sojourn < 2×target); none dropped yet.
         assert_eq!(c.codel_dropped(), 0);
@@ -1303,7 +1315,7 @@ mod tests {
         c.queue(small(99), now - 12_000_000); // newest stale frame, sojourn 12 ms
         assert_eq!(c.out_bytes(), 20);
         assert_eq!(c.flush(now), WriteStatus::Drained);
-        drain_tags(&mut peer, &mut got);
+        drain_tags_until(&mut peer, &mut got, before_got + 1);
         assert_eq!(
             c.codel_dropped(),
             before_dropped + 1,
@@ -1330,12 +1342,13 @@ mod tests {
         // boundary clears `overloaded`; a subsequent stale frame is no longer
         // dropped — it flows. tag bytes 100..=130 (1 ms sojourn, sent).
         let base = 300_000_000u64; // 300 ms
+        let phase3_got = got.len(); // tags received so far (Phase 1 + tag 99)
         for k in 0..=30u8 {
             let now = base + (k as u64) * 5_000_000; // 5 ms apart → spans 150 ms
             let enqueue = now - 1_000_000; // sojourn 1 ms
             c.queue(small(100 + k), enqueue);
             assert_eq!(c.flush(now), WriteStatus::Drained);
-            drain_tags(&mut peer, &mut got);
+            drain_tags_until(&mut peer, &mut got, phase3_got + k as usize + 1);
         }
         assert!(!c.is_overloaded(), "interval min 1 ms ≤ target ⇒ recovered");
         let recovered_sent = got.len();
@@ -1350,7 +1363,7 @@ mod tests {
         let now = 500_000_000;
         c.queue(small(200), now - 12_000_000);
         assert_eq!(c.flush(now), WriteStatus::Drained);
-        drain_tags(&mut peer, &mut got);
+        drain_tags_until(&mut peer, &mut got, recovered_sent + 1);
         assert_eq!(c.codel_dropped(), before_dropped + 1, "recovered ⇒ no drop");
         assert_eq!(got.len(), recovered_sent + 1, "the once-stale frame flowed");
         assert_eq!(*got.last().unwrap(), 200);
@@ -1368,7 +1381,7 @@ mod tests {
         // A frame 1 full second stale, flushed with CoDel off → still sent.
         c.queue(small(7), 0);
         assert_eq!(c.flush(1_000_000_000), WriteStatus::Drained);
-        drain_tags(&mut peer, &mut got);
+        drain_tags_until(&mut peer, &mut got, 1);
         assert_eq!(c.codel_dropped(), 0);
         assert_eq!(got, vec![7]);
     }

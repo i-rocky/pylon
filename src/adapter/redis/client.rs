@@ -71,15 +71,44 @@ return count
 
 /// UNSUBSCRIBE membership script. Removes this member from the occupancy hash and
 /// — on the cluster 1→0 edge — deletes the now-empty hash and de-indexes the
-/// channel. Returns the remaining `HLEN` (authoritative cluster-wide count).
+/// channel. Returns `{ remaining_count, won }`: the remaining `HLEN` (the
+/// authoritative cluster-wide count) plus the VACATE CAS flag — `won == 1` iff
+/// THIS call's `SREM` actually removed the channel from the `chans` index, i.e.
+/// this caller owns the single cluster-wide `channel_vacated` emission right
+/// (see [`VACATE_LUA`]; Redis serializes scripts, so exactly one of the two
+/// vacating writers can ever observe `SREM == 1`).
 ///
 /// `KEYS[1]` = occ hash, `KEYS[2]` = chans set.
 /// `ARGV[1]` = member_token, `ARGV[2]` = channel.
 const UNSUBSCRIBE_LUA: &str = r#"
 redis.call('HDEL', KEYS[1], ARGV[1])
 local count = redis.call('HLEN', KEYS[1])
-if count <= 0 then redis.call('DEL', KEYS[1]); redis.call('SREM', KEYS[2], ARGV[2]) end
-return count
+local won = 0
+if count <= 0 then
+  redis.call('DEL', KEYS[1])
+  won = redis.call('SREM', KEYS[2], ARGV[2])
+end
+return {count, won}
+"#;
+
+/// VACATE CAS script (the sweeper's orphan reclaim). Atomically decides AND
+/// performs the vacate: if the occ hash holds no members (or is already gone),
+/// DEL it and `SREM` the channel from the `chans` index, returning `1` — the
+/// single cluster-wide `channel_vacated` emission right — ONLY if THIS call's
+/// SREM actually removed the entry. Returns `0` when a member (re-)appeared, or
+/// when another writer (the last-unsubscribe's [`UNSUBSCRIBE_LUA`]) already
+/// removed the entry and therefore already owns the emission. Together the two
+/// scripts guarantee exactly one `channel_vacated` per vacancy in every
+/// interleaving.
+///
+/// `KEYS[1]` = occ hash, `KEYS[2]` = chans set.
+/// `ARGV[1]` = channel.
+const VACATE_LUA: &str = r#"
+if redis.call('HLEN', KEYS[1]) == 0 then
+  redis.call('DEL', KEYS[1])
+  return redis.call('SREM', KEYS[2], ARGV[1])
+end
+return 0
 "#;
 
 /// PRESENCE_JOIN. Records this connection's member, bumps the user's cluster-wide
@@ -140,8 +169,11 @@ return conn
 pub struct Scripts {
     /// Records a member and returns the new cluster-wide subscription count.
     pub subscribe: Script,
-    /// Removes a member and returns the remaining cluster-wide subscription count.
+    /// Removes a member and returns `{remaining cluster-wide count, vacate-CAS won}`.
     pub unsubscribe: Script,
+    /// The sweeper's atomic vacate: returns 1 iff THIS call won the
+    /// `channel_vacated` emission right (its SREM removed the chans entry).
+    pub vacate: Script,
     /// Records a presence join and returns the user's new connection refcount.
     pub presence_join: Script,
     /// Records a presence leave and returns the user's remaining connection refcount.
@@ -158,6 +190,7 @@ impl Scripts {
         Self {
             subscribe: Script::from_lua(SUBSCRIBE_LUA),
             unsubscribe: Script::from_lua(UNSUBSCRIBE_LUA),
+            vacate: Script::from_lua(VACATE_LUA),
             presence_join: Script::from_lua(PRESENCE_JOIN_LUA),
             presence_leave: Script::from_lua(PRESENCE_LEAVE_LUA),
             user_signin: Script::from_lua(USER_SIGNIN_LUA),
@@ -188,5 +221,12 @@ mod tests {
         let s = Scripts::new();
         assert_ne!(s.user_signin.sha1(), s.user_signout.sha1());
         assert_ne!(s.user_signin.sha1(), s.subscribe.sha1());
+    }
+
+    #[test]
+    fn scripts_compile_including_vacate() {
+        let s = Scripts::new();
+        assert_ne!(s.vacate.sha1(), s.unsubscribe.sha1());
+        assert_ne!(s.vacate.sha1(), s.subscribe.sha1());
     }
 }
