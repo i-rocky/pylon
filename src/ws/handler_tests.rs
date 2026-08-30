@@ -131,6 +131,38 @@ fn assert_frame_shape(ev: &ServerEvent, expected_event: &str, expected_keys: &[&
     );
 }
 
+/// Task 1.9 (P9): prove a `pusher:subscription_error` is NON-FATAL — the
+/// connection must stay open and keep processing. At dispatch level the
+/// context owns no close mechanism (teardown lives in the session task), so
+/// liveness is proven behaviorally: a Ping after the error must still Pong,
+/// and a fresh valid subscribe on the SAME context must still succeed.
+/// Status-value pins (`data.status` semantics) live with each test below;
+/// the verification table for the chosen values (4009 invalid name / 401
+/// auth failure) is in `src/ws/subscribe.rs` near the constructions.
+async fn assert_connection_stays_open_after_subscription_error(
+    c: &mut ConnectionContext,
+    rx: &mut mpsc::Receiver<Box<ServerEvent>>,
+) {
+    c.dispatch(ClientCommand::Ping).await;
+    assert!(
+        matches!(rx.try_recv().map(|b| *b), Ok(ServerEvent::Pong)),
+        "connection must stay open: Pong must follow a Ping sent after subscription_error"
+    );
+    c.dispatch(ClientCommand::Subscribe {
+        channel: "after-error".into(),
+        auth: None,
+        channel_data: None,
+    })
+    .await;
+    assert!(
+        matches!(
+            rx.try_recv().map(|b| *b),
+            Ok(ServerEvent::SubscriptionSucceeded { .. })
+        ),
+        "connection must stay open: a fresh subscribe must succeed after subscription_error"
+    );
+}
+
 #[tokio::test]
 async fn ping_enqueues_pong() {
     let (mut c, mut rx) = ctx(app(false));
@@ -222,10 +254,15 @@ async fn private_subscribe_without_auth_errors_non_fatally() {
                 &["event", "channel", "data"],
             );
             assert_eq!(channel, "private-x");
+            // 1.9 (P9) pin: auth failure → data.status == 401. Hosted Pusher
+            // does not document subscription_error statuses (verification
+            // table in subscribe.rs); soketi parity is status: 401.
             assert_eq!(*status, 401);
         }
         other => panic!("expected SubscriptionError, got {other:?}"),
     }
+    // 1.9 (P9): the error is non-fatal — the connection stays open.
+    assert_connection_stays_open_after_subscription_error(&mut c, &mut rx).await;
 }
 
 #[tokio::test]
@@ -288,10 +325,14 @@ async fn encrypted_subscribe_without_auth_errors_non_fatally() {
             channel, status, ..
         }) => {
             assert_eq!(channel, "private-encrypted-x");
+            // 1.9 (P9) pin: auth failure → data.status == 401 (see
+            // subscribe.rs verification table).
             assert_eq!(status, 401);
         }
         other => panic!("expected SubscriptionError, got {other:?}"),
     }
+    // 1.9 (P9): non-fatal — connection stays open.
+    assert_connection_stays_open_after_subscription_error(&mut c, &mut rx).await;
 }
 
 #[tokio::test]
@@ -328,10 +369,16 @@ async fn presence_subscribe_with_bad_auth_errors() {
         channel_data: Some(r#"{"user_id":"u1"}"#.into()),
     })
     .await;
-    assert!(matches!(
-        rx.try_recv().map(|b| *b),
-        Ok(ServerEvent::SubscriptionError { .. })
-    ));
+    match rx.try_recv().map(|b| *b) {
+        Ok(ServerEvent::SubscriptionError { status, .. }) => {
+            // 1.9 (P9) pin: bad auth signature on presence → data.status == 401
+            // (see subscribe.rs verification table).
+            assert_eq!(status, 401);
+        }
+        other => panic!("expected SubscriptionError, got {other:?}"),
+    }
+    // 1.9 (P9): non-fatal — connection stays open.
+    assert_connection_stays_open_after_subscription_error(&mut c, &mut rx).await;
 }
 
 #[tokio::test]
@@ -1351,6 +1398,9 @@ async fn subscribe_over_length_channel_name_errors_4009() {
             channel, status, ..
         }) => {
             assert_eq!(channel, long_name);
+            // 1.9 (P9) pin: invalid channel name → data.status == 4009. Hosted
+            // Pusher does not document subscription_error statuses (verification
+            // table in subscribe.rs); soketi parity is status: 4009.
             assert_eq!(status, 4009);
         }
         other => panic!("expected SubscriptionError 4009 for over-length channel, got {other:?}"),
@@ -1363,6 +1413,8 @@ async fn subscribe_over_length_channel_name_errors_4009() {
             .subscription_count,
         0
     );
+    // 1.9 (P9): non-fatal — connection stays open.
+    assert_connection_stays_open_after_subscription_error(&mut c, &mut rx).await;
 }
 
 #[tokio::test]
@@ -1380,6 +1432,8 @@ async fn subscribe_illegal_char_channel_name_errors_4009() {
             channel, status, ..
         }) => {
             assert_eq!(channel, bad_name);
+            // 1.9 (P9) pin: invalid channel name (charset) → data.status == 4009
+            // (see subscribe.rs verification table).
             assert_eq!(status, 4009);
         }
         other => panic!("expected SubscriptionError 4009 for bad-charset channel, got {other:?}"),
@@ -1388,6 +1442,8 @@ async fn subscribe_illegal_char_channel_name_errors_4009() {
         c.adapter.channel("app", bad_name).await.subscription_count,
         0
     );
+    // 1.9 (P9): non-fatal — connection stays open.
+    assert_connection_stays_open_after_subscription_error(&mut c, &mut rx).await;
 }
 
 #[tokio::test]
@@ -1471,10 +1527,14 @@ async fn subscribe_empty_channel_name_errors_4009() {
             channel, status, ..
         }) => {
             assert_eq!(channel, "");
+            // 1.9 (P9) pin: empty channel name → data.status == 4009 (see
+            // subscribe.rs verification table).
             assert_eq!(status, 4009, "empty channel name must yield 4009 (P14)");
         }
         other => panic!("expected SubscriptionError 4009 for empty channel name, got {other:?}"),
     }
+    // 1.9 (P9): non-fatal — connection stays open.
+    assert_connection_stays_open_after_subscription_error(&mut c, &mut rx).await;
 }
 
 // P4 — presence channels must NOT receive pusher_internal:subscription_count

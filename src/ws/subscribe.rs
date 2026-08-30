@@ -63,6 +63,28 @@ impl ConnectionContext {
             return self.send_subscription_error(&channel, "AuthError", "Unknown channel", 401);
         }
 
+        // ── Task 1.9 (P9): `pusher:subscription_error` `data.status` values —
+        // verification vs hosted Pusher (checked 2026-08-30) ──
+        //
+        // Decision rule: if hosted Pusher's documented/observable semantics
+        // differ from ours, adopt hosted; if undocumented/ambiguous, KEEP
+        // current behavior deliberately. Result: UNDOCUMENTED → KEEP.
+        //
+        // | Source | Quote / finding | Decision |
+        // |---|---|---|
+        // | https://pusher.com/docs/channels/library_auth_reference/pusher-websockets-protocol/ | Does NOT document `pusher:subscription_error` at all — no frame shape, no `data.status` semantics. Only covers `pusher:subscribe`/`unsubscribe`/`pusher_internal:subscription_succeeded`; the only 4009 on the page is a WebSocket CLOSE code ("4009: Connection is unauthorized") in the close-code table, i.e. a different namespace from an in-band frame's `data.status`. | hosted silent on `data.status` |
+        // | pusher-js v8.6.0 master, src/core/channels/channel.ts | The ONLY `pusher:subscription_error` emission is CLIENT-side, for a local channel-authorizer failure: `this.emit('pusher:subscription_error', Object.assign({}, { type: 'AuthError', error: error.message }, error instanceof HTTPAuthError ? { status: error.status } : {}))` — that `status` is the auth ENDPOINT's HTTP status, not a server-frame value. Server-SENT frames get no dedicated handling: `handleEvent` only special-cases `pusher_internal:*`, else `this.emit(eventName, data, metadata)` forwards `data` verbatim. `Protocol.getCloseAction` (protocol.ts) maps WebSocket close codes only. | client does not read `data.status` off server frames |
+        // | soketi 1.x (SECONDARY, not hosted), src/ws-handler.ts | Over-length name: `{ event: 'pusher:subscription_error', channel, data: { type: 'LimitReached', error: ..., status: 4009 } }`; authError: `{ data: { type: 'AuthError', error: ..., status: 401 } }` — sent via `ws.sendJson` with NO `ws.end`, i.e. non-fatal. | corroborates 4009 (name) / 401 (auth), non-fatal |
+        //
+        // KEPT: invalid channel name → status 4009; auth failure (bad/missing
+        // auth on private/presence/encrypted, reserved-# channels) → status 401;
+        // both non-fatal (connection stays open). Pinned in
+        // `src/ws/handler_tests.rs` (`*_errors_4009`, `*_errors_non_fatally`,
+        // `presence_subscribe_with_bad_auth_errors`).
+        // NOTE: soketi labels the 4009 name error type `LimitReached`; Pylon
+        // uses `InvalidChannel` — type strings are also undocumented, kept
+        // as-is (out of scope for P9, which is about `data.status` values).
+        //
         // P8: enforce channel name length + charset before any auth or registry work.
         if !validate_channel_name(&channel, self.limits.max_channel_name_length) {
             return self.send_subscription_error(
