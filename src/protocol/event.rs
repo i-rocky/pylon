@@ -85,11 +85,12 @@ pub enum ServerEvent {
     WatchlistEvents {
         events: Vec<WatchlistChange>,
     },
-    /// `pusher:error` scoped to a channel (client-event rejections: 4301).
-    /// Unlike the connection-level `Error`, this carries the `channel` so the
-    /// wire frame matches soketi: `{ event, channel, data: { code, message } }`.
+    /// `pusher:error` scoped to a client-event rejection (4301). Wire shape is
+    /// IDENTICAL to the connection-level `Error`: the protocol page defines
+    /// pusher:error as `{ "event": "pusher:error", "data": { "message", "code" } }`
+    /// — there is NO top-level `channel` field (only `pusher:subscription_error`
+    /// is channel-scoped). Kept as a distinct variant for call-site clarity.
     ClientEventError {
-        channel: String,
         code: u16,
         message: String,
     },

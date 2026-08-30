@@ -222,6 +222,7 @@ pub fn run_percore(
         limits: config.limits(),
         activity_timeout: config.activity_timeout,
         pong_timeout: config.pong_timeout,
+        max_conn_lifetime_secs: config.max_conn_lifetime_secs,
         strict_protocol: config.strict_protocol,
         conn_counts,
         node_conns,
@@ -417,6 +418,9 @@ pub fn run_percore(
         let cfg = WorkerConfig {
             addr,
             max_payload,
+            // Reassembled-message cap (RFC 6455 §5.4): the per-message event
+            // budget — tighter than the per-frame `max_payload` ceiling.
+            max_message_bytes: config.max_event_payload_bytes,
             high_water,
             mode: Mode::Dispatch(env.clone()),
             rest_handoff: rest_handoff.clone(),

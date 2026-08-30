@@ -91,6 +91,7 @@ TLS configuration is covered in detail on the [TLS / SSL](tls.md) page.
 |---|---|---|
 | `PYLON_ACTIVITY_TIMEOUT` | `120` | Seconds of inactivity after which the server sends a `pusher:ping`. |
 | `PYLON_PONG_TIMEOUT` | `30` | Seconds the server waits for a `pusher:pong` reply before closing the connection. |
+| `PYLON_MAX_CONN_LIFETIME_SECS` | `86400` | Maximum connection age in seconds before the server closes the connection with code `4202` ("Closed after inactivity" — Pusher's 24-hour maximum connection lifetime; clients reconnect immediately). The deadline is absolute from connection establishment and is not reset by activity. Set `0` to disable. |
 | `PYLON_STRICT_PROTOCOL` | `false` | When `true`, reject any Pusher protocol violation instead of silently ignoring it. Set `1` or `true` to enable. |
 | `PYLON_MAX_CHANNEL_NAME_LENGTH` | `164` | Maximum allowed channel name length in bytes. |
 | `PYLON_MAX_EVENT_NAME_LENGTH` | `200` | Maximum allowed event name length in bytes. |
@@ -99,6 +100,7 @@ TLS configuration is covered in detail on the [TLS / SSL](tls.md) page.
 | `PYLON_MAX_PRESENCE_USER_ID_LENGTH` | `128` | Maximum length of a presence member's `user_id` in bytes. |
 | `PYLON_MAX_PRESENCE_USER_INFO_BYTES` | `1024` | Maximum size of a presence member's `user_info` JSON in bytes. |
 | `PYLON_MAX_CLIENT_EVENTS_PER_SECOND` | `10` | Maximum client events a single connection may send per second. |
+| `PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION` | `200` | Maximum simultaneous channel subscriptions per connection. Excess subscribes get a non-fatal `pusher:subscription_error` (`LimitReached`, `4004`). A pylon-specific guard — hosted Pusher documents no such limit. Set `0` for unlimited. |
 | `PYLON_MAX_WATCHLIST_SIZE` | `100` | Maximum number of channels a single connection may watch simultaneously. |
 | `PYLON_CACHE_TTL_SECS` | `1800` | TTL (seconds) for cached channel and presence state (30 minutes). |
 | `PYLON_MAX_CHANNELS_PER_PUBLISH` | `100` | Maximum number of channels a single REST publish call may target. |

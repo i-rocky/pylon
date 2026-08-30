@@ -104,6 +104,12 @@ pub struct DispatchEnv {
     /// before closing the connection with code `4201`. Drives this worker's
     /// [`TimerWheel`].
     pub pong_timeout: u32,
+    /// Maximum connection age in seconds: once a session has been established
+    /// for this long the worker closes the connection with code **4202**
+    /// ("Closed after inactivity", Pusher's 24h maximum connection lifetime —
+    /// reconnect-immediately band). Armed ONCE per session (absolute deadline in
+    /// the [`TimerWheel`]); activity never pushes it out. `0` disables.
+    pub max_conn_lifetime_secs: u64,
     pub strict_protocol: bool,
     /// Per-app live connection counters (shared with the rest of the server),
     /// mirroring `AppState::conn_counts`.
@@ -154,6 +160,13 @@ pub struct WorkerConfig {
     pub addr: std::net::SocketAddr,
     /// Maximum accepted WebSocket payload size (bytes) per frame.
     pub max_payload: usize,
+    /// Maximum accepted size (bytes) of one REASSEMBLED inbound text message
+    /// (the sum of its RFC 6455 §5.4 fragments). Plumbed from
+    /// `max_event_payload_bytes` — the same per-message budget the protocol
+    /// layer holds unfragmented events to. An assembled message over this cap
+    /// is dropped (and the fragment accumulator reset) WITHOUT closing the
+    /// connection; each individual fragment stays bounded by `max_payload`.
+    pub max_message_bytes: usize,
     /// Per-connection outbound high-water mark (bytes) before backpressure-close.
     pub high_water: usize,
     /// Behaviour applied to inbound frames.
@@ -251,6 +264,24 @@ struct Session {
     subs: HashSet<String>,
 }
 
+/// RFC 6455 §5.4: the in-progress fragmented message on this connection.
+///
+/// `Text` accumulates the payload of a fragmented TEXT message (the only data
+/// kind the Pusher protocol carries): Continuation frames append to it and the
+/// FIN=1 Continuation dispatches the assembled payload through the normal Text
+/// path, resetting this to `None`.
+///
+/// `Binary` marks an in-progress fragmented BINARY message. Binary is not part
+/// of the Pusher protocol — a lone Binary frame is silently ignored — so a
+/// fragmented one is ignored the same way: its Continuations are dropped until
+/// the FIN=1 Continuation completes the message, after which the state resets.
+/// The variant exists only so those Continuations are not mistaken for strays
+/// (which fail the connection per §5.4).
+enum Fragment {
+    Text(Vec<u8>),
+    Binary,
+}
+
 /// Per-connection slab entry: the [`Connection`] plus its read remainder and,
 /// for dispatch workers, the v7 [`Session`] built at handshake completion.
 ///
@@ -265,6 +296,12 @@ struct Entry {
     token: Token,
     /// v7 protocol state; `None` for echo workers and pre-handshake connections.
     session: Option<Session>,
+    /// RFC 6455 §5.4: in-progress fragmented message, `Some` once a FIN=0 Text
+    /// or Binary frame has opened one (see [`Fragment`]). Reset — and a partial
+    /// TEXT message dropped — when the assembled size would exceed the
+    /// per-message cap (`max_message_bytes`); the state dies with this `Entry`
+    /// when the connection closes.
+    fragment: Option<Fragment>,
     /// Phase 7: set while this connection is PARKED waiting on an offloaded app
     /// lookup (L1 miss). `Open` + `session: None` + `pending_establish: Some(..)`
     /// is the park state. Cleared (`take`) when its `ResolvedApp` arrives, or
@@ -696,6 +733,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             &mailbox_waker,
                             &resolved_tx,
                             &mut next_gen,
+                            &mut wheel,
                         ) {
                             Action::Close => {
                                 remove(
@@ -916,6 +954,33 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         );
                         work = true;
                     }
+                    Due::Close4202(key) => {
+                        // Max connection lifetime reached: emit the in-band
+                        // `pusher:error` 4202 first, then the WS Close 4202
+                        // (same belt-and-suspenders convention as the drain
+                        // path's 4200), and tear the connection down through
+                        // the normal `remove` close path.
+                        queue_lifetime_error(&mut conns, key, now_ns);
+                        send_close_4202(&poll, &mut conns, key, now_ns);
+                        // INCREMENTAL INFLIGHT: mirror the 4201 arm — fold the
+                        // queued/flushed delta before `remove` subtracts the
+                        // connection's still-queued bytes.
+                        fold_delta(&mut conns, key, &mut inflight_bytes);
+                        fold_codel(&mut conns, key, &mut codel_dropped_total);
+                        remove(
+                            &poll,
+                            &mut conns,
+                            key,
+                            &mut local_subs,
+                            &mut sid_to_token,
+                            &mut wheel,
+                            &mut inflight_bytes,
+                            &conn_counts,
+                            &app_registry,
+                            &node_conns,
+                        );
+                        work = true;
+                    }
                 }
             }
         }
@@ -952,20 +1017,12 @@ fn queue_ping(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u6
     true
 }
 
-/// Send a WebSocket Close frame with the given `code` and `reason` text, then
-/// let the caller handle the connection (either `remove` it immediately or wait
-/// for flush). Mirrors the `ServerEvent::Close` arm of [`drain_session`].
-fn send_close(
-    poll: &Poll,
-    conns: &mut slab::Slab<Entry>,
-    key: usize,
-    now_ns: u64,
-    code: u16,
-    reason: &str,
-) {
-    let Some(entry) = conns.get_mut(key) else {
-        return;
-    };
+/// Queue a single WebSocket Close frame (`code` + `reason`) onto `entry`'s
+/// out-queue (no flush). Shared core of every outbound Close frame: the
+/// server-initiated closes ([`send_close_reply`], [`close_fragment_violation`],
+/// [`close_invalid_utf8`], the drain path) and the RFC 6455 §5.5.1 echo of a
+/// client-initiated Close.
+fn queue_close_frame(entry: &mut Entry, code: u16, reason: &str, now_ns: u64) {
     let mut frame_body = Vec::with_capacity(2 + reason.len());
     frame_body.extend_from_slice(&code.to_be_bytes());
     frame_body.extend_from_slice(reason.as_bytes());
@@ -974,6 +1031,25 @@ fn send_close(
     let _ = entry
         .conn
         .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+}
+
+/// Send a WebSocket Close frame with the given `code` and `reason` text —
+/// queue it and flush so it actually reaches the peer — then let the caller
+/// handle the connection (either `remove` it immediately or wait for flush).
+/// The single generalized Close-reply helper; [`send_close_4200`] and
+/// [`send_close_4201`] are thin callers.
+fn send_close_reply(
+    poll: &Poll,
+    conns: &mut slab::Slab<Entry>,
+    key: usize,
+    code: u16,
+    reason: &str,
+    now_ns: u64,
+) {
+    let Some(entry) = conns.get_mut(key) else {
+        return;
+    };
+    queue_close_frame(entry, code, reason, now_ns);
     // Flush so the Close frame actually reaches the peer before we deregister.
     let _ = flush_and_arm(poll, entry, now_ns);
 }
@@ -981,13 +1057,13 @@ fn send_close(
 /// SP11 §4: send a WebSocket Close frame with code `4201` (pong-timeout) with the
 /// canonical Pusher v7 reason text, then let the caller `remove` the connection.
 fn send_close_4201(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) {
-    send_close(
+    send_close_reply(
         poll,
         conns,
         key,
-        now_ns,
         4201,
         "Pong reply not received: ping was sent to the client, but no reply was received",
+        now_ns,
     );
 }
 
@@ -997,14 +1073,64 @@ fn send_close_4201(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_n
 /// client disruption on a rolling restart compared to the 1001 generic-gone-away.
 /// The caller is responsible for the subsequent `fold_delta` + eventual `remove`.
 fn send_close_4200(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) {
-    send_close(
+    send_close_reply(
         poll,
         conns,
         key,
-        now_ns,
         4200,
         "Server is shutting down; please reconnect",
+        now_ns,
     );
+}
+
+/// Max connection lifetime (Pusher parity, default 24h): send a WebSocket Close
+/// frame with code `4202` — "Closed after inactivity", the reconnect-immediately
+/// band. Message text is the exact close-code name from the Pusher protocol
+/// page (see [`crate::protocol::error::PusherError::max_lifetime`]). The caller
+/// is responsible for the subsequent `fold_delta` + `remove` (the `Due::Close4202`
+/// arm queues the in-band `pusher:error` 4202 first via [`queue_lifetime_error`]).
+fn send_close_4202(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) {
+    send_close_reply(
+        poll,
+        conns,
+        key,
+        4202,
+        crate::protocol::error::PusherError::max_lifetime()
+            .message
+            .as_str(),
+        now_ns,
+    );
+}
+
+/// Max connection lifetime: queue a `pusher:error` 4202 text frame onto `key`'s
+/// out-queue BEFORE the Close frame (the same belt-and-suspenders convention as
+/// [`queue_shutdown_error`]): `{"event":"pusher:error","data":{"code":4202,
+/// "message":"Closed after inactivity"}}`. No-op if the connection no longer
+/// exists — the Close frame alone still carries the code for pusher-js.
+fn queue_lifetime_error(conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) {
+    let Some(entry) = conns.get_mut(key) else {
+        return;
+    };
+    let error = crate::protocol::error::PusherError::max_lifetime();
+    // A lifetime close only ever fires on an ESTABLISHED session, but fall back
+    // to the raw-JSON form (as `queue_shutdown_error` does) for a conn whose
+    // session vanished between arming and firing.
+    let text = if let Some(session) = entry.session.as_ref() {
+        session.codec.encode(&ServerEvent::Error(error))
+    } else {
+        serde_json::json!({
+            "event": "pusher:error",
+            "data": { "code": error.code, "message": error.message }
+        })
+        .to_string()
+    };
+    let mut out = BytesMut::new();
+    frame::encode_text(&mut out, text.as_bytes());
+    let _ = entry
+        .conn
+        .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+    // No explicit flush here: the caller queues the Close frame next via
+    // `send_close_4202`, whose `flush_and_arm` flushes both frames together.
 }
 
 /// C2a drain: queue a `pusher:error` 4200 text frame onto `key`'s out-queue
@@ -1104,6 +1230,7 @@ fn accept_ready(
                     inbuf: BytesMut::new(),
                     token: Token(key),
                     session: None,
+                    fragment: None,
                     pending_establish: None,
                 });
                 accepted += 1;
@@ -1119,12 +1246,28 @@ fn accept_ready(
     accepted
 }
 
+/// Arm `key`'s max-connection-lifetime deadline in the wheel: ABSOLUTE at
+/// `now_ms + max_conn_lifetime_secs` (Pusher closes connections at a maximum
+/// age with code 4202). No-op when the lifetime is disabled (`0`). Called once
+/// per session, at establish; [`TimerWheel::touch`] on later activity re-arms
+/// only the liveness timer, never this deadline.
+fn arm_lifetime(wheel: &mut TimerWheel, env: &DispatchEnv, key: usize, now_ms: u64) {
+    if env.max_conn_lifetime_secs > 0 {
+        let deadline_ms = now_ms.saturating_add(env.max_conn_lifetime_secs.saturating_mul(1000));
+        wheel.arm_lifetime(key, deadline_ms);
+    }
+}
+
 /// Handle a readable event: either advance the handshake or process frames.
 ///
 /// `dirty_tx` + `mailbox_waker` are this worker's selective-drain notifier inputs;
 /// on handshake completion they are stamped (with this connection's slab `key` as
 /// the token) into the new session's `ctx.mailbox_notify`, so a later
 /// cross-connection `Mailbox::send` marks this connection dirty and wakes the worker.
+///
+/// `wheel` is the worker's liveness wheel: at handshake completion the new
+/// session's absolute max-connection-lifetime deadline is armed on it (the
+/// idle deadline is armed by the caller's `touch` on every readable).
 #[allow(clippy::too_many_arguments)]
 fn handle_readable(
     poll: &Poll,
@@ -1136,6 +1279,7 @@ fn handle_readable(
     mailbox_waker: &Arc<mio::Waker>,
     resolved_tx: &std::sync::mpsc::Sender<ResolvedApp>,
     next_gen: &mut u64,
+    wheel: &mut TimerWheel,
 ) -> Action {
     let entry = &mut conns[key];
     match entry.conn.state {
@@ -1149,6 +1293,7 @@ fn handle_readable(
             mailbox_waker,
             resolved_tx,
             next_gen,
+            wheel,
         ),
         ConnState::Open | ConnState::Closing => handle_frames(poll, entry, cfg, now_ns),
     }
@@ -1159,6 +1304,8 @@ fn handle_readable(
 /// `key` is this connection's slab token; `dirty_tx` + `mailbox_waker` are the
 /// worker's selective-drain notifier inputs, stamped (with `key`) into the new
 /// session's `ctx.mailbox_notify` so cross-connection sends wake the worker.
+/// `wheel` receives the new session's absolute max-connection-lifetime deadline
+/// at establish (see [`arm_lifetime`]).
 #[allow(clippy::too_many_arguments)]
 fn handle_handshake(
     poll: &Poll,
@@ -1170,6 +1317,7 @@ fn handle_handshake(
     mailbox_waker: &Arc<mio::Waker>,
     resolved_tx: &std::sync::mpsc::Sender<ResolvedApp>,
     next_gen: &mut u64,
+    wheel: &mut TimerWheel,
 ) -> Action {
     // Pull all available bytes into the head-accumulation buffer (`inbuf`).
     if drain_into(&mut entry.conn, &mut entry.inbuf) == ReadOutcome::Closed {
@@ -1189,9 +1337,10 @@ fn handle_handshake(
 
             // For a dispatch worker, build the v7 session now: resolve the app,
             // check capacity, create the mailbox + ConnectionContext, and queue
-            // the connection_established frame. On a rejection (unknown app 4001,
-            // unsupported protocol 4007, over-capacity 4004) emit the `pusher:error`
-            // frame + a WS Close carrying the error code.
+            // the connection_established frame. On a rejection (malformed path
+            // 4005, unknown app 4001, unsupported protocol 4007, over-capacity
+            // 4004) emit the `pusher:error` frame + a WS Close carrying the
+            // error code.
             if let Mode::Dispatch(env) = &cfg.mode {
                 // Stamp this connection's slab token + the worker's notifier inputs
                 // into the session so a cross-connection `Mailbox::send` marks this
@@ -1202,11 +1351,31 @@ fn handle_handshake(
                     waker: mailbox_waker.clone(),
                 };
                 use crate::protocol::error::PusherError;
-                let (app_key, protocol) = parse_app_path(&path);
-                let codec = match negotiate(protocol.as_deref(), env.strict_protocol) {
-                    Ok(c) => c,
-                    Err(error) => {
-                        queue_reject(entry, &Reject { error, codec: None }, now_ns);
+                let (app_key, protocol, version) = parse_app_path(&path);
+                let codec =
+                    match negotiate(protocol.as_deref(), version.as_deref(), env.strict_protocol) {
+                        Ok(c) => c,
+                        Err(error) => {
+                            queue_reject(entry, &Reject { error, codec: None }, now_ns);
+                            let _ = flush_and_arm(poll, entry, now_ns);
+                            return Action::Close;
+                        }
+                    };
+                // 4005 "Path not found": the path must match the `/app/{key}`
+                // shape (non-empty single-segment key) BEFORE any app lookup —
+                // Pusher reserves 4001 for a well-formed path with an UNKNOWN
+                // key (see the protocol's error-code table).
+                let app_key = match app_key {
+                    Some(key) => key,
+                    None => {
+                        queue_reject(
+                            entry,
+                            &Reject {
+                                error: PusherError::path_not_found(),
+                                codec: Some(codec),
+                            },
+                            now_ns,
+                        );
                         let _ = flush_and_arm(poll, entry, now_ns);
                         return Action::Close;
                     }
@@ -1272,6 +1441,11 @@ fn handle_handshake(
                             .conn
                             .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
                         entry.session = Some(session);
+                        // Session established: arm the ABSOLUTE
+                        // max-connection-lifetime deadline (close 4202) from
+                        // this moment. Activity on the connection never pushes
+                        // it out — only this establish instant sets it.
+                        arm_lifetime(wheel, env, key, now_ns / 1_000_000);
                     }
                     Err(reject) => {
                         queue_reject(entry, &reject, now_ns);
@@ -1459,21 +1633,36 @@ fn queue_reject(entry: &mut Entry, reject: &Reject, now_ns: u64) {
         .queue(Arc::from(close_out.to_vec().into_boxed_slice()), now_ns);
 }
 
-/// Split a `/app/{key}` path (with an optional `?protocol=N&...` query) into the
-/// app key and the `protocol` query value.
-fn parse_app_path(path: &str) -> (String, Option<String>) {
+/// Split a `/app/{key}` path (with an optional `?protocol=N&version=X&...`
+/// query) into the app key, the `protocol` query value, and the `version`
+/// query value.
+///
+/// The key is `None` when the path does not match the single-segment
+/// `/app/{key}` shape — no `/app/` prefix, an empty key, or a multi-segment
+/// key. Callers reject those with 4005 "Path not found" (Pusher parity);
+/// 4001 stays reserved for a well-formed path with an unknown key.
+fn parse_app_path(path: &str) -> (Option<String>, Option<String>, Option<String>) {
     let (raw_path, query) = match path.split_once('?') {
         Some((p, q)) => (p, Some(q)),
         None => (path, None),
     };
-    let key = raw_path.strip_prefix("/app/").unwrap_or("").to_string();
-    let protocol = query.and_then(|q| {
+    let key = raw_path
+        .strip_prefix("/app/")
+        .filter(|k| !k.is_empty() && !k.contains('/'))
+        .map(str::to_string);
+    let protocol = query_param(query, "protocol");
+    let version = query_param(query, "version");
+    (key, protocol, version)
+}
+
+/// First value of `name` in a raw query string (`None` when absent).
+fn query_param(query: Option<&str>, name: &str) -> Option<String> {
+    query.and_then(|q| {
         q.split('&').find_map(|pair| {
             let (k, v) = pair.split_once('=')?;
-            (k == "protocol").then(|| v.to_string())
+            (k == name).then(|| v.to_string())
         })
-    });
-    (key, protocol)
+    })
 }
 
 /// Read and process every complete frame currently buffered, per [`Mode`].
@@ -1494,7 +1683,7 @@ fn handle_frames(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig, now_ns: u64
 
     match &cfg.mode {
         Mode::Echo => echo_frames(poll, entry, frames, now_ns),
-        Mode::Dispatch(_) => dispatch_frames(poll, entry, frames, now_ns),
+        Mode::Dispatch(_) => dispatch_frames(poll, entry, frames, cfg.max_message_bytes, now_ns),
     }
 }
 
@@ -1532,33 +1721,123 @@ fn echo_frames(poll: &Poll, entry: &mut Entry, frames: Vec<frame::Frame>, now_ns
     }
 }
 
-/// [`Mode::Dispatch`]: decode each Text frame to a [`ClientCommand`] and drive
-/// `ctx.dispatch`, answer pings with pongs, close on a Close frame, then drain
-/// this connection's mailbox so any self-directed replies go out.
+/// [`Mode::Dispatch`]: decode each complete Text message to a [`ClientCommand`]
+/// and drive `ctx.dispatch`, answer pings with pongs, echo a client-initiated
+/// Close per RFC 6455 §5.5.1, then drain this connection's mailbox so any
+/// self-directed replies go out.
+///
+/// Fragmented text messages (RFC 6455 §5.4) are reassembled in
+/// [`Entry::fragment`] before dispatch: a FIN=0 Text frame opens the
+/// accumulation, Continuation frames append (bounded by `max_message_bytes`),
+/// and the FIN=1 Continuation dispatches the assembled payload through the
+/// same path as an unfragmented Text frame. Fragmented BINARY messages are
+/// ignored frame-by-frame (binary is outside the Pusher protocol, like a lone
+/// Binary frame). Control frames interleaved mid-fragment are handled in
+/// frame order, so a Ping between fragments is answered before the message
+/// completes (RFC 6455 §5.5.2).
 fn dispatch_frames(
     poll: &Poll,
     entry: &mut Entry,
     frames: Vec<frame::Frame>,
+    max_message_bytes: usize,
     now_ns: u64,
 ) -> Action {
     for f in frames {
         match f.opcode {
+            // RFC 6455 §5.4: a fragmented message consists of one FIN=0 data
+            // frame followed by Continuation frames ONLY. Interleaving a new
+            // data frame with an open fragmented TEXT message is a protocol
+            // violation — fail the connection with Close 1002. (A Binary frame
+            // interleaved with a text fragment falls here too; Binary frames
+            // while a BINARY fragment is open are ignored below — binary is
+            // outside the protocol and never fatal on its own.)
+            OpCode::Text if entry.fragment.is_some() => {
+                return close_fragment_violation(
+                    poll,
+                    entry,
+                    now_ns,
+                    "data frame interleaved with a fragmented message",
+                );
+            }
+            OpCode::Binary if matches!(entry.fragment, Some(Fragment::Text(_))) => {
+                return close_fragment_violation(
+                    poll,
+                    entry,
+                    now_ns,
+                    "data frame interleaved with a fragmented message",
+                );
+            }
+            OpCode::Text if !f.fin => {
+                // First fragment of a new message: hold the payload until the
+                // FIN=1 Continuation completes it. No cap check here — a lone
+                // first fragment is already bounded by the per-frame
+                // `max_payload`; the per-message cap fires on the next append.
+                entry.fragment = Some(Fragment::Text(f.payload.to_vec()));
+            }
             OpCode::Text => {
-                // The session always exists once Open on a dispatch worker.
-                let Some(session) = entry.session.as_mut() else {
+                // A complete (unfragmented) message.
+                if dispatch_text_message(poll, entry, &f.payload, now_ns) == Action::Close {
                     return Action::Close;
+                }
+            }
+            // Binary is not part of the Pusher protocol; ignore, never fatal.
+            // A FIN=0 Binary opens a message whose frames must all be ignored:
+            // mark the fragment state as [`Fragment::Binary`] so its
+            // Continuation frames (below) are dropped until the FIN=1
+            // Continuation completes it — instead of tripping the stray-
+            // Continuation guard.
+            OpCode::Binary => {
+                if !f.fin && entry.fragment.is_none() {
+                    entry.fragment = Some(Fragment::Binary);
+                }
+            }
+            OpCode::Continuation => {
+                // RFC 6455 §5.4: a Continuation must follow an open fragmented
+                // message on this connection; a stray one is a protocol
+                // violation — fail the connection with Close 1002. (This also
+                // catches further fragments of a TEXT message already dropped
+                // for exceeding the cap below.)
+                let Some(fragment) = entry.fragment.take() else {
+                    return close_fragment_violation(
+                        poll,
+                        entry,
+                        now_ns,
+                        "continuation frame without a fragmented message",
+                    );
                 };
-                let text = match std::str::from_utf8(&f.payload) {
-                    Ok(t) => t,
-                    // A non-UTF-8 text frame is malformed; drop it.
-                    Err(_) => continue,
-                };
-                match session.codec.decode(text) {
-                    Ok(cmd) => dispatch_command(session, cmd),
-                    Err(e) => {
-                        // Unparseable frames are silently dropped; 4200 is a
-                        // close/reconnect code and must not be sent in-band.
-                        tracing::trace!("dropping malformed client frame: {e}");
+                match fragment {
+                    // Continuation of an ignored fragmented Binary: drop the
+                    // payload and stay in ignore-mode until FIN=1 completes it.
+                    Fragment::Binary => {
+                        if !f.fin {
+                            entry.fragment = Some(Fragment::Binary);
+                        }
+                    }
+                    Fragment::Text(mut buf) => {
+                        // Per-message byte cap (`max_event_payload_bytes`): the
+                        // same budget an unfragmented protocol message is held
+                        // to. Oversize → drop the partial message AND reset the
+                        // accumulator; the connection stays usable for the next
+                        // well-formed message.
+                        if buf.len().saturating_add(f.payload.len()) > max_message_bytes {
+                            tracing::trace!(
+                                assembled = buf.len() + f.payload.len(),
+                                max_message_bytes,
+                                "dropping oversize fragmented message"
+                            );
+                            continue; // `buf` dropped here; accumulator left reset (`None`).
+                        }
+                        buf.extend_from_slice(&f.payload);
+                        if f.fin {
+                            // Message complete: dispatch the assembled payload
+                            // through the normal Text path (`fragment` stays
+                            // `None`).
+                            if dispatch_text_message(poll, entry, &buf, now_ns) == Action::Close {
+                                return Action::Close;
+                            }
+                        } else {
+                            entry.fragment = Some(Fragment::Text(buf)); // still open
+                        }
                     }
                 }
             }
@@ -1568,11 +1847,22 @@ fn dispatch_frames(
                 let _ = entry
                     .conn
                     .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+                // RFC 6455 §5.5.2: answer a Ping "as soon as is practical" —
+                // flush the Pong NOW. The end-of-batch drain below only
+                // flushes when mailbox events were written, so a lone Ping's
+                // reply (e.g. interleaved mid-fragment) would otherwise sit
+                // queued until unrelated activity.
+                if flush_and_arm(poll, entry, now_ns) == Action::Close {
+                    return Action::Close;
+                }
             }
             OpCode::Pong => {}
-            // Binary/Continuation are not part of the Pusher protocol; ignore.
-            OpCode::Binary | OpCode::Continuation => {}
-            OpCode::Close => return Action::Close,
+            // RFC 6455 §5.5.1: a client-initiated Close completes the closing
+            // handshake — echo a Close frame (flushed before teardown, which
+            // `remove()` does not do) carrying the client's code when present.
+            OpCode::Close => {
+                return close_handshake_reply(poll, entry, &f.payload, now_ns);
+            }
         }
     }
 
@@ -1582,6 +1872,87 @@ fn dispatch_frames(
     // membership after a `Keep` (see the `Action::Keep` arm in `run`), so any
     // `subscribed` change a drained `SubscriptionError` made here is picked up there.
     drain_session(poll, entry, now_ns).action
+}
+
+/// Dispatch one complete (reassembled or unfragmented) text payload through
+/// the v7 codec. Returns `Action::Close` when the session is gone or the
+/// payload is not valid UTF-8 (RFC 6455 §8.1 → Close 1007 via
+/// [`close_invalid_utf8`]); payloads that are valid UTF-8 but undecodable by
+/// the codec are dropped silently, matching the pre-fragmentation behavior.
+fn dispatch_text_message(poll: &Poll, entry: &mut Entry, payload: &[u8], now_ns: u64) -> Action {
+    // RFC 6455 §8.1: a Text message (unfragmented frame or assembled
+    // fragments) that is not valid UTF-8 is a fatal framing error — fail the
+    // connection, do not silently skip the message. Checked before the
+    // session borrow so the close path can take `entry` mutably.
+    let text = match std::str::from_utf8(payload) {
+        Ok(t) => t,
+        Err(_) => return close_invalid_utf8(poll, entry, now_ns),
+    };
+    // The session always exists once Open on a dispatch worker.
+    let Some(session) = entry.session.as_mut() else {
+        return Action::Close;
+    };
+    match session.codec.decode(text) {
+        Ok(cmd) => dispatch_command(session, cmd),
+        Err(e) => {
+            // Unparseable frames are silently dropped; 4200 is a
+            // close/reconnect code and must not be sent in-band.
+            tracing::trace!("dropping malformed client frame: {e}");
+        }
+    }
+    Action::Keep
+}
+
+/// Fail the connection for an RFC 6455 §5.4 fragmentation violation: queue a
+/// WebSocket Close frame with status code 1002 (protocol error) + `reason`,
+/// flush it so it reaches the peer before teardown (`remove()` does not
+/// flush), and report [`Action::Close`]. The fragment accumulator is reset —
+/// explicit here even though the entry is torn down immediately after.
+fn close_fragment_violation(poll: &Poll, entry: &mut Entry, now_ns: u64, reason: &str) -> Action {
+    entry.fragment = None;
+    queue_close_frame(entry, 1002, reason, now_ns);
+    let _ = flush_and_arm(poll, entry, now_ns);
+    Action::Close
+}
+
+/// Fail the connection for a non-UTF-8 Text payload (RFC 6455 §8.1): queue a
+/// WebSocket Close frame with status code 1007 (invalid frame payload data) +
+/// reason, flush it so it reaches the peer before teardown (`remove()` does
+/// not flush — same mechanics as [`close_fragment_violation`]), and report
+/// [`Action::Close`]. This is a WebSocket-level failure, NOT a Pusher protocol
+/// error: no `pusher:error` frame is sent (those carry 4xxx Pusher codes).
+fn close_invalid_utf8(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action {
+    entry.fragment = None;
+    queue_close_frame(entry, 1007, "invalid UTF-8 in a text message", now_ns);
+    let _ = flush_and_arm(poll, entry, now_ns);
+    Action::Close
+}
+
+/// RFC 6455 §5.5.1: complete the closing handshake on a client-initiated
+/// Close. The server MUST send a Close frame in response before closing the
+/// connection, so queue the echo and flush it (teardown via `remove()` does
+/// not flush — same mechanics as [`close_fragment_violation`]). The echo
+/// carries the client's status code when its Close payload has one, else code
+/// 1000 (normal closure), per [`echo_close_code`].
+fn close_handshake_reply(poll: &Poll, entry: &mut Entry, payload: &[u8], now_ns: u64) -> Action {
+    queue_close_frame(entry, echo_close_code(payload), "", now_ns);
+    let _ = flush_and_arm(poll, entry, now_ns);
+    Action::Close
+}
+
+/// The status code for the §5.5.1 echo of a client Close: the client's own
+/// code when its payload carries one, else 1000 (normal closure). Codes an
+/// endpoint must never put on the wire (RFC 6455 §7.4: the 1005/1006/1015
+/// sentinels, codes below 1000 or above 4999) fall back to 1000 so the echo
+/// is always a well-formed Close frame.
+fn echo_close_code(payload: &[u8]) -> u16 {
+    if payload.len() >= 2 {
+        let code = u16::from_be_bytes([payload[0], payload[1]]);
+        if (1000..=4999).contains(&code) && !matches!(code, 1005 | 1006 | 1015) {
+            return code;
+        }
+    }
+    1000
 }
 
 /// Run one command through the (async) protocol handler synchronously.
@@ -1892,6 +2263,9 @@ fn drain_resolved(
                     // so a resumed connection is ALWAYS liveness-monitored, and starts
                     // its idle clock at establish (`touch` reschedules — never duplicates).
                     wheel.touch(token, now_ns / 1_000_000);
+                    // The max-connection-lifetime clock also starts at THIS establish
+                    // moment (the park is not part of the connection's life).
+                    arm_lifetime(wheel, env, token, now_ns / 1_000_000);
                 }
             }
             Err(reject) => {
@@ -2389,6 +2763,7 @@ mod tests {
                 WorkerConfig {
                     addr,
                     max_payload: 1 << 20,
+                    max_message_bytes: 1 << 20,
                     high_water: 1 << 20,
                     mode: Mode::Echo,
                     rest_handoff: None,
@@ -2499,18 +2874,52 @@ mod tests {
     }
 
     #[test]
-    fn parse_app_path_extracts_key_and_protocol() {
+    fn parse_app_path_extracts_key_protocol_and_version() {
         assert_eq!(
-            parse_app_path("/app/app-key?protocol=7"),
-            ("app-key".to_string(), Some("7".to_string()))
+            parse_app_path("/app/app-key?protocol=7&version=7.4.1"),
+            (
+                Some("app-key".to_string()),
+                Some("7".to_string()),
+                Some("7.4.1".to_string())
+            )
         );
         assert_eq!(
             parse_app_path("/app/app-key"),
-            ("app-key".to_string(), None)
+            (Some("app-key".to_string()), None, None)
         );
         assert_eq!(
-            parse_app_path("/app/k?foo=1&protocol=7&bar=2"),
-            ("k".to_string(), Some("7".to_string()))
+            parse_app_path("/app/k?foo=1&protocol=7&version=8.2.0&bar=2"),
+            (
+                Some("k".to_string()),
+                Some("7".to_string()),
+                Some("8.2.0".to_string())
+            )
         );
+        // `version` without `protocol` (the inference path's input shape).
+        assert_eq!(
+            parse_app_path("/app/k?version=7.4.1"),
+            (Some("k".to_string()), None, Some("7.4.1".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_app_path_rejects_non_app_shapes_with_none() {
+        // No `/app/` prefix → 4005, not an empty-key app lookup (4001).
+        assert_eq!(
+            parse_app_path("/nope/?protocol=7"),
+            (None, Some("7".to_string()), None)
+        );
+        // Empty key → 4005.
+        assert_eq!(
+            parse_app_path("/app/?protocol=7"),
+            (None, Some("7".to_string()), None)
+        );
+        // Multi-segment key (a `/` inside the key) → 4005.
+        assert_eq!(
+            parse_app_path("/app/a/b?protocol=7"),
+            (None, Some("7".to_string()), None)
+        );
+        // No path at all → 4005.
+        assert_eq!(parse_app_path("/"), (None, None, None));
     }
 }

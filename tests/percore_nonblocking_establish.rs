@@ -103,6 +103,7 @@ async fn spawn_slow(delay: Duration) -> Harness {
         limits: config.limits(),
         activity_timeout: config.activity_timeout,
         pong_timeout: config.pong_timeout,
+        max_conn_lifetime_secs: 0, // lifetime close not under test here
         strict_protocol: config.strict_protocol,
         conn_counts: conn_counts.clone(),
         node_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -124,6 +125,7 @@ async fn spawn_slow(delay: Duration) -> Harness {
             WorkerConfig {
                 addr,
                 max_payload: 1 << 20,
+                max_message_bytes: 1 << 20,
                 high_water: 1 << 20,
                 mode: Mode::Dispatch(env),
                 rest_handoff: None,

@@ -21,6 +21,15 @@ impl ConnectionContext {
         // Per-connection subscription cap: reject new subscriptions once the limit
         // is reached. `0` means unlimited. Checked after the idempotency guard so
         // re-subscribing an already-held channel is always exempt and never errors.
+        //
+        // P10: hosted Pusher documents NO per-connection subscription limit (checked
+        // 2026-08-30 — channels doc + WS protocol reference are both silent; Pusher's
+        // limits FAQ only covers channels per app). This cap is therefore a
+        // deliberate pylon-specific memory guard, NOT parity: each subscription
+        // holds server-side state, so an uncapped connection could grow memory
+        // without bound. Rejection is non-fatal (`pusher:subscription_error`,
+        // LimitReached/4004 — connection stays open). Documented in
+        // website/docs/user-guide/channels.md, "Per-connection subscription cap".
         let cap = self.limits.max_subscriptions_per_connection;
         if cap != 0 && self.subscribed.len() >= cap {
             return self.send_subscription_error(
@@ -63,6 +72,28 @@ impl ConnectionContext {
             return self.send_subscription_error(&channel, "AuthError", "Unknown channel", 401);
         }
 
+        // ── Task 1.9 (P9): `pusher:subscription_error` `data.status` values —
+        // verification vs hosted Pusher (checked 2026-08-30) ──
+        //
+        // Decision rule: if hosted Pusher's documented/observable semantics
+        // differ from ours, adopt hosted; if undocumented/ambiguous, KEEP
+        // current behavior deliberately. Result: UNDOCUMENTED → KEEP.
+        //
+        // | Source | Quote / finding | Decision |
+        // |---|---|---|
+        // | https://pusher.com/docs/channels/library_auth_reference/pusher-websockets-protocol/ | Does NOT document `pusher:subscription_error` at all — no frame shape, no `data.status` semantics. Only covers `pusher:subscribe`/`unsubscribe`/`pusher_internal:subscription_succeeded`; the only 4009 on the page is a WebSocket CLOSE code ("4009: Connection is unauthorized") in the close-code table, i.e. a different namespace from an in-band frame's `data.status`. | hosted silent on `data.status` |
+        // | pusher-js v8.6.0 master, src/core/channels/channel.ts | The ONLY `pusher:subscription_error` emission is CLIENT-side, for a local channel-authorizer failure: `this.emit('pusher:subscription_error', Object.assign({}, { type: 'AuthError', error: error.message }, error instanceof HTTPAuthError ? { status: error.status } : {}))` — that `status` is the auth ENDPOINT's HTTP status, not a server-frame value. Server-SENT frames get no dedicated handling: `handleEvent` only special-cases `pusher_internal:*`, else `this.emit(eventName, data, metadata)` forwards `data` verbatim. `Protocol.getCloseAction` (protocol.ts) maps WebSocket close codes only. | client does not read `data.status` off server frames |
+        // | soketi 1.x (SECONDARY, not hosted), src/ws-handler.ts | Over-length name: `{ event: 'pusher:subscription_error', channel, data: { type: 'LimitReached', error: ..., status: 4009 } }`; authError: `{ data: { type: 'AuthError', error: ..., status: 401 } }` — sent via `ws.sendJson` with NO `ws.end`, i.e. non-fatal. | corroborates 4009 (name) / 401 (auth), non-fatal |
+        //
+        // KEPT: invalid channel name → status 4009; auth failure (bad/missing
+        // auth on private/presence/encrypted, reserved-# channels) → status 401;
+        // both non-fatal (connection stays open). Pinned in
+        // `src/ws/handler_tests.rs` (`*_errors_4009`, `*_errors_non_fatally`,
+        // `presence_subscribe_with_bad_auth_errors`).
+        // NOTE: soketi labels the 4009 name error type `LimitReached`; Pylon
+        // uses `InvalidChannel` — type strings are also undocumented, kept
+        // as-is (out of scope for P9, which is about `data.status` values).
+        //
         // P8: enforce channel name length + charset before any auth or registry work.
         if !validate_channel_name(&channel, self.limits.max_channel_name_length) {
             return self.send_subscription_error(
@@ -347,9 +378,46 @@ impl ConnectionContext {
         channel: String,
         data: Value,
     ) {
+        // ── Task 1.7: client-event rejection codes — verification vs hosted Pusher ──
+        //
+        // All four rejection paths below reuse code 4301. That was verified against
+        // live sources (2026-08-30), per class:
+        //
+        // 1. Client messaging disabled (app gate):
+        //    https://pusher.com/docs/channels/library_auth_reference/pusher-websockets-protocol/
+        //    documents no code for this class — the client-events page
+        //    (https://pusher.com/docs/channels/using_channels/events/) only says
+        //    "Client events must be enabled for the application." → 4301 KEPT
+        //    (deliberate, undocumented class); message is soketi parity
+        //    (soketi 1.x src/ws-handler.ts: "The app does not have client messaging enabled.").
+        //
+        // 2. Oversized event name (> max_event_name_length, default 200):
+        //    Neither the protocol page's error-codes table nor the client-events page
+        //    documents a code/message for this class (only the `client-` prefix rule).
+        //    → 4301 KEPT (deliberate, undocumented class); message is soketi parity
+        //    ("Event name is too long. Maximum allowed size is ${max}.").
+        //
+        // 3. Oversized payload (> max_event_payload_bytes, default 10 KiB):
+        //    No code/message documented for the WS path (the REST API page documents
+        //    a 413 HTTP error, which does not apply to in-band pusher:error frames).
+        //    → 4301 KEPT (deliberate, undocumented class); message is Pylon's own,
+        //    kept byte-stable.
+        //
+        // 4. Rate limit (>10 client events/sec/connection):
+        //    The protocol page's error-codes table documents exactly one
+        //    client-event code — "4301: Client event rejected due to rate limit" —
+        //    and the events page: "Publish no more than 10 messages per second per
+        //    client (connection). Any events triggered above this rate limit will be
+        //    rejected by our API." → 4301 with the documented message verbatim.
+        //
+        // Client tolerance (pusher-js master): in-band `pusher:error` frames are
+        // forwarded verbatim — src/core/connection/connection.ts:
+        //   case 'pusher:error': this.emit('error', { type: 'PusherError', data: pusherEvent.data })
+        // with no code-specific branching for 43xx (Protocol.getCloseAction only maps
+        // WebSocket CLOSE codes, and only during handshake/close), so any of these
+        // frames is surfaced to app error handlers without disconnecting.
         if !self.app.client_messages_enabled {
             self.send_self(ServerEvent::ClientEventError {
-                channel,
                 code: 4301,
                 message: "The app does not have client messaging enabled.".into(),
             });
@@ -368,7 +436,6 @@ impl ConnectionContext {
         if event.len() > self.limits.max_event_name_length {
             let max = self.limits.max_event_name_length;
             self.send_self(ServerEvent::ClientEventError {
-                channel,
                 code: 4301,
                 message: format!("Event name is too long. Maximum allowed size is {max}."),
             });
@@ -378,7 +445,6 @@ impl ConnectionContext {
         if serde_json::to_string(&data).map_or(0, |s| s.len()) > self.limits.max_event_payload_bytes
         {
             self.send_self(ServerEvent::ClientEventError {
-                channel,
                 code: 4301,
                 message: "Client event rejected - the data is too large".into(),
             });
@@ -396,7 +462,6 @@ impl ConnectionContext {
         // window is exhausted (Pusher parity: 10 client events/sec/connection).
         if !self.client_event_rate.check() {
             self.send_self(ServerEvent::ClientEventError {
-                channel,
                 code: 4301,
                 message: "Client event rejected due to rate limit".to_string(),
             });

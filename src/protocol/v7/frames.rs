@@ -92,12 +92,11 @@ pub fn encode(event: &ServerEvent) -> String {
             json!({ "event": "pusher_internal:watchlist_events", "data": { "events": events } })
                 .to_string()
         }
-        ServerEvent::ClientEventError {
-            channel,
-            code,
-            message,
-        } => {
-            json!({ "event": "pusher:error", "channel": channel, "data": { "code": code, "message": message } })
+        ServerEvent::ClientEventError { code, message } => {
+            // Strict Pusher parity (1.8/P8): pusher:error is EXACTLY
+            // { event, data } — the protocol defines no top-level `channel`
+            // (channel-scoping belongs to pusher:subscription_error only).
+            json!({ "event": "pusher:error", "data": { "code": code, "message": message } })
                 .to_string()
         }
         // Control frame — the connection task intercepts `Close` before encoding,
@@ -185,6 +184,24 @@ mod tests {
 
     fn parse(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
+    }
+
+    /// Assert the frame's top-level object has EXACTLY `keys` — strict Pusher
+    /// parity: no extra, non-standard fields (e.g. no `channel` on pusher:error).
+    fn assert_exact_keys(v: &Value, keys: &[&str]) {
+        let mut got: Vec<&str> = v
+            .as_object()
+            .expect("frame must be an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        got.sort_unstable();
+        let mut want: Vec<&str> = keys.to_vec();
+        want.sort_unstable();
+        assert_eq!(
+            got, want,
+            "top-level keys must be exactly {want:?}, got {got:?}"
+        );
     }
 
     #[test]
@@ -320,6 +337,9 @@ mod tests {
         }));
         assert_eq!(out["event"], "pusher:subscription_error");
         assert_eq!(out["channel"], "private-x");
+        // subscription_error is its OWN event type and legitimately carries
+        // `channel` at top level — exact shape {event, channel, data}.
+        assert_exact_keys(&out, &["event", "channel", "data"]);
         assert!(
             out["data"].is_object(),
             "subscription_error data must be an object"
@@ -415,18 +435,26 @@ mod tests {
     }
 
     #[test]
-    fn client_event_error_carries_channel_at_top_level() {
-        // P11: pusher:error for client-event rejections must include `channel`.
-        let out = parse(&encode(&ServerEvent::ClientEventError {
-            channel: "private-x".into(),
+    fn pusher_error_frames_have_exactly_event_and_data() {
+        // Task 1.8 (P8): the protocol page defines pusher:error as
+        // `{ "event": "pusher:error", "data": { "message": String, "code": Integer } }`
+        // — NO top-level `channel`, for connection-level AND channel-scoped
+        // (client-event rejection) errors alike.
+        let conn = parse(&encode(&ServerEvent::Error(PusherError::app_not_found())));
+        assert_eq!(conn["event"], "pusher:error");
+        assert_exact_keys(&conn, &["event", "data"]);
+
+        let scoped = parse(&encode(&ServerEvent::ClientEventError {
             code: 4301,
-            message: "Client event rejected - the data is too large".into(),
+            message: "Client event rejected due to rate limit".into(),
         }));
-        assert_eq!(out["event"], "pusher:error");
-        assert_eq!(out["channel"], "private-x", "channel must be at top level");
-        assert!(out["data"].is_object());
-        assert_eq!(out["data"]["code"], 4301);
-        assert!(!out["data"]["message"].as_str().unwrap_or("").is_empty());
+        assert_eq!(scoped["event"], "pusher:error");
+        assert_exact_keys(&scoped, &["event", "data"]);
+        assert_eq!(scoped["data"]["code"], 4301);
+        assert_eq!(
+            scoped["data"]["message"],
+            "Client event rejected due to rate limit"
+        );
     }
 
     #[test]
