@@ -1191,6 +1191,133 @@ async fn ws_disabled_app_key_close_frame_carries_4001() {
     );
 }
 
+// ── R3 parity tests — distinct 401 auth-failure messages ─────────────────────
+
+/// Overwrite one `k=v` pair in a signed query string (string surgery on the
+/// canonical `k=v&…` form `signed_query_as` produces), keeping the tail intact.
+fn set_query_param(q: &str, key: &str, value: &str) -> String {
+    let start = q.find(&format!("{key}=")).unwrap();
+    let end = q[start..].find('&').map(|i| start + i).unwrap_or(q.len());
+    format!("{}{}={}{}", &q[..start], key, value, &q[end..])
+}
+
+/// Drop one `k=v` pair (and its trailing `&` if present) from a signed query
+/// string.
+fn drop_query_param(q: &str, key: &str) -> String {
+    let start = q.find(&format!("{key}=")).unwrap();
+    let end = match q[start..].find('&') {
+        Some(i) => start + i + 1, // drop through the separator
+        None => q.len(),          // param is last: drop to the end
+    };
+    format!("{}{}", &q[..start], &q[end..])
+}
+
+/// POST the (mutated) signed query and return the parsed 401 error message.
+async fn post_expect_401_message(addr: &str, path: &str, q: &str, body: &str) -> String {
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}{path}?{q}"))
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(
+        v["status"],
+        json!(401),
+        "status field must mirror 401, got: {v}"
+    );
+    v["error"].as_str().unwrap().to_string()
+}
+
+/// R3: a stale `auth_timestamp` (outside the 600s window) gets the hosted
+/// wording `Timestamp expired: …` — not the generic "invalid authentication".
+#[tokio::test]
+async fn rest_stale_timestamp_says_timestamp_expired() {
+    let addr = spawn().await;
+    let body = json!({"name":"e","data":"{}","channels":["c"]}).to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    // 1970 is far outside the 600s window; the window check fires before the
+    // signature check, so the (now invalid) signature is irrelevant.
+    let stale = set_query_param(&q, "auth_timestamp", "1");
+    let msg = post_expect_401_message(&addr.to_string(), "/apps/app1/events", &stale, &body).await;
+    assert!(
+        msg.starts_with("Timestamp expired"),
+        "stale timestamp must say `Timestamp expired: …`, got: {msg:?}"
+    );
+}
+
+/// R3: a tampered `auth_signature` gets `Invalid signature: …`.
+#[tokio::test]
+async fn rest_bad_signature_says_invalid_signature() {
+    let addr = spawn().await;
+    let body = json!({"name":"e","data":"{}","channels":["c"]}).to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let tampered = set_query_param(&q, "auth_signature", "deadbeef");
+    let msg =
+        post_expect_401_message(&addr.to_string(), "/apps/app1/events", &tampered, &body).await;
+    assert!(
+        msg.starts_with("Invalid signature"),
+        "bad signature must say `Invalid signature: …`, got: {msg:?}"
+    );
+}
+
+/// R3: an unsupported `auth_version` gets `Invalid auth version`.
+#[tokio::test]
+async fn rest_bad_auth_version_says_invalid_auth_version() {
+    let addr = spawn().await;
+    let body = json!({"name":"e","data":"{}","channels":["c"]}).to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    // The version check fires first, so the (now invalid) signature is moot.
+    let bad = set_query_param(&q, "auth_version", "2.0");
+    let msg = post_expect_401_message(&addr.to_string(), "/apps/app1/events", &bad, &body).await;
+    assert_eq!(
+        msg, "Invalid auth version",
+        "unsupported auth_version must say `Invalid auth version`, got: {msg:?}"
+    );
+}
+
+/// R3: a missing required auth param (`auth_timestamp`) gets the specific
+/// `Missing auth parameters`.
+#[tokio::test]
+async fn rest_missing_auth_param_says_missing_auth_parameters() {
+    let addr = spawn().await;
+    let body = json!({"name":"e","data":"{}","channels":["c"]}).to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let missing = drop_query_param(&q, "auth_timestamp");
+    let msg =
+        post_expect_401_message(&addr.to_string(), "/apps/app1/events", &missing, &body).await;
+    assert_eq!(
+        msg, "Missing auth parameters",
+        "missing auth param must say `Missing auth parameters`, got: {msg:?}"
+    );
+}
+
+/// R3 anti-enumeration pin: an UNKNOWN `auth_key` on an otherwise well-formed
+/// request stays the GENERIC `invalid authentication` — the same string the
+/// unknown-app path emits — so probing keys learns nothing beyond "not this
+/// app's key" (keys/ids are public identifiers; the app secret is the secret).
+#[tokio::test]
+async fn rest_unknown_auth_key_stays_generic() {
+    let addr = spawn().await;
+    let body = json!({"name":"e","data":"{}","channels":["c"]}).to_string();
+    // Correctly signed (over its own params) but carrying a key that is not
+    // app1's: shape-valid, credentials wrong.
+    let q = signed_query_as(
+        "no-such-key",
+        SECRET,
+        "POST",
+        "/apps/app1/events",
+        body.as_bytes(),
+        &[],
+    );
+    let msg = post_expect_401_message(&addr.to_string(), "/apps/app1/events", &q, &body).await;
+    assert_eq!(
+        msg, "invalid authentication",
+        "unknown auth_key must stay the generic message, got: {msg:?}"
+    );
+}
+
 // ── R15 carry-in — malformed query strings ────────────────────────────────────
 
 /// R15: a malformed percent-escape (`%zz`) in the query string is parsed
