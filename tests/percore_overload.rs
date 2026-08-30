@@ -693,3 +693,205 @@ async fn overload_total_inflight_stays_within_budget() {
 
     result.expect("budget flood did not complete within the wall");
 }
+
+/// Task 3.1 (finding G1) — NO BUSY-SPIN ON A BACKPRESSURED CONNECTION, AND NO
+/// LOSS. One subscriber whose socket can absorb almost nothing (client-side
+/// `SO_RCVBUF` shrunk via socket2 — the integration-test analogue of the
+/// `pair_tiny_sndbuf` unit-test trick, applied to the end of the pair the test
+/// can reach) subscribes to a channel and then STOPS READING. The publisher
+/// floods until the worker holds queued bytes for it
+/// (`percore_total_inflight_bytes() > 0`): the connection is backpressured
+/// with a non-empty out-queue. Then all work stops.
+///
+/// `mio` is level-triggered: a connection with a full send buffer produces NO
+/// writable event, so a loop that polls 0 ms whenever `inflight_bytes > 0` —
+/// even when the previous iteration did no work — spins the whole worker core
+/// at 100% CPU. The loop must instead park in the 50 ms poll, which is sound
+/// only because every connection with queued bytes holds WRITABLE interest
+/// (armed by `flush_and_arm` on `WouldBlock`): the kernel wakes the loop the
+/// moment the socket drains.
+///
+/// Asserts BOTH halves:
+///
+///   1. NO SPIN: during a quiet window with the backlog still queued, the
+///      `percore_poll_zero_timeouts()` counter stops growing (bounded by a
+///      handful of straggler iterations after the last enqueue).
+///   2. NO LOSS: the queued bytes REMAIN queued while parked (inflight stays
+///      > 0 — nothing was dropped to escape the poll), and once the client
+///      finally drains, EVERY published frame is delivered in order via the
+///      wake-on-writable path, with inflight reaching exactly 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backpressured_connection_does_not_spin_and_backlog_survives() {
+    let _guard = HARNESS_LOCK.lock().await;
+    // ONE worker so the measured poll loop is the only one in the process, and
+    // no shed/CoDel/drop-head interference with the backlog: big budget, big
+    // per-conn cap, CoDel off. Whatever backs up must STAY queued.
+    let config = ServerConfig {
+        workers: 1,
+        memory_budget_bytes: 64 << 20,
+        expected_conns_per_worker: 8,
+        perconn_queue_min_bytes: 8 << 20,
+        perconn_queue_max_bytes: 8 << 20,
+        codel_target_ms: 0,
+        ..base_config(free_port())
+    };
+    // ≈ 8.3 KiB per frame × 400 ≈ 3.3 MiB — far past the shrunk receive
+    // buffer + the server's send buffer, so the server's flush MUST WouldBlock
+    // and leave the bulk queued; far under the 8 MiB per-conn cap, so drop-head
+    // never fires and the whole backlog must survive to be delivered.
+    const N_PUB: u64 = 400;
+    let pad = "z".repeat(8192);
+
+    let result = tokio::time::timeout(WALL, async {
+        let h = spawn_with(config).await;
+        let channel = "spin-chan";
+
+        // ── The backpressured subscriber: tiny receive buffer, never read
+        //    after the subscription ack. ─────────────────────────────────────
+        let mut slow = connect_tiny_rcvbuf(h.port).await;
+        let est = next_json_raw(&mut slow).await;
+        assert_eq!(est["event"], "pusher:connection_established");
+        slow.send(Message::Text(
+            json!({
+                "event": "pusher:subscribe",
+                "data": { "channel": channel }
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        let succ = next_json_raw(&mut slow).await;
+        assert_eq!(succ["event"], "pusher_internal:subscription_succeeded");
+
+        // ── Flood until the worker holds queued bytes for the connection. ──
+        let client = reqwest::Client::new();
+        let mut inflight_seen: u64 = 0;
+        for seq in 1..=N_PUB {
+            let status = publish_seq(h.port, &client, channel, seq, &pad).await;
+            assert_eq!(status, 200, "flood publish must be accepted (no shed here)");
+            inflight_seen = inflight_seen.max(pylon::transport::percore_total_inflight_bytes());
+        }
+        assert!(
+            inflight_seen > 0,
+            "flood never backed the subscriber up; backpressure path not exercised"
+        );
+
+        // ── QUIET WINDOW: no more publishes; the only live connection is the
+        //    silent, backpressured subscriber. Let stragglers settle, then
+        //    measure two 0ms-poll-counter snapshots separated by far longer
+        //    than a spinning loop would need to run away. ────────────────────
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            pylon::transport::percore_total_inflight_bytes() > 0,
+            "backlog must still be queued after the flood"
+        );
+        let polls_before = pylon::transport::worker::percore_poll_zero_timeouts();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let polls_after = pylon::transport::worker::percore_poll_zero_timeouts();
+        let spun = polls_after - polls_before;
+        assert!(
+            spun <= 8,
+            "worker made {spun} zero-timeout polls in a 400ms quiet window with a \
+             backpressured connection; the loop is busy-spinning on queued bytes"
+        );
+        assert!(
+            pylon::transport::percore_total_inflight_bytes() > 0,
+            "queued bytes vanished while parked; the backlog was silently dropped"
+        );
+
+        // ── NO LOSS: drain the client. Writable events wake the loop and the
+        //    whole backlog flushes — every frame, in order, inflight → 0. ────
+        let mut got: Vec<u64> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match tokio::time::timeout(Duration::from_millis(1_000), slow.next()).await {
+                Ok(Some(Ok(Message::Text(t)))) => {
+                    let v: Value = serde_json::from_str(&t).unwrap();
+                    if v["event"] == "flood" {
+                        got.push(seq_of(v["data"].as_str().unwrap()));
+                    }
+                }
+                Ok(Some(Ok(_))) => {}
+                Ok(Some(Err(e))) => panic!("backlog drain read failed: {e}"),
+                Ok(None) => break, // server closed the stream
+                Err(_) => break,   // 1s of silence: backlog fully drained
+            }
+            if got.len() == N_PUB as usize {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "backlog did not fully drain in time; got {} of {N_PUB} frames",
+                got.len()
+            );
+        }
+        let expected: Vec<u64> = (1..=N_PUB).collect();
+        assert_eq!(
+            got, expected,
+            "the whole backlog must be delivered in order after the drain"
+        );
+        // And nothing remains queued anywhere on the worker.
+        let mut inflight_zero = false;
+        for _ in 0..100 {
+            if pylon::transport::percore_total_inflight_bytes() == 0 {
+                inflight_zero = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            inflight_zero,
+            "inflight bytes never reached 0 after draining the backlog"
+        );
+
+        drop(slow);
+        drop(h);
+    })
+    .await;
+    result.expect("busy-spin test did not complete within the wall");
+}
+
+/// Connect a WebSocket client over a TCP socket whose `SO_RCVBUF` has been
+/// shrunk to a few KiB — the client kernel can then buffer almost nothing, so
+/// a server that keeps writing to a client that never reads backpressures
+/// after a handful of frames. (The server end's `SO_SNDBUF` is owned by the
+/// worker and unreachable from the test; shrinking the receive side pins the
+/// total absorbable bytes just as tightly.)
+async fn connect_tiny_rcvbuf(
+    port: u16,
+) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+    let std_stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    socket2::SockRef::from(&std_stream)
+        .set_recv_buffer_size(4 * 1024)
+        .unwrap();
+    std_stream.set_nonblocking(true).unwrap();
+    let stream = tokio::net::TcpStream::from_std(std_stream).unwrap();
+    let url = format!("ws://127.0.0.1:{port}/app/{KEY}?protocol=7");
+    let (ws, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::client_async(url, stream),
+    )
+    .await
+    .expect("connect within 5s")
+    .expect("ws handshake");
+    ws
+}
+
+/// `next_json` for the raw (non-`MaybeTlsStream`) client returned by
+/// [`connect_tiny_rcvbuf`]. Reads the next Text frame as JSON, 5s wall.
+async fn next_json_raw<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await.unwrap().unwrap() {
+                Message::Text(t) => return serde_json::from_str(&t).unwrap(),
+                Message::Close(_) => panic!("unexpected close while awaiting a frame"),
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .expect("frame within 5s")
+}

@@ -11,7 +11,10 @@
 //! `READABLE`-only and only gains `WRITABLE` interest when a [`Connection::flush`] returns
 //! [`WriteStatus::WouldBlock`]; the interest is dropped back to `READABLE` once
 //! the queue drains. This keeps the loop from spinning on a writable socket with
-//! nothing to send.
+//! nothing to send. It is also what lets the loop poll with a real (50ms)
+//! timeout whenever the previous iteration did no work: a backpressured
+//! connection's queued bytes are guaranteed a wake-up on socket-drain, so the
+//! loop never needs to busy-poll them.
 //!
 //! Two behaviours are supported:
 //!
@@ -81,6 +84,23 @@ pub static SELECTIVE_DRAIN_VISITS: AtomicU64 = AtomicU64::new(0);
 #[cfg(any(test, feature = "test-hooks"))]
 pub fn percore_selective_drain_visits() -> u64 {
     SELECTIVE_DRAIN_VISITS.load(Ordering::Relaxed)
+}
+
+/// Test-hooks instrumentation (G1): a monotonic count of how many times this
+/// process's worker loops polled with a 0 ms timeout. The loop only polls 0 ms
+/// when the PREVIOUS iteration did real work; a backpressured connection
+/// (queued bytes, full send buffer) produces no readiness event, so a test can
+/// assert this counter STOPS growing once the flood stops — proving the loop
+/// parks in the 50 ms poll instead of busy-spinning on queued bytes. Behind
+/// `test-hooks` so it is free in release builds.
+#[cfg(any(test, feature = "test-hooks"))]
+pub static POLL_ZERO_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+
+/// Test-hooks accessor: the cumulative number of 0 ms (non-blocking) worker
+/// polls across this process (see [`POLL_ZERO_TIMEOUTS`]).
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn percore_poll_zero_timeouts() -> u64 {
+    POLL_ZERO_TIMEOUTS.load(Ordering::Relaxed)
 }
 
 /// Reserved token for this worker's single [`mio::Waker`]. One below [`LISTENER`];
@@ -508,12 +528,10 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     let mut events = Events::with_capacity(1024);
     let mut conns: slab::Slab<Entry> = slab::Slab::new();
 
-    // Adaptive poll timeout: when the previous iteration did real work (or any
-    // connection still has buffered writes), poll non-blocking so cross-worker
-    // mailbox deliveries drain promptly under load; when idle, block up to 50ms
-    // (which also bounds how long `shutdown` goes unchecked) to avoid spinning.
-    // A cross-connection mailbox send no longer waits for this idle poll: it wakes
-    // the `MAILBOX_WAKER` and the selective drain delivers it on the next pass.
+    // Adaptive poll timeout (G1): poll non-blocking only when the previous
+    // iteration did real work; when idle, block up to 50ms to avoid spinning.
+    // Queued out-bytes do NOT force a 0ms poll — see the in-loop comment for
+    // why that would busy-spin on a backpressured connection.
     let mut did_work = true;
     let dispatch = matches!(cfg.mode, Mode::Dispatch(_));
     // Total connections this worker has accepted — logged at shutdown so an
@@ -601,9 +619,11 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 return Ok(());
             }
             // else: fall through — the rest of the loop polls writable events and
-            // flushes the queued Close frames + any pending out-bytes. The poll
-            // timeout of 0ms (pending_writes is true while inflight_bytes > 0)
-            // keeps this tight. We re-check inflight_bytes/deadline each iteration.
+            // flushes the queued Close frames + any pending out-bytes. The
+            // Close-queue flush armed WRITABLE on every still-backpressured
+            // connection, so the poll wakes on the next drain event (or the
+            // 50ms idle tick, whichever comes first). We re-check
+            // inflight_bytes/deadline each iteration.
         }
 
         // Debug-only cross-check: the incrementally-maintained `inflight_bytes`
@@ -621,6 +641,22 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
             "incremental inflight_bytes drifted from the true out_bytes sum",
         );
 
+        // G1 invariant: any connection with queued out-bytes MUST hold WRITABLE
+        // interest in the poll registry. This is what makes the idle 50ms poll
+        // safe for a backpressured connection — the kernel wakes the loop with
+        // a writable event the moment the socket drains, so queued bytes can
+        // never be stranded behind a sleeping poll. Every queue site flushes
+        // via `flush_and_arm` before control returns to the loop top, arming
+        // WRITABLE on `WouldBlock`, so this holds by construction; a violation
+        // means a queue path forgot to arm.
+        debug_assert!(
+            conns
+                .iter()
+                .all(|(_, e)| e.conn.out_bytes() == 0 || e.conn.writable_armed()),
+            "connection has queued out-bytes but no WRITABLE interest armed; \
+             the idle poll could strand its backlog"
+        );
+
         // Mirror the incrementally-maintained total into the shared slot for the
         // off-hot-path `percore_total_inflight_bytes()` test hook. O(1).
         if let Some(slot) = &inflight_slot {
@@ -632,10 +668,22 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 slot.store(codel_dropped_total, Ordering::Relaxed);
             }
         }
-        // `pending_writes` is just "any bytes still queued", now read off the
-        // incremental counter instead of a fresh O(N) sum.
-        let pending_writes = inflight_bytes > 0;
-        let timeout = if did_work || pending_writes {
+        // Adaptive poll timeout (G1): poll non-blocking ONLY when the previous
+        // iteration did real work, so cross-worker mailbox deliveries drain
+        // promptly under load; otherwise block up to 50ms (which also bounds
+        // how long `shutdown` goes unchecked). Queued out-bytes deliberately do
+        // NOT force a 0ms poll: mio is level-triggered, so a backpressured
+        // connection (full send buffer) produces NO readiness event and a 0ms
+        // poll on `inflight_bytes > 0` would busy-spin the whole core. This is
+        // safe because every connection with queued bytes holds WRITABLE
+        // interest (armed by `flush_and_arm` on `WouldBlock`; asserted at the
+        // loop top) — the kernel wakes the loop the moment the socket drains.
+        // A cross-connection mailbox send never waits for this idle poll: it
+        // wakes the WORKER_WAKER and the selective drain delivers it on the
+        // next pass.
+        let timeout = if did_work {
+            #[cfg(any(test, feature = "test-hooks"))]
+            POLL_ZERO_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
             Some(Duration::from_millis(0))
         } else {
             Some(Duration::from_millis(50))
@@ -920,17 +968,45 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
             for due in wheel.due(now_ms) {
                 match due {
                     Due::Ping(key) => {
-                        if queue_ping(&poll, &mut conns, key, now_ns) {
-                            // INCREMENTAL INFLIGHT: the ping was queued + flushed;
-                            // fold this connection's net delta into the total.
-                            fold_delta(&mut conns, key, &mut inflight_bytes);
-                            // Ping queued: arm the pong-timeout close deadline.
-                            wheel.mark_ping_sent(key, now_ms);
-                            work = true;
-                        } else {
-                            // The connection vanished (or had no session): drop it
-                            // from the wheel so the entry doesn't linger.
-                            wheel.remove(key);
+                        match queue_ping(&poll, &mut conns, key, now_ns) {
+                            Some(action) => {
+                                // INCREMENTAL INFLIGHT: the ping was queued +
+                                // flushed; fold this connection's net delta
+                                // into the total.
+                                fold_delta(&mut conns, key, &mut inflight_bytes);
+                                if action == Action::Close {
+                                    // The ping flush failed (dead peer or a
+                                    // failed re-registration): reap the
+                                    // connection NOW — the queued ping bytes
+                                    // would otherwise sit behind a poll
+                                    // interest that never fires for a dead
+                                    // socket.
+                                    fold_codel(&mut conns, key, &mut codel_dropped_total);
+                                    remove(
+                                        &poll,
+                                        &mut conns,
+                                        key,
+                                        &mut local_subs,
+                                        &mut sid_to_token,
+                                        &mut wheel,
+                                        &mut inflight_bytes,
+                                        &conn_counts,
+                                        &app_registry,
+                                        &node_conns,
+                                    );
+                                } else {
+                                    // Ping queued: arm the pong-timeout close
+                                    // deadline.
+                                    wheel.mark_ping_sent(key, now_ms);
+                                }
+                                work = true;
+                            }
+                            None => {
+                                // The connection vanished (or had no session):
+                                // drop it from the wheel so the entry doesn't
+                                // linger.
+                                wheel.remove(key);
+                            }
                         }
                     }
                     Due::Close4201(key) => {
@@ -991,19 +1067,23 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
 
 /// SP11 §4: queue a `pusher:ping` (v7 `{"event":"pusher:ping","data":{}}`) onto
 /// `key`'s out-queue and flush, the same way [`drain_session`] emits a server
-/// frame. Returns `true` if the frame was queued
-/// (the connection exists, is Open, and has a session); `false` otherwise (caller
-/// drops the wheel entry). A flush that backpressures arms writable interest; a
-/// flush that fails closes the connection on the next event.
-fn queue_ping(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) -> bool {
-    let Some(entry) = conns.get_mut(key) else {
-        return false;
-    };
-    let Some(session) = entry.session.as_mut() else {
-        return false;
-    };
+/// frame. Returns `Some(action)` when the ping was queued (the connection
+/// exists, is Open, and has a session) — `action` is the flush outcome, so a
+/// dead-peer write failure is reported as [`Action::Close`] and the caller
+/// reaps the connection instead of stranding the queued ping behind a poll
+/// interest that will never fire for a dead socket. Returns `None` otherwise
+/// (caller drops the wheel entry). A flush that backpressures arms writable
+/// interest, so the ping rides the next writable event.
+fn queue_ping(
+    poll: &Poll,
+    conns: &mut slab::Slab<Entry>,
+    key: usize,
+    now_ns: u64,
+) -> Option<Action> {
+    let entry = conns.get_mut(key)?;
+    let session = entry.session.as_mut()?;
     if entry.conn.state != ConnState::Open {
-        return false;
+        return None;
     }
     let text = session.codec.encode(&ServerEvent::Ping);
     let mut out = BytesMut::new();
@@ -1011,10 +1091,7 @@ fn queue_ping(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u6
     let _ = entry
         .conn
         .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
-    // Best-effort flush; interest re-arming / close is handled by the caller's
-    // subsequent `remove` only on a hard write failure (rare for a tiny frame).
-    let _ = flush_and_arm(poll, entry, now_ns);
-    true
+    Some(flush_and_arm(poll, entry, now_ns))
 }
 
 /// Queue a single WebSocket Close frame (`code` + `reason`) onto `entry`'s
@@ -2319,6 +2396,10 @@ fn handle_writable(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_n
 /// * [`WriteStatus::Drained`] → re-arm `READABLE`-only (drop `WRITABLE`).
 /// * [`WriteStatus::WouldBlock`] → add `WRITABLE` so we get a writable event.
 /// * [`WriteStatus::Closed`] → close.
+///
+/// The tracked `writable_armed` mirror on the [`Connection`] is updated after
+/// every successful re-registration so the loop-top debug invariant ("queued
+/// bytes ⇒ WRITABLE armed") can verify the arm really happened.
 fn flush_and_arm(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action {
     // Read the token before the mutable stream borrow below.
     let token = entry.token;
@@ -2331,6 +2412,7 @@ fn flush_and_arm(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action {
             {
                 return Action::Close;
             }
+            entry.conn.set_writable_armed(false);
             Action::Keep
         }
         WriteStatus::WouldBlock => {
@@ -2345,6 +2427,7 @@ fn flush_and_arm(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action {
             {
                 return Action::Close;
             }
+            entry.conn.set_writable_armed(true);
             Action::Keep
         }
         WriteStatus::Closed => Action::Close,

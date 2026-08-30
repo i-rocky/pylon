@@ -181,6 +181,16 @@ pub struct Connection {
     /// Count of frames dropped by CoDel on dequeue for being stale (sojourn
     /// `> 2 * target` while overloaded). Distinct from drop-head evictions.
     codel_dropped: u64,
+    /// Whether this connection's `mio` poll registration currently includes
+    /// [`mio::Interest::WRITABLE`] — the tracked mirror of the actual registry
+    /// interest, maintained by the worker at every re-registration site
+    /// ([`flush_and_arm`](crate::transport::worker) records each outcome; the
+    /// accept-time READABLE-only registration matches the `false` construction
+    /// default). Powers the worker-loop debug invariant "queued out-bytes ⇒
+    /// WRITABLE armed" — the tripwire proving an idle 50 ms poll can never
+    /// strand a backpressured connection's out-queue: with WRITABLE armed the
+    /// kernel wakes the loop the moment the socket drains.
+    writable_armed: bool,
     /// Signed accumulator of every change to `out_bytes` since the last
     /// [`take_inflight_delta`](Self::take_inflight_delta), so the worker can
     /// maintain its `inflight_bytes` total incrementally (O(work), not
@@ -208,6 +218,7 @@ impl Connection {
             codel: CodelParams::DISABLED,
             codel_state: CodelState::default(),
             codel_dropped: 0,
+            writable_armed: false,
             inflight_delta: 0,
         }
     }
@@ -226,6 +237,7 @@ impl Connection {
             codel: CodelParams::DISABLED,
             codel_state: CodelState::default(),
             codel_dropped: 0,
+            writable_armed: false,
             inflight_delta: 0,
         }
     }
@@ -790,6 +802,23 @@ impl Connection {
     /// re-arming).
     pub fn has_pending_writes(&self) -> bool {
         !self.out.is_empty()
+    }
+
+    /// Whether WRITABLE interest is currently armed on this connection's poll
+    /// registration (see the [`writable_armed`](Self::writable_armed) field
+    /// doc). Read by the worker loop's debug invariant: a connection with
+    /// queued out-bytes MUST hold WRITABLE interest, or an idle poll could
+    /// strand its backlog.
+    pub fn writable_armed(&self) -> bool {
+        self.writable_armed
+    }
+
+    /// Record the connection's current WRITABLE-interest state. Called by the
+    /// worker's `flush_and_arm` after every successful interest
+    /// re-registration; the accept-time READABLE-only registration is matched
+    /// by the `false` construction default.
+    pub fn set_writable_armed(&mut self, armed: bool) {
+        self.writable_armed = armed;
     }
 
     /// This connection's out-queue byte cap (its drop-head high-water). The
