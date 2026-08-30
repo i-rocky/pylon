@@ -1,4 +1,4 @@
-//! The six webhook triggers and their exact JSON serialization (spec §4).
+//! The seven webhook triggers and their exact JSON serialization (spec §4).
 //! Each `WebhookEvent` carries the app id (used to route at flush) plus the
 //! per-event fields; `to_json()` produces the object that goes in the envelope's
 //! `events` array, byte-shaped to match what pusher-http-node consumers expect.
@@ -40,6 +40,19 @@ pub enum WebhookEvent {
         app: String,
         channel: String,
     },
+    /// Verified against https://pusher.com/docs/channels/server_api/webhooks/
+    /// (checked 2026-08-30): "Channels will send a subscription_count webhook
+    /// whenever a new client subscribes or unsubscribes to a channel", payload
+    /// `{name, channel, subscription_count}` with the count as a JSON number.
+    /// Gated at emission on the app's Subscription Count feature flag
+    /// (`subscription_count_enabled`, the doc's App-Settings toggle), fires on
+    /// all channel types except presence, and NEVER carries a zero count (the
+    /// vacate edge's signal is `channel_vacated`).
+    SubscriptionCount {
+        app: String,
+        channel: String,
+        count: usize,
+    },
 }
 
 impl WebhookEvent {
@@ -51,7 +64,8 @@ impl WebhookEvent {
             | WebhookEvent::MemberAdded { app, .. }
             | WebhookEvent::MemberRemoved { app, .. }
             | WebhookEvent::ClientEvent { app, .. }
-            | WebhookEvent::CacheMiss { app, .. } => app,
+            | WebhookEvent::CacheMiss { app, .. }
+            | WebhookEvent::SubscriptionCount { app, .. } => app,
         }
     }
 
@@ -64,6 +78,7 @@ impl WebhookEvent {
             WebhookEvent::MemberRemoved { .. } => "member_removed",
             WebhookEvent::ClientEvent { .. } => "client_event",
             WebhookEvent::CacheMiss { .. } => "cache_miss",
+            WebhookEvent::SubscriptionCount { .. } => "subscription_count",
         }
     }
 
@@ -103,6 +118,9 @@ impl WebhookEvent {
             }
             WebhookEvent::CacheMiss { channel, .. } => {
                 json!({ "name": "cache_miss", "channel": channel })
+            }
+            WebhookEvent::SubscriptionCount { channel, count, .. } => {
+                json!({ "name": "subscription_count", "channel": channel, "subscription_count": count })
             }
         }
     }
@@ -163,6 +181,31 @@ mod tests {
             }
             .to_json(),
             json!({ "name": "cache_miss", "channel": "cache-x" })
+        );
+    }
+
+    /// Payload verified against https://pusher.com/docs/channels/server_api/webhooks/
+    /// (checked 2026-08-30): `{name, channel, subscription_count}` with the count
+    /// as a JSON NUMBER ("the subscription count").
+    #[test]
+    fn subscription_count_serializes_with_numeric_count() {
+        assert_eq!(
+            WebhookEvent::SubscriptionCount {
+                app: "a".into(),
+                channel: "ch".into(),
+                count: 2,
+            }
+            .to_json(),
+            json!({ "name": "subscription_count", "channel": "ch", "subscription_count": 2 })
+        );
+        assert_eq!(
+            WebhookEvent::SubscriptionCount {
+                app: "a".into(),
+                channel: "ch".into(),
+                count: 1,
+            }
+            .name(),
+            "subscription_count"
         );
     }
 

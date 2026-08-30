@@ -205,6 +205,22 @@ impl ConnectionContext {
                     None,
                 )
                 .await;
+            // `subscription_count` WEBHOOK — same edge as the broadcast above,
+            // additionally requiring the operator's per-endpoint opt-in. Verified
+            // against https://pusher.com/docs/channels/server_api/webhooks/
+            // (2026-08-30): "Channels will send a subscription_count webhook
+            // whenever a new client subscribes or unsubscribes to a channel".
+            // `count > 0` mirrors the cluster bridge's count-broadcast guard so
+            // both paths behave identically — the vacate edge's signal is
+            // `channel_vacated`, never a zero-count event (the local broadcast
+            // above with count 0 is a physical no-op: no subscriber remains).
+            if count > 0 && self.app.has_subscription_count_webhooks {
+                self.emit_webhook(crate::webhook::event::WebhookEvent::SubscriptionCount {
+                    app: self.app.id.clone(),
+                    channel: channel.to_string(),
+                    count,
+                });
+            }
         }
     }
 

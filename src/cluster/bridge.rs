@@ -771,6 +771,24 @@ async fn handle_cmd(
                         None,
                     )
                     .await;
+                // `subscription_count` WEBHOOK — emitted HERE (not in the worker's
+                // handler): this arm owns the cluster-authoritative count, exactly
+                // like the occupied webhook below. Verified against
+                // https://pusher.com/docs/channels/server_api/webhooks/ (2026-08-30):
+                // "Channels will send a subscription_count webhook whenever a new
+                // client subscribes or unsubscribes to a channel". The `count > 0` /
+                // enabled / non-presence gates are inherited from the broadcast above;
+                // `has_subscription_count_webhooks` is the operator's per-endpoint
+                // `event_types` opt-in.
+                if a.has_subscription_count_webhooks {
+                    if let Some(wh) = webhooks.get() {
+                        wh.enqueue(WebhookEvent::SubscriptionCount {
+                            app: app.to_string(),
+                            channel: channel.to_string(),
+                            count,
+                        });
+                    }
+                }
             }
             // Single cluster-wide channel_occupied on the cluster 0→1 edge.
             if occupied && a.has_channel_occupied_webhooks {
@@ -852,6 +870,19 @@ async fn handle_cmd(
                         None,
                     )
                     .await;
+                // `subscription_count` WEBHOOK with the REMAINING cluster count —
+                // emitted by this arm (the count's owner), mirroring Subscribe.
+                // The 1→0 edge skips this whole block: `channel_vacated` below is
+                // the vacancy signal, never a zero-count webhook.
+                if a.has_subscription_count_webhooks {
+                    if let Some(wh) = webhooks.get() {
+                        wh.enqueue(WebhookEvent::SubscriptionCount {
+                            app: app.to_string(),
+                            channel: channel.to_string(),
+                            count,
+                        });
+                    }
+                }
             }
             // Single cluster-wide channel_vacated on the cluster 1→0 edge. `vacated`
             // is the VACATE CAS verdict: true only when THIS unsubscribe's atomic

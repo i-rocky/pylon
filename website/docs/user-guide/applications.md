@@ -28,7 +28,8 @@ default `apps.json` (configurable via [`PYLON_APPS_PATH`](configuration.md)).
           "member_added",
           "member_removed",
           "client_event",
-          "cache_miss"
+          "cache_miss",
+          "subscription_count"
         ],
         "headers": { "X-Custom": "value" }
       }
@@ -47,7 +48,7 @@ default `apps.json` (configurable via [`PYLON_APPS_PATH`](configuration.md)).
 | `secret` | string | Shared secret for HMAC signing. Never sent to clients. |
 | `enabled` | boolean | When `false`, the app is treated as if it did not exist: new connections are rejected and (with a DB-backed store) existing connections are force-closed. Defaults to `true`. |
 | `client_messages_enabled` | boolean | When `true`, clients may publish events to channels via `client_event`. Defaults to `false`. |
-| `subscription_count_enabled` | boolean | When `true`, the server emits `pusher_internal:subscription_count` events as a channel's subscriber count changes. Defaults to `false`. |
+| `subscription_count_enabled` | boolean | When `true`, the server emits `pusher_internal:subscription_count` events as a channel's subscriber count changes, and the `subscription_count` webhook (if the endpoint also lists it in `event_types`). Defaults to `false`. |
 | `capacity` | integer | Maximum concurrent WebSocket connections for this app (`0` = unlimited). Connections beyond this limit are refused with WebSocket close code **4004**. |
 | `webhooks` | array | Zero or more webhook targets. Each entry has a `url`, an `event_types` list, and an optional `headers` map. See the [Webhooks](webhooks.md) page for the full event-type reference. |
 

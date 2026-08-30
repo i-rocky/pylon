@@ -24,7 +24,7 @@ third-party service.
 private-encrypted, and cache channels (including all `cache-`, `private-cache-`, and
 `presence-cache-` variants); client events; user authentication (`pusher:signin`); webhooks
 (`channel_occupied`, `channel_vacated`, `member_added`, `member_removed`, `client_event`,
-`cache_miss`); and the complete Pusher HTTP REST API including batch publish and presence queries.
+`cache_miss`, `subscription_count`); and the complete Pusher HTTP REST API including batch publish and presence queries.
 
 **Per-core architecture.** Pylon uses a shared-nothing, per-core event-loop model — one worker
 thread per CPU core, `SO_REUSEPORT` accept sharding, and an encode-once sharded fan-out path.

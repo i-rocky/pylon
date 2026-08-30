@@ -104,7 +104,18 @@ async fn spawn_pylon_with(
                             "event_types":["channel_occupied","channel_vacated"]}}]}}
         ]"#
     );
-    let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(&apps_json).unwrap());
+    spawn_pylon_apps(&apps_json, backoff_base_ms, backoff_cap_ms, retry_budget_ms).await
+}
+
+/// Like [`spawn_pylon_with`] but with the caller's raw `apps.json` (extra per-app
+/// flags like `subscription_count_enabled` and arbitrary `event_types`).
+async fn spawn_pylon_apps(
+    apps_json: &str,
+    backoff_base_ms: u64,
+    backoff_cap_ms: u64,
+    retry_budget_ms: u64,
+) -> SocketAddr {
+    let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(apps_json).unwrap());
     let local = Arc::new(LocalAdapter::new(
         Arc::new(Registry::new()),
         Arc::new(pylon::adapter::app_registry::AppRegistry::new()),
@@ -312,5 +323,286 @@ async fn metrics_reflect_a_driven_webhook() {
     assert!(
         delivered_ok >= 1,
         "pylon_webhook_delivered_total{{status=\"ok\"}} must be >= 1 after a 2xx delivery, got {delivered_ok}"
+    );
+}
+
+/// Collect every event object with `name == want` from the POSTs the receiver
+/// has captured so far, oldest first (POST order + in-envelope order).
+fn events_named(captured: &[(String, String)], want: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    for (body, _) in captured {
+        let env: Value = serde_json::from_str(body).unwrap();
+        if let Some(events) = env["events"].as_array() {
+            for e in events {
+                if e["name"].as_str() == Some(want) {
+                    out.push(e.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Task 2.5 / audit R6 (verified against
+/// https://pusher.com/docs/channels/server_api/webhooks/, 2026-08-30: "Channels
+/// will send a subscription_count webhook whenever a new client subscribes or
+/// unsubscribes to a channel", payload `{name, channel, subscription_count}`).
+/// An app with BOTH `subscription_count_enabled: true` (the App-Settings
+/// feature toggle the doc requires) AND the `subscription_count` webhook event
+/// type must see, in order: subscribe → count 1, second subscribe → count 2,
+/// unsubscribe → count 1. No zero-count event on the final unsubscribe is
+/// pinned here too (mirrors the cluster path's `count > 0` broadcast guard —
+/// `channel_vacated` is the vacancy signal).
+#[tokio::test]
+async fn subscription_count_webhook_carries_counts_across_sub_and_unsub() {
+    let (receiver_addr, mut rx) = spawn_receiver().await;
+    let apps_json = format!(
+        r#"[
+            {{"name":"Test","id":"app","key":"{KEY}","secret":"{SECRET}",
+              "client_messages_enabled":true,
+              "subscription_count_enabled":true,
+              "webhooks":[{{"url":"http://{receiver_addr}/pusher/webhooks",
+                            "event_types":["subscription_count"]}}]}}
+        ]"#
+    );
+    let pylon_addr = spawn_pylon_apps(&apps_json, 50, 100, 250).await;
+
+    let mut ws1 = connect(pylon_addr).await;
+    assert_eq!(
+        next_json(&mut ws1).await["event"],
+        "pusher:connection_established"
+    );
+    let mut ws2 = connect(pylon_addr).await;
+    assert_eq!(
+        next_json(&mut ws2).await["event"],
+        "pusher:connection_established"
+    );
+
+    for ws in [&mut ws1, &mut ws2] {
+        ws.send(Message::Text(
+            json!({ "event": "pusher:subscribe", "data": { "channel": "count-room" } }).to_string(),
+        ))
+        .await
+        .unwrap();
+    }
+    for ws in [&mut ws1, &mut ws2] {
+        assert_eq!(
+            next_json(ws).await["event"],
+            "pusher_internal:subscription_succeeded"
+        );
+    }
+    // Unsubscribe ws2 only → the count goes 2 → 1 (ws1 stays subscribed).
+    ws2.send(Message::Text(
+        json!({ "event": "pusher:unsubscribe", "data": { "channel": "count-room" } }).to_string(),
+    ))
+    .await
+    .unwrap();
+
+    // Collect POSTs until three subscription_count events have landed (bounded;
+    // the 30ms batch window may split or merge them, order is preserved).
+    let mut captured: Vec<(String, String)> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while events_named(&captured, "subscription_count").len() < 3 {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(pair)) => captured.push(pair),
+            other => panic!(
+                "expected 3 subscription_count webhooks, got {}: {other:?}",
+                events_named(&captured, "subscription_count").len()
+            ),
+        }
+    }
+    // Drain anything still inside the batch window so the "no more" assertions
+    // below see the full picture.
+    while let Ok(Some(pair)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+        captured.push(pair);
+    }
+
+    let events = events_named(&captured, "subscription_count");
+    let counts: Vec<u64> = events
+        .iter()
+        .map(|e| {
+            e["subscription_count"]
+                .as_u64()
+                .expect("count must be a JSON number")
+        })
+        .collect();
+    assert_eq!(
+        counts,
+        vec![1, 2, 1],
+        "counts must track subscribe/sub/unsub"
+    );
+    for e in &events {
+        assert_eq!(e["channel"], "count-room");
+        assert_eq!(e["name"], "subscription_count");
+        assert!(e.get("user_id").is_none(), "no extra fields in the payload");
+    }
+    assert_eq!(
+        events_named(&captured, "channel_occupied").len()
+            + events_named(&captured, "channel_vacated").len(),
+        0,
+        "endpoint subscribes to subscription_count only — no other event types"
+    );
+    assert!(
+        !counts.contains(&0),
+        "no zero-count webhook on vacate (count > 0 guard; channel_vacated is the vacancy signal)"
+    );
+
+    // ws1 is still subscribed; closing it vacates the channel — still no count-0
+    // subscription_count webhook.
+    ws1.send(Message::Close(None)).await.unwrap();
+    while let Ok(Some(pair)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+        captured.push(pair);
+    }
+    let counts_after: Vec<u64> = events_named(&captured, "subscription_count")
+        .iter()
+        .map(|e| e["subscription_count"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        counts_after,
+        vec![1, 2, 1],
+        "vacate must not emit a count-0 event"
+    );
+}
+
+/// Negative pin 1: an app WITHOUT `subscription_count` in its webhook
+/// `event_types` must never receive the event, even with
+/// `subscription_count_enabled: true` (the two toggles are independent: the
+/// feature flag enables the count machinery, the event_types entry routes the
+/// webhook).
+#[tokio::test]
+async fn subscription_count_webhook_absent_without_event_type() {
+    let (receiver_addr, mut rx) = spawn_receiver().await;
+    let apps_json = format!(
+        r#"[
+            {{"name":"Test","id":"app","key":"{KEY}","secret":"{SECRET}",
+              "client_messages_enabled":true,
+              "subscription_count_enabled":true,
+              "webhooks":[{{"url":"http://{receiver_addr}/pusher/webhooks",
+                            "event_types":["channel_occupied","channel_vacated"]}}]}}
+        ]"#
+    );
+    let pylon_addr = spawn_pylon_apps(&apps_json, 50, 100, 250).await;
+
+    let mut ws1 = connect(pylon_addr).await;
+    assert_eq!(
+        next_json(&mut ws1).await["event"],
+        "pusher:connection_established"
+    );
+    let mut ws2 = connect(pylon_addr).await;
+    assert_eq!(
+        next_json(&mut ws2).await["event"],
+        "pusher:connection_established"
+    );
+
+    for ws in [&mut ws1, &mut ws2] {
+        ws.send(Message::Text(
+            json!({ "event": "pusher:subscribe", "data": { "channel": "neg-room" } }).to_string(),
+        ))
+        .await
+        .unwrap();
+    }
+    for ws in [&mut ws1, &mut ws2] {
+        assert_eq!(
+            next_json(ws).await["event"],
+            "pusher_internal:subscription_succeeded"
+        );
+    }
+    ws2.send(Message::Text(
+        json!({ "event": "pusher:unsubscribe", "data": { "channel": "neg-room" } }).to_string(),
+    ))
+    .await
+    .unwrap();
+
+    // The pipeline is provably live once the occupied webhook POST arrives.
+    let mut captured: Vec<(String, String)> = Vec::new();
+    loop {
+        let pair = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("channel_occupied webhook POST arrived")
+            .expect("channel open");
+        captured.push(pair);
+        if !events_named(&captured, "channel_occupied").is_empty() {
+            break;
+        }
+    }
+    // Exposure window well beyond the 30ms batch window (+ unsubscribe edge).
+    while let Ok(Some(pair)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+        captured.push(pair);
+    }
+    assert_eq!(
+        events_named(&captured, "subscription_count").len(),
+        0,
+        "no subscription_count webhook without the event_types entry"
+    );
+}
+
+/// Negative pin 2: the webhook doc gates the event on the App-Settings
+/// Subscription Count feature toggle ("navigate to the Channels dashboard for
+/// your app > App Settings and switch the toggle on") — Pylon's
+/// `subscription_count_enabled`. With the flag off, listing
+/// `subscription_count` in `event_types` must NOT produce events.
+#[tokio::test]
+async fn subscription_count_webhook_absent_without_feature_toggle() {
+    let (receiver_addr, mut rx) = spawn_receiver().await;
+    let apps_json = format!(
+        r#"[
+            {{"name":"Test","id":"app","key":"{KEY}","secret":"{SECRET}",
+              "client_messages_enabled":true,
+              "subscription_count_enabled":false,
+              "webhooks":[{{"url":"http://{receiver_addr}/pusher/webhooks",
+                            "event_types":["subscription_count","channel_occupied"]}}]}}
+        ]"#
+    );
+    let pylon_addr = spawn_pylon_apps(&apps_json, 50, 100, 250).await;
+
+    let mut ws1 = connect(pylon_addr).await;
+    assert_eq!(
+        next_json(&mut ws1).await["event"],
+        "pusher:connection_established"
+    );
+    let mut ws2 = connect(pylon_addr).await;
+    assert_eq!(
+        next_json(&mut ws2).await["event"],
+        "pusher:connection_established"
+    );
+
+    for ws in [&mut ws1, &mut ws2] {
+        ws.send(Message::Text(
+            json!({ "event": "pusher:subscribe", "data": { "channel": "neg2-room" } }).to_string(),
+        ))
+        .await
+        .unwrap();
+    }
+    for ws in [&mut ws1, &mut ws2] {
+        assert_eq!(
+            next_json(ws).await["event"],
+            "pusher_internal:subscription_succeeded"
+        );
+    }
+    ws2.send(Message::Text(
+        json!({ "event": "pusher:unsubscribe", "data": { "channel": "neg2-room" } }).to_string(),
+    ))
+    .await
+    .unwrap();
+
+    // Pipeline live: the occupied POST arrives.
+    let mut captured: Vec<(String, String)> = Vec::new();
+    loop {
+        let pair = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("channel_occupied webhook POST arrived")
+            .expect("channel open");
+        captured.push(pair);
+        if !events_named(&captured, "channel_occupied").is_empty() {
+            break;
+        }
+    }
+    while let Ok(Some(pair)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+        captured.push(pair);
+    }
+    assert_eq!(
+        events_named(&captured, "subscription_count").len(),
+        0,
+        "no subscription_count webhook with subscription_count_enabled = false (doc: the App Settings feature toggle gates the event)"
     );
 }

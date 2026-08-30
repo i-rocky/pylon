@@ -142,6 +142,7 @@ fn row_to_app(r: &AnyRow) -> Result<App, AppLookupError> {
         has_member_removed_webhooks: false,
         has_client_event_webhooks: false,
         has_cache_miss_webhooks: false,
+        has_subscription_count_webhooks: false,
     };
     app.recompute_has_flags();
     app.validate().map_err(AppLookupError::Decode)?;

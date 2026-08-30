@@ -12,14 +12,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// The six webhook event names, in canonical order. The only legal `event_types`.
-pub const WEBHOOK_EVENT_TYPES: [&str; 6] = [
+/// The seven webhook event names, in canonical order. The only legal `event_types`.
+/// `subscription_count` additionally requires the app's Subscription Count feature
+/// flag (`subscription_count_enabled`) at emission time — the webhook doc gates the
+/// event on the App-Settings toggle.
+pub const WEBHOOK_EVENT_TYPES: [&str; 7] = [
     "channel_occupied",
     "channel_vacated",
     "member_added",
     "member_removed",
     "client_event",
     "cache_miss",
+    "subscription_count",
 ];
 
 /// A per-app webhook endpoint (apps.json `webhooks[]`).
@@ -62,6 +66,8 @@ pub struct App {
     pub has_client_event_webhooks: bool,
     #[serde(skip)]
     pub has_cache_miss_webhooks: bool,
+    #[serde(skip)]
+    pub has_subscription_count_webhooks: bool,
 }
 
 fn default_enabled() -> bool {
@@ -82,10 +88,11 @@ impl App {
         self.has_member_removed_webhooks = any("member_removed");
         self.has_client_event_webhooks = any("client_event");
         self.has_cache_miss_webhooks = any("cache_miss");
+        self.has_subscription_count_webhooks = any("subscription_count");
     }
 
     /// Fail-fast load validation (spec §6): non-empty `event_types`, every entry
-    /// one of the six, non-empty `url`.
+    /// one of the seven, non-empty `url`.
     pub fn validate(&self) -> Result<(), String> {
         for (i, w) in self.webhooks.iter().enumerate() {
             if w.url.trim().is_empty() {
@@ -219,6 +226,17 @@ mod tests {
         assert!(a.has_client_event_webhooks);
         assert!(!a.has_channel_vacated_webhooks);
         assert!(!a.has_member_added_webhooks);
+        assert!(a.validate().is_ok());
+    }
+
+    #[test]
+    fn subscription_count_is_a_valid_event_type_and_sets_its_flag() {
+        let a = parse(serde_json::json!({
+            "name": "t", "id": "app", "key": "k", "secret": "s",
+            "webhooks": [{ "url": "https://e.test", "event_types": ["subscription_count"] }]
+        }));
+        assert!(a.has_subscription_count_webhooks);
+        assert!(!a.has_channel_occupied_webhooks);
         assert!(a.validate().is_ok());
     }
 

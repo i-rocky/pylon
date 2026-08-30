@@ -22,7 +22,8 @@ types to deliver, and optional custom headers:
         "member_added",
         "member_removed",
         "client_event",
-        "cache_miss"
+        "cache_miss",
+        "subscription_count"
       ],
       "headers": {
         "X-Custom-Token": "secret-value"
@@ -44,7 +45,7 @@ You may define multiple webhook entries per app — each with its own URL and ev
 
 ## Event types
 
-Pylon fires six event types:
+Pylon fires seven event types:
 
 | Event type | Fired when |
 |---|---|
@@ -54,6 +55,7 @@ Pylon fires six event types:
 | `member_removed` | A client leaves a presence channel (`presence-*`). |
 | `client_event` | A client publishes a `client-` prefixed event (only fired when `client_messages_enabled` is `true` for the app). |
 | `cache_miss` | A new subscriber joins a cache channel (`cache-*`, `private-cache-*`, `presence-cache-*`) and no cached event exists for that channel. |
+| `subscription_count` | A client subscribes to or unsubscribes from a non-presence channel and the app has `subscription_count_enabled: true`. The payload carries the channel's new subscriber count. Fires for every count change (no count is ever `0` — the last subscriber leaving is signalled by `channel_vacated`). |
 
 ---
 
@@ -85,6 +87,17 @@ The `events` array contains one or more event objects. Their shapes by type:
 ```json
 { "name": "member_added", "channel": "presence-room", "user_id": "user-42" }
 ```
+
+**`subscription_count`:**
+```json
+{ "name": "subscription_count", "channel": "my-channel", "subscription_count": 2 }
+```
+
+Requires `subscription_count_enabled: true` on the app (the same toggle that enables the
+`pusher_internal:subscription_count` WebSocket event) in addition to the `event_types`
+entry. It fires on all channel types except presence channels. Hosted Channels throttles
+this webhook to once every 5 seconds on channels with more than 100 connected clients;
+pylon delivers every count change through its normal batch window and does not throttle.
 
 **`client_event`:**
 ```json
