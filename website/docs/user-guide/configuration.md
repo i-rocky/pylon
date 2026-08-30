@@ -158,6 +158,36 @@ a specific workload.
 
 ---
 
+## Deliberate restrictions vs hosted Pusher
+
+Pylon is a drop-in replacement for the common path, and a few tighter limits are
+deliberate hardening rather than gaps. They are all operator-tunable where that
+makes sense:
+
+- **REST request body cap.** POST bodies are capped at
+  `max_batch_events × max_event_payload_bytes + 64 KiB` of JSON-framing headroom
+  — **164 KiB at the defaults** (10 × 10 KiB + 64 KiB), where hosted Pusher
+  accepts up to a 10 MB envelope. Every legitimate request (a full batch of
+  max-size events) fits; the smaller cap simply bounds how much memory one
+  unauthenticated request can make the server allocate. Raising
+  `PYLON_MAX_BATCH_EVENTS` / `PYLON_MAX_EVENT_PAYLOAD_BYTES` raises the cap with
+  them.
+- **Per-connection subscription cap.** `PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION`
+  (default `200`, `0` = unlimited). Hosted Pusher documents no per-connection
+  subscription limit; this is a pylon-specific memory guard (each subscription
+  holds server-side state). Excess subscribes fail non-fatally with
+  `pusher:subscription_error` (`LimitReached`, `4004`).
+- **Protocol v7 only.** Pylon speaks Pusher Channels protocol **v7** and
+  nothing else: connections negotiating an unsupported `protocol`/`version` are
+  rejected with `4007`. There is no v5/v6 compatibility surface.
+- **Encrypted channels are a pure relay.** Like current hosted Pusher, the
+  encryption happens in the client libraries (and your app server for
+  server-triggered payloads) — pylon transports `private-encrypted-*` frames as
+  opaque ciphertext and never decrypts or inspects them. There is no
+  server-side `encryption_master_key` facility to configure.
+
+---
+
 For the authoritative full list of variables (including any added after this page was written),
 see [`src/server/config.rs`](https://github.com/i-rocky/pylon/blob/master/src/server/config.rs).
 

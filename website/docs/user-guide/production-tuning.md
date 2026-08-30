@@ -180,7 +180,7 @@ capacity). See [Applications & Authentication](applications.md).
 
 ## Graceful Restart
 
-Pylon supports zero-dropped-message restarts when used with a process manager:
+Pylon supports bounded-drain restarts when used with a process manager:
 
 1. Send `SIGTERM` to the running process.
 2. Pylon stops accepting new connections and sets `/ready` to `503 draining`.
@@ -190,6 +190,17 @@ Pylon supports zero-dropped-message restarts when used with a process manager:
    restarting — reconnect immediately") within `PYLON_SHUTDOWN_GRACE_MS`
    milliseconds (default: 10 000 ms).
 5. The process exits cleanly; the process manager starts the new binary.
+
+What the drain guarantees — and what it does not: each worker keeps flushing
+frames already **queued** for a connection until its outbound queue empties or
+the grace deadline passes, so in-flight delivery is not truncated mid-stream.
+Clients then reconnect (immediately, per the 4200 band) to the new process.
+**Events triggered during the restart gap are not replayed** — a publish that
+arrives while no node holds the channel's subscribers is simply delivered to
+whoever is subscribed at that moment, and a client that reconnects after the
+gap does not receive events from before its re-subscribe. If your workload
+needs gap coverage, drain with multiple instances behind the load balancer
+(restart one at a time) so surviving nodes hold the subscriptions.
 
 ```bash
 # systemd rolling restart
@@ -202,9 +213,10 @@ bounded 4200 close) is what makes the restart rolling rather than dropped;
 for zero-downtime at the front, run multiple instances behind a load balancer
 that health-checks `/ready` and restart them one at a time.
 
-Set `PYLON_SHUTDOWN_GRACE_MS` to allow enough time for your clients to
-reconnect before the old process exits. Pusher.js will reconnect immediately on
-a 4200 close, so even a short grace window avoids message loss.
+Set `PYLON_SHUTDOWN_GRACE_MS` to allow enough time for slow consumers to drain
+their queued frames before the old process exits. Pusher.js reconnects
+immediately on a 4200 close, but note the boundary above: the grace window
+bounds queue flushing, not delivery of events published during the gap.
 
 See [Observability](observability.md) for how to use `/ready` as a load-balancer
 health check.

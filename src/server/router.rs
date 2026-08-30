@@ -21,9 +21,14 @@ pub struct AppState {
     /// SP10 admission control: the percore broadcast pipeline's saturation flag,
     /// threaded as a side channel (NOT via the `Adapter` trait, which stays
     /// unchanged). `Some` whenever a concrete `LocalAdapter` backs the broadcast
-    /// sink (a clone of its flag); `None` when there's no concrete local adapter
-    /// (the redis+percore fallback) or in tests, where [`AppState::is_saturated`]
-    /// is always `false` so the 503 gate is a no-op.
+    /// sink (a clone of its flag).
+    ///
+    /// X2 — latent trap: `None` **disables the saturation gate entirely**
+    /// ([`AppState::is_saturated`] is then always `false`, so the REST 503
+    /// admission gate and the WS client-event ingress drop are silent no-ops).
+    /// Both production paths in `main.rs` (standalone local and clustered
+    /// redis+percore) pass `Some(local.saturation_flag())`; `None` appears only
+    /// in tests. Do not wire a production `AppState` without the flag.
     pub saturated: Option<Arc<AtomicBool>>,
     /// C2b graceful-shutdown draining flag. Set to `true` when a shutdown signal
     /// fires (C2a, a later task). The `/ready` handler returns 503 while draining
