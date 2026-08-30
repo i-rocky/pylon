@@ -417,6 +417,9 @@ pub fn run_percore(
         let cfg = WorkerConfig {
             addr,
             max_payload,
+            // Reassembled-message cap (RFC 6455 §5.4): the per-message event
+            // budget — tighter than the per-frame `max_payload` ceiling.
+            max_message_bytes: config.max_event_payload_bytes,
             high_water,
             mode: Mode::Dispatch(env.clone()),
             rest_handoff: rest_handoff.clone(),

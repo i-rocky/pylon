@@ -11,6 +11,9 @@ use futures_util::SinkExt;
 use futures_util::StreamExt;
 use pylon::server::config::ServerConfig;
 use serde_json::{json, Value};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::Data as WsData;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::OpCode as WsOpCode;
+use tokio_tungstenite::tungstenite::protocol::frame::Frame as WsFrame;
 use tokio_tungstenite::tungstenite::Message;
 
 /// Spawn the standard capacity-2 app on the selected transport.
@@ -454,4 +457,191 @@ async fn ws_client_event_name_exactly_200_is_broadcast() {
     .expect("b must receive a client-event with a 200-char name");
     assert_eq!(got["event"], exact_event);
     assert_eq!(got["channel"], "private-y");
+}
+
+// ── P1 parity tests — fragmented text messages (RFC 6455 §5.4) ──────────────
+
+/// Send one raw WebSocket frame (the tokio-tungstenite writer applies the
+/// mandatory client masking itself, RFC 6455 §5.1). This is how the tests
+/// below split a message into FIN=0 / FIN=1 fragments.
+async fn send_raw_frame(ws: &mut Ws, frame: WsFrame) {
+    ws.send(Message::Frame(frame)).await.unwrap();
+}
+
+/// P1: a `pusher:subscribe` split across a FIN=0 Text frame and a FIN=1
+/// Continuation frame must be reassembled into one protocol message and
+/// answered with `pusher_internal:subscription_succeeded` (RFC 6455 §5.4).
+#[tokio::test]
+async fn fragmented_text_message_is_reassembled_and_dispatched() {
+    let addr = spawn(ServerConfig::default()).await;
+    let mut ws = connect(addr, "?protocol=7").await;
+    let _ = established_socket_id(&mut ws).await;
+
+    // `pusher:subscribe` for "frag-ch", split mid-word.
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(
+            b"{\"event\":\"pusher:sub".to_vec(),
+            WsOpCode::Data(WsData::Text),
+            false,
+        ),
+    )
+    .await;
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(
+            b"scribe\",\"data\":{\"channel\":\"frag-ch\"}}".to_vec(),
+            WsOpCode::Data(WsData::Continue),
+            true,
+        ),
+    )
+    .await;
+
+    let frame = next_event_named(&mut ws, "pusher_internal:subscription_succeeded").await;
+    assert_eq!(frame["channel"], "frag-ch");
+}
+
+/// P1 / RFC 6455 §5.5.2: control frames interleaved between fragments must be
+/// answered immediately — a Ping sent between the two fragments of a message
+/// gets its Pong back BEFORE the completed message is dispatched.
+#[tokio::test]
+async fn ping_between_fragments_is_answered_before_message_completes() {
+    let addr = spawn(ServerConfig::default()).await;
+    let mut ws = connect(addr, "?protocol=7").await;
+    let _ = established_socket_id(&mut ws).await;
+
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(
+            b"{\"event\":\"pusher:sub".to_vec(),
+            WsOpCode::Data(WsData::Text),
+            false,
+        ),
+    )
+    .await;
+    ws.send(Message::Ping(b"mid-fragment".to_vec()))
+        .await
+        .unwrap();
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(
+            b"scribe\",\"data\":{\"channel\":\"frag-mid\"}}".to_vec(),
+            WsOpCode::Data(WsData::Continue),
+            true,
+        ),
+    )
+    .await;
+
+    // The very first inbound frame must be the mid-fragment Pong, not the
+    // completed message's reply.
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        .await
+        .expect("a frame within 5s")
+        .expect("stream open");
+    match first {
+        Ok(Message::Pong(p)) => assert_eq!(p.as_slice(), b"mid-fragment"),
+        other => panic!("expected Pong before the message completes, got {other:?}"),
+    }
+    let frame = next_event_named(&mut ws, "pusher_internal:subscription_succeeded").await;
+    assert_eq!(frame["channel"], "frag-mid");
+}
+
+/// P1 cap rule: the assembled message is capped at `max_event_payload_bytes`
+/// (default 10 KiB) per message. An oversize assembled message is dropped and
+/// the accumulator reset WITHOUT closing the connection — the follow-up
+/// well-formed fragmented message below must still reassemble and dispatch.
+#[tokio::test]
+async fn oversize_assembled_message_is_dropped_and_connection_stays_usable() {
+    let addr = spawn(ServerConfig::default()).await; // max_event_payload_bytes = 10_240
+    let mut ws = connect(addr, "?protocol=7").await;
+    let _ = established_socket_id(&mut ws).await;
+
+    // Two 8 KiB fragments: each alone is under the per-message cap, the
+    // assembled 16 KiB message exceeds it.
+    let first = format!(
+        "{{\"event\":\"pusher:subscribe\",\"data\":{{\"channel\":\"cap-ch\",\"pad\":\"{}",
+        "a".repeat(8 * 1024)
+    );
+    let second = format!("{}\"}}}}", "b".repeat(8 * 1024));
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(first.into_bytes(), WsOpCode::Data(WsData::Text), false),
+    )
+    .await;
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(second.into_bytes(), WsOpCode::Data(WsData::Continue), true),
+    )
+    .await;
+
+    // The oversize message must be dropped silently: no error, no close, no reply.
+    if let Some(v) = try_next_json_short(&mut ws).await {
+        panic!("oversize assembled message must be dropped silently, got {v}");
+    }
+
+    // The accumulator was reset, so a small well-formed fragmented message
+    // still reassembles and dispatches (proves the connection is usable AND
+    // the accumulator was not left wedged open).
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(
+            b"{\"event\":\"pusher:sub".to_vec(),
+            WsOpCode::Data(WsData::Text),
+            false,
+        ),
+    )
+    .await;
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(
+            b"scribe\",\"data\":{\"channel\":\"after-cap\"}}".to_vec(),
+            WsOpCode::Data(WsData::Continue),
+            true,
+        ),
+    )
+    .await;
+    let frame = next_event_named(&mut ws, "pusher_internal:subscription_succeeded").await;
+    assert_eq!(frame["channel"], "after-cap");
+}
+
+/// P1 / RFC 6455 §5.4: a new Text data frame arriving while a fragmented
+/// message is open is a protocol violation — the server must fail the
+/// connection with a WebSocket Close carrying code 1002 (protocol error), and
+/// the interleaved message must NOT be dispatched.
+#[tokio::test]
+async fn text_frame_while_fragment_open_closes_1002() {
+    let addr = spawn(ServerConfig::default()).await;
+    let mut ws = connect(addr, "?protocol=7").await;
+    let _ = established_socket_id(&mut ws).await;
+
+    // Open a fragment...
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(
+            b"{\"event\":\"pusher:sub".to_vec(),
+            WsOpCode::Data(WsData::Text),
+            false,
+        ),
+    )
+    .await;
+    // ...then send a NEW complete Text message instead of the continuation.
+    send_json(
+        &mut ws,
+        json!({ "event": "pusher:subscribe", "data": { "channel": "viol-ch" } }),
+    )
+    .await;
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        .await
+        .expect("a frame within 5s")
+        .expect("stream open");
+    match first {
+        Ok(Message::Close(Some(cf))) => assert_eq!(
+            u16::from(cf.code),
+            1002,
+            "expected close code 1002, got {}",
+            cf.code
+        ),
+        other => panic!("expected Close(1002) on interleaved Text frame, got {other:?}"),
+    }
 }

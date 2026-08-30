@@ -154,6 +154,13 @@ pub struct WorkerConfig {
     pub addr: std::net::SocketAddr,
     /// Maximum accepted WebSocket payload size (bytes) per frame.
     pub max_payload: usize,
+    /// Maximum accepted size (bytes) of one REASSEMBLED inbound text message
+    /// (the sum of its RFC 6455 §5.4 fragments). Plumbed from
+    /// `max_event_payload_bytes` — the same per-message budget the protocol
+    /// layer holds unfragmented events to. An assembled message over this cap
+    /// is dropped (and the fragment accumulator reset) WITHOUT closing the
+    /// connection; each individual fragment stays bounded by `max_payload`.
+    pub max_message_bytes: usize,
     /// Per-connection outbound high-water mark (bytes) before backpressure-close.
     pub high_water: usize,
     /// Behaviour applied to inbound frames.
@@ -265,6 +272,14 @@ struct Entry {
     token: Token,
     /// v7 protocol state; `None` for echo workers and pre-handshake connections.
     session: Option<Session>,
+    /// RFC 6455 §5.4: in-progress fragmented text-message accumulator. `Some`
+    /// once a FIN=0 Text frame has opened a message; Continuation frames append
+    /// to it and the FIN=1 Continuation dispatches the assembled payload
+    /// through the normal Text path, resetting this to `None`. Also reset —
+    /// and the partial message dropped — when the assembled size would exceed
+    /// the per-message cap (`max_message_bytes`); the accumulator dies with
+    /// this `Entry` when the connection closes.
+    fragment: Option<Vec<u8>>,
     /// Phase 7: set while this connection is PARKED waiting on an offloaded app
     /// lookup (L1 miss). `Open` + `session: None` + `pending_establish: Some(..)`
     /// is the park state. Cleared (`take`) when its `ResolvedApp` arrives, or
@@ -1104,6 +1119,7 @@ fn accept_ready(
                     inbuf: BytesMut::new(),
                     token: Token(key),
                     session: None,
+                    fragment: None,
                     pending_establish: None,
                 });
                 accepted += 1;
@@ -1494,7 +1510,7 @@ fn handle_frames(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig, now_ns: u64
 
     match &cfg.mode {
         Mode::Echo => echo_frames(poll, entry, frames, now_ns),
-        Mode::Dispatch(_) => dispatch_frames(poll, entry, frames, now_ns),
+        Mode::Dispatch(_) => dispatch_frames(poll, entry, frames, cfg.max_message_bytes, now_ns),
     }
 }
 
@@ -1532,34 +1548,86 @@ fn echo_frames(poll: &Poll, entry: &mut Entry, frames: Vec<frame::Frame>, now_ns
     }
 }
 
-/// [`Mode::Dispatch`]: decode each Text frame to a [`ClientCommand`] and drive
-/// `ctx.dispatch`, answer pings with pongs, close on a Close frame, then drain
-/// this connection's mailbox so any self-directed replies go out.
+/// [`Mode::Dispatch`]: decode each complete Text message to a [`ClientCommand`]
+/// and drive `ctx.dispatch`, answer pings with pongs, close on a Close frame,
+/// then drain this connection's mailbox so any self-directed replies go out.
+///
+/// Fragmented text messages (RFC 6455 §5.4) are reassembled in
+/// [`Entry::fragment`] before dispatch: a FIN=0 Text frame opens the
+/// accumulation, Continuation frames append (bounded by `max_message_bytes`),
+/// and the FIN=1 Continuation dispatches the assembled payload through the
+/// same path as an unfragmented Text frame. Control frames interleaved
+/// mid-fragment are handled in frame order, so a Ping between fragments is
+/// answered before the message completes (RFC 6455 §5.5.2).
 fn dispatch_frames(
     poll: &Poll,
     entry: &mut Entry,
     frames: Vec<frame::Frame>,
+    max_message_bytes: usize,
     now_ns: u64,
 ) -> Action {
     for f in frames {
         match f.opcode {
+            // RFC 6455 §5.4: a fragmented message consists of one FIN=0 data
+            // frame followed by Continuation frames ONLY. Interleaving any new
+            // data frame (Text or Binary) with an open fragmented message is a
+            // protocol violation — fail the connection with Close 1002.
+            OpCode::Text | OpCode::Binary if entry.fragment.is_some() => {
+                return close_fragment_violation(
+                    poll,
+                    entry,
+                    now_ns,
+                    "data frame interleaved with a fragmented message",
+                );
+            }
+            OpCode::Text if !f.fin => {
+                // First fragment of a new message: hold the payload until the
+                // FIN=1 Continuation completes it. No cap check here — a lone
+                // first fragment is already bounded by the per-frame
+                // `max_payload`; the per-message cap fires on the next append.
+                entry.fragment = Some(f.payload.to_vec());
+            }
             OpCode::Text => {
-                // The session always exists once Open on a dispatch worker.
-                let Some(session) = entry.session.as_mut() else {
+                // A complete (unfragmented) message.
+                if dispatch_text_message(entry, &f.payload) == Action::Close {
                     return Action::Close;
+                }
+            }
+            OpCode::Continuation => {
+                // RFC 6455 §5.4: a Continuation must follow an open fragmented
+                // message on this connection; a stray one is a protocol
+                // violation — fail the connection with Close 1002. (This also
+                // catches further fragments of a message already dropped for
+                // exceeding the cap below.)
+                let Some(mut buf) = entry.fragment.take() else {
+                    return close_fragment_violation(
+                        poll,
+                        entry,
+                        now_ns,
+                        "continuation frame without a fragmented message",
+                    );
                 };
-                let text = match std::str::from_utf8(&f.payload) {
-                    Ok(t) => t,
-                    // A non-UTF-8 text frame is malformed; drop it.
-                    Err(_) => continue,
-                };
-                match session.codec.decode(text) {
-                    Ok(cmd) => dispatch_command(session, cmd),
-                    Err(e) => {
-                        // Unparseable frames are silently dropped; 4200 is a
-                        // close/reconnect code and must not be sent in-band.
-                        tracing::trace!("dropping malformed client frame: {e}");
+                // Per-message byte cap (`max_event_payload_bytes`): the same
+                // budget an unfragmented protocol message is held to. Oversize
+                // → drop the partial message AND reset the accumulator; the
+                // connection stays usable for the next well-formed message.
+                if buf.len().saturating_add(f.payload.len()) > max_message_bytes {
+                    tracing::trace!(
+                        assembled = buf.len() + f.payload.len(),
+                        max_message_bytes,
+                        "dropping oversize fragmented message"
+                    );
+                    continue; // `buf` dropped here; accumulator left reset (`None`).
+                }
+                buf.extend_from_slice(&f.payload);
+                if f.fin {
+                    // Message complete: dispatch the assembled payload through
+                    // the normal Text path (`fragment` stays `None`).
+                    if dispatch_text_message(entry, &buf) == Action::Close {
+                        return Action::Close;
                     }
+                } else {
+                    entry.fragment = Some(buf); // still open — keep accumulating.
                 }
             }
             OpCode::Ping => {
@@ -1568,10 +1636,19 @@ fn dispatch_frames(
                 let _ = entry
                     .conn
                     .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+                // RFC 6455 §5.5.2: answer a Ping "as soon as is practical" —
+                // flush the Pong NOW. The end-of-batch drain below only
+                // flushes when mailbox events were written, so a lone Ping's
+                // reply (e.g. interleaved mid-fragment) would otherwise sit
+                // queued until unrelated activity.
+                if flush_and_arm(poll, entry, now_ns) == Action::Close {
+                    return Action::Close;
+                }
             }
             OpCode::Pong => {}
-            // Binary/Continuation are not part of the Pusher protocol; ignore.
-            OpCode::Binary | OpCode::Continuation => {}
+            // Binary is not part of the Pusher protocol; ignore (an open
+            // fragment was already failed by the guard arm above).
+            OpCode::Binary => {}
             OpCode::Close => return Action::Close,
         }
     }
@@ -1582,6 +1659,50 @@ fn dispatch_frames(
     // membership after a `Keep` (see the `Action::Keep` arm in `run`), so any
     // `subscribed` change a drained `SubscriptionError` made here is picked up there.
     drain_session(poll, entry, now_ns).action
+}
+
+/// Dispatch one complete (reassembled or unfragmented) text payload through
+/// the v7 codec. Returns `Action::Close` only when the session is gone;
+/// malformed payloads (non-UTF-8, undecodable) are dropped silently, matching
+/// the pre-fragmentation behavior.
+fn dispatch_text_message(entry: &mut Entry, payload: &[u8]) -> Action {
+    // The session always exists once Open on a dispatch worker.
+    let Some(session) = entry.session.as_mut() else {
+        return Action::Close;
+    };
+    let text = match std::str::from_utf8(payload) {
+        Ok(t) => t,
+        // A non-UTF-8 text frame is malformed; drop it.
+        Err(_) => return Action::Keep,
+    };
+    match session.codec.decode(text) {
+        Ok(cmd) => dispatch_command(session, cmd),
+        Err(e) => {
+            // Unparseable frames are silently dropped; 4200 is a
+            // close/reconnect code and must not be sent in-band.
+            tracing::trace!("dropping malformed client frame: {e}");
+        }
+    }
+    Action::Keep
+}
+
+/// Fail the connection for an RFC 6455 §5.4 fragmentation violation: queue a
+/// WebSocket Close frame with status code 1002 (protocol error) + `reason`,
+/// flush it so it reaches the peer before teardown (`remove()` does not
+/// flush), and report [`Action::Close`]. The fragment accumulator is reset —
+/// explicit here even though the entry is torn down immediately after.
+fn close_fragment_violation(poll: &Poll, entry: &mut Entry, now_ns: u64, reason: &str) -> Action {
+    entry.fragment = None;
+    let mut frame_body = Vec::with_capacity(2 + reason.len());
+    frame_body.extend_from_slice(&1002u16.to_be_bytes());
+    frame_body.extend_from_slice(reason.as_bytes());
+    let mut out = BytesMut::new();
+    frame::encode(&mut out, true, OpCode::Close, &frame_body);
+    let _ = entry
+        .conn
+        .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+    let _ = flush_and_arm(poll, entry, now_ns);
+    Action::Close
 }
 
 /// Run one command through the (async) protocol handler synchronously.
@@ -2389,6 +2510,7 @@ mod tests {
                 WorkerConfig {
                     addr,
                     max_payload: 1 << 20,
+                    max_message_bytes: 1 << 20,
                     high_water: 1 << 20,
                     mode: Mode::Echo,
                     rest_handoff: None,
