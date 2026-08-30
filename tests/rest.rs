@@ -212,6 +212,25 @@ async fn established_socket_id(ws: &mut Ws) -> String {
     data["socket_id"].as_str().unwrap().to_string()
 }
 
+/// Subscribe an established `ws` (socket_id already read) to a presence
+/// channel as `user_id`, consuming the roster success frame.
+async fn subscribe_presence(ws: &mut Ws, socket_id: &str, channel: &str, user_id: &str) {
+    let channel_data = json!({"user_id": user_id}).to_string();
+    let token = format!(
+        "app-key:{}",
+        channel_signature(SECRET, socket_id, channel, Some(&channel_data))
+    );
+    ws.send(Message::Text(
+        json!({"event":"pusher:subscribe","data":{
+            "channel": channel, "auth": token, "channel_data": channel_data
+        }})
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let _ = next_json(ws).await; // pusher_internal:subscription_succeeded (roster)
+}
+
 /// Subscribe `ws` to a public channel and consume the success frame.
 async fn subscribe_public(ws: &mut Ws, channel: &str) {
     ws.send(Message::Text(
@@ -438,6 +457,161 @@ async fn rest_get_channel_cache_info_null_after_ttl_expiry() {
     );
 }
 
+// ── R8 — inapplicable info attributes on channel queries are 400 ────────────
+//
+// Verified against https://pusher.com/docs/channels/library_auth_reference/rest-api/
+// (fetched 2026-08-30). GET /apps/[app_id]/channels/[channel_name], "Available
+// info attributes" table (applicability column):
+//
+//   user_count         — Presence
+//   subscription_count — All (except Presence channels)
+//   cache              — Cache
+//
+// "Requesting an attribute which is not available for the requested channel
+// will return an error (for example requesting a the `user_count` for a public
+// channel)."
+
+/// R8: GET /channels/:name?info=user_count on each non-presence kind → 400
+/// (the doc's literal example is user_count on a public channel).
+#[tokio::test]
+async fn rest_get_channel_user_count_on_non_presence_is_400() {
+    let addr = spawn().await;
+    for ch in ["public-room", "private-room", "private-encrypted-room"] {
+        let q = signed_query(
+            "GET",
+            &format!("/apps/app1/channels/{ch}"),
+            b"",
+            &[("info", "user_count")],
+        );
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/apps/app1/channels/{ch}?{q}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "user_count on {ch} must be 400");
+        let v: Value = resp.json().await.unwrap();
+        assert_eq!(v["status"], 400, "error body must be JSON, got: {v}");
+        assert!(
+            v["error"].is_string(),
+            "error body must carry error, got: {v}"
+        );
+    }
+}
+
+/// R8 positive control: user_count on a presence channel → 200 with the count.
+#[tokio::test]
+async fn rest_get_channel_user_count_on_presence_is_200() {
+    let addr = spawn().await;
+    let mut ws = connect_ws(addr).await;
+    let socket_id = established_socket_id(&mut ws).await;
+    subscribe_presence(&mut ws, &socket_id, "presence-room", "u1").await;
+
+    let q = signed_query(
+        "GET",
+        "/apps/app1/channels/presence-room",
+        b"",
+        &[("info", "user_count")],
+    );
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/apps/app1/channels/presence-room?{q}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["user_count"], 1, "got: {v}");
+}
+
+/// R8: subscription_count on a presence channel → 400 ("All (except Presence
+/// channels)"). Uses app2 (subscription_count_enabled=true) so the 400 is
+/// proven to come from channel-type applicability, not the app setting.
+/// Positive controls on non-presence channels: rest_get_channel_subscription_
+/// count_enabled / rest_get_channel_reports_occupancy.
+#[tokio::test]
+async fn rest_get_channel_subscription_count_on_presence_is_400() {
+    let addr = spawn().await;
+    let q = signed_query2(
+        "GET",
+        "/apps/app2/channels/presence-room",
+        b"",
+        &[("info", "subscription_count")],
+    );
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/apps/app2/channels/presence-room?{q}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "subscription_count on presence must be 400"
+    );
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["status"], 400, "error body must be JSON, got: {v}");
+    assert!(
+        v["error"].is_string(),
+        "error body must carry error, got: {v}"
+    );
+}
+
+/// R8: cache on each non-cache channel kind → 400 ("Cache" applicability).
+/// `presence-room` proves auth kind and cache-ness are orthogonal dimensions.
+/// Positive controls on cache channels: the R7 cache tests above.
+#[tokio::test]
+async fn rest_get_channel_cache_on_non_cache_is_400() {
+    let addr = spawn().await;
+    for ch in ["public-room", "private-room", "presence-room"] {
+        let q = signed_query(
+            "GET",
+            &format!("/apps/app1/channels/{ch}"),
+            b"",
+            &[("info", "cache")],
+        );
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/apps/app1/channels/{ch}?{q}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "cache on {ch} must be 400");
+        let v: Value = resp.json().await.unwrap();
+        assert_eq!(v["status"], 400, "error body must be JSON, got: {v}");
+        assert!(
+            v["error"].is_string(),
+            "error body must carry error, got: {v}"
+        );
+    }
+}
+
+/// R8: `cache` stays applicable on a presence-cache channel (a cache channel of
+/// any auth kind): no cached event → the doc's empty case, `"cache": null`.
+#[tokio::test]
+async fn rest_get_channel_cache_on_presence_cache_channel_is_200() {
+    let addr = spawn().await;
+    let q = signed_query(
+        "GET",
+        "/apps/app1/channels/presence-cache-room",
+        b"",
+        &[("info", "cache")],
+    );
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/apps/app1/channels/presence-cache-room?{q}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert!(
+        v["cache"].is_null(),
+        "empty cache on a presence-cache channel must be null, got: {v}"
+    );
+}
+
 /// POST /events with info=subscription_count and flag OFF → attribute omitted.
 #[tokio::test]
 async fn rest_trigger_info_subscription_count_disabled() {
@@ -601,6 +775,67 @@ async fn rest_get_channels_list_subscription_count_disabled() {
             .is_none(),
         "GET /channels with flag OFF must NOT emit subscription_count (P15), got: {v}"
     );
+}
+
+// R8, collection endpoint (GET /apps/[app_id]/channels): the doc's "Available
+// info attributes" table there has a single row — `user_count` (Presence) —
+// and "If an attribute such as `user_count` is requested, and the request is
+// not limited to presence channels, the API will return an error (400 code)."
+// That 400 is pinned by rest_channels_user_count_without_presence_filter_is_
+// 400 / _with_presence_filter_is_200 (P7b). `cache` read-back is documented
+// only for the single-channel endpoint, so requesting it here is the
+// inapplicable-attribute 400. `subscription_count` is absent from the
+// collection table too, but is deliberately kept working (flag-gated) — see
+// the comment on the handler.
+
+/// R8: GET /channels?info=cache → 400 (no `cache` row in the collection
+/// endpoint's info table; cached-data read-back is single-channel only).
+#[tokio::test]
+async fn rest_get_channels_cache_info_is_400() {
+    let addr = spawn().await;
+    let q = signed_query("GET", "/apps/app1/channels", b"", &[("info", "cache")]);
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/apps/app1/channels?{q}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "cache on the collection endpoint must be 400"
+    );
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["status"], 400, "error body must be JSON, got: {v}");
+    assert!(
+        v["error"].is_string(),
+        "error body must carry error, got: {v}"
+    );
+}
+
+/// R8 positive control: GET /channels?info=user_count&filter_by_prefix=
+/// presence- returns the count for an occupied presence channel (P7b only
+/// pinned the status code, not the payload).
+#[tokio::test]
+async fn rest_get_channels_user_count_with_presence_filter_returns_count() {
+    let addr = spawn().await;
+    let mut ws = connect_ws(addr).await;
+    let socket_id = established_socket_id(&mut ws).await;
+    subscribe_presence(&mut ws, &socket_id, "presence-room", "u1").await;
+
+    let q = signed_query(
+        "GET",
+        "/apps/app1/channels",
+        b"",
+        &[("info", "user_count"), ("filter_by_prefix", "presence-")],
+    );
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/apps/app1/channels?{q}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["channels"]["presence-room"]["user_count"], 1, "got: {v}");
 }
 
 #[tokio::test]

@@ -1,6 +1,6 @@
 //! GET /apps/{app_id}/channels and /channels/{name}.
 
-use crate::channel::kind::ChannelInfo;
+use crate::channel::kind::{AuthKind, ChannelInfo};
 use crate::http::error::RestError;
 use crate::http::rest::auth::authenticate;
 use crate::server::router::AppState;
@@ -44,6 +44,19 @@ pub async fn get_channels(
             "user_count is only allowed when filtering by presence channels",
         ));
     }
+    // R8: this endpoint's doc table has a single info row — `user_count`
+    // (Presence). `cache` read-back ("Cached data and TTL ... for this
+    // channel") is documented only for GET /channels/{name}, so requesting it
+    // here is an inapplicable-attribute 400, same rule as user_count above.
+    // (`subscription_count` is missing from the collection table too, but is
+    // deliberately kept working — flag-gated, as on the single-channel
+    // endpoint — because hosted Pusher serves it here and Pylon pins that in
+    // tests; see rest_get_channels_list_subscription_count_enabled.)
+    if wants(&params, "cache") {
+        return Err(RestError::bad_request(
+            "cache is not available when listing channels",
+        ));
+    }
     let summaries = state.adapter.channels(&app.id, prefix).await;
     let mut chans = Map::new();
     for s in summaries {
@@ -69,6 +82,29 @@ pub async fn get_channel(
 ) -> Result<Json<Value>, RestError> {
     let params = query_params(query)?;
     let app = authenticate(&state, &app_id, "GET", uri.path(), &params, &[]).await?;
+    // R8: enforce the doc's info-attribute applicability BEFORE any lookup —
+    // the table says `user_count` → "Presence", `subscription_count` → "All
+    // (except Presence channels)", `cache` → "Cache", and "Requesting an
+    // attribute which is not available for the requested channel will return
+    // an error (for example requesting a the `user_count` for a public
+    // channel)." Auth kind and cache-ness are orthogonal, so a
+    // presence-cache-* channel is valid for both user_count and cache.
+    let info = ChannelInfo::of(&channel);
+    if wants(&params, "user_count") && info.auth != AuthKind::Presence {
+        return Err(RestError::bad_request(
+            "user_count is only available for presence channels",
+        ));
+    }
+    if wants(&params, "subscription_count") && info.auth == AuthKind::Presence {
+        return Err(RestError::bad_request(
+            "subscription_count is not available for presence channels",
+        ));
+    }
+    if wants(&params, "cache") && !info.cache {
+        return Err(RestError::bad_request(
+            "cache is only available for cache channels",
+        ));
+    }
     let s = state.adapter.channel(&app.id, &channel).await;
     let mut out = Map::new();
     out.insert("occupied".into(), Value::Bool(s.occupied));
@@ -85,11 +121,10 @@ pub async fn get_channel(
     // empty." `cache_get` is TTL-aware (local: lazy expiry check; redis: PX
     // key expiry), so an expired entry already reads as the doc's empty case.
     // The reported `ttl` is the channel's cache TTL (`cache_ttl_secs`), the
-    // same value the REST trigger cached the event with.
-    //
-    // Requesting `cache` on a non-cache channel is the inapplicable-attribute
-    // 400 (Task 2.7); until that lands the attribute is simply omitted.
-    if wants(&params, "cache") && ChannelInfo::of(&channel).cache {
+    // same value the REST trigger cached the event with. (Reaching here with
+    // `info=cache` implies a cache channel — the R8 check above rejected the
+    // rest.)
+    if wants(&params, "cache") {
         let cached = state.adapter.cache_get(&app.id, &channel).await;
         let v = match cached {
             Some(e) => json!({ "data": e.data, "ttl": state.config.cache_ttl_secs }),
