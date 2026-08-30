@@ -1,8 +1,8 @@
 # Webhooks
 
 Pylon fires signed HTTP POST requests (webhooks) to your server when specific channel events
-occur. Webhooks are configured per-app in `apps.json` and delivered with retry and backoff on
-transient failures.
+occur. Webhooks are configured per-app in `apps.json`. Like Pusher Channels, pylon retries any
+delivery that does not get a 2xx response, with exponential backoff, for up to five minutes.
 
 ---
 
@@ -165,10 +165,34 @@ variables:
 |---|---|---|
 | `PYLON_WEBHOOK_BATCH_MS` | `50` | Coalescing window in milliseconds |
 | `PYLON_WEBHOOK_MAX_CONCURRENCY` | `100` | Maximum simultaneous in-flight deliveries |
-| `PYLON_WEBHOOK_MAX_RETRIES` | `3` | Retry attempts on `5xx` or `429` responses |
-| `PYLON_WEBHOOK_RETRY_BASE_MS` | `100` | Base delay for exponential backoff |
+| `PYLON_WEBHOOK_BACKOFF_BASE_MS` | `1000` | First retry delay; doubles each attempt |
+| `PYLON_WEBHOOK_BACKOFF_CAP_MS` | `60000` | Upper bound for each retry delay |
+| `PYLON_WEBHOOK_RETRY_BUDGET_MS` | `300000` | Total time a delivery may keep retrying |
 | `PYLON_WEBHOOK_TIMEOUT_MS` | `5000` | Per-attempt HTTP request timeout |
 | `PYLON_WEBHOOK_VACATED_GRACE_MS` | `3000` | Grace period before firing `channel_vacated` |
 
-Delivery failures (permanent `4xx` after retry exhaustion, or transport errors) are counted in
-the Prometheus metrics exposed at `/metrics`.
+### Retries
+
+Respond to the POST with any `2XX` status to acknowledge a webhook — anything else is a failure.
+Following Channels' documented behavior ("If a non 2XX status code is returned, Channels will
+retry sending the webhook, with exponential backoff, for 5 minutes"), pylon retries **every
+non-2xx response and every transport error** (timeout, connection refused, DNS failure, …):
+
+- The delay before the first retry is `PYLON_WEBHOOK_BACKOFF_BASE_MS` (default 1 s).
+- Each subsequent delay doubles, up to `PYLON_WEBHOOK_BACKOFF_CAP_MS` (default 60 s).
+- Retrying stops once `PYLON_WEBHOOK_RETRY_BUDGET_MS` (default 300 000 ms = 5 minutes) of total
+  elapsed time — attempts included — has passed since the first attempt; the delivery is then
+  counted as failed. `0` disables retries (single attempt).
+
+With the defaults and an unresponsive endpoint, attempts are made at roughly 0, 1, 3, 7, 15, 31,
+63, 123, 183, 243, and 303 seconds (11 attempts).
+
+### Deprecated variables
+
+| Variable | Status |
+|---|---|
+| `PYLON_WEBHOOK_RETRY_BASE_MS` | Deprecated alias of `PYLON_WEBHOOK_BACKOFF_BASE_MS`; honored (with a startup warning) for one release. If both are set, the new variable wins. |
+| `PYLON_WEBHOOK_MAX_RETRIES` | Deprecated and ignored (warns at startup). Retries are bounded by `PYLON_WEBHOOK_RETRY_BUDGET_MS` (total time, not attempt count). |
+
+Deliveries that never receive a 2xx within the retry budget are counted as failures in the
+Prometheus metrics exposed at `/metrics`.

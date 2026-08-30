@@ -101,17 +101,53 @@ impl WebhookTransport for RecordingTransport {
     }
 }
 
-/// Production transport: reqwest POST with per-attempt timeout, bounded
-/// retry/backoff, and a global concurrency semaphore (spec §6). `deliver`
-/// spawns the attempt loop and returns immediately — it never blocks the caller.
-pub struct HttpTransport {
+/// One POST attempt, abstracted so the retry policy is testable under paused
+/// tokio time without real sockets. `Ok(status)` is any HTTP response status
+/// (2xx/3xx/4xx/5xx alike); `Err` is a transport error (timeout, connection
+/// refused, DNS, …).
+#[async_trait]
+pub(crate) trait AttemptSender: Send + Sync {
+    async fn post(&self, delivery: &WebhookDelivery) -> Result<u16, String>;
+}
+
+/// Production [`AttemptSender`]: one reqwest POST with the per-attempt timeout
+/// baked into the client.
+struct ReqwestSender {
     client: reqwest::Client,
-    max_retries: u32,
-    retry_base_ms: u64,
+}
+
+#[async_trait]
+impl AttemptSender for ReqwestSender {
+    async fn post(&self, delivery: &WebhookDelivery) -> Result<u16, String> {
+        let mut req = self.client.post(&delivery.url).body(delivery.body.clone());
+        for (k, v) in &delivery.headers {
+            req = req.header(k, v);
+        }
+        match req.send().await {
+            Ok(resp) => Ok(resp.status().as_u16()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+/// Production transport: reqwest POST with per-attempt timeout, a Pusher-parity
+/// retry policy, and a global concurrency semaphore (spec §6). Pusher's
+/// documented behavior — "If a non 2XX status code is returned, Channels will
+/// retry sending the webhook, with exponential backoff, for 5 minutes" — is
+/// modeled as: every non-2xx response AND every transport error is retried;
+/// delays grow `backoff_base_ms * 2^n` capped at `backoff_cap_ms`; the loop
+/// gives up once `retry_budget_ms` of total elapsed time (attempts included)
+/// has passed. `deliver` spawns the attempt loop and returns immediately — it
+/// never blocks the caller.
+pub struct HttpTransport {
+    sender: Arc<dyn AttemptSender>,
+    backoff_base_ms: u64,
+    backoff_cap_ms: u64,
+    retry_budget_ms: u64,
     semaphore: Arc<Semaphore>,
     /// Shared pipeline counters. The spawned delivery task bumps `delivered_ok`
-    /// (2xx) or `delivered_failed` (permanent 4xx / exhausted retries / closed
-    /// semaphore) exactly once when the attempt loop resolves.
+    /// (2xx) or `delivered_failed` (retry budget exhausted without a 2xx /
+    /// closed semaphore) exactly once when the attempt loop resolves.
     metrics: Arc<WebhookMetrics>,
 }
 
@@ -120,8 +156,9 @@ impl HttpTransport {
     /// simultaneous in-flight deliveries. `metrics` is the shared pipeline
     /// counter set; the spawned delivery task records each resolved outcome.
     pub fn new(
-        max_retries: u32,
-        retry_base_ms: u64,
+        backoff_base_ms: u64,
+        backoff_cap_ms: u64,
+        retry_budget_ms: u64,
         timeout_ms: u64,
         max_concurrency: usize,
         metrics: Arc<WebhookMetrics>,
@@ -130,34 +167,50 @@ impl HttpTransport {
             .timeout(Duration::from_millis(timeout_ms))
             .build()
             .expect("reqwest client builds");
+        Self::with_sender(
+            Arc::new(ReqwestSender { client }),
+            backoff_base_ms,
+            backoff_cap_ms,
+            retry_budget_ms,
+            max_concurrency,
+            metrics,
+        )
+    }
+
+    /// Test seam: build with an injectable [`AttemptSender`] so the retry
+    /// policy runs under paused tokio time with deterministic canned attempts.
+    pub(crate) fn with_sender(
+        sender: Arc<dyn AttemptSender>,
+        backoff_base_ms: u64,
+        backoff_cap_ms: u64,
+        retry_budget_ms: u64,
+        max_concurrency: usize,
+        metrics: Arc<WebhookMetrics>,
+    ) -> Self {
         Self {
-            client,
-            max_retries,
-            retry_base_ms,
+            sender,
+            backoff_base_ms,
+            backoff_cap_ms,
+            retry_budget_ms,
             semaphore: Arc::new(Semaphore::new(max_concurrency)),
             metrics,
         }
-    }
-
-    /// True if `status` should be retried: 5xx and 429 retry; other 4xx are
-    /// permanent (transport errors are retried separately in the attempt loop).
-    fn retryable(status: reqwest::StatusCode) -> bool {
-        status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
     }
 }
 
 #[async_trait]
 impl WebhookTransport for HttpTransport {
-    /// Spawn the attempt loop (with retry + backoff) and return immediately —
+    /// Spawn the attempt loop (retry + backoff) and return immediately —
     /// the caller (dispatcher) is never blocked, so it keeps draining its
     /// mailbox. Concurrent deliveries are bounded by the `Semaphore` acquired
     /// *inside* the spawned task. When the loop resolves, the task bumps
-    /// `delivered_ok` (2xx) or `delivered_failed` (permanent failure / exhausted
-    /// retries / closed semaphore) exactly once.
+    /// `delivered_ok` (2xx) or `delivered_failed` (retry budget exhausted /
+    /// closed semaphore) exactly once.
     async fn deliver(&self, delivery: WebhookDelivery) {
-        let client = self.client.clone();
-        let max_retries = self.max_retries;
-        let base = self.retry_base_ms;
+        let sender = self.sender.clone();
+        let base = self.backoff_base_ms;
+        let cap = self.backoff_cap_ms;
+        let budget = self.retry_budget_ms;
         let sem = self.semaphore.clone();
         let metrics = self.metrics.clone();
 
@@ -172,40 +225,53 @@ impl WebhookTransport for HttpTransport {
                 }
             };
 
-            // attempt 0 is the first try; up to `max_retries` extra attempts.
-            for attempt in 0..=max_retries {
-                let mut req = client.post(&delivery.url).body(delivery.body.clone());
-                for (k, v) in &delivery.headers {
-                    req = req.header(k, v);
-                }
-                match req.send().await {
-                    Ok(resp) => {
-                        let status = resp.status();
-                        if status.is_success() {
-                            metrics.delivered_ok.fetch_add(1, Ordering::Relaxed);
-                            return;
-                        }
-                        if !HttpTransport::retryable(status) {
-                            tracing::warn!(url = %delivery.url, %status, "webhook rejected (permanent)");
-                            metrics.delivered_failed.fetch_add(1, Ordering::Relaxed);
-                            return; // 4xx (non-429): permanent failure
-                        }
-                        // retryable status: fall through to backoff
-                        tracing::debug!(url = %delivery.url, %status, attempt, "webhook retryable status");
+            let start = tokio::time::Instant::now();
+            // First backoff delay: `base` (clamped to >= 1ms so a degenerate 0
+            // can't hot-spin), doubling per attempt, capped at `cap`.
+            let mut delay_ms = base.max(1);
+            let mut attempt: u32 = 0;
+            loop {
+                match sender.post(&delivery).await {
+                    Ok(status) if (200..300).contains(&status) => {
+                        metrics.delivered_ok.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    Ok(status) => {
+                        // Any non-2xx is retried (Pusher parity).
+                        tracing::debug!(
+                            url = %delivery.url,
+                            status,
+                            attempt,
+                            "webhook non-2xx; retrying"
+                        );
                     }
                     Err(e) => {
                         // transport error (timeout, connection refused): retry
-                        tracing::debug!(url = %delivery.url, error = %e, attempt, "webhook transport error");
+                        tracing::debug!(
+                            url = %delivery.url,
+                            error = %e,
+                            attempt,
+                            "webhook transport error; retrying"
+                        );
                     }
                 }
-                if attempt == max_retries {
-                    tracing::warn!(url = %delivery.url, "webhook delivery exhausted retries; dropping");
+                // The budget bounds TOTAL elapsed time — attempts included —
+                // not the sleep schedule alone: once `retry_budget_ms` has
+                // passed since the first attempt began, give up. `0` therefore
+                // means "no retries" (single attempt).
+                if start.elapsed() >= Duration::from_millis(budget) {
+                    tracing::warn!(
+                        url = %delivery.url,
+                        budget_ms = budget,
+                        attempts = attempt + 1,
+                        "webhook delivery exhausted retry budget; dropping"
+                    );
                     metrics.delivered_failed.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
-                // exponential backoff: base * 2^attempt.
-                let delay = base.saturating_mul(1u64 << attempt);
-                tokio::time::sleep(Duration::from_millis(delay)).await;
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                delay_ms = delay_ms.saturating_mul(2).min(cap);
+                attempt += 1;
             }
         });
     }
@@ -224,6 +290,224 @@ mod tests {
         vec![json!({ "name": "channel_occupied", "channel": "ch" })]
     }
 
+    fn delivery() -> WebhookDelivery {
+        build_signed_delivery(
+            "https://e.test/wh",
+            "k",
+            "s",
+            1,
+            &events(),
+            &BTreeMap::new(),
+        )
+    }
+
+    /// Mock [`AttemptSender`]: every call invokes `respond(attempt_index)` and
+    /// records the (paused) instant it ran, so tests can pin the exact retry
+    /// schedule under `start_paused = true` tokio time.
+    struct MockSender<F> {
+        respond: F,
+        calls: Arc<AtomicUsize>,
+        times: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+    }
+
+    #[async_trait]
+    impl<F> AttemptSender for MockSender<F>
+    where
+        F: Fn(u32) -> Result<u16, String> + Send + Sync,
+    {
+        async fn post(&self, _delivery: &WebhookDelivery) -> Result<u16, String> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) as u32;
+            self.times.lock().unwrap().push(tokio::time::Instant::now());
+            (self.respond)(n)
+        }
+    }
+
+    /// One canned webhook endpoint: the sender, its call counter, and the
+    /// (paused) instants of every attempt.
+    struct MockEndpoint<F> {
+        sender: Arc<MockSender<F>>,
+        calls: Arc<AtomicUsize>,
+        times: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+    }
+
+    fn mock<F>(respond: F) -> MockEndpoint<F>
+    where
+        F: Fn(u32) -> Result<u16, String> + Send + Sync + 'static,
+    {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let times = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sender = Arc::new(MockSender {
+            respond,
+            calls: calls.clone(),
+            times: times.clone(),
+        });
+        MockEndpoint {
+            sender,
+            calls,
+            times,
+        }
+    }
+
+    /// Yield until the spawned delivery task has made `expected` attempts
+    /// (bounded so a real regression fails fast rather than hanging).
+    async fn await_attempts(calls: &AtomicUsize, expected: usize) {
+        for _ in 0..10_000 {
+            if calls.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "delivery task did not reach {expected} attempts (got {})",
+            calls.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Yield until the delivery loop has resolved a failure (bounded).
+    async fn await_failed(metrics: &WebhookMetrics) {
+        for _ in 0..10_000 {
+            if metrics.delivered_failed.load(Ordering::Relaxed) == 1 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("delivery task did not resolve delivered_failed");
+    }
+
+    /// R4 (a): a permanently-failing endpoint is retried with exponential
+    /// backoff — 1s doubling to the 60s cap — and gives up only once the
+    /// 5-minute total budget has elapsed. With instant (mock) attempts the
+    /// default schedule is: attempts at t = 0, 1, 3, 7, 15, 31, 63, 123, 183,
+    /// 243, 303 s → exactly 11 attempts, giving up just past the 300 s budget.
+    #[tokio::test(start_paused = true)]
+    async fn retry_budget_is_five_minutes_of_exponential_backoff() {
+        let m = mock(|_| Ok(500u16));
+        let metrics = Arc::new(WebhookMetrics::new(64));
+        let t = HttpTransport::with_sender(m.sender, 1000, 60_000, 300_000, 10, metrics.clone());
+        t.deliver(delivery()).await;
+        await_attempts(&m.calls, 1).await;
+
+        // Drive time forward one backoff gap at a time: each step lands exactly
+        // on the next attempt's scheduled deadline.
+        let schedule = [
+            1000u64, 2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000, 60000,
+        ];
+        let mut expected = 1;
+        for gap in schedule {
+            tokio::time::advance(Duration::from_millis(gap)).await;
+            expected += 1;
+            await_attempts(&m.calls, expected).await;
+        }
+
+        // All 11 attempts happened; the loop gave up (never a 2xx).
+        assert_eq!(m.calls.load(Ordering::SeqCst), 11, "11 attempts total");
+        await_failed(&metrics).await;
+        assert_eq!(metrics.delivered_ok.load(Ordering::Relaxed), 0);
+
+        // The recorded attempt instants pin the exponential schedule + cap.
+        let times = m.times.lock().unwrap().clone();
+        let gaps: Vec<u128> = times
+            .windows(2)
+            .map(|w| (w[1] - w[0]).as_millis())
+            .collect();
+        assert_eq!(
+            gaps,
+            vec![1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000, 60000],
+            "1s doubling, capped at 60s"
+        );
+        // Give-up happens only AFTER the full budget of virtual time elapsed
+        // (303 s ≥ 300 s budget — the budget bounds total time incl. attempts).
+        let gave_up_after = tokio::time::Instant::now() - times[0];
+        assert!(
+            gave_up_after >= Duration::from_millis(300_000),
+            "gave up after only {gave_up_after:?}"
+        );
+    }
+
+    /// R4 (a, early-budget check): just before the budget elapses the loop is
+    /// still retrying (10 attempts done by t = 243 s, no failure recorded).
+    #[tokio::test(start_paused = true)]
+    async fn still_retrying_just_inside_the_budget() {
+        let m = mock(|_| Ok(500u16));
+        let metrics = Arc::new(WebhookMetrics::new(64));
+        let t = HttpTransport::with_sender(m.sender, 1000, 60_000, 300_000, 10, metrics.clone());
+        t.deliver(delivery()).await;
+        await_attempts(&m.calls, 1).await;
+        // Drive each scheduled gap up to t = 243 s (10 attempts), confirming
+        // each lands before moving the clock again.
+        let mut expected = 1;
+        for gap in [1000u64, 2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000] {
+            tokio::time::advance(Duration::from_millis(gap)).await;
+            expected += 1;
+            await_attempts(&m.calls, expected).await;
+        }
+        assert_eq!(m.calls.load(Ordering::SeqCst), 10, "attempt 10 at t=243s");
+        assert_eq!(
+            metrics.delivered_failed.load(Ordering::Relaxed),
+            0,
+            "no give-up before the budget elapses"
+        );
+        assert_eq!(metrics.delivered_ok.load(Ordering::Relaxed), 0);
+    }
+
+    /// R4 (b): a 404 (non-2xx that is neither 5xx nor 429) is retried.
+    #[tokio::test(start_paused = true)]
+    async fn non_2xx_404_is_retried() {
+        let m = mock(|_| Ok(404u16));
+        let metrics = Arc::new(WebhookMetrics::new(64));
+        let t = HttpTransport::with_sender(m.sender, 50, 100, 300, 10, metrics.clone());
+        t.deliver(delivery()).await;
+        // Let attempt 1 run (and arm its backoff timer at t=50ms) BEFORE
+        // jumping the clock, then jump well past the (small) budget: the loop
+        // wakes, retries, and resolves failed — strictly more than the single
+        // attempt the old permanent-4xx policy would have made.
+        await_attempts(&m.calls, 1).await;
+        tokio::time::advance(Duration::from_millis(10_000)).await;
+        await_failed(&metrics).await;
+        assert!(
+            m.calls.load(Ordering::SeqCst) > 1,
+            "404 must be retried, got {} attempts",
+            m.calls.load(Ordering::SeqCst)
+        );
+        assert_eq!(metrics.delivered_ok.load(Ordering::Relaxed), 0);
+    }
+
+    /// R4 (c): a 2xx resolves immediately with exactly one attempt.
+    #[tokio::test(start_paused = true)]
+    async fn success_is_exactly_one_attempt() {
+        let m = mock(|_| Ok(200u16));
+        let metrics = Arc::new(WebhookMetrics::new(64));
+        let t = HttpTransport::with_sender(m.sender, 1000, 60_000, 300_000, 10, metrics.clone());
+        t.deliver(delivery()).await;
+        await_attempts(&m.calls, 1).await;
+        assert_eq!(metrics.delivered_ok.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.delivered_failed.load(Ordering::Relaxed), 0);
+        // Advance far past the budget: no further attempts after success.
+        tokio::time::advance(Duration::from_millis(400_000)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(m.calls.load(Ordering::SeqCst), 1, "no retries after 2xx");
+    }
+
+    /// Transport errors (timeouts, refused connections) retry on the same
+    /// budget-bounded schedule.
+    #[tokio::test(start_paused = true)]
+    async fn transport_errors_are_retried() {
+        let m = mock(|_| Err("connection refused".into()));
+        let metrics = Arc::new(WebhookMetrics::new(64));
+        let t = HttpTransport::with_sender(m.sender, 10, 20, 50, 10, metrics.clone());
+        t.deliver(delivery()).await;
+        // Attempt 1 first (arms the timer), then jump past the small budget.
+        await_attempts(&m.calls, 1).await;
+        tokio::time::advance(Duration::from_millis(1000)).await;
+        await_failed(&metrics).await;
+        assert!(
+            m.calls.load(Ordering::SeqCst) > 1,
+            "transport errors must be retried"
+        );
+    }
+
     /// 503 for the first two hits, then 200 — counts every hit in the shared counter.
     async fn flaky_handler(State(calls): State<Arc<AtomicUsize>>) -> StatusCode {
         let n = calls.fetch_add(1, Ordering::SeqCst);
@@ -234,10 +518,11 @@ mod tests {
         }
     }
 
-    /// Always 400 (permanent) — counts every hit so we can assert "no retry".
+    /// Always 404 (non-2xx — now retryable) — counts every hit so we can
+    /// assert "retried, not treated as permanent".
     async fn reject_handler(State(calls): State<Arc<AtomicUsize>>) -> StatusCode {
         calls.fetch_add(1, Ordering::SeqCst);
-        StatusCode::BAD_REQUEST
+        StatusCode::NOT_FOUND
     }
 
     /// Bind a throwaway server on a random port; the handler still carries the
@@ -261,7 +546,8 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let addr = spawn_mock(post(flaky_handler), calls.clone()).await;
         let metrics = Arc::new(WebhookMetrics::new(64));
-        let t = HttpTransport::new(3, 1, 5000, 10, metrics.clone()); // base 1ms so the test is fast
+        // base 1ms / cap 10ms / budget 5s so the test is fast.
+        let t = HttpTransport::new(1, 10, 5_000, 5_000, 10, metrics.clone());
         let d = build_signed_delivery(
             &format!("http://{addr}/wh"),
             "k",
@@ -284,11 +570,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_transport_does_not_retry_on_400() {
+    async fn http_transport_retries_on_404() {
         let calls = Arc::new(AtomicUsize::new(0));
         let addr = spawn_mock(post(reject_handler), calls.clone()).await;
         let metrics = Arc::new(WebhookMetrics::new(64));
-        let t = HttpTransport::new(3, 1, 5000, 10, metrics.clone());
+        // Small budget (100ms) so the retry loop resolves quickly in real time.
+        let t = HttpTransport::new(1, 10, 100, 5_000, 10, metrics.clone());
         let d = build_signed_delivery(
             &format!("http://{addr}/wh"),
             "k",
@@ -298,18 +585,18 @@ mod tests {
             &BTreeMap::new(),
         );
         t.deliver(d).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "4xx is permanent: single attempt"
+        // settle past the small budget: retries happen, then give-up.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            calls.load(Ordering::SeqCst) > 1,
+            "non-2xx must be retried (Pusher retries any non-2xx), got {}",
+            calls.load(Ordering::SeqCst)
         );
-        // A permanent 4xx bumps delivered_failed exactly once, never ok.
         assert_eq!(metrics.delivered_ok.load(Ordering::Relaxed), 0, "no ok");
         assert_eq!(
             metrics.delivered_failed.load(Ordering::Relaxed),
             1,
-            "one failed"
+            "one failed after budget exhaustion"
         );
     }
 

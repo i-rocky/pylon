@@ -31,19 +31,29 @@ use tokio_tungstenite::tungstenite::Message;
 const SECRET: &str = "app-secret";
 const KEY: &str = "app-key";
 
-/// Spawn a local axum receiver that captures the first POST body + signature header,
-/// returning its address and a channel that yields `(raw_body, signature)`.
-async fn spawn_receiver() -> (SocketAddr, mpsc::UnboundedReceiver<(String, String)>) {
+/// Shared receiver state: where to send captured POSTs, and the status to
+/// answer every request with (use a non-2xx to exercise retries).
+type ReceiverState = (
+    Arc<mpsc::UnboundedSender<(String, String)>>,
+    axum::http::StatusCode,
+);
+
+/// Spawn a local axum receiver that captures each POST body + signature header,
+/// returning its address and a channel that yields `(raw_body, signature)` per
+/// POST. Every response uses `status` — use a non-2xx to exercise retries.
+async fn spawn_receiver_status(
+    status: axum::http::StatusCode,
+) -> (SocketAddr, mpsc::UnboundedReceiver<(String, String)>) {
     use axum::extract::State;
     use axum::http::HeaderMap;
     use axum::routing::post;
     use axum::Router;
 
     let (tx, rx) = mpsc::unbounded_channel::<(String, String)>();
-    let tx = Arc::new(tx);
+    let state: ReceiverState = (Arc::new(tx), status);
 
     async fn handler(
-        State(tx): State<Arc<mpsc::UnboundedSender<(String, String)>>>,
+        State((tx, status)): State<ReceiverState>,
         headers: HeaderMap,
         body: String,
     ) -> axum::http::StatusCode {
@@ -53,12 +63,12 @@ async fn spawn_receiver() -> (SocketAddr, mpsc::UnboundedReceiver<(String, Strin
             .unwrap_or("")
             .to_string();
         let _ = tx.send((body, sig));
-        axum::http::StatusCode::OK
+        status
     }
 
     let app = Router::new()
         .route("/pusher/webhooks", post(handler))
-        .with_state(tx);
+        .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -67,8 +77,25 @@ async fn spawn_receiver() -> (SocketAddr, mpsc::UnboundedReceiver<(String, Strin
     (addr, rx)
 }
 
-/// Spawn the pylon server pointed at a webhook endpoint with a small batch window.
+/// A receiver that always answers 200 (webhook successfully received).
+async fn spawn_receiver() -> (SocketAddr, mpsc::UnboundedReceiver<(String, String)>) {
+    spawn_receiver_status(axum::http::StatusCode::OK).await
+}
+
+/// Spawn the pylon server pointed at a webhook endpoint with a small batch
+/// window and a small retry budget (failures resolve fast in tests).
 async fn spawn_pylon(receiver: SocketAddr) -> SocketAddr {
+    spawn_pylon_with(receiver, 50, 100, 250).await
+}
+
+/// Like [`spawn_pylon`] but with explicit webhook retry knobs (backoff base ms,
+/// backoff cap ms, total retry budget ms).
+async fn spawn_pylon_with(
+    receiver: SocketAddr,
+    backoff_base_ms: u64,
+    backoff_cap_ms: u64,
+    retry_budget_ms: u64,
+) -> SocketAddr {
     let apps_json = format!(
         r#"[
             {{"name":"Test","id":"app","key":"{KEY}","secret":"{SECRET}",
@@ -84,8 +111,15 @@ async fn spawn_pylon(receiver: SocketAddr) -> SocketAddr {
     ));
     let webhooks = pylon::webhook::spawn(
         apps.clone(),
-        |metrics| {
-            Arc::new(HttpTransport::new(3, 50, 5000, 100, metrics)) as Arc<dyn WebhookTransport>
+        move |metrics| {
+            Arc::new(HttpTransport::new(
+                backoff_base_ms,
+                backoff_cap_ms,
+                retry_budget_ms,
+                5000,
+                100,
+                metrics,
+            )) as Arc<dyn WebhookTransport>
         },
         Arc::new(SystemClock),
         30, // 30ms batch window
@@ -168,6 +202,46 @@ async fn occupied_webhook_is_posted_and_signature_validates() {
     // Signature validates exactly the way pusher-http-node's WebHook does:
     // hex(HMAC_SHA256(secret, raw_body)) == X-Pusher-Signature.
     assert_eq!(signature, hmac_sha256_hex(SECRET, &body));
+}
+
+/// R4 end-to-end (Pusher parity): "If a non 2XX status code is returned,
+/// Channels will retry sending the webhook, with exponential backoff, for 5
+/// minutes." A receiver that always answers 404 must be hit more than once.
+/// Uses a tiny backoff/budget so the test stays fast; the retry POLICY (any
+/// non-2xx retried) is what is under test here, not the 5-minute budget
+/// (pinned by the paused-time transport unit tests).
+#[tokio::test]
+async fn non_2xx_receiver_is_retried() {
+    let (receiver_addr, mut rx) = spawn_receiver_status(axum::http::StatusCode::NOT_FOUND).await;
+    // base 20ms / cap 40ms / budget 400ms → ~10 attempts inside the budget.
+    let pylon_addr = spawn_pylon_with(receiver_addr, 20, 40, 400).await;
+
+    let mut ws = connect(pylon_addr).await;
+    let est = next_json(&mut ws).await;
+    assert_eq!(est["event"], "pusher:connection_established");
+
+    // Subscribe → channel_occupied webhook fires against the 404 receiver.
+    ws.send(Message::Text(
+        json!({ "event": "pusher:subscribe", "data": { "channel": "retry-room" } }).to_string(),
+    ))
+    .await
+    .unwrap();
+    let ack = next_json(&mut ws).await;
+    assert_eq!(ack["event"], "pusher_internal:subscription_succeeded");
+
+    // The first POST plus at least one RETRY must arrive (each fully signed).
+    let (body1, sig1) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("first webhook POST arrived")
+        .expect("channel open");
+    let (body2, sig2) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("retry POST arrived (non-2xx must be retried)")
+        .expect("channel open");
+    assert_eq!(sig1, hmac_sha256_hex(SECRET, &body1));
+    assert_eq!(sig2, hmac_sha256_hex(SECRET, &body2));
+    // Same signed envelope retried verbatim.
+    assert_eq!(body1, body2);
 }
 
 /// Parse a single `metric_name value` series out of a Prometheus text body,
