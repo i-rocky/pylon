@@ -769,7 +769,10 @@ async fn fragmented_binary_is_ignored_and_connection_stays_usable() {
 // ── P2 parity tests — closing handshake (RFC 6455 §5.5.1) ───────────────────
 
 /// P2: on a client-initiated Close the server MUST echo a Close frame back
-/// before tearing the socket down, carrying the client's close code.
+/// before tearing the socket down, carrying the client's close code. The
+/// client sends a DISTINCTIVE code (4000, a wire-legal private-use code — not
+/// the 1000 the parameterless-Close fallback produces) so this pins the
+/// code-carrying branch of the echo: a regression that hardcodes 1000 fails.
 #[tokio::test]
 async fn client_initiated_close_is_echoed_before_teardown() {
     let addr = spawn(ServerConfig::default()).await;
@@ -777,7 +780,7 @@ async fn client_initiated_close_is_echoed_before_teardown() {
     let _ = established_socket_id(&mut ws).await;
 
     ws.send(Message::Close(Some(CloseFrame {
-        code: 1000.into(),
+        code: 4000.into(),
         reason: "bye".into(),
     })))
     .await
@@ -790,11 +793,11 @@ async fn client_initiated_close_is_echoed_before_teardown() {
     match first {
         Ok(Message::Close(Some(cf))) => assert_eq!(
             u16::from(cf.code),
-            1000,
-            "expected the echoed Close to carry the client's code 1000, got {}",
+            4000,
+            "expected the echoed Close to carry the client's code 4000, got {}",
             cf.code
         ),
-        other => panic!("expected Close(1000) echo before teardown, got {other:?}"),
+        other => panic!("expected Close(4000) echo before teardown, got {other:?}"),
     }
 }
 
