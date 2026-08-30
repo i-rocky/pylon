@@ -1835,3 +1835,83 @@ async fn ws_unknown_app_key_close_frame_carries_4001() {
         "unknown-app-key reject must close with code 4001 (P13), got: {close_code:?}"
     );
 }
+
+// ── R10 parity tests — router-level 404 fallback ──────────────────────────────
+
+/// R10: assert a router-level miss (no route matches the path) renders the
+/// exact Pusher JSON error body — not axum's default EMPTY 404. The fallback
+/// fires before any handler (and thus before auth), so the request carries no
+/// signature at all.
+async fn assert_fallback_404(resp: reqwest::Response) {
+    assert_eq!(resp.status(), 404);
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        content_type, "application/json",
+        "router-level 404 must be application/json, got: {content_type}"
+    );
+    assert_eq!(
+        resp.text().await.unwrap(),
+        r#"{"error":"Not found","status":404}"#,
+        "router-level 404 must carry the Pusher JSON error shape"
+    );
+}
+
+/// R10: a trailing-slash variant of a real route (`/apps/{id}/events/`) matches
+/// nothing (axum does not treat `/foo/` as `/foo`), so it hits the router
+/// fallback — previously axum's default EMPTY 404, now the JSON error shape.
+#[tokio::test]
+async fn rest_trailing_slash_route_is_json_404() {
+    let addr = spawn().await;
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/apps/app1/events/"))
+        .send()
+        .await
+        .unwrap();
+    assert_fallback_404(resp).await;
+}
+
+/// R10: a completely unknown path (`/nope`) hits the router fallback → JSON 404.
+#[tokio::test]
+async fn rest_unknown_route_is_json_404() {
+    let addr = spawn().await;
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/nope"))
+        .send()
+        .await
+        .unwrap();
+    assert_fallback_404(resp).await;
+}
+
+/// A wrong method on a VALID path (`DELETE /apps/{id}/channels/{name}`) is
+/// answered by axum's MethodRouter with **405** — a method mismatch does NOT
+/// flow through the router fallback, so it keeps axum's default empty body.
+///
+/// Deliberate, documented decision (R10 scope): Pusher's REST docs define the
+/// JSON error shape for handler-level 4xx errors and say nothing about
+/// wrong-method requests; covering 405 would require a per-route
+/// `MethodRouter::fallback` on every route. This test pins the honest current
+/// behavior — 405 with an empty body — so it is intentional, not accidental.
+#[tokio::test]
+async fn rest_wrong_method_on_valid_path_is_405() {
+    let addr = spawn().await;
+    let resp = reqwest::Client::new()
+        .delete(format!("http://{addr}/apps/app1/channels/public-room"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        405,
+        "a matched path with an unsupported method must be 405, not 404"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.is_empty(),
+        "405 keeps axum's default empty body (documented non-goal of R10), got: {body}"
+    );
+}
