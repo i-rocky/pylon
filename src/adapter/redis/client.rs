@@ -6,10 +6,35 @@
 //! is kept alive by storing its [`JoinHandle`] — dropping it would stop the
 //! automatic re-subscribe on reconnect.
 
-use fred::clients::SubscriberClient;
+use fred::clients::{Pool, SubscriberClient};
+use fred::error::Error as FredError;
 use fred::prelude::*;
 use fred::types::scripts::Script;
 use tokio::task::JoinHandle;
+
+/// Publish `payload` on a Pylon pub/sub channel (`msg` / `usermsg` / `watch`),
+/// honoring the `PYLON_REDIS_SHARDED_PUBSUB` flag: Redis 7 `SPUBLISH` when set,
+/// ordinary `PUBLISH` otherwise. The two commands address SEPARATE namespaces —
+/// `SPUBLISH` reaches only `SSUBSCRIBE`rs, `PUBLISH` only `SUBSCRIBE`rs — so
+/// every node of a cluster must run with the same flag. Returns the underlying
+/// result; the per-site error handling (log + keep going, never fatal) stays at
+/// the call sites.
+pub(crate) async fn publish_channel(
+    pool: &Pool,
+    channel: &str,
+    payload: String,
+    sharded: bool,
+) -> Result<(), FredError> {
+    if sharded {
+        pool.next()
+            .spublish::<(), _, _>(channel.to_string(), payload)
+            .await
+    } else {
+        pool.next()
+            .publish::<(), _, _>(channel.to_string(), payload)
+            .await
+    }
+}
 
 /// The connected fred clients for one Redis adapter instance.
 pub struct RedisClients {

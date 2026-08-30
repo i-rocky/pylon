@@ -3,12 +3,13 @@
 //! return `anyhow::Result` (or are best-effort with logging); callers fall back
 //! to the node-local adapter on error.
 
+use super::client;
 use super::client::Scripts;
 use super::envelope::{Envelope, EnvelopeKind};
 use super::keys::{member_token, Keys};
 use crate::protocol::socket_id::SocketId;
 use fred::clients::Pool;
-use fred::interfaces::{HashesInterface, KeysInterface, PubsubInterface, SetsInterface};
+use fred::interfaces::{HashesInterface, KeysInterface, SetsInterface};
 use serde_json::Value;
 
 /// Run USER_SIGNIN. Returns the cluster `first_for_user` edge (HLEN == 1 → the user
@@ -86,7 +87,14 @@ pub(super) async fn is_online(
 /// The WatchOffline envelope's publisher `node_id` is the DEAD node (the stale token's
 /// prefix, or an empty sentinel for an already-gone hash) so this sweeper's OWN receive
 /// loop does NOT self-dedup it — A must still notify its local watchers of u7's offline.
-pub(super) async fn reap_user(pool: &Pool, keys: &Keys, app: &str, user_id: &str, now: u64) {
+pub(super) async fn reap_user(
+    pool: &Pool,
+    keys: &Keys,
+    app: &str,
+    user_id: &str,
+    sharded: bool,
+    now: u64,
+) {
     let usr = keys.usr(app, user_id);
     let members: Vec<(String, String)> = match pool.next().hgetall(&usr).await {
         Ok(m) => m,
@@ -167,6 +175,7 @@ pub(super) async fn reap_user(pool: &Pool, keys: &Keys, app: &str, user_id: &str
         user_id,
         super::envelope::EnvelopeKind::WatchOffline,
         serde_json::Value::Null,
+        sharded,
     )
     .await;
 }
@@ -175,7 +184,9 @@ pub(super) async fn reap_user(pool: &Pool, keys: &Keys, app: &str, user_id: &str
 /// pre-encoded v7 frame for `UserSend`; `Null` for the other kinds. `node_id` is
 /// the publisher (self) for live paths, or the DEAD node (token prefix) from the
 /// sweeper so every live node — including the sweeper's own — acts on it.
-/// Best-effort: logs + continues on any Redis error.
+/// `sharded` routes the publish through SPUBLISH vs PUBLISH (the cluster-wide
+/// `PYLON_REDIS_SHARDED_PUBSUB` setting). Best-effort: logs + continues on any
+/// Redis error.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn publish(
     pool: &Pool,
@@ -185,6 +196,7 @@ pub(super) async fn publish(
     user_id: &str,
     kind: EnvelopeKind,
     frame: Value,
+    sharded: bool,
 ) {
     let env = Envelope {
         node_id: node_id.to_string(),
@@ -195,11 +207,7 @@ pub(super) async fn publish(
         except: None,
     };
     if let Ok(payload) = String::from_utf8(env.encode()) {
-        if let Err(e) = pool
-            .next()
-            .publish::<(), _, _>(channel.to_string(), payload)
-            .await
-        {
+        if let Err(e) = client::publish_channel(pool, channel, payload, sharded).await {
             tracing::warn!(error = %e, app, user_id, "redis user publish failed");
         }
     }

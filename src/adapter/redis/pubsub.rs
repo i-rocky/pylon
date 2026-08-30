@@ -10,9 +10,43 @@ use crate::adapter::local::LocalAdapter;
 use crate::adapter::Adapter;
 use crate::protocol::event::{ServerEvent, WatchlistChange};
 use crate::protocol::socket_id::SocketId;
+use fred::clients::SubscriberClient;
+use fred::error::Error as FredError;
+use fred::interfaces::PubsubInterface;
 use fred::types::Message;
 use std::sync::Arc;
 use tokio::sync::broadcast;
+
+/// Subscribe the node's subscriber client to a Pylon pub/sub channel, honoring
+/// the `PYLON_REDIS_SHARDED_PUBSUB` flag: Redis 7 `SSUBSCRIBE` (sharded pub/sub —
+/// the channel's traffic is routed to and fan-out stays on the slot-owning shard)
+/// when enabled, ordinary `SUBSCRIBE` otherwise. The two modes are SEPARATE
+/// namespaces server-side, so every node of a cluster must run with the same
+/// flag. Error handling stays at the call sites (log + keep going, never fatal).
+pub(crate) async fn sub_channel(
+    sub: &SubscriberClient,
+    channel: String,
+    sharded: bool,
+) -> Result<(), FredError> {
+    if sharded {
+        sub.ssubscribe(channel).await
+    } else {
+        sub.subscribe(channel).await
+    }
+}
+
+/// Teardown twin of [`sub_channel`]: `SUNSUBSCRIBE` vs `UNSUBSCRIBE`.
+pub(crate) async fn unsub_channel(
+    sub: &SubscriberClient,
+    channel: String,
+    sharded: bool,
+) -> Result<(), FredError> {
+    if sharded {
+        sub.sunsubscribe(channel).await
+    } else {
+        sub.unsubscribe(channel).await
+    }
+}
 
 /// Consume the subscriber's message stream forever, fanning each remote broadcast
 /// out to this node's local sockets.

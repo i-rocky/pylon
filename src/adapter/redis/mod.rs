@@ -28,9 +28,7 @@ use crate::server::config::ServerConfig;
 use crate::user::{UserJoinOutcome, UserLeaveOutcome};
 use async_trait::async_trait;
 use fred::clients::Pool;
-use fred::interfaces::{
-    EventInterface, HashesInterface, KeysInterface, PubsubInterface, SetsInterface,
-};
+use fred::interfaces::{EventInterface, HashesInterface, KeysInterface, SetsInterface};
 use fred::types::Expiration;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -283,6 +281,16 @@ impl RedisAdapter {
             tokio::spawn(async move { pubsub::receive_loop(rx, recv_local, recv_node).await });
 
         let redis_cfg = RedisConfig::from_server_config(cfg);
+        if redis_cfg.sharded_pubsub {
+            // The knob selects SSUBSCRIBE/SPUBLISH (Redis 7 sharded pub/sub) for
+            // every pub/sub channel this adapter touches. SPUBLISH reaches ONLY
+            // SSUBSCRIBErs — a cluster must run the flag uniformly, and the server
+            // must be Redis 7.0+ (older servers reject SSUBSCRIBE, degrading to
+            // log-warned no-op cross-node delivery).
+            tracing::info!(
+                "PYLON_REDIS_SHARDED_PUBSUB enabled: using SSUBSCRIBE/SPUBLISH (requires Redis 7.0+ on every node)"
+            );
+        }
 
         // Spawn the membership TTL heartbeat. It re-stamps every local member's
         // `expireAt` and bumps the occ-hash TTL every `presence_heartbeat_secs`, so a
@@ -341,8 +349,18 @@ impl RedisAdapter {
         let pool = self.clients.pool.clone();
         let keys = self.keys.clone();
         let node_id = self.node_id.clone();
+        let sharded = self.cfg.sharded_pubsub;
         let handle = tokio::spawn(async move {
-            sweeper::sweeper_loop(pool, keys, node_id, lease_ms, interval_secs, webhooks).await
+            sweeper::sweeper_loop(
+                pool,
+                keys,
+                node_id,
+                lease_ms,
+                interval_secs,
+                sharded,
+                webhooks,
+            )
+            .await
         });
         if let Ok(mut guard) = self.sweeper_handle.lock() {
             *guard = Some(handle);
@@ -366,6 +384,7 @@ impl RedisAdapter {
             &self.keys,
             &self.node_id,
             lease_ms,
+            self.cfg.sharded_pubsub,
             webhooks,
             now_ms,
         )
@@ -384,14 +403,17 @@ impl RedisAdapter {
     }
 
     /// Test-support accessor: the set of Redis pub/sub channels this node's
-    /// SubscriberClient is currently tracking. Used by the cluster integration
-    /// tests to assert the per-(app,channel) subscription lifecycle.
+    /// SubscriberClient is currently tracking — ordinary AND sharded (fred
+    /// tracks them in separate sets; under `PYLON_REDIS_SHARDED_PUBSUB` the
+    /// entries live in the shard set). Used by the cluster integration tests
+    /// to assert the per-(app,channel) subscription lifecycle in either mode.
     #[doc(hidden)]
     pub fn tracked_redis_channels(&self) -> Vec<String> {
         self.clients
             .sub
             .tracked_channels()
             .into_iter()
+            .chain(self.clients.sub.tracked_shard_channels())
             .map(|c| c.to_string())
             .collect()
     }
@@ -426,7 +448,10 @@ impl RedisAdapter {
         // Subscribe to the msg channel when this NODE goes 0 → 1 for the channel.
         if node_first {
             let msg_key = self.keys.msg(app, channel);
-            if let Err(e) = self.clients.sub.subscribe(msg_key.clone()).await {
+            if let Err(e) =
+                pubsub::sub_channel(&self.clients.sub, msg_key.clone(), self.cfg.sharded_pubsub)
+                    .await
+            {
                 // The local subscription already succeeded; a Redis SUBSCRIBE
                 // failure only costs cross-node delivery for this channel on this
                 // node. Log loudly but never panic the connection task.
@@ -512,7 +537,10 @@ impl RedisAdapter {
         // Tear down the Redis subscription on the node-LOCAL 1 → 0 edge.
         if node_last {
             let msg_key = self.keys.msg(app, channel);
-            if let Err(e) = self.clients.sub.unsubscribe(msg_key.clone()).await {
+            if let Err(e) =
+                pubsub::unsub_channel(&self.clients.sub, msg_key.clone(), self.cfg.sharded_pubsub)
+                    .await
+            {
                 tracing::warn!(
                     error = %e,
                     channel = &msg_key,
@@ -651,11 +679,12 @@ impl RedisAdapter {
         // gains its first connection for the user (0→1), SUBSCRIBE the per-user `usermsg`
         // channel so cross-node send/terminate reach this node.
         if node_first {
-            if let Err(e) = self
-                .clients
-                .sub
-                .subscribe(self.keys.usermsg(app, user_id))
-                .await
+            if let Err(e) = pubsub::sub_channel(
+                &self.clients.sub,
+                self.keys.usermsg(app, user_id),
+                self.cfg.sharded_pubsub,
+            )
+            .await
             {
                 tracing::warn!(error = %e, app, user_id, "failed to SUBSCRIBE usermsg on local 0→1");
             }
@@ -703,6 +732,7 @@ impl RedisAdapter {
                         user_id,
                         envelope::EnvelopeKind::WatchOnline,
                         serde_json::Value::Null,
+                        self.cfg.sharded_pubsub,
                     )
                     .await;
                 }
@@ -730,11 +760,12 @@ impl RedisAdapter {
     ) -> bool {
         // usermsg sub teardown on the node-LOCAL last-connection edge (1→0).
         if node_last {
-            if let Err(e) = self
-                .clients
-                .sub
-                .unsubscribe(self.keys.usermsg(app, user_id))
-                .await
+            if let Err(e) = pubsub::unsub_channel(
+                &self.clients.sub,
+                self.keys.usermsg(app, user_id),
+                self.cfg.sharded_pubsub,
+            )
+            .await
             {
                 tracing::warn!(error = %e, app, user_id, "failed to UNSUBSCRIBE usermsg on local 1→0");
             }
@@ -763,6 +794,7 @@ impl RedisAdapter {
                         user_id,
                         envelope::EnvelopeKind::WatchOffline,
                         serde_json::Value::Null,
+                        self.cfg.sharded_pubsub,
                     )
                     .await;
                 }
@@ -791,7 +823,13 @@ impl RedisAdapter {
         // Subscribe to each newly-watched user's watch channel so this node receives
         // their cluster online/offline transitions.
         for u in newly_watched {
-            if let Err(e) = self.clients.sub.subscribe(self.keys.watch(app, u)).await {
+            if let Err(e) = pubsub::sub_channel(
+                &self.clients.sub,
+                self.keys.watch(app, u),
+                self.cfg.sharded_pubsub,
+            )
+            .await
+            {
                 tracing::warn!(error = %e, app, user = %u, "failed to SUBSCRIBE watch channel");
             }
         }
@@ -818,7 +856,13 @@ impl RedisAdapter {
     #[doc(hidden)]
     pub async fn cluster_unwatch(&self, app: &str, no_longer_watched: &[String]) {
         for u in no_longer_watched {
-            if let Err(e) = self.clients.sub.unsubscribe(self.keys.watch(app, u)).await {
+            if let Err(e) = pubsub::unsub_channel(
+                &self.clients.sub,
+                self.keys.watch(app, u),
+                self.cfg.sharded_pubsub,
+            )
+            .await
+            {
                 tracing::warn!(error = %e, app, user = %u, "failed to UNSUBSCRIBE watch channel");
             }
         }
@@ -855,12 +899,9 @@ impl RedisAdapter {
             }
         };
         let key = self.keys.msg(app, channel);
-        if let Err(e) = self
-            .clients
-            .pool
-            .next()
-            .publish::<(), _, _>(key, payload)
-            .await
+        if let Err(e) =
+            client::publish_channel(&self.clients.pool, &key, payload, self.cfg.sharded_pubsub)
+                .await
         {
             tracing::warn!(error = %e, app, channel, "redis publish failed");
         }
@@ -1220,6 +1261,7 @@ impl Adapter for RedisAdapter {
             user_id,
             envelope::EnvelopeKind::UserSend,
             serde_json::Value::String(frame),
+            self.cfg.sharded_pubsub,
         )
         .await;
     }
@@ -1236,6 +1278,7 @@ impl Adapter for RedisAdapter {
             user_id,
             envelope::EnvelopeKind::UserTerminate,
             serde_json::Value::Null,
+            self.cfg.sharded_pubsub,
         )
         .await;
         ids

@@ -40,16 +40,21 @@ pub(crate) struct SweepReport {
 
 /// Run one deterministic sweep pass. `now` is the current wall-clock millis used to
 /// decide which members are stale (passed in so tests can drive time precisely).
+/// `sharded` is the cluster-wide `PYLON_REDIS_SHARDED_PUBSUB` setting, threading
+/// into the reap paths' WatchOffline/member_removed publishes so they ride the
+/// same pub/sub namespace (SPUBLISH vs PUBLISH) the live nodes subscribe on.
 ///
 /// Lease protocol: try `SET sweeplock node_id NX PX lease_ms`. If acquired, sweep.
 /// If not, `GET sweeplock`: if we already own it, renew (`SET … PX lease_ms`, no NX)
 /// and sweep; otherwise yield (another node sweeps) and return `acquired = false`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn sweep_once(
     pool: &Pool,
     scripts: &Scripts,
     keys: &Keys,
     node_id: &str,
     lease_ms: u64,
+    sharded: bool,
     webhooks: &WebhookHandle,
     now: u64,
 ) -> SweepReport {
@@ -113,7 +118,10 @@ pub(crate) async fn sweep_once(
             // users still live on another node are handled correctly.
             if super::presence::is_presence(&channel) {
                 for token in &stale {
-                    super::presence::reap_member(pool, keys, &app, &channel, token, webhooks).await;
+                    super::presence::reap_member(
+                        pool, keys, &app, &channel, token, sharded, webhooks,
+                    )
+                    .await;
                 }
             }
 
@@ -200,7 +208,7 @@ pub(crate) async fn sweep_once(
             }
         };
         for user_id in users {
-            super::user::reap_user(pool, keys, app, &user_id, now).await;
+            super::user::reap_user(pool, keys, app, &user_id, sharded, now).await;
         }
     }
 
@@ -292,13 +300,16 @@ async fn acquire_lease(pool: &Pool, keys: &Keys, node_id: &str, lease_ms: u64) -
 /// Background sweep loop. Ticks every `interval_secs` and runs one `sweep_once` with
 /// the current wall-clock millis. The lease (`lease_ms`) is sized to outlive a tick so
 /// the holder keeps sweeping, but auto-frees (PX expiry) if the holder dies — letting
-/// another node take over within a couple of ticks.
+/// another node take over within a couple of ticks. `sharded` threads the cluster's
+/// pub/sub mode into the reap publishes (see [`sweep_once`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn sweeper_loop(
     pool: Pool,
     keys: Keys,
     node_id: String,
     lease_ms: u64,
     interval_secs: u64,
+    sharded: bool,
     webhooks: WebhookHandle,
 ) {
     // Compiled once (pure local SHA-1 hashing, no Redis round-trip); reused by
@@ -313,6 +324,7 @@ pub(crate) async fn sweeper_loop(
             &keys,
             &node_id,
             lease_ms,
+            sharded,
             &webhooks,
             super::now_ms(),
         )
