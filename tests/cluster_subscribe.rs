@@ -451,17 +451,16 @@ async fn cross_node_vacated_single_emit() {
         // PRECONDITION GATE (the actual fix for CI run 33303526290's zero-delivery
         // failure): wait until A's `channel_occupied` webhook (fired by A's
         // subscribe, the cluster 0→1 edge) has been DELIVERED by A's dispatcher
-        // before firing any unsubscribe. Webhook spec §5 coalesces a
-        // `channel_occupied` and a `channel_vacated` for the same channel that
-        // share ONE batch window — they cancel 1:1 and NEITHER is ever delivered
-        // (deterministic: coalesce([occupied, vacated]) == [] is a unit-tested
-        // spec rule). If node A wins the vacate-CAS while its occupied is still
-        // pending in the same 10ms window (exactly what a stalled runner's
-        // scheduler gap produces), the vacated would be cancelled away and NO
-        // budget would ever observe it. With the occupied DELIVERED, A's batch is
-        // flushed and empty, so whichever node later wins the vacate lands in a
-        // fresh batch and is delivered. This gates the test's precondition; it
-        // changes no assertion.
+        // before firing any unsubscribe. Historically this gated against the
+        // batch coalescer cancelling an occupied+vacated pair sharing one
+        // 10ms window; that coalescing was removed for Pusher parity (audit
+        // R12a — the doc's vacate delay + reconnect-only suppression implies
+        // BOTH sides of a create-and-vacate are delivered), so the cancellation
+        // hazard is gone. The gate is kept as belt-and-suspenders: with the
+        // occupied DELIVERED, A's batch is flushed and empty, so whichever node
+        // later wins the vacate lands in a fresh batch — isolating the
+        // exactly-once assertion from dispatcher window timing entirely. This
+        // gates the test's precondition; it changes no assertion.
         assert!(
             wait_until(WEBHOOK_CHAIN_BUDGET, || async {
                 count_webhook(&node_a.transport, "channel_occupied").await >= 1

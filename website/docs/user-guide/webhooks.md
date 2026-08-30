@@ -157,13 +157,16 @@ app.post("/pusher/webhooks", (req, res) => {
 
 ## Batching and delivery knobs
 
-Pylon coalesces events that arrive within `PYLON_WEBHOOK_BATCH_MS` (default 50 ms) into a single
-POST to reduce request overhead. See [Configuration](configuration.md) for the full set of tuning
-variables:
+Pylon batches events that arrive within `PYLON_WEBHOOK_BATCH_MS` (default 50 ms) into a single
+POST to reduce request overhead — batching groups events, it never drops them: a channel that is
+created and vacated within one window still produces both the `channel_occupied` and the
+`channel_vacated` event (matching hosted Channels, where `channel_vacated` / `member_removed`
+are only delayed — "up to three seconds" — and suppressed only if the client reconnects within
+that delay). See [Configuration](configuration.md) for the full set of tuning variables:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `PYLON_WEBHOOK_BATCH_MS` | `50` | Coalescing window in milliseconds |
+| `PYLON_WEBHOOK_BATCH_MS` | `50` | Batching window in milliseconds |
 | `PYLON_WEBHOOK_MAX_CONCURRENCY` | `100` | Maximum simultaneous in-flight deliveries |
 | `PYLON_WEBHOOK_BACKOFF_BASE_MS` | `1000` | First retry delay; doubles each attempt |
 | `PYLON_WEBHOOK_BACKOFF_CAP_MS` | `60000` | Upper bound for each retry delay |

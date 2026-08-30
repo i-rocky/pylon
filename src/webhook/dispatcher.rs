@@ -3,7 +3,6 @@
 //! `event_types`, signing, and handing deliveries to a `WebhookTransport`.
 
 use crate::app::AppManager;
-use crate::webhook::batch::coalesce;
 use crate::webhook::event::WebhookEvent;
 use crate::webhook::occupancy::OccupancySource;
 use crate::webhook::transport::{build_signed_delivery, WebhookTransport};
@@ -104,8 +103,23 @@ impl WebhookDispatcher {
         }
     }
 
-    /// Partition by app, coalesce, then per configured endpoint filter by
-    /// `event_types`, build+sign one envelope, and deliver.
+    /// Partition by app, then per configured endpoint filter by `event_types`,
+    /// build+sign one envelope, and deliver.
+    ///
+    /// There is deliberately NO opposing-pair coalescing within a batch
+    /// (audit R12a, resolved 2026-08-30). Pusher's webhooks doc
+    /// (https://pusher.com/docs/channels/server_api/webhooks/) states: "There
+    /// is a delay of up to three seconds between a client disconnecting and
+    /// channel_vacated or member_removed webhooks being sent. If the client
+    /// reconnects within this delay, no webhooks will be sent." Nothing in the
+    /// documented model cancels an already-fired `channel_occupied` (the delay
+    /// applies only to the vacate/remove side, and suppression happens only on
+    /// reconnect) — so a channel created and vacated within one window still
+    /// gets BOTH events on hosted Channels. The former 1:1
+    /// occupied↔vacated / member_added↔member_removed cancellation delivered
+    /// NEITHER and was removed for parity; reconnect suppression is provided
+    /// by the cluster-path vacated grace + occupancy recheck below (and see
+    /// docs/superpowers/specs/2026-08-30-audit-findings.md, R12a).
     ///
     /// On the cluster path (`vacated_grace_ms > 0` and `occupancy.is_some()`)
     /// each surviving `channel_vacated` is NOT delivered inline; instead a
@@ -122,10 +136,10 @@ impl WebhookDispatcher {
         let cluster = self.vacated_grace_ms > 0 && self.occupancy.is_some();
 
         for (app_id, events) in by_app {
-            let survivors = coalesce(events);
-            if survivors.is_empty() {
-                continue;
-            }
+            // No coalescing — see the doc comment above (R12a: Pusher delivers
+            // both sides of a create-and-vacate within one window; suppression
+            // belongs to the reconnect path, not the batch window).
+            let survivors = events;
 
             // On the cluster path, peel surviving vacated events off for the
             // debounced grace+recheck; everything else delivers inline now.
@@ -336,7 +350,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn one_window_batches_and_coalesces_into_one_delivery() {
+    async fn one_window_batches_all_events_into_one_delivery() {
         let app = app_with(vec![WebhookConfig {
             url: "https://e.test/all".into(),
             event_types: vec![
@@ -361,7 +375,11 @@ mod tests {
         };
         let task = tokio::spawn(dispatcher.run());
 
-        // Three triggers inside ONE window: occ + vac (cancel) + miss (survives).
+        // Three triggers inside ONE window: occ + vac + miss. Pusher documents
+        // that channel_occupied fires immediately while channel_vacated is
+        // merely delayed ("up to three seconds") and suppressed only when the
+        // client reconnects — a channel created and vacated within one window
+        // still gets BOTH events. No opposing-pair cancellation (audit R12a).
         tx.send(occ()).await.unwrap();
         tx.send(vac()).await.unwrap();
         tx.send(miss()).await.unwrap();
@@ -382,10 +400,15 @@ mod tests {
         let events = env["events"].as_array().unwrap();
         assert_eq!(
             events.len(),
-            1,
-            "occ+vac coalesced away; only cache_miss left"
+            3,
+            "occ+vac+miss all delivered; no cancellation"
         );
-        assert_eq!(events[0]["name"], "cache_miss");
+        let names: Vec<&str> = events.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec!["channel_occupied", "channel_vacated", "cache_miss"],
+            "enqueue order preserved"
+        );
 
         drop(tx);
         let _ = task.await;

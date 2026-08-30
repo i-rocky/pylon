@@ -985,7 +985,8 @@ async fn subscribe_emits_channel_occupied_then_close_emits_vacated() {
     })
     .await;
     // Let the occupied window (30ms) close and flush BEFORE the vacated trigger,
-    // so the two transitions land in SEPARATE batches and don't coalesce away.
+    // so the two transitions land in SEPARATE batches (each gets its own
+    // delivery envelope — nothing is cancelled either way; see dispatcher.rs).
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     // Close → unsubscribes all → vacated.
     c.on_close().await;
@@ -1019,7 +1020,7 @@ async fn subscribe_emits_channel_occupied_then_close_emits_vacated() {
 }
 
 #[tokio::test]
-async fn rapid_subscribe_unsubscribe_in_window_emits_nothing() {
+async fn rapid_subscribe_unsubscribe_in_window_delivers_both() {
     let mut app = serde_json::from_value::<App>(serde_json::json!({
         "name": "t", "id": "app", "key": "app-key", "secret": "app-secret",
         "webhooks": [{ "url": "https://e.test/wh",
@@ -1028,7 +1029,10 @@ async fn rapid_subscribe_unsubscribe_in_window_emits_nothing() {
     .unwrap();
     app.recompute_has_flags();
 
-    // Large window so subscribe+unsubscribe land in the SAME batch → coalesce → empty.
+    // Large window so subscribe+unsubscribe land in the SAME batch: BOTH events
+    // are delivered in one envelope (Pusher delays channel_vacated "up to three
+    // seconds" and suppresses it only when the client reconnects — it never
+    // cancels an already-fired channel_occupied; audit R12a).
     let (webhooks, recorder) = recording_webhooks(app.clone(), 200);
     let adapter: std::sync::Arc<dyn crate::adapter::Adapter> =
         std::sync::Arc::new(crate::adapter::local::LocalAdapter::new(
@@ -1065,9 +1069,23 @@ async fn rapid_subscribe_unsubscribe_in_window_emits_nothing() {
     .await;
 
     tokio::time::sleep(std::time::Duration::from_millis(260)).await;
-    assert!(
-        recorder.recorded().await.is_empty(),
-        "occupied+vacated in one window must coalesce to no delivery"
+    let recorded = recorder.recorded().await;
+    assert_eq!(
+        recorded.len(),
+        1,
+        "occupied+vacated in one window batch into exactly one delivery"
+    );
+    let env: serde_json::Value = serde_json::from_str(&recorded[0].body).unwrap();
+    let names: Vec<&str> = env["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["channel_occupied", "channel_vacated"],
+        "both transitions delivered, enqueue order preserved"
     );
 }
 
