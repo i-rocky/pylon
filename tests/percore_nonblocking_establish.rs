@@ -9,7 +9,7 @@ use futures_util::StreamExt;
 use pylon::adapter::app_registry::AppRegistry;
 use pylon::adapter::local::LocalAdapter;
 use pylon::adapter::Adapter;
-use pylon::app::{App, AppLookupError, AppManager};
+use pylon::app::{App, AppLookup, AppLookupError, AppManager};
 use pylon::channel::registry::Registry;
 use pylon::server::config::ServerConfig;
 use pylon::transport::worker::{run, DispatchEnv, Mode, WorkerConfig};
@@ -22,6 +22,10 @@ use tokio_tungstenite::tungstenite::Message;
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// The key of a DISABLED app in [`SlowAppManager`] — resolves `Disabled` after
+/// the same artificial delay, exercising the PARKED → `drain_resolved` path.
+const DISABLED_KEY: &str = "off-key";
+
 /// An AppManager whose L1 probe always MISSES (forcing offload) and whose async
 /// `by_key` sleeps `delay` before resolving — modelling a slow DB round-trip.
 /// `calls` counts how many offloaded lookups actually ran.
@@ -33,21 +37,23 @@ struct SlowAppManager {
 
 #[async_trait::async_trait]
 impl AppManager for SlowAppManager {
-    async fn by_key(&self, key: &str) -> Result<Option<Arc<App>>, AppLookupError> {
+    async fn by_key(&self, key: &str) -> Result<AppLookup, AppLookupError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(self.delay).await;
         if key == self.app.key {
-            Ok(Some(self.app.clone()))
+            Ok(AppLookup::Found(self.app.clone()))
+        } else if key == DISABLED_KEY {
+            Ok(AppLookup::Disabled)
         } else {
-            Ok(None)
+            Ok(AppLookup::NotFound)
         }
     }
-    async fn by_id(&self, id: &str) -> Result<Option<Arc<App>>, AppLookupError> {
+    async fn by_id(&self, id: &str) -> Result<AppLookup, AppLookupError> {
         tokio::time::sleep(self.delay).await;
         if id == self.app.id {
-            Ok(Some(self.app.clone()))
+            Ok(AppLookup::Found(self.app.clone()))
         } else {
-            Ok(None)
+            Ok(AppLookup::NotFound)
         }
     }
     // No `by_key_cached` override → defaults to `None` → always offloads.
@@ -326,4 +332,52 @@ async fn parked_disconnect_leaks_no_counter_and_discards_late_resolution() {
     );
 
     drop(b);
+}
+
+// ── R1: disabled key on the PARKED (offloaded) path ──────────────────────────
+
+/// A DISABLED app's key resolved through the offload path (park →
+/// `drain_resolved`) keeps the single WS answer for an unusable key: reject
+/// `pusher:error` 4001 "Could not find app by key" + Close 4001. REST carries
+/// the 403 distinction; WS deliberately does not.
+#[tokio::test]
+async fn parked_disabled_key_rejects_4001() {
+    let h = spawn_slow(Duration::from_millis(20)).await;
+    let url = format!("ws://127.0.0.1:{}/app/{}?protocol=7", h.port, DISABLED_KEY);
+    let (mut ws, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(url),
+    )
+    .await
+    .expect("connect within 5s")
+    .expect("ws handshake");
+
+    // The reject arrives via drain_resolved once the offloaded lookup lands.
+    let frame = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await.unwrap().unwrap() {
+                Message::Text(t) => break serde_json::from_str::<Value>(&t).unwrap(),
+                Message::Close(_) => panic!("close before the pusher:error frame"),
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .expect("frame within 5s");
+    assert_eq!(frame["event"], "pusher:error", "frame: {frame}");
+    assert_eq!(frame["data"]["code"], 4001, "frame: {frame}");
+    assert_eq!(frame["data"]["message"], "Could not find app by key");
+
+    let mut close_code: Option<u16> = None;
+    while let Some(Ok(msg)) = ws.next().await {
+        if let Message::Close(f) = msg {
+            close_code = f.map(|c| u16::from(c.code));
+            break;
+        }
+    }
+    assert_eq!(
+        close_code,
+        Some(4001),
+        "disabled-key reject (parked path) must close 4001, got: {close_code:?}"
+    );
 }

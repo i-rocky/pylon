@@ -21,8 +21,19 @@ const APPS: &str = r#"[
     {"name":"Test2","id":"app2","key":"app2-key","secret":"app2-secret",
      "client_messages_enabled":true,"subscription_count_enabled":true}
 ]"#;
+/// Same as [`APPS`] plus a DISABLED app (`"enabled": false`) — the R1 fixture:
+/// a disabled app exists but must not authenticate (REST 403 / WS 4001).
+const APPS_WITH_DISABLED: &str = r#"[
+    {"name":"Test","id":"app1","key":"app-key","secret":"app-secret",
+     "client_messages_enabled":true,"subscription_count_enabled":false},
+    {"name":"Test2","id":"app2","key":"app2-key","secret":"app2-secret",
+     "client_messages_enabled":true,"subscription_count_enabled":true},
+    {"name":"Off","id":"off-app","key":"off-key","secret":"off-secret",
+     "enabled":false}
+]"#;
 const SECRET: &str = "app-secret";
 const SECRET2: &str = "app2-secret";
+const OFF_SECRET: &str = "off-secret";
 
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -34,9 +45,14 @@ type Ws =
 /// flag are leaked; the OS reclaims them at process exit (test processes are
 /// short-lived).
 async fn spawn() -> SocketAddr {
+    spawn_with_apps(APPS).await
+}
+
+/// [`spawn`] with a custom apps.json fixture (e.g. [`APPS_WITH_DISABLED`]).
+async fn spawn_with_apps(apps_json: &str) -> SocketAddr {
     use std::sync::atomic::AtomicBool;
 
-    let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
+    let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(apps_json).unwrap());
     let local = Arc::new(LocalAdapter::new(
         Arc::new(Registry::new()),
         Arc::new(pylon::adapter::app_registry::AppRegistry::new()),
@@ -113,12 +129,35 @@ async fn spawn() -> SocketAddr {
 
 /// Build the signed query string for a request, returning the full URL query.
 fn signed_query(method: &str, path: &str, body: &[u8], extra: &[(&str, &str)]) -> String {
+    signed_query_as("app-key", SECRET, method, path, body, extra)
+}
+
+/// [`signed_query`] for app2 (the subscription_count-enabled app).
+fn signed_query2(method: &str, path: &str, body: &[u8], extra: &[(&str, &str)]) -> String {
+    signed_query_as("app2-key", SECRET2, method, path, body, extra)
+}
+
+/// [`signed_query`] for the DISABLED app in [`APPS_WITH_DISABLED`].
+fn signed_query_off(method: &str, path: &str, body: &[u8], extra: &[(&str, &str)]) -> String {
+    signed_query_as("off-key", OFF_SECRET, method, path, body, extra)
+}
+
+/// Build the signed query string for `key`/`secret` (the shared core of the
+/// per-app `signed_query*` helpers).
+fn signed_query_as(
+    key: &str,
+    secret: &str,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    extra: &[(&str, &str)],
+) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
     let mut p: BTreeMap<String, String> = BTreeMap::new();
-    p.insert("auth_key".into(), "app-key".into());
+    p.insert("auth_key".into(), key.to_string());
     p.insert("auth_timestamp".into(), now.to_string());
     p.insert("auth_version".into(), "1.0".into());
     if !body.is_empty() {
@@ -133,7 +172,7 @@ fn signed_query(method: &str, path: &str, body: &[u8], extra: &[(&str, &str)]) -
         .collect::<Vec<_>>()
         .join("&");
     let signed = format!("{}\n{}\n{}", method.to_uppercase(), path, canon);
-    let sig = hmac_sha256_hex(SECRET, &signed);
+    let sig = hmac_sha256_hex(secret, &signed);
     format!("{canon}&auth_signature={sig}")
 }
 
@@ -149,33 +188,6 @@ async fn connect_ws2(addr: SocketAddr) -> Ws {
         .await
         .unwrap();
     ws
-}
-
-fn signed_query2(method: &str, path: &str, body: &[u8], extra: &[(&str, &str)]) -> String {
-    use pylon::auth::signature::hmac_sha256_hex;
-    use pylon::auth::signature::md5_hex;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let mut p: BTreeMap<String, String> = BTreeMap::new();
-    p.insert("auth_key".into(), "app2-key".into());
-    p.insert("auth_timestamp".into(), now.to_string());
-    p.insert("auth_version".into(), "1.0".into());
-    if !body.is_empty() {
-        p.insert("body_md5".into(), md5_hex(body));
-    }
-    for (k, v) in extra {
-        p.insert((*k).to_string(), (*v).to_string());
-    }
-    let canon = p
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("&");
-    let signed = format!("{}\n{}\n{}", method.to_uppercase(), path, canon);
-    let sig = hmac_sha256_hex(SECRET2, &signed);
-    format!("{canon}&auth_signature={sig}")
 }
 
 async fn next_json(ws: &mut Ws) -> Value {
@@ -1097,6 +1109,86 @@ async fn rest_error_body_413_body_limit_is_json() {
         .await
         .unwrap();
     assert_json_error(resp, 413).await;
+}
+
+// ── R1 parity tests — disabled app: REST 403, unknown app: REST 401 ──────────
+
+/// R1: an app with `"enabled": false` in apps.json must get **403 Forbidden**
+/// (Pusher documents 403 for a disabled app) with the JSON error body — NOT the
+/// 401 "invalid authentication" that a missing app gets.
+#[tokio::test]
+async fn rest_disabled_app_is_403() {
+    let addr = spawn_with_apps(APPS_WITH_DISABLED).await;
+    // A CORRECTLY signed request for the disabled app (right key + secret) —
+    // the 403 comes from the app's disabled state, not a signature failure.
+    let body = json!({"name":"e","data":"{}","channels":["c"]}).to_string();
+    let q = signed_query_off("POST", "/apps/off-app/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/off-app/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_json_error(resp, 403).await;
+}
+
+/// R1: the 403 for a disabled app is not a blanket change — an UNKNOWN app id
+/// keeps 401 "invalid authentication" (anti-enumeration: the server must not
+/// reveal which app ids exist; disabled is the one documented distinction).
+#[tokio::test]
+async fn rest_unknown_app_id_is_still_401() {
+    let addr = spawn().await;
+    // Sign with app1's (valid) credentials over a path naming a nonexistent app.
+    let body = json!({"name":"e","data":"{}","channels":["c"]}).to_string();
+    let q = signed_query("POST", "/apps/no-such-app/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/no-such-app/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_json_error(resp, 401).await;
+}
+
+/// R1 regression pin: an ENABLED app keeps normal operation (200) — the
+/// found/disabled/not-found split must not disturb the happy path.
+#[tokio::test]
+async fn rest_enabled_app_still_200() {
+    let addr = spawn_with_apps(APPS_WITH_DISABLED).await;
+    let body = json!({"name":"e","data":"{}","channels":["c"]}).to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+/// R1 (WS side): connecting with a DISABLED app's KEY keeps the single WS
+/// answer for an unusable key — 4001 "Could not find app by key" (the audit's
+/// chosen behavior; REST carries the 403 distinction, WS does not).
+#[tokio::test]
+async fn ws_disabled_app_key_close_frame_carries_4001() {
+    let addr = spawn_with_apps(APPS_WITH_DISABLED).await;
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(format!("ws://{addr}/app/off-key?protocol=7"))
+            .await
+            .unwrap();
+
+    let mut close_code: Option<u16> = None;
+    while let Some(Ok(msg)) = ws.next().await {
+        if let Message::Close(frame) = msg {
+            close_code = frame.map(|f| u16::from(f.code));
+            break;
+        }
+    }
+    assert_eq!(
+        close_code,
+        Some(4001),
+        "disabled-app-key reject must close with code 4001 (R1), got: {close_code:?}"
+    );
 }
 
 // ── P13 parity tests — pre-handshake reject must carry Pusher 4xxx close code ─

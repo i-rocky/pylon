@@ -743,8 +743,9 @@ async fn handle_cmd(
             // Resolve the per-app flags ourselves (the worker's handler is guarded off in
             // cluster mode). An app that vanished mid-flight just drops the edge.
             let a = match apps.by_id(&app).await {
-                Ok(Some(a)) => a,
-                Ok(None) => return,
+                Ok(crate::app::AppLookup::Found(a)) => a,
+                // App vanished or was disabled mid-flight: drop the edge.
+                Ok(_) => return,
                 Err(e) => {
                     tracing::warn!(error = %e, "cluster-edge app lookup failed; skipping");
                     return;
@@ -826,8 +827,9 @@ async fn handle_cmd(
                 .cluster_unsubscribe(&app, &channel, &socket_id, node_last)
                 .await;
             let a = match apps.by_id(&app).await {
-                Ok(Some(a)) => a,
-                Ok(None) => return,
+                Ok(crate::app::AppLookup::Found(a)) => a,
+                // App vanished or was disabled mid-flight: drop the edge.
+                Ok(_) => return,
                 Err(e) => {
                     tracing::warn!(error = %e, "cluster-edge app lookup failed; skipping");
                     return;
@@ -951,8 +953,9 @@ async fn handle_cmd(
             // Resolve the per-app flags ourselves (the worker's handler is guarded off in
             // cluster mode). An app that vanished mid-flight just drops the edges.
             let a = match apps.by_id(&app).await {
-                Ok(Some(a)) => a,
-                Ok(None) => return,
+                Ok(crate::app::AppLookup::Found(a)) => a,
+                // App vanished or was disabled mid-flight: drop the edge.
+                Ok(_) => return,
                 Err(e) => {
                     tracing::warn!(error = %e, "cluster-edge app lookup failed; skipping");
                     return;
@@ -1025,8 +1028,9 @@ async fn handle_cmd(
                 }
             };
             let a = match apps.by_id(&app).await {
-                Ok(Some(a)) => a,
-                Ok(None) => return,
+                Ok(crate::app::AppLookup::Found(a)) => a,
+                // App vanished or was disabled mid-flight: drop the edge.
+                Ok(_) => return,
                 Err(e) => {
                     tracing::warn!(error = %e, "cluster-edge app lookup failed; skipping");
                     return;

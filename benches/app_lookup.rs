@@ -26,7 +26,7 @@ use criterion::{
 };
 use pylon::app::cache::{CacheConfig, CachingAppManager};
 use pylon::app::static_file::StaticFileAppManager;
-use pylon::app::{App, AppLookupError, AppManager};
+use pylon::app::{App, AppLookup, AppLookupError, AppManager};
 
 /// Lookups folded into a single `block_on` so the runtime/executor overhead is
 /// amortised across the batch and the per-element number reflects the lookup.
@@ -51,11 +51,11 @@ struct MockDriver {
 
 #[async_trait::async_trait]
 impl AppManager for MockDriver {
-    async fn by_id(&self, _id: &str) -> Result<Option<Arc<App>>, AppLookupError> {
+    async fn by_id(&self, _id: &str) -> Result<AppLookup, AppLookupError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        Ok(self.app.clone())
+        Ok(AppLookup::from(self.app.clone()))
     }
-    async fn by_key(&self, k: &str) -> Result<Option<Arc<App>>, AppLookupError> {
+    async fn by_key(&self, k: &str) -> Result<AppLookup, AppLookupError> {
         self.by_id(k).await
     }
 }
@@ -108,7 +108,14 @@ fn bench_l1_hit(c: &mut Criterion) {
     let (drv, calls) = driver(Some(app("app-0", "key-0")));
     let cache = CachingAppManager::new(drv, cache_cfg(), None);
     // Warm L1 once.
-    rt.block_on(async { cache.by_id("app-0").await.unwrap().unwrap() });
+    rt.block_on(async {
+        cache
+            .by_id("app-0")
+            .await
+            .unwrap()
+            .into_enabled()
+            .expect("found");
+    });
     assert_eq!(
         calls.load(Ordering::Relaxed),
         1,
@@ -121,7 +128,13 @@ fn bench_l1_hit(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 for _ in 0..BATCH {
-                    black_box(cache.by_id(black_box("app-0")).await.unwrap().unwrap());
+                    black_box(
+                        cache
+                            .by_id(black_box("app-0"))
+                            .await
+                            .unwrap()
+                            .into_enabled(),
+                    );
                 }
             });
         });
@@ -158,7 +171,7 @@ fn bench_static_scan(c: &mut Criterion) {
             b.iter(|| {
                 rt.block_on(async {
                     for _ in 0..BATCH {
-                        black_box(mgr.by_id(black_box(last)).await.unwrap().unwrap());
+                        black_box(mgr.by_id(black_box(last)).await.unwrap().into_enabled());
                     }
                 });
             });
@@ -193,7 +206,7 @@ fn bench_cold_miss(c: &mut Criterion) {
             || format!("miss-{}", next.fetch_add(1, Ordering::Relaxed)),
             |id| {
                 rt.block_on(async {
-                    black_box(cache.by_id(black_box(&id)).await.unwrap().unwrap());
+                    black_box(cache.by_id(black_box(&id)).await.unwrap().into_enabled());
                 });
             },
             BatchSize::SmallInput,
@@ -235,7 +248,7 @@ fn bench_single_flight(c: &mut Criterion) {
                             let c = cache.clone();
                             let id = id.clone();
                             handles.push(tokio::spawn(async move {
-                                black_box(c.by_id(&id).await.unwrap().unwrap())
+                                black_box(c.by_id(&id).await.unwrap().into_enabled())
                             }));
                         }
                         for h in handles {

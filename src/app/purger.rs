@@ -45,8 +45,9 @@ impl AppPurger {
     /// composing `RedisAdapter::purge_app` already SREM'd `{prefix}:apps`.
     ///
     /// Cache-first ordering is deliberate: once the L1/L2 entry is gone, any new
-    /// connect for this app re-fetches the (uncached) driver — which returns
-    /// `Ok(None)` for a removed/disabled app — and is rejected at `by_key` rather
+    /// connect for this app re-fetches the (uncached) driver — which answers
+    /// `Disabled`/`NotFound` for a removed/disabled app — and is rejected at
+    /// `by_key` rather
     /// than establishing against a stale-positive cache entry and surviving the
     /// drain. The only residual window is a connect that already passed `by_key`
     /// (cache hit) but registers in `AppRegistry` after the drain; that bounded
@@ -59,9 +60,10 @@ impl AppPurger {
 }
 
 /// One sweep pass: for each distinct connected app, query the AUTHORITATIVE
-/// (uncached) driver by id. `Ok(None)` ⇒ the app is gone/disabled ⇒ purge it.
-/// `Ok(Some)` ⇒ live, skip. `Err` ⇒ backend trouble, LOG + skip (an outage must
-/// never evict a live app). Returns the number of apps purged this pass.
+/// (uncached) driver by id. Anything but `Found` ⇒ the app is gone/disabled ⇒
+/// purge it. `Found` ⇒ live, skip. `Err` ⇒ backend trouble, LOG + skip (an
+/// outage must never evict a live app). Returns the number of apps purged this
+/// pass.
 ///
 /// The app key needed for cache eviction is resolved from the still-warm cache
 /// (`cache.by_id`) BEFORE purging; if the cache no longer holds it the id-keyed
@@ -78,19 +80,16 @@ pub(crate) async fn sweep_once(
         // Resolve the key from the warm cache BEFORE the driver verdict (a removed
         // app returns no App, so we couldn't learn its key afterwards). Empty key
         // ⇒ id-keyed eviction only (key alias falls back to TTL); never blocks.
-        let key = cache
-            .by_id(&id)
-            .await
-            .ok()
-            .flatten()
-            .map(|a| a.key.clone())
-            .unwrap_or_default();
+        let key = match cache.by_id(&id).await {
+            Ok(crate::app::AppLookup::Found(a)) => a.key.clone(),
+            _ => String::new(),
+        };
         match driver.by_id(&id).await {
-            Ok(None) => {
+            Ok(crate::app::AppLookup::Disabled) | Ok(crate::app::AppLookup::NotFound) => {
                 purger.purge(&id, &key).await;
                 purged += 1;
             }
-            Ok(Some(_)) => {} // live — skip
+            Ok(crate::app::AppLookup::Found(_)) => {} // live — skip
             Err(e) => {
                 tracing::warn!(error = %e, app = %id, "app-purge sweep: driver lookup failed; skipping (no purge on error)");
             }
@@ -149,11 +148,11 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl AppManager for Mock {
-        async fn by_id(&self, _: &str) -> Result<Option<Arc<App>>, AppLookupError> {
+        async fn by_id(&self, _: &str) -> Result<crate::app::AppLookup, AppLookupError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.app.clone())
+            Ok(crate::app::AppLookup::from(self.app.clone()))
         }
-        async fn by_key(&self, k: &str) -> Result<Option<Arc<App>>, AppLookupError> {
+        async fn by_key(&self, k: &str) -> Result<crate::app::AppLookup, AppLookupError> {
             self.by_id(k).await
         }
     }
@@ -196,7 +195,9 @@ mod tests {
         let cache = Arc::new(CachingAppManager::new(mock_driver, cfg, None));
 
         // Warm the cache: driver must be hit exactly once.
-        assert_eq!(cache.by_id("a").await.unwrap().unwrap().key, "k");
+        assert!(
+            matches!(&cache.by_id("a").await.unwrap(), crate::app::AppLookup::Found(a) if a.key == "k")
+        );
         let calls_after_warm = driver_calls.load(Ordering::SeqCst);
         assert_eq!(calls_after_warm, 1, "warm-up must hit the driver once");
 
@@ -243,14 +244,14 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl AppManager for VarMock {
-        async fn by_id(&self, _: &str) -> Result<Option<Arc<App>>, AppLookupError> {
+        async fn by_id(&self, _: &str) -> Result<crate::app::AppLookup, AppLookupError> {
             match self.outcome {
-                Outcome::Some => Ok(std::option::Option::Some(self.app.clone())),
-                Outcome::None => Ok(std::option::Option::None),
+                Outcome::Some => Ok(crate::app::AppLookup::Found(self.app.clone())),
+                Outcome::None => Ok(crate::app::AppLookup::NotFound),
                 Outcome::Err => Err(AppLookupError::Backend("down".into())),
             }
         }
-        async fn by_key(&self, k: &str) -> Result<Option<Arc<App>>, AppLookupError> {
+        async fn by_key(&self, k: &str) -> Result<crate::app::AppLookup, AppLookupError> {
             self.by_id(k).await
         }
     }

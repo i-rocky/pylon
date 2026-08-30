@@ -139,8 +139,9 @@ impl WebhookDispatcher {
 
             if !immediate.is_empty() {
                 let app = match self.apps.by_id(&app_id).await {
-                    Ok(Some(a)) => a,
-                    Ok(None) => continue, // app vanished (hot-reload race): drop
+                    Ok(crate::app::AppLookup::Found(a)) => a,
+                    // App vanished OR was disabled (hot-reload race): drop.
+                    Ok(_) => continue,
                     Err(e) => {
                         tracing::warn!(error = %e, "webhook app lookup failed; skipping cycle");
                         continue;
@@ -190,8 +191,9 @@ impl WebhookDispatcher {
                             return;
                         }
                         let resolved = match apps.by_id(&app).await {
-                            Ok(Some(a)) => a,
-                            Ok(None) => return, // app vanished: drop
+                            Ok(crate::app::AppLookup::Found(a)) => a,
+                            // App vanished or disabled: drop.
+                            Ok(_) => return,
                             Err(e) => {
                                 tracing::warn!(error = %e, "webhook app lookup failed; skipping cycle");
                                 return;
@@ -264,11 +266,15 @@ mod tests {
 
     #[async_trait]
     impl AppManager for OneApp {
-        async fn by_key(&self, key: &str) -> Result<Option<std::sync::Arc<App>>, AppLookupError> {
-            Ok((self.0.key == key).then(|| std::sync::Arc::new(self.0.clone())))
+        async fn by_key(&self, key: &str) -> Result<crate::app::AppLookup, AppLookupError> {
+            Ok((self.0.key == key)
+                .then(|| std::sync::Arc::new(self.0.clone()))
+                .into())
         }
-        async fn by_id(&self, id: &str) -> Result<Option<std::sync::Arc<App>>, AppLookupError> {
-            Ok((self.0.id == id).then(|| std::sync::Arc::new(self.0.clone())))
+        async fn by_id(&self, id: &str) -> Result<crate::app::AppLookup, AppLookupError> {
+            Ok((self.0.id == id)
+                .then(|| std::sync::Arc::new(self.0.clone()))
+                .into())
         }
     }
 

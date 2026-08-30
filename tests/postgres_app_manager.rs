@@ -1,6 +1,6 @@
 //! Postgres-backed SqlAppManager integration test. Fail-loud (assumes a Postgres at
 //! PYLON_TEST_POSTGRES_URL or 127.0.0.1:5433), per the repo's redis_cluster.rs convention.
-use pylon::app::{sql::SqlAppManager, AppManager};
+use pylon::app::{sql::SqlAppManager, AppLookup, AppManager};
 use sqlx::any::AnyPoolOptions;
 
 fn url() -> String {
@@ -61,13 +61,29 @@ async fn postgres_resolves_by_id_and_key_and_filters_disabled() {
         .unwrap();
 
     let m = SqlAppManager::connect(&url()).await.unwrap();
-    let a = m.by_id(&id).await.unwrap().expect("by_id hit");
+    let AppLookup::Found(a) = m.by_id(&id).await.unwrap() else {
+        panic!("by_id hit");
+    };
     assert_eq!(a.key, key);
     assert_eq!(a.capacity, 7);
     assert!(a.client_messages_enabled);
     assert!(a.has_channel_occupied_webhooks); // recompute ran
-    assert_eq!(m.by_key(&key).await.unwrap().unwrap().id, id);
-    assert!(m.by_id("nope-xyz").await.unwrap().is_none()); // missing -> None
-    assert!(m.by_id(&off_id).await.unwrap().is_none()); // disabled -> None
-    assert!(m.by_key(&off_key).await.unwrap().is_none());
+    let AppLookup::Found(k) = m.by_key(&key).await.unwrap() else {
+        panic!("by_key hit");
+    };
+    assert_eq!(k.id, id);
+    // R1: missing -> NotFound (REST 401) ...
+    assert!(matches!(
+        m.by_id("nope-xyz").await.unwrap(),
+        AppLookup::NotFound
+    ));
+    // ... while disabled -> Disabled (REST 403) — the row exists, enabled=0.
+    assert!(matches!(
+        m.by_id(&off_id).await.unwrap(),
+        AppLookup::Disabled
+    ));
+    assert!(matches!(
+        m.by_key(&off_key).await.unwrap(),
+        AppLookup::Disabled
+    ));
 }

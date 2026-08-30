@@ -127,10 +127,46 @@ impl std::fmt::Display for AppLookupError {
 }
 impl std::error::Error for AppLookupError {}
 
+/// The outcome of an app lookup, distinguishing a DISABLED app (found in the
+/// store, `enabled=false` — Pusher documents HTTP **403 Forbidden** for it) from
+/// a NOT-FOUND id/key (**401**, indistinguishable from a signature failure for
+/// anti-enumeration). REST auth maps the three states to 200/403/401; the WS
+/// establish path deliberately collapses `Disabled` and `NotFound` into the
+/// single 4001 "Could not find app by key" answer.
+#[derive(Debug)]
+pub enum AppLookup {
+    Found(Arc<App>),
+    Disabled,
+    NotFound,
+}
+
+impl AppLookup {
+    /// Collapse to the pre-R1 `Option`: `Some` only when found AND enabled.
+    /// For call sites that treat a disabled app exactly like a missing one
+    /// (WS 4001, webhook/cluster edges).
+    pub fn into_enabled(self) -> Option<Arc<App>> {
+        match self {
+            AppLookup::Found(app) => Some(app),
+            AppLookup::Disabled | AppLookup::NotFound => None,
+        }
+    }
+}
+
+impl From<Option<Arc<App>>> for AppLookup {
+    /// Lift an `Option<Arc<App>>` (Some = enabled app) into the enum. Used by
+    /// in-memory managers and test doubles whose source already filters.
+    fn from(v: Option<Arc<App>>) -> Self {
+        match v {
+            Some(app) => AppLookup::Found(app),
+            None => AppLookup::NotFound,
+        }
+    }
+}
+
 #[async_trait::async_trait]
 pub trait AppManager: Send + Sync {
-    async fn by_key(&self, key: &str) -> Result<Option<Arc<App>>, AppLookupError>;
-    async fn by_id(&self, id: &str) -> Result<Option<Arc<App>>, AppLookupError>;
+    async fn by_key(&self, key: &str) -> Result<AppLookup, AppLookupError>;
+    async fn by_id(&self, id: &str) -> Result<AppLookup, AppLookupError>;
 
     /// SYNCHRONOUS L1-only probe for the per-core establish fast path.
     ///
@@ -140,7 +176,7 @@ pub trait AppManager: Send + Sync {
     /// async [`Self::by_key`] to a tokio task and parks the connection rather than
     /// blocking the worker. The default is `None`: a raw `SqlAppManager` /
     /// `MongoAppManager` has no in-memory tier, so it always offloads.
-    fn by_key_cached(&self, _key: &str) -> Option<Result<Option<Arc<App>>, AppLookupError>> {
+    fn by_key_cached(&self, _key: &str) -> Option<Result<AppLookup, AppLookupError>> {
         None
     }
 }
@@ -236,5 +272,24 @@ mod tests {
     fn app_lookup_error_is_clone() {
         let e = AppLookupError::Backend("x".into());
         let _c = e.clone();
+    }
+
+    #[test]
+    fn app_lookup_into_enabled_collapses_disabled_and_not_found() {
+        let app = Arc::new(parse(serde_json::json!({
+            "name": "t", "id": "a", "key": "k", "secret": "s"
+        })));
+        assert!(AppLookup::Found(app).into_enabled().is_some());
+        assert!(AppLookup::Disabled.into_enabled().is_none());
+        assert!(AppLookup::NotFound.into_enabled().is_none());
+    }
+
+    #[test]
+    fn app_lookup_from_option_lifts_found_and_not_found() {
+        let app = Arc::new(parse(serde_json::json!({
+            "name": "t", "id": "a", "key": "k", "secret": "s"
+        })));
+        assert!(matches!(AppLookup::from(Some(app)), AppLookup::Found(_)));
+        assert!(matches!(AppLookup::from(None), AppLookup::NotFound));
     }
 }

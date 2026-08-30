@@ -40,6 +40,14 @@ impl RestError {
             message: message.into(),
         }
     }
+    /// R1: Pusher's HTTP API documents **403 Forbidden** for a disabled app —
+    /// distinct from the 401 an unknown app / bad signature gets.
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
     pub fn payload_too_large(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
@@ -117,6 +125,7 @@ mod tests {
         for (err, code) in [
             (RestError::bad_request("bad"), 400),
             (RestError::unauthorized("no"), 401),
+            (RestError::forbidden("app is disabled"), 403),
             (RestError::not_found("gone"), 404),
             (RestError::payload_too_large("big"), 413),
             (RestError::service_unavailable("busy"), 503),
@@ -170,6 +179,7 @@ mod tests {
             RestError::unauthorized("x").status,
             StatusCode::UNAUTHORIZED
         );
+        assert_eq!(RestError::forbidden("x").status, StatusCode::FORBIDDEN);
         assert_eq!(
             RestError::payload_too_large("x").status,
             StatusCode::PAYLOAD_TOO_LARGE

@@ -15,11 +15,15 @@ mod pylon_dispatcher_helpers {
     pub struct OneApp(pub App);
     #[async_trait]
     impl AppManager for OneApp {
-        async fn by_key(&self, key: &str) -> Result<Option<std::sync::Arc<App>>, AppLookupError> {
-            Ok((self.0.key == key).then(|| std::sync::Arc::new(self.0.clone())))
+        async fn by_key(&self, key: &str) -> Result<crate::app::AppLookup, AppLookupError> {
+            Ok((self.0.key == key)
+                .then(|| std::sync::Arc::new(self.0.clone()))
+                .into())
         }
-        async fn by_id(&self, id: &str) -> Result<Option<std::sync::Arc<App>>, AppLookupError> {
-            Ok((self.0.id == id).then(|| std::sync::Arc::new(self.0.clone())))
+        async fn by_id(&self, id: &str) -> Result<crate::app::AppLookup, AppLookupError> {
+            Ok((self.0.id == id)
+                .then(|| std::sync::Arc::new(self.0.clone()))
+                .into())
         }
     }
 
