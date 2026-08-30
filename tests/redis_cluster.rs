@@ -134,9 +134,13 @@ async fn smoke_connectivity() {
         .expect("PUBLISH must succeed");
 
     // Receive, with a hard timeout so a broken stream fails instead of hanging.
-    let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+    // Generous-but-bounded: the loopback round trip is sub-millisecond (p99
+    // well under 10ms), but a loaded runner can stall the runtime far past
+    // that — the old 2s window was observed to flake ~1/13 full-sequence runs
+    // while never failing solo. Same semantics: the message MUST arrive.
+    let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
-        .expect("must receive the published message within 2s")
+        .expect("must receive the published message within 5s")
         .expect("broadcast receiver must yield a message");
 
     assert_eq!(msg.channel.to_string(), channel);

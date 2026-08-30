@@ -27,8 +27,8 @@
 mod common;
 
 use common::{
-    auth_token, connect, established_socket_id, next_event_named, next_json, send_json,
-    spawn_percore_cluster, spawn_percore_cluster_with, Ws,
+    auth_token, connect, established_socket_id, next_event_named, next_json, next_json_within,
+    send_json, spawn_percore_cluster, spawn_percore_cluster_with, Ws,
 };
 use serde_json::{json, Value};
 use std::net::SocketAddr;
@@ -135,8 +135,11 @@ async fn count_member_removed(ws: &mut Ws, want_user: &str, deadline: Duration) 
 }
 
 /// Count `event`-named frames whose double-encoded `data.user_id` equals `want_user`,
-/// reading until `deadline`. Bounded per read (raced against the remaining budget);
-/// an elapsed budget just stops the loop (it never masks a failure — a missing frame
+/// reading until `deadline`. Each read is bounded by the REMAINING budget via
+/// `next_json_within` (a non-panicking read): racing `next_json` itself against an
+/// equal-length outer timeout let `next_json`'s INTERNAL 5s panic win the tie on a
+/// starved duplicate-detection read and kill an otherwise-passing test. An elapsed
+/// budget just stops the loop (it never masks a failure — a missing frame
 /// returns 0, a duplicate returns ≥2).
 async fn count_member_frames(
     ws: &mut Ws,
@@ -148,9 +151,9 @@ async fn count_member_frames(
     let mut seen = 0usize;
     while tokio::time::Instant::now() < stop {
         let remaining = stop.saturating_duration_since(tokio::time::Instant::now());
-        let frame = match tokio::time::timeout(remaining, next_json(ws)).await {
-            Ok(f) => f,
-            Err(_) => break,
+        let frame = match next_json_within(ws, remaining).await {
+            Some(f) => f,
+            None => break,
         };
         if frame["event"] == event {
             if let Some(s) = frame["data"].as_str() {

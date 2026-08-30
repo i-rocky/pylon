@@ -32,9 +32,11 @@
 mod common;
 
 use common::{
-    connect, established_socket_id, next_json, send_json, spawn_percore_cluster, Ws, KEY, SECRET,
+    connect, established_socket_id, next_json, next_json_within, send_json, spawn_percore_cluster,
+    wait_pubsub_subscribers, wait_redis_hlen_ge, Ws, KEY, SECRET,
 };
 use futures_util::StreamExt;
+use pylon::adapter::redis::keys::Keys;
 use pylon::auth::signature::{hmac_sha256_hex, md5_hex, user_signature};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -103,7 +105,10 @@ async fn signin(ws: &mut Ws, socket_id: &str, user_data: &str) {
 
 /// Wait (bounded) for the next `pusher_internal:watchlist_events` frame, returning
 /// its single change's `(name, user_ids)`. Skips any interleaved non-watchlist
-/// frames. Returns `None` if `deadline` elapses with no watchlist frame.
+/// frames. Returns `None` if `deadline` elapses with no watchlist frame. Each read
+/// is bounded by the REMAINING budget via `next_json_within` (non-panicking —
+/// racing `next_json` itself against an equal-length outer timeout let its
+/// INTERNAL 5s panic win the tie).
 async fn next_watchlist(ws: &mut Ws, deadline: Duration) -> Option<(String, Vec<String>)> {
     let stop = tokio::time::Instant::now() + deadline;
     loop {
@@ -111,10 +116,7 @@ async fn next_watchlist(ws: &mut Ws, deadline: Duration) -> Option<(String, Vec<
         if remaining.is_zero() {
             return None;
         }
-        let frame = match tokio::time::timeout(remaining, next_json(ws)).await {
-            Ok(f) => f,
-            Err(_) => return None,
-        };
+        let frame = next_json_within(ws, remaining).await?;
         if frame["event"] == "pusher_internal:watchlist_events" {
             let ev = &frame["data"]["events"][0];
             let name = ev["name"].as_str().unwrap_or_default().to_string();
@@ -158,9 +160,15 @@ async fn cross_node_watchlist_online() {
         "w must receive no watchlist snapshot while U is offline"
     );
 
-    // Give w's node-local 0→1 watch edge a moment to drive the bridge's Redis
-    // SUBSCRIBE on U's watch channel so the WatchOnline isn't lost.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Gate u's signin on the OBSERVABLE "A's bridge finished its Redis SUBSCRIBE of
+    // U's watch channel" (PUBSUB NUMSUB >= 1). The cluster online edge PUBLISHES on
+    // that channel, and a publish racing a still-in-flight SUBSCRIBE is silently
+    // lost by pub/sub — the old fixed 300ms sleep was a guess at this.
+    let watch_key = Keys::new(&prefix).watch(APP_ID, "U");
+    assert!(
+        wait_pubsub_subscribers(&watch_key, 1, Duration::from_secs(5)).await,
+        "A's bridge must SUBSCRIBE {watch_key} before U signs in on B"
+    );
 
     // u signs in as U on B → cluster online edge → w gets ONE online event for U.
     let (mut u, sid_u) = connect_established(addr_b).await;
@@ -188,7 +196,13 @@ async fn cross_node_watchlist_offline() {
     let (mut w, sid_w) = connect_established(addr_a).await;
     signin(&mut w, &sid_w, r#"{"id":"W","watchlist":["U"]}"#).await;
     let _ = next_watchlist(&mut w, Duration::from_millis(300)).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Same gate as the online test: A's watch-channel SUBSCRIBE must land before
+    // u's signin publishes the WatchOnline on it (the observable, not a sleep).
+    let watch_key = Keys::new(&prefix).watch(APP_ID, "U");
+    assert!(
+        wait_pubsub_subscribers(&watch_key, 1, Duration::from_secs(5)).await,
+        "A's bridge must SUBSCRIBE {watch_key} before U signs in on B"
+    );
 
     // u signs in as U on B → w sees online; drain it.
     let (u, sid_u) = connect_established(addr_b).await;
@@ -220,8 +234,14 @@ async fn cross_node_watchlist_initial_online_snapshot() {
     // u signs in as U on B first → U is online cluster-wide.
     let (mut u, sid_u) = connect_established(addr_b).await;
     signin(&mut u, &sid_u, r#"{"id":"U"}"#).await;
-    // Let the USER_SIGNIN refcount land in Redis before w reads the snapshot.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Gate w's signin on the OBSERVABLE the snapshot reads: U's cluster binding
+    // hash (`usr`) must be non-empty in Redis. The signin ack does NOT prove the
+    // bridge's async USER_SIGNIN write landed — the old 300ms sleep guessed.
+    let usr_key = Keys::new(&prefix).usr(APP_ID, "U");
+    assert!(
+        wait_redis_hlen_ge(&usr_key, 1, Duration::from_secs(5)).await,
+        "U's usr binding must land in Redis before w's snapshot read"
+    );
 
     // w signs in on A watching U → initial snapshot must report U online.
     let (mut w, sid_w) = connect_established(addr_a).await;
@@ -249,9 +269,15 @@ async fn cross_node_send_to_user() {
     // the user registry, not a channel).
     let (mut u, sid_u) = connect_established(addr_b).await;
     signin(&mut u, &sid_u, r#"{"id":"U"}"#).await;
-    // Let U's USER_SIGNIN refcount + the usermsg SUBSCRIBE land on node B before the
-    // REST trigger fires on A.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Gate the REST trigger on the OBSERVABLE "B's bridge finished its Redis
+    // SUBSCRIBE of U's usermsg channel": the trigger PUBLISHES on that channel,
+    // and a publish racing a still-in-flight SUBSCRIBE is silently lost by
+    // pub/sub — the old fixed 300ms sleep was a guess at this.
+    let usermsg_key = Keys::new(&prefix).usermsg(APP_ID, "U");
+    assert!(
+        wait_pubsub_subscribers(&usermsg_key, 1, Duration::from_secs(5)).await,
+        "B's bridge must SUBSCRIBE {usermsg_key} before the REST trigger fires on A"
+    );
 
     // Server-to-user trigger on node A's REST: `data` is a JSON-encoded STRING.
     let body = json!({
@@ -302,7 +328,13 @@ async fn cross_node_terminate_user() {
     // u signs in as U on node B.
     let (mut u, sid_u) = connect_established(addr_b).await;
     signin(&mut u, &sid_u, r#"{"id":"U"}"#).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Same gate as send_to_user: the terminate PUBLISHES on U's usermsg channel,
+    // so B's SUBSCRIBE of it must land first (the observable, not a sleep).
+    let usermsg_key = Keys::new(&prefix).usermsg(APP_ID, "U");
+    assert!(
+        wait_pubsub_subscribers(&usermsg_key, 1, Duration::from_secs(5)).await,
+        "B's bridge must SUBSCRIBE {usermsg_key} before the REST terminate fires on A"
+    );
 
     // Terminate U via node A's REST terminate_connections route (body `{}`).
     let path = format!("/apps/{APP_ID}/users/U/terminate_connections");

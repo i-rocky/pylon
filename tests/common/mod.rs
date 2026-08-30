@@ -29,6 +29,7 @@ use pylon::server::config::ServerConfig;
 use pylon::server::router::{build_router, AppState};
 use pylon::webhook::WebhookHandle;
 use serde_json::Value;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -189,11 +190,15 @@ pub async fn spawn_percore(spec: SpawnSpec) -> SocketAddr {
     // Keep the worker alive for the whole test process.
     std::mem::forget((shutdown, handle));
 
-    // Give the worker a moment to bind its SO_REUSEPORT listener before the first
-    // client connects (mirrors tests/percore.rs).
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    format!("127.0.0.1:{port}").parse().unwrap()
+    // Wait for the worker's SO_REUSEPORT listener to actually accept connections
+    // (the observable bind event — NOT a wall-clock guess; a slow bind under load
+    // used to race the first client's connect).
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    assert!(
+        wait_listener_ready(addr, Duration::from_secs(5)).await,
+        "percore worker must bind {addr} within 5s"
+    );
+    addr
 }
 
 /// Test Redis URL for the clustered harness: `PYLON_TEST_REDIS_URL` or the
@@ -355,17 +360,141 @@ pub async fn spawn_percore_cluster_with(
         );
     });
 
-    // Give the worker a moment to bind its SO_REUSEPORT listener before any client
-    // connects (mirrors `spawn_percore`).
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
+    // Wait for the worker's SO_REUSEPORT listener to actually accept connections
+    // (the observable bind event — NOT a wall-clock guess; a slow bind under load
+    // used to race the first client's connect). Mirrors `spawn_percore`.
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    assert!(
+        wait_listener_ready(addr, Duration::from_secs(5)).await,
+        "cluster percore worker must bind {addr} within 5s"
+    );
+
     let guard = ClusterNodeGuard {
         bridge: Some(bridge),
         shutdown,
         worker: Some(worker),
     };
     (addr, guard)
+}
+
+// ── Shared wait/poll helpers (event-based waits, never wall-clock guesses) ──
+
+/// Poll `pred` every ~10ms until it returns `true` or `timeout` elapses.
+/// Returns whether the predicate held within the budget. The de-flake primitive:
+/// waits observe an EVENT (subscriber count, received frame, Redis key, listener
+/// accept) instead of sleeping for a guessed duration.
+///
+/// `pred` may be async (return any `Future<Output = bool>`), so it can itself
+/// await the observable (e.g. a Redis read or a webhook transport snapshot).
+pub async fn wait_until<F, Fut>(timeout: Duration, mut pred: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if pred().await {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(10))).await;
+    }
+}
+
+/// Whether `addr` accepts a TCP connection within `timeout` — the observable
+/// "the spawned worker finished binding its listener" event (each attempt fails
+/// fast while the port is closed, so this is a poll, not a blocking hold).
+async fn wait_listener_ready(addr: SocketAddr, timeout: Duration) -> bool {
+    wait_until(timeout, || async {
+        tokio::net::TcpStream::connect(addr).await.is_ok()
+    })
+    .await
+}
+
+/// Read the next text frame as JSON within `budget`, or `None` if none arrives
+/// (budget elapsed, the stream ended, or the socket errored/closed). Unlike
+/// [`next_json`] this NEVER panics on a stall — it is the bounded, non-fatal
+/// read that deadline-driven poll loops (duplicate detection, "await the wanted
+/// frame") must use: racing `next_json` itself against an outer timeout of the
+/// same length lets `next_json`'s INTERNAL timeout panic win the tie and kill
+/// an otherwise-passing test.
+pub async fn next_json_within(ws: &mut Ws, budget: Duration) -> Option<Value> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match tokio::time::timeout(remaining, ws.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => match serde_json::from_str(&t) {
+                Ok(v) => return Some(v),
+                Err(_) => continue,
+            },
+            // Non-text frames (pings/pongs): keep draining within the budget.
+            Ok(Some(Ok(_))) => continue,
+            // Socket error / stream ended: no further frame can arrive.
+            Ok(Some(Err(_))) | Ok(None) => return None,
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Poll Redis `PUBSUB NUMSUB <channel>` until at least `want` subscribers are
+/// attached to the pub/sub channel, bounded by `timeout`. The observable "this
+/// cluster node's bridge finished its Redis SUBSCRIBE" event — what a
+/// cross-node publish must gate on so the published frame is not lost to a
+/// subscription that is still in flight.
+pub async fn wait_pubsub_subscribers(channel: &str, want: usize, timeout: Duration) -> bool {
+    use fred::interfaces::{ClientLike, PubsubInterface};
+    let Some(client) = fred_test_client().await else {
+        return false;
+    };
+    let ok = wait_until(timeout, || async {
+        let counts: std::collections::HashMap<String, i64> =
+            client.pubsub_numsub(channel).await.unwrap_or_default();
+        counts.get(channel).copied().unwrap_or(0) >= want as i64
+    })
+    .await;
+    let _ = client.quit().await;
+    ok
+}
+
+/// Poll Redis `HLEN <key>` until it is at least `want`, bounded by `timeout`.
+/// The observable "the cluster-side write landed" event (e.g. a signed-in
+/// user's `usr` binding hash) for tests that must gate a read on a
+/// cross-process write they cannot otherwise observe.
+pub async fn wait_redis_hlen_ge(key: &str, want: i64, timeout: Duration) -> bool {
+    use fred::interfaces::{ClientLike, HashesInterface};
+    let Some(client) = fred_test_client().await else {
+        return false;
+    };
+    let ok = wait_until(timeout, || async {
+        let n: i64 = client.hlen(key).await.unwrap_or(0);
+        n >= want
+    })
+    .await;
+    let _ = client.quit().await;
+    ok
+}
+
+/// One connected fred client against the test Redis, for the poll helpers above
+/// (`SubscriberClient` is the client type fred's builder exposes without a pool;
+/// nothing is subscribed on it — it just issues NUMSUB/HLEN reads). `None` if
+/// the connect fails (the caller's bounded wait then simply reports
+/// not-satisfied and the test's assert fails loud).
+async fn fred_test_client() -> Option<fred::clients::SubscriberClient> {
+    use fred::interfaces::ClientLike;
+    use fred::prelude::Builder;
+    let url = cluster_test_redis_url();
+    let config = fred::prelude::Config::from_url(url.as_str()).ok()?;
+    let client = Builder::from_config(config)
+        .build_subscriber_client()
+        .ok()?;
+    client.init().await.ok()?;
+    Some(client)
 }
 
 // ── Shared WS client helpers (identical across every WS suite) ──────────────
@@ -422,10 +551,7 @@ pub async fn next_event_named(ws: &mut Ws, event: &str) -> Value {
 
 /// Try to read a frame within a short window; `None` if none arrived.
 pub async fn try_next_json_short(ws: &mut Ws) -> Option<Value> {
-    match tokio::time::timeout(Duration::from_millis(300), ws.next()).await {
-        Ok(Some(Ok(Message::Text(t)))) => serde_json::from_str(&t).ok(),
-        _ => None,
-    }
+    next_json_within(ws, Duration::from_millis(300)).await
 }
 
 pub async fn send_json(ws: &mut Ws, v: Value) {

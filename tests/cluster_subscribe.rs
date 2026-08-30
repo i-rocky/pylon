@@ -135,13 +135,46 @@ async fn fake_subscriber(
     (socket_id, out.subscription_count, mailbox, rx)
 }
 
-/// Drain `rx` until a `SubscriptionCount` frame for `channel` is observed (parsing the
-/// registry-mailbox `Raw` frame), returning its `count`, or `None` within `timeout`.
+/// Poll `pred` every ~10ms until it returns `true` or `timeout` elapses. The
+/// event-based wait for this suite's webhook assertions: poll the observable
+/// (the recorded webhook count) instead of sleeping for a guessed settle time.
+/// (The WS-driving suites' equivalent lives in `tests/common/mod.rs::wait_until`;
+/// this suite is self-contained by design.)
+async fn wait_until<F, Fut>(timeout: Duration, mut pred: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if pred().await {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(10))).await;
+    }
+}
+
+/// Drain `rx` until a `SubscriptionCount` frame for `channel` reporting `want` is
+/// observed (parsing the registry-mailbox `Raw` frame), skipping earlier/smaller
+/// counts; bounded by `timeout`. Returns whether the wanted count arrived.
+///
+/// Skipping earlier counts is REQUIRED, not a convenience: the bridge's count
+/// broadcast fans out node-locally AND via Redis, so a remote node's EARLIER
+/// count (e.g. node A's 1, delivered to B's mailbox through B's recv loop) can
+/// arrive before B's own local count-2 delivery — the order is nondeterministic,
+/// and asserting on the FIRST frame raced (observed as a flaky `Some(1)` vs
+/// `Some(2)`). If B only ever broadcast its node-local count, `want` never
+/// arrives and the assert still fails — identical semantics.
 async fn await_subscription_count(
     rx: &mut tokio::sync::mpsc::Receiver<Box<pylon::protocol::event::ServerEvent>>,
     channel: &str,
+    want: u64,
     timeout: Duration,
-) -> Option<u64> {
+) -> bool {
     let fut = async {
         loop {
             match rx.recv().await.map(|b| *b) {
@@ -164,15 +197,17 @@ async fn await_subscription_count(
                             Some(other) => other.clone(),
                             None => Value::Null,
                         };
-                        return inner.get("subscription_count").and_then(|c| c.as_u64());
+                        if inner.get("subscription_count").and_then(|c| c.as_u64()) == Some(want) {
+                            return true;
+                        }
                     }
                 }
                 Some(_) => continue,
-                None => return None,
+                None => return false,
             }
         }
     };
-    tokio::time::timeout(timeout, fut).await.ok().flatten()
+    tokio::time::timeout(timeout, fut).await.unwrap_or(false)
 }
 
 /// Short timeout wrapper so a wedged Redis fails loud instead of hanging the suite.
@@ -237,15 +272,21 @@ async fn clustered_count_and_occupied_single_node() {
             .subscribe(Arc::from(TEST_APP), Arc::from(channel), sid, mailbox, true);
 
         // The bridge broadcasts the cluster subscription_count to the fake subscriber.
-        let count = await_subscription_count(&mut rx, channel, Duration::from_secs(3)).await;
-        assert_eq!(
-            count,
-            Some(1),
+        assert!(
+            await_subscription_count(&mut rx, channel, 1, Duration::from_secs(3)).await,
             "bridge must broadcast cluster subscription_count == 1"
         );
 
-        // And channel_occupied fired exactly once (settle the batch window first).
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // And channel_occupied fired exactly once: poll the recording transport
+        // until the webhook is DELIVERED (the 10ms batch window + flush are
+        // asynchronous) instead of sleeping for a guessed settle time.
+        assert!(
+            wait_until(Duration::from_secs(2), || async {
+                count_webhook(&node.transport, "channel_occupied").await >= 1
+            })
+            .await,
+            "channel_occupied must fire on the cluster 0→1 edge"
+        );
         assert_eq!(
             count_webhook(&node.transport, "channel_occupied").await,
             1,
@@ -287,8 +328,10 @@ async fn cross_node_count_and_single_occupied_emit() {
             mailbox_a,
             true,
         );
-        let count_a = await_subscription_count(&mut rx_a, channel, Duration::from_secs(3)).await;
-        assert_eq!(count_a, Some(1), "A's bridge broadcasts cluster count 1");
+        assert!(
+            await_subscription_count(&mut rx_a, channel, 1, Duration::from_secs(3)).await,
+            "A's bridge broadcasts cluster count 1"
+        );
 
         // Node B: a SECOND cluster subscriber on a DIFFERENT node → cluster count 2,
         // and NOT a 0→1 cluster edge (occupied must NOT fire again).
@@ -301,16 +344,22 @@ async fn cross_node_count_and_single_occupied_emit() {
             mailbox_b,
             true,
         );
-        let count_b = await_subscription_count(&mut rx_b, channel, Duration::from_secs(3)).await;
-        assert_eq!(
-            count_b,
-            Some(2),
+        assert!(
+            await_subscription_count(&mut rx_b, channel, 2, Duration::from_secs(3)).await,
             "B's bridge broadcasts the CLUSTER count 2 (not B's node-local 1)"
         );
 
-        // Settle the batch windows, then assert occupied fired exactly once across BOTH
-        // nodes' sinks (single cluster-wide emit on the cluster 0→1 edge).
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Poll until occupied is delivered somewhere, then assert EXACTLY once
+        // across BOTH nodes' sinks (single cluster-wide emit on the 0→1 edge).
+        assert!(
+            wait_until(Duration::from_secs(2), || async {
+                count_webhook(&node_a.transport, "channel_occupied").await
+                    + count_webhook(&node_b.transport, "channel_occupied").await
+                    >= 1
+            })
+            .await,
+            "channel_occupied must fire somewhere cluster-wide"
+        );
         let occ_a = count_webhook(&node_a.transport, "channel_occupied").await;
         let occ_b = count_webhook(&node_b.transport, "channel_occupied").await;
         assert_eq!(
@@ -347,9 +396,9 @@ async fn cross_node_vacated_single_emit() {
             mailbox_a,
             true,
         );
-        assert_eq!(
-            await_subscription_count(&mut rx_a, channel, Duration::from_secs(3)).await,
-            Some(1)
+        assert!(
+            await_subscription_count(&mut rx_a, channel, 1, Duration::from_secs(3)).await,
+            "A's bridge broadcasts cluster count 1"
         );
 
         let (sid_b, _cb, mailbox_b, mut rx_b) = fake_subscriber(&node_b.local, channel).await;
@@ -360,9 +409,9 @@ async fn cross_node_vacated_single_emit() {
             mailbox_b,
             true,
         );
-        assert_eq!(
-            await_subscription_count(&mut rx_b, channel, Duration::from_secs(3)).await,
-            Some(2)
+        assert!(
+            await_subscription_count(&mut rx_b, channel, 2, Duration::from_secs(3)).await,
+            "B's bridge broadcasts the CLUSTER count 2"
         );
 
         // Unsubscribe A's member → node_last=true locally, but cluster count → 1, NOT
@@ -386,8 +435,18 @@ async fn cross_node_vacated_single_emit() {
             un_b.subscription_count == 0,
         );
 
-        // Settle the batch windows, then assert vacated fired EXACTLY ONCE cluster-wide.
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Poll until vacated is delivered somewhere (the batch window + flush are
+        // asynchronous), then assert EXACTLY once cluster-wide — the vacate-CAS
+        // guarantee: only the atomic SREM winner emits.
+        assert!(
+            wait_until(Duration::from_secs(2), || async {
+                count_webhook(&node_a.transport, "channel_vacated").await
+                    + count_webhook(&node_b.transport, "channel_vacated").await
+                    >= 1
+            })
+            .await,
+            "channel_vacated must fire somewhere cluster-wide"
+        );
         let vac_a = count_webhook(&node_a.transport, "channel_vacated").await;
         let vac_b = count_webhook(&node_b.transport, "channel_vacated").await;
         assert_eq!(
