@@ -10,11 +10,16 @@
 //! **resumes** automatically — Fred reconnects and resubscribes, the receive
 //! loop on B resumes, and the next publish reaches B.
 //!
-//! Run:
+//! The bounced container is `PYLON_TEST_REDIS_FAILOVER_CONTAINER` (default
+//! `pylon-test-redis`). CI — and anyone running other suites against the shared
+//! container — points both that and `PYLON_TEST_REDIS_URL` at a DEDICATED
+//! throwaway container so the restart never disrupts parallel suites:
+//!
 //! ```sh
-//! docker start pylon-test-redis
-//! PYLON_TEST_REDIS_FAILOVER=1 PYLON_TEST_REDIS_URL=redis://127.0.0.1:6390 \
-//!   cargo test --test redis_failover -- --nocapture
+//! docker run -d --name pylon-test-redis-failover -p 6391:6379 redis:7
+//! PYLON_TEST_REDIS_FAILOVER=1 PYLON_TEST_REDIS_URL=redis://127.0.0.1:6391 \
+//!   PYLON_TEST_REDIS_FAILOVER_CONTAINER=pylon-test-redis-failover \
+//!   cargo test --test redis_failover -- --test-threads=1 --nocapture
 //! ```
 
 mod common;
@@ -108,13 +113,22 @@ async fn recv_event(ws: &mut common::Ws, event_name: &str, timeout_secs: u64) ->
         })
 }
 
-/// Poll until `docker exec pylon-test-redis redis-cli ping` returns "PONG" or
+/// The Docker container this test bounces: `PYLON_TEST_REDIS_FAILOVER_CONTAINER`
+/// or the documented local default (`pylon-test-redis`). Parametrized so CI can
+/// point the restart at a dedicated throwaway container instead of the shared
+/// one the other cluster suites ride on.
+fn bounce_container() -> String {
+    std::env::var("PYLON_TEST_REDIS_FAILOVER_CONTAINER")
+        .unwrap_or_else(|_| "pylon-test-redis".to_string())
+}
+
+/// Poll until `docker exec <container> redis-cli ping` returns "PONG" or
 /// `max_wait` elapses. Returns whether Redis responded in time.
-fn wait_for_redis_ping(max_wait: Duration) -> bool {
+fn wait_for_redis_ping(container: &str, max_wait: Duration) -> bool {
     let start = std::time::Instant::now();
     loop {
         let out = std::process::Command::new("docker")
-            .args(["exec", "pylon-test-redis", "redis-cli", "ping"])
+            .args(["exec", container, "redis-cli", "ping"])
             .output();
         if let Ok(o) = out {
             if o.status.success() {
@@ -169,21 +183,19 @@ async fn redis_failover_cross_node_resumes() {
     eprintln!("[redis_failover] baseline cross-node delivery: PASS");
 
     // ── 4. Bounce Redis ───────────────────────────────────────────────────────
-    eprintln!("[redis_failover] bouncing pylon-test-redis …");
+    let container = bounce_container();
+    eprintln!("[redis_failover] bouncing {container} …");
     let bounce = std::process::Command::new("docker")
-        .args(["restart", "pylon-test-redis"])
+        .args(["restart", &container])
         .status()
         .expect("docker restart must be accessible");
-    assert!(
-        bounce.success(),
-        "docker restart pylon-test-redis must succeed"
-    );
+    assert!(bounce.success(), "docker restart {container} must succeed");
     eprintln!("[redis_failover] docker restart exited OK; waiting for PONG …");
 
     // Poll until Redis is back (bounded to 30 s).
     assert!(
-        wait_for_redis_ping(Duration::from_secs(30)),
-        "Redis must respond to PING within 30s after the bounce"
+        wait_for_redis_ping(&container, Duration::from_secs(30)),
+        "Redis ({container}) must respond to PING within 30s after the bounce"
     );
     eprintln!("[redis_failover] Redis is back (PONG received)");
 

@@ -123,3 +123,46 @@ jobs:
           cargo test --locked --no-fail-fast \
             --test mongo_app_manager --test mysql_app_manager --test postgres_app_manager \
             -- --test-threads=1
+
+  # Redis failover/self-heal regression: proves cross-node delivery (A → Redis →
+  # B) RESUMES after `docker restart` of the Redis container (Fred reconnects +
+  # resubscribes; B's receive loop survives). The suite bounces its Redis BY
+  # NAME via the Docker CLI, so it gets a dedicated throwaway container — never
+  # the `check` job's shared redis:7 service the cluster suites ride on (GitHub
+  # assigns service containers unpredictable names anyway, so the container is
+  # spawned in-step under a fixed name the test can restart/exec). Blocking.
+  failover:
+    name: redis failover
+    runs-on: ubuntu-22.04
+    env:
+      # Opt-in gate for the suite, plus the dedicated bounceable container's URL
+      # and name (port 6391 — mirrors the documented local-dev throwaway).
+      PYLON_TEST_REDIS_FAILOVER: "1"
+      PYLON_TEST_REDIS_URL: redis://127.0.0.1:6391
+      PYLON_TEST_REDIS_FAILOVER_CONTAINER: pylon-test-redis-failover
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Start dedicated Redis (bounceable)
+        run: |
+          docker run -d --name pylon-test-redis-failover -p 6391:6379 redis:7
+          for i in $(seq 1 30); do
+            if docker exec pylon-test-redis-failover redis-cli ping | grep -q PONG; then
+              break
+            fi
+            sleep 1
+          done
+          # Fail loud if Redis never came up within the bounded loop above.
+          docker exec pylon-test-redis-failover redis-cli ping | grep -q PONG
+
+      # Serial (`--test-threads=1`): the test bounces Redis mid-run. `--nocapture`
+      # so the log proves the suite EXECUTED — the opt-in gate skips via an early
+      # return, which would otherwise still report "1 passed".
+      - name: Test (redis failover)
+        run: cargo test --locked --test redis_failover -- --test-threads=1 --nocapture
