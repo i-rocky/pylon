@@ -112,12 +112,19 @@ impl WebhookHandle {
 /// transport that doesn't count (e.g. `RecordingTransport`) simply ignores it.
 ///
 /// `vacated_grace_ms` + `occupancy` enable the cluster-aware `channel_vacated`
-/// grace window (Task D1): when both are active (grace > 0 and `occupancy` is
-/// `Some`), a surviving `channel_vacated` is debounced by the grace window and
-/// re-checked against the cluster subscription_count before firing — suppressed
-/// if the channel is occupied again anywhere in the cluster. With `0` / `None`
-/// (the local-adapter path) vacated fires immediately, as before.
-pub fn spawn<F>(
+/// grace window (Task D1): when a grace window is configured, a surviving
+/// `channel_vacated` is debounced by it and — if an occupancy source is also
+/// supplied — re-checked against the cluster subscription_count before firing,
+/// suppressed if the channel is occupied again anywhere in the cluster. Without
+/// an occupancy source the re-check is skipped and the event fires after the
+/// grace (logged as an error). With `0` (the local-adapter path) vacated fires
+/// immediately, as before.
+///
+/// The transport factory is fallible: a build failure (e.g. `HttpTransport`'s
+/// reqwest/TLS initialization) is returned as `Err` — BEFORE the dispatcher is
+/// spawned — so startup fails cleanly with the real error instead of a panic
+/// (G9).
+pub fn spawn<F, E>(
     apps: Arc<dyn AppManager>,
     make_transport: F,
     clock: Arc<dyn Clock>,
@@ -125,13 +132,13 @@ pub fn spawn<F>(
     mailbox_capacity: usize,
     vacated_grace_ms: u64,
     occupancy: Option<Arc<dyn OccupancySource>>,
-) -> WebhookHandle
+) -> Result<WebhookHandle, E>
 where
-    F: FnOnce(Arc<WebhookMetrics>) -> Arc<dyn WebhookTransport>,
+    F: FnOnce(Arc<WebhookMetrics>) -> Result<Arc<dyn WebhookTransport>, E>,
 {
     let (tx, rx) = mpsc::channel(mailbox_capacity);
     let metrics = Arc::new(WebhookMetrics::new(mailbox_capacity));
-    let transport = make_transport(metrics.clone());
+    let transport = make_transport(metrics.clone())?;
     let dispatcher = WebhookDispatcher::new(
         rx,
         apps,
@@ -142,5 +149,53 @@ where
         occupancy,
     );
     tokio::spawn(dispatcher.run());
-    WebhookHandle { tx, metrics }
+    Ok(WebhookHandle { tx, metrics })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    /// Minimal AppManager double: nothing is ever found (the dispatcher on the
+    /// error path is never even constructed).
+    struct NoApps;
+
+    #[async_trait]
+    impl AppManager for NoApps {
+        async fn by_key(
+            &self,
+            _key: &str,
+        ) -> Result<crate::app::AppLookup, crate::app::AppLookupError> {
+            Ok(crate::app::AppLookup::NotFound)
+        }
+
+        async fn by_id(
+            &self,
+            _id: &str,
+        ) -> Result<crate::app::AppLookup, crate::app::AppLookupError> {
+            Ok(crate::app::AppLookup::NotFound)
+        }
+    }
+
+    /// G9: a transport factory failure must propagate out of `spawn` as an
+    /// `Err` — startup fails cleanly with the real error — instead of being
+    /// forced into a panic inside the factory (the old `HttpTransport::new`
+    /// `.expect`). Uses an injected error: reqwest's builder cannot be made
+    /// to fail deterministically without mocking reqwest (deliberately not
+    /// done), so the reqwest-specific failure MODE is not testable here —
+    /// this pins the Result plumbing end to end.
+    #[tokio::test]
+    async fn spawn_propagates_transport_factory_error() {
+        let result: Result<WebhookHandle, ()> = spawn(
+            Arc::new(NoApps),
+            |_metrics| Err(()),
+            Arc::new(dispatcher::FixedClock(0)),
+            10,
+            16,
+            0,
+            None,
+        );
+        assert!(result.is_err(), "factory failure must surface from spawn");
+    }
 }

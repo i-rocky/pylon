@@ -50,6 +50,8 @@ struct PercoreRegistry {
     accepted_slots: Vec<Arc<AtomicU64>>,
     /// Per-worker cumulative CoDel-dropped-frames counter (B1).
     codel_dropped_slots: Vec<Arc<AtomicU64>>,
+    /// Per-worker cumulative drop-head-evicted-frames counter (G8).
+    drophead_dropped_slots: Vec<Arc<AtomicU64>>,
     /// Task 4: per-worker cumulative mailbox-full-drop counter.
     mailbox_dropped_slots: Vec<Arc<AtomicU64>>,
     budget_factor: Arc<AtomicU32>,
@@ -66,6 +68,10 @@ pub struct PercoreMetricsSnapshot {
     pub accepted: Vec<u64>,
     /// Per-worker cumulative CoDel-dropped-frames count (B1).
     pub codel_dropped: Vec<u64>,
+    /// Per-worker cumulative drop-head-evicted-frames count (G8). Distinct from
+    /// CoDel: these frames were evicted at ENQUEUE time (oldest dropped so a new
+    /// frame fits the per-connection byte cap), not at dequeue for staleness.
+    pub drophead_dropped: Vec<u64>,
     /// Task 4: per-worker cumulative mailbox-full-drop count.
     pub mailbox_dropped: Vec<u64>,
     /// Sum of all workers' inflight bytes.
@@ -106,6 +112,11 @@ pub fn percore_metrics_snapshot() -> Option<PercoreMetricsSnapshot> {
         .iter()
         .map(|s| s.load(Ordering::Relaxed))
         .collect();
+    let drophead_dropped: Vec<u64> = guard
+        .drophead_dropped_slots
+        .iter()
+        .map(|s| s.load(Ordering::Relaxed))
+        .collect();
     let mailbox_dropped: Vec<u64> = guard
         .mailbox_dropped_slots
         .iter()
@@ -119,6 +130,7 @@ pub fn percore_metrics_snapshot() -> Option<PercoreMetricsSnapshot> {
         dropped,
         accepted,
         codel_dropped,
+        drophead_dropped,
         mailbox_dropped,
         inflight_total,
         budget_factor,
@@ -133,6 +145,31 @@ pub fn percore_total_inflight_bytes() -> u64 {
     percore_metrics_snapshot()
         .map(|s| s.inflight_total)
         .unwrap_or(0)
+}
+
+/// Lock the process-global percore metrics registry for the startup write in
+/// [`run_percore`], recovering from a poisoned lock instead of panicking (G9):
+/// a previous holder's panic leaves the data structurally valid (Vecs of
+/// atomics — at worst stale), registry writes don't need poisoning semantics,
+/// and startup must not die on a metrics registry. Mirrors the recovery in
+/// [`percore_metrics_snapshot`]. The `get_or_init` body is transient (an empty
+/// registry): the very first caller overwrites every field right after.
+fn lock_percore_registry_for_write() -> std::sync::MutexGuard<'static, PercoreRegistry> {
+    PERCORE_REGISTRY
+        .get_or_init(|| {
+            std::sync::Mutex::new(PercoreRegistry {
+                inflight_slots: Vec::new(),
+                worker_slots: Vec::new(),
+                accepted_slots: Vec::new(),
+                codel_dropped_slots: Vec::new(),
+                drophead_dropped_slots: Vec::new(),
+                mailbox_dropped_slots: Vec::new(),
+                budget_factor: Arc::new(AtomicU32::new(1000)),
+                worker_budget_bytes: 0,
+            })
+        })
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
 }
 
 /// Run the per-core transport as the actual server.
@@ -278,6 +315,12 @@ pub fn run_percore(
     let codel_dropped_slots: Vec<Arc<AtomicU64>> = (0..worker_count)
         .map(|_| Arc::new(AtomicU64::new(0)))
         .collect();
+    // G8: per-worker drop-head-evicted-frames counters (same pattern as the
+    // CoDel slots above): each worker mirrors its local total into its slot,
+    // which `/metrics` emits as `pylon_drophead_dropped_total`.
+    let drophead_dropped_slots: Vec<Arc<AtomicU64>> = (0..worker_count)
+        .map(|_| Arc::new(AtomicU64::new(0)))
+        .collect();
     // Task 4: per-worker mailbox-full-drop counters. Each worker's counter Arc is
     // cloned into every `Mailbox` created on that worker, so the counter tracks
     // all mailbox drops attributable to that worker.
@@ -380,22 +423,10 @@ pub fn run_percore(
 
     // Fill the global percore metrics registry. Overwrites any prior entry (safe:
     // `get_or_init` initialises the Mutex once; subsequent runs replace the inner
-    // value so re-runs in tests see fresh slots).
+    // value so re-runs in tests see fresh slots). The lock recovers from
+    // poisoning instead of panicking — see [`lock_percore_registry_for_write`].
     {
-        let mut g = PERCORE_REGISTRY
-            .get_or_init(|| {
-                std::sync::Mutex::new(PercoreRegistry {
-                    inflight_slots: Vec::new(),
-                    worker_slots: Vec::new(),
-                    accepted_slots: Vec::new(),
-                    codel_dropped_slots: Vec::new(),
-                    mailbox_dropped_slots: Vec::new(),
-                    budget_factor: budget_factor.clone(),
-                    worker_budget_bytes: per_worker_budget,
-                })
-            })
-            .lock()
-            .unwrap();
+        let mut g = lock_percore_registry_for_write();
         g.inflight_slots.clear();
         g.inflight_slots.extend(inflight_slots.iter().cloned());
         g.worker_slots.clear();
@@ -406,6 +437,9 @@ pub fn run_percore(
         g.codel_dropped_slots.clear();
         g.codel_dropped_slots
             .extend(codel_dropped_slots.iter().cloned());
+        g.drophead_dropped_slots.clear();
+        g.drophead_dropped_slots
+            .extend(drophead_dropped_slots.iter().cloned());
         g.mailbox_dropped_slots.clear();
         g.mailbox_dropped_slots
             .extend(mailbox_dropped_slots.iter().cloned());
@@ -421,6 +455,9 @@ pub fn run_percore(
             // Reassembled-message cap (RFC 6455 §5.4): the per-message event
             // budget — tighter than the per-frame `max_payload` ceiling.
             max_message_bytes: config.max_event_payload_bytes,
+            // G3 (slowloris) hardening: request-head cap + handshake deadline.
+            max_head_bytes: config.max_head_bytes,
+            handshake_timeout_ms: config.handshake_timeout_ms,
             high_water,
             mode: Mode::Dispatch(env.clone()),
             rest_handoff: rest_handoff.clone(),
@@ -430,6 +467,7 @@ pub fn run_percore(
             inflight_slot: Some(inflight_slots[i].clone()),
             accepted_slot: Some(accepted_slots[i].clone()),
             codel_dropped_slot: Some(codel_dropped_slots[i].clone()),
+            drophead_dropped_slot: Some(drophead_dropped_slots[i].clone()),
             mailbox_dropped_slot: Some(mailbox_dropped_slots[i].clone()),
             codel,
             budget_factor: Some(budget_factor.clone()),
@@ -571,5 +609,47 @@ mod psi_tests {
             g = compute_factor(g, 0.0, threshold);
         }
         assert_eq!(g, 1000, "recovers to full budget");
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::{lock_percore_registry_for_write, percore_metrics_snapshot, PERCORE_REGISTRY};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+
+    /// G9: a panic while holding the registry mutex must not turn every later
+    /// metrics read/write into a worker-killing panic. Both the `/metrics`
+    /// reader and the startup writer recover the (still structurally valid)
+    /// data via `into_inner`. The registry is a process-global static, so this
+    /// test poisons it for the remainder of the test binary — safe because
+    /// every lock site now recovers.
+    #[test]
+    fn registry_recovers_from_lock_poisoning() {
+        // Ensure the OnceLock is initialized, then poison it: panic while the
+        // write guard is held.
+        drop(lock_percore_registry_for_write());
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _g = lock_percore_registry_for_write();
+            panic!("intentional: poison the percore registry lock");
+        }));
+        assert!(
+            PERCORE_REGISTRY.get().is_some_and(|m| m.is_poisoned()),
+            "precondition: the lock really is poisoned"
+        );
+
+        // Reader recovers: the /metrics snapshot still answers (no panic).
+        let snap = percore_metrics_snapshot();
+        assert!(snap.is_some(), "reader recovers from a poisoned registry");
+
+        // Writer recovers: a re-run of the startup install still works.
+        {
+            let mut g = lock_percore_registry_for_write();
+            g.inflight_slots.clear();
+            g.inflight_slots.push(Arc::new(AtomicU64::new(7)));
+        }
+        let snap = percore_metrics_snapshot().expect("reader still answers after re-install");
+        assert_eq!(snap.inflight, vec![7], "write landed despite the poison");
     }
 }

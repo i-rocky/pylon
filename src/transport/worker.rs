@@ -9,9 +9,14 @@
 //!
 //! Readiness is managed edge-friendly: a connection is registered
 //! `READABLE`-only and only gains `WRITABLE` interest when a [`Connection::flush`] returns
-//! [`WriteStatus::WouldBlock`]; the interest is dropped back to `READABLE` once
+//! [`WriteStatus::WouldBlock`] or (G2) a TLS handshake flight write blocks
+//! mid-handshake (see [`crate::transport::conn::DrainStatus::NeedsWrite`]);
+//! the interest is dropped back to `READABLE` once
 //! the queue drains. This keeps the loop from spinning on a writable socket with
-//! nothing to send.
+//! nothing to send. It is also what lets the loop poll with a real (50ms)
+//! timeout whenever the previous iteration did no work: a backpressured
+//! connection's queued bytes are guaranteed a wake-up on socket-drain, so the
+//! loop never needs to busy-poll them.
 //!
 //! Two behaviours are supported:
 //!
@@ -47,7 +52,7 @@ use crate::protocol::command::ClientCommand;
 use crate::protocol::event::ServerEvent;
 use crate::protocol::socket_id::SocketId;
 use crate::protocol::{codec::Codec, negotiate};
-use crate::transport::conn::{ConnError, ConnState, Connection, WriteStatus};
+use crate::transport::conn::{ConnError, ConnState, Connection, DrainStatus, WriteStatus};
 use crate::transport::frame::{self, OpCode};
 use crate::transport::handshake::{self, HeadResult};
 use crate::transport::timer::{Due, TimerWheel};
@@ -58,7 +63,7 @@ use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -81,6 +86,45 @@ pub static SELECTIVE_DRAIN_VISITS: AtomicU64 = AtomicU64::new(0);
 #[cfg(any(test, feature = "test-hooks"))]
 pub fn percore_selective_drain_visits() -> u64 {
     SELECTIVE_DRAIN_VISITS.load(Ordering::Relaxed)
+}
+
+/// Test-hooks instrumentation (G1): a monotonic count of how many times this
+/// process's worker loops polled with a 0 ms timeout. The loop only polls 0 ms
+/// when the PREVIOUS iteration did real work; a backpressured connection
+/// (queued bytes, full send buffer) produces no readiness event, so a test can
+/// assert this counter STOPS growing once the flood stops — proving the loop
+/// parks in the 50 ms poll instead of busy-spinning on queued bytes. Behind
+/// `test-hooks` so it is free in release builds.
+#[cfg(any(test, feature = "test-hooks"))]
+pub static POLL_ZERO_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+
+/// Test-hooks accessor: the cumulative number of 0 ms (non-blocking) worker
+/// polls across this process (see [`POLL_ZERO_TIMEOUTS`]).
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn percore_poll_zero_timeouts() -> u64 {
+    POLL_ZERO_TIMEOUTS.load(Ordering::Relaxed)
+}
+
+/// Test-hooks instrumentation (G5): a live gauge of the worker-local delivery
+/// indexes across this process — the number of `(app, channel) → socket_id`
+/// membership slots held in every worker's `local_subs` (the sum of every
+/// channel set's length). Maintained exactly at the two `local_subs` mutation
+/// sites (`reconcile_membership`'s insert/remove and `deindex_connection`'s
+/// remove, both keyed off the boolean return of the set operation), so a test
+/// can assert the index fully EMPTIES when a connection closes — including the
+/// same-batch [subscribe, Close] case, where the close path runs before any
+/// reconcile ever saw the subscription. Signed so a bookkeeping bug surfaces as
+/// a negative instead of a near-`u64::MAX` positive. Behind `test-hooks` so it
+/// is free in release builds.
+#[cfg(any(test, feature = "test-hooks"))]
+pub static LOCAL_SUBS_SLOTS: AtomicI64 = AtomicI64::new(0);
+
+/// Test-hooks accessor: the current number of `(app, channel) → socket_id`
+/// membership slots across this process's workers' `local_subs` indexes (see
+/// [`LOCAL_SUBS_SLOTS`]). 0 when every connection has been deindexed.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn percore_local_subs_len() -> i64 {
+    LOCAL_SUBS_SLOTS.load(Ordering::Relaxed)
 }
 
 /// Reserved token for this worker's single [`mio::Waker`]. One below [`LISTENER`];
@@ -167,6 +211,20 @@ pub struct WorkerConfig {
     /// is dropped (and the fragment accumulator reset) WITHOUT closing the
     /// connection; each individual fragment stays bounded by `max_payload`.
     pub max_message_bytes: usize,
+    /// G3 (slowloris): maximum accepted HTTP request-head size (bytes) — the
+    /// window `inbuf` may grow to while the head is incomplete. A head larger
+    /// than this is [`HeadResult::Bad`] and the connection closes, so a client
+    /// dribbling headerless bytes cannot grow the buffer (and the slab slot)
+    /// without bound. `0` disables the cap. Plumbed from
+    /// `ServerConfig::max_head_bytes` (`PYLON_MAX_HEAD_BYTES`, default 16384).
+    pub max_head_bytes: usize,
+    /// G3 (slowloris): absolute deadline (ms) from ACCEPT for a connection to
+    /// complete its handshake (head + TLS + WS upgrade + session establish).
+    /// On expiry the pre-session connection is closed and its slot reclaimed;
+    /// inbound dribble does NOT postpone it. `0` disables the deadline. Plumbed
+    /// from `ServerConfig::handshake_timeout_ms`
+    /// (`PYLON_HANDSHAKE_TIMEOUT_MS`, default 10000).
+    pub handshake_timeout_ms: u64,
     /// Per-connection outbound high-water mark (bytes) before backpressure-close.
     pub high_water: usize,
     /// Behaviour applied to inbound frames.
@@ -195,6 +253,11 @@ pub struct WorkerConfig {
     /// B1: cumulative CoDel-dropped-frames counter for this worker. Updated after
     /// each flush by folding `conn.take_codel_dropped()`; `None` for test workers.
     pub codel_dropped_slot: Option<Arc<AtomicU64>>,
+    /// G8: cumulative drop-head-evicted-frames counter for this worker. Updated
+    /// at the same fold sites as `codel_dropped_slot` by folding
+    /// `conn.take_drophead_dropped()`; `None` for test workers. Under overload
+    /// drop-head is a PRIMARY frame-loss mechanism, so it must be observable.
+    pub drophead_dropped_slot: Option<Arc<AtomicU64>>,
     /// Task 4: cumulative mailbox-full-drop counter for this worker. Incremented
     /// inside each connection's [`crate::connection::handle::Mailbox::send`] on a `try_send` full-error.
     /// Shared (via `Arc` clone) with every `Mailbox` created by this worker's
@@ -288,7 +351,9 @@ enum Fragment {
 /// `inbuf` is empty or tiny when the connection is idle (it only holds bytes
 /// that arrived mid-frame). During [`ConnState::Handshaking`] it doubles as the
 /// head-accumulation buffer until [`handshake::read_head`] returns something
-/// other than [`HeadResult::NeedMore`].
+/// other than [`HeadResult::NeedMore`]. Its growth while Handshaking is
+/// bounded by `WorkerConfig::max_head_bytes` (G3): past the cap `read_head`
+/// returns `Bad` and the connection closes.
 struct Entry {
     conn: Connection,
     inbuf: BytesMut,
@@ -450,6 +515,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     let inflight_slot = cfg.inflight_slot.clone();
     let accepted_slot = cfg.accepted_slot.clone();
     let codel_dropped_slot = cfg.codel_dropped_slot.clone();
+    let drophead_dropped_slot = cfg.drophead_dropped_slot.clone();
     // SP10 §8: shared PSI budget factor (×1000 fixed-point). `None` ⇒ no backstop.
     let budget_factor = cfg.budget_factor.clone();
     // SP10 §7: CoDel parameters stamped onto every accepted connection.
@@ -461,6 +527,9 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     let mut inflight_bytes: u64 = 0;
     // B1: worker-local accumulator for CoDel drops; mirrored into `codel_dropped_slot`.
     let mut codel_dropped_total: u64 = 0;
+    // G8: worker-local accumulator for drop-head evictions; mirrored into
+    // `drophead_dropped_slot` (same pattern as the CoDel accumulator above).
+    let mut drophead_dropped_total: u64 = 0;
 
     // Worker-local subscription index: which of THIS worker's connections are in
     // each `(app, channel)`. Populated by reconciling `ctx.subscribed` after each
@@ -508,12 +577,10 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     let mut events = Events::with_capacity(1024);
     let mut conns: slab::Slab<Entry> = slab::Slab::new();
 
-    // Adaptive poll timeout: when the previous iteration did real work (or any
-    // connection still has buffered writes), poll non-blocking so cross-worker
-    // mailbox deliveries drain promptly under load; when idle, block up to 50ms
-    // (which also bounds how long `shutdown` goes unchecked) to avoid spinning.
-    // A cross-connection mailbox send no longer waits for this idle poll: it wakes
-    // the `MAILBOX_WAKER` and the selective drain delivers it on the next pass.
+    // Adaptive poll timeout (G1): poll non-blocking only when the previous
+    // iteration did real work; when idle, block up to 50ms to avoid spinning.
+    // Queued out-bytes do NOT force a 0ms poll — see the in-loop comment for
+    // why that would busy-spin on a backpressured connection.
     let mut did_work = true;
     let dispatch = matches!(cfg.mode, Mode::Dispatch(_));
     // Total connections this worker has accepted — logged at shutdown so an
@@ -564,6 +631,12 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                     // is exact: the exit only fires when all Close frames are truly
                     // flushed, and the debug_assert_eq holds on a non-idle drain.
                     fold_delta(&mut conns, k, &mut inflight_bytes);
+                    // G8: fold this connection's drop counters too — the queued
+                    // 4200 frames may have evicted older frames (drop-head) and
+                    // the flush may have CoDel-dropped stale ones. Uniform with
+                    // every other queue/flush site.
+                    fold_codel(&mut conns, k, &mut codel_dropped_total);
+                    fold_drophead(&mut conns, k, &mut drophead_dropped_total);
                 }
                 tracing::info!(
                     worker = cfg.worker_id,
@@ -601,9 +674,11 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 return Ok(());
             }
             // else: fall through — the rest of the loop polls writable events and
-            // flushes the queued Close frames + any pending out-bytes. The poll
-            // timeout of 0ms (pending_writes is true while inflight_bytes > 0)
-            // keeps this tight. We re-check inflight_bytes/deadline each iteration.
+            // flushes the queued Close frames + any pending out-bytes. The
+            // Close-queue flush armed WRITABLE on every still-backpressured
+            // connection, so the poll wakes on the next drain event (or the
+            // 50ms idle tick, whichever comes first). We re-check
+            // inflight_bytes/deadline each iteration.
         }
 
         // Debug-only cross-check: the incrementally-maintained `inflight_bytes`
@@ -621,6 +696,22 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
             "incremental inflight_bytes drifted from the true out_bytes sum",
         );
 
+        // G1 invariant: any connection with queued out-bytes MUST hold WRITABLE
+        // interest in the poll registry. This is what makes the idle 50ms poll
+        // safe for a backpressured connection — the kernel wakes the loop with
+        // a writable event the moment the socket drains, so queued bytes can
+        // never be stranded behind a sleeping poll. Every queue site flushes
+        // via `flush_and_arm` before control returns to the loop top, arming
+        // WRITABLE on `WouldBlock`, so this holds by construction; a violation
+        // means a queue path forgot to arm.
+        debug_assert!(
+            conns
+                .iter()
+                .all(|(_, e)| e.conn.out_bytes() == 0 || e.conn.writable_armed()),
+            "connection has queued out-bytes but no WRITABLE interest armed; \
+             the idle poll could strand its backlog"
+        );
+
         // Mirror the incrementally-maintained total into the shared slot for the
         // off-hot-path `percore_total_inflight_bytes()` test hook. O(1).
         if let Some(slot) = &inflight_slot {
@@ -632,10 +723,29 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 slot.store(codel_dropped_total, Ordering::Relaxed);
             }
         }
-        // `pending_writes` is just "any bytes still queued", now read off the
-        // incremental counter instead of a fresh O(N) sum.
-        let pending_writes = inflight_bytes > 0;
-        let timeout = if did_work || pending_writes {
+        // G8: mirror drop-head eviction total into the shared slot (O(1), only
+        // on actual evictions) — same pattern as the CoDel mirror above.
+        if drophead_dropped_total > 0 {
+            if let Some(slot) = &drophead_dropped_slot {
+                slot.store(drophead_dropped_total, Ordering::Relaxed);
+            }
+        }
+        // Adaptive poll timeout (G1): poll non-blocking ONLY when the previous
+        // iteration did real work, so cross-worker mailbox deliveries drain
+        // promptly under load; otherwise block up to 50ms (which also bounds
+        // how long `shutdown` goes unchecked). Queued out-bytes deliberately do
+        // NOT force a 0ms poll: mio is level-triggered, so a backpressured
+        // connection (full send buffer) produces NO readiness event and a 0ms
+        // poll on `inflight_bytes > 0` would busy-spin the whole core. This is
+        // safe because every connection with queued bytes holds WRITABLE
+        // interest (armed by `flush_and_arm` on `WouldBlock`; asserted at the
+        // loop top) — the kernel wakes the loop the moment the socket drains.
+        // A cross-connection mailbox send never waits for this idle poll: it
+        // wakes the WORKER_WAKER and the selective drain delivers it on the
+        // next pass.
+        let timeout = if did_work {
+            #[cfg(any(test, feature = "test-hooks"))]
+            POLL_ZERO_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
             Some(Duration::from_millis(0))
         } else {
             Some(Duration::from_millis(50))
@@ -675,7 +785,26 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
         for event in events.iter() {
             match event.token() {
                 LISTENER => {
-                    let n = accept_ready(&poll, &mut listener, &mut conns, &cfg, codel);
+                    // G3 (slowloris): the ABSOLUTE handshake deadline every new
+                    // connection is born with — accept time plus the configured
+                    // timeout. `None` when disabled (`0`) or on echo workers
+                    // (whose `due()` loop never runs). It lives on the wheel's
+                    // SEPARATE handshake side table, so inbound dribble (the
+                    // `touch` every readable event does) can never postpone it.
+                    let handshake_deadline = if liveness && cfg.handshake_timeout_ms > 0 {
+                        Some(now_ms.saturating_add(cfg.handshake_timeout_ms))
+                    } else {
+                        None
+                    };
+                    let n = accept_ready(
+                        &poll,
+                        &mut listener,
+                        &mut conns,
+                        &cfg,
+                        codel,
+                        &mut wheel,
+                        handshake_deadline,
+                    );
                     accepted_total += n;
                     if n > 0 {
                         if let Some(slot) = &accepted_slot {
@@ -736,6 +865,13 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             &mut wheel,
                         ) {
                             Action::Close => {
+                                // G8: fold this connection's drop counters before
+                                // teardown — the readable batch queued reject/close
+                                // frames and flushed them, which can evict
+                                // (drop-head) or CoDel-drop. Without this fold the
+                                // counts die with the slab entry.
+                                fold_codel(&mut conns, key, &mut codel_dropped_total);
+                                fold_drophead(&mut conns, key, &mut drophead_dropped_total);
                                 remove(
                                     &poll,
                                     &mut conns,
@@ -756,6 +892,8 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                 // REST head queued nothing, so any folded delta is
                                 // 0; fold anyway so a removed conn never leaks.
                                 fold_delta(&mut conns, key, &mut inflight_bytes);
+                                fold_codel(&mut conns, key, &mut codel_dropped_total);
+                                fold_drophead(&mut conns, key, &mut drophead_dropped_total);
                                 wheel.remove(key);
                                 handoff_rest(&poll, &mut conns, key, &cfg, prefix);
                                 continue;
@@ -767,6 +905,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                 // net delta into the running total.
                                 fold_delta(&mut conns, key, &mut inflight_bytes);
                                 fold_codel(&mut conns, key, &mut codel_dropped_total);
+                                fold_drophead(&mut conns, key, &mut drophead_dropped_total);
                                 // A subscribe/unsubscribe in this readable batch
                                 // may have changed channel membership; reconcile
                                 // this connection's worker-local subscription
@@ -786,24 +925,63 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                     }
 
                     if event.is_writable() && conns.contains(key) {
-                        let action = handle_writable(&poll, &mut conns, key, now_ns);
+                        let action = handle_writable(
+                            &poll,
+                            &mut conns,
+                            key,
+                            &cfg,
+                            now_ns,
+                            &dirty_tx,
+                            &mailbox_waker,
+                            &resolved_tx,
+                            &mut next_gen,
+                            &mut wheel,
+                        );
                         // INCREMENTAL INFLIGHT: the flush sent bytes out; fold the
-                        // (negative) delta before any close so the count is exact.
+                        // (negative) delta before any close/handoff so the count
+                        // is exact.
                         fold_delta(&mut conns, key, &mut inflight_bytes);
                         fold_codel(&mut conns, key, &mut codel_dropped_total);
-                        if action == Action::Close {
-                            remove(
-                                &poll,
-                                &mut conns,
-                                key,
-                                &mut local_subs,
-                                &mut sid_to_token,
-                                &mut wheel,
-                                &mut inflight_bytes,
-                                &conn_counts,
-                                &app_registry,
-                                &node_conns,
-                            );
+                        fold_drophead(&mut conns, key, &mut drophead_dropped_total);
+                        match action {
+                            Action::Close => {
+                                remove(
+                                    &poll,
+                                    &mut conns,
+                                    key,
+                                    &mut local_subs,
+                                    &mut sid_to_token,
+                                    &mut wheel,
+                                    &mut inflight_bytes,
+                                    &conn_counts,
+                                    &app_registry,
+                                    &node_conns,
+                                );
+                            }
+                            // G2: a TLS handshake that completed on the WRITABLE
+                            // path can yield a REST head exactly as the readable
+                            // path does — its plaintext was waiting behind the
+                            // blocked flight.
+                            Action::Handoff(prefix) => {
+                                wheel.remove(key);
+                                handoff_rest(&poll, &mut conns, key, &cfg, prefix);
+                            }
+                            Action::Keep => {
+                                // A session established by the writable-path
+                                // handshake drive: reconcile its (empty initial)
+                                // membership the same way the readable arm does,
+                                // keeping the paths symmetric.
+                                if let Some(entry) = conns.get_mut(key) {
+                                    if let Some(session) = entry.session.as_mut() {
+                                        reconcile_membership(
+                                            session,
+                                            key,
+                                            &mut local_subs,
+                                            &mut sid_to_token,
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -827,6 +1005,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 effective_budget,
                 &mut inflight_bytes,
                 &mut codel_dropped_total,
+                &mut drophead_dropped_total,
                 saturated.as_ref(),
                 now_ns,
                 &conn_counts,
@@ -873,6 +1052,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 &mut wheel,
                 &mut inflight_bytes,
                 &mut codel_dropped_total,
+                &mut drophead_dropped_total,
                 now_ns,
                 &conn_counts,
                 &app_registry,
@@ -898,6 +1078,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                     &mut wheel,
                     &mut inflight_bytes,
                     &mut codel_dropped_total,
+                    &mut drophead_dropped_total,
                     now_ns,
                     &conn_counts,
                     &app_registry,
@@ -920,17 +1101,50 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
             for due in wheel.due(now_ms) {
                 match due {
                     Due::Ping(key) => {
-                        if queue_ping(&poll, &mut conns, key, now_ns) {
-                            // INCREMENTAL INFLIGHT: the ping was queued + flushed;
-                            // fold this connection's net delta into the total.
-                            fold_delta(&mut conns, key, &mut inflight_bytes);
-                            // Ping queued: arm the pong-timeout close deadline.
-                            wheel.mark_ping_sent(key, now_ms);
-                            work = true;
-                        } else {
-                            // The connection vanished (or had no session): drop it
-                            // from the wheel so the entry doesn't linger.
-                            wheel.remove(key);
+                        match queue_ping(&poll, &mut conns, key, now_ns) {
+                            Some(action) => {
+                                // INCREMENTAL INFLIGHT: the ping was queued +
+                                // flushed; fold this connection's net delta
+                                // into the total.
+                                fold_delta(&mut conns, key, &mut inflight_bytes);
+                                if action == Action::Close {
+                                    // The ping flush failed (dead peer or a
+                                    // failed re-registration): reap the
+                                    // connection NOW — the queued ping bytes
+                                    // would otherwise sit behind a poll
+                                    // interest that never fires for a dead
+                                    // socket.
+                                    fold_codel(&mut conns, key, &mut codel_dropped_total);
+                                    fold_drophead(&mut conns, key, &mut drophead_dropped_total);
+                                    remove(
+                                        &poll,
+                                        &mut conns,
+                                        key,
+                                        &mut local_subs,
+                                        &mut sid_to_token,
+                                        &mut wheel,
+                                        &mut inflight_bytes,
+                                        &conn_counts,
+                                        &app_registry,
+                                        &node_conns,
+                                    );
+                                } else {
+                                    // Ping queued: arm the pong-timeout close
+                                    // deadline.
+                                    wheel.mark_ping_sent(key, now_ms);
+                                }
+                                work = true;
+                            }
+                            None => {
+                                // The connection vanished (or had no session):
+                                // drop its LIVENESS timer so the entry doesn't
+                                // linger — but keep any armed ABSOLUTE deadline
+                                // (handshake, and for parked conns the eventual
+                                // lifetime) intact: a pre-session connection
+                                // whose spurious idle timer fired here must
+                                // still be reaped by the handshake deadline.
+                                wheel.clear_liveness(key);
+                            }
                         }
                     }
                     Due::Close4201(key) => {
@@ -940,6 +1154,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         // bytes still queued on the connection being torn down.
                         fold_delta(&mut conns, key, &mut inflight_bytes);
                         fold_codel(&mut conns, key, &mut codel_dropped_total);
+                        fold_drophead(&mut conns, key, &mut drophead_dropped_total);
                         remove(
                             &poll,
                             &mut conns,
@@ -967,6 +1182,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         // connection's still-queued bytes.
                         fold_delta(&mut conns, key, &mut inflight_bytes);
                         fold_codel(&mut conns, key, &mut codel_dropped_total);
+                        fold_drophead(&mut conns, key, &mut drophead_dropped_total);
                         remove(
                             &poll,
                             &mut conns,
@@ -981,6 +1197,44 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         );
                         work = true;
                     }
+                    Due::HandshakeTimeout(key) => {
+                        // G3 (slowloris) reap: the connection never completed
+                        // its handshake within `handshake_timeout_ms` of
+                        // accept. No WS session exists (maybe not even a 101),
+                        // so there is no protocol close to emit — tear the TCP
+                        // connection down through the normal `remove` path,
+                        // which reclaims the fd, the slab slot and the wheel
+                        // entries. Counters need no fixing here: BOTH
+                        // `node_conns` and the per-app `conn_counts` are taken
+                        // only in `finish_establish` (paired synchronously with
+                        // `session = Some(..)`), so a pre-session connection
+                        // holds none — `remove`'s `if let Some(session)` guard
+                        // correctly decrements nothing.
+                        let pre_session =
+                            conns.get(key).is_some_and(|entry| entry.session.is_none());
+                        if pre_session {
+                            remove(
+                                &poll,
+                                &mut conns,
+                                key,
+                                &mut local_subs,
+                                &mut sid_to_token,
+                                &mut wheel,
+                                &mut inflight_bytes,
+                                &conn_counts,
+                                &app_registry,
+                                &node_conns,
+                            );
+                        } else {
+                            // Established or gone: with the wheel's eager
+                            // scrub the stale-entry case cannot arise (the
+                            // establish path removed the side-table entry AND
+                            // its timeline slot), but keep the defensive
+                            // clear — a no-op when nothing is armed.
+                            wheel.clear_handshake(key);
+                        }
+                        work = true;
+                    }
                 }
             }
         }
@@ -991,19 +1245,23 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
 
 /// SP11 §4: queue a `pusher:ping` (v7 `{"event":"pusher:ping","data":{}}`) onto
 /// `key`'s out-queue and flush, the same way [`drain_session`] emits a server
-/// frame. Returns `true` if the frame was queued
-/// (the connection exists, is Open, and has a session); `false` otherwise (caller
-/// drops the wheel entry). A flush that backpressures arms writable interest; a
-/// flush that fails closes the connection on the next event.
-fn queue_ping(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) -> bool {
-    let Some(entry) = conns.get_mut(key) else {
-        return false;
-    };
-    let Some(session) = entry.session.as_mut() else {
-        return false;
-    };
+/// frame. Returns `Some(action)` when the ping was queued (the connection
+/// exists, is Open, and has a session) — `action` is the flush outcome, so a
+/// dead-peer write failure is reported as [`Action::Close`] and the caller
+/// reaps the connection instead of stranding the queued ping behind a poll
+/// interest that will never fire for a dead socket. Returns `None` otherwise
+/// (caller drops the wheel entry). A flush that backpressures arms writable
+/// interest, so the ping rides the next writable event.
+fn queue_ping(
+    poll: &Poll,
+    conns: &mut slab::Slab<Entry>,
+    key: usize,
+    now_ns: u64,
+) -> Option<Action> {
+    let entry = conns.get_mut(key)?;
+    let session = entry.session.as_mut()?;
     if entry.conn.state != ConnState::Open {
-        return false;
+        return None;
     }
     let text = session.codec.encode(&ServerEvent::Ping);
     let mut out = BytesMut::new();
@@ -1011,10 +1269,7 @@ fn queue_ping(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u6
     let _ = entry
         .conn
         .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
-    // Best-effort flush; interest re-arming / close is handled by the caller's
-    // subsequent `remove` only on a hard write failure (rare for a tiny frame).
-    let _ = flush_and_arm(poll, entry, now_ns);
-    true
+    Some(flush_and_arm(poll, entry, now_ns))
 }
 
 /// Queue a single WebSocket Close frame (`code` + `reason`) onto `entry`'s
@@ -1191,12 +1446,22 @@ enum Action {
 /// Drain the listener's accept backlog, registering every accepted socket.
 /// Returns the number of connections accepted this call (for accept-distribution
 /// accounting).
+///
+/// G3 (slowloris): every accepted connection is born with an ABSOLUTE
+/// handshake deadline (`handshake_deadline`, computed by the caller from
+/// accept time + `handshake_timeout_ms`), armed on `wheel`'s handshake side
+/// table. A connection that never completes its head/TLS/WS handshake by then
+/// is reaped by the `Due::HandshakeTimeout` arm of the liveness loop — the fd
+/// and slab slot no longer leak. Inbound dribble arms only the liveness timer
+/// (`touch`), never this deadline. `None` disables the arming.
 fn accept_ready(
     poll: &Poll,
     listener: &mut TcpListener,
     conns: &mut slab::Slab<Entry>,
     cfg: &WorkerConfig,
     codel: crate::transport::conn::CodelParams,
+    wheel: &mut TimerWheel,
+    handshake_deadline: Option<u64>,
 ) -> u64 {
     let mut accepted = 0;
     loop {
@@ -1233,6 +1498,12 @@ fn accept_ready(
                     fragment: None,
                     pending_establish: None,
                 });
+                // G3: arm the handshake deadline AFTER the slot exists (the
+                // slab key is the wheel's ConnId). Cleared at session establish;
+                // fires (reap) otherwise.
+                if let Some(deadline_ms) = handshake_deadline {
+                    wheel.arm_handshake(key, deadline_ms);
+                }
                 accepted += 1;
             }
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -1320,12 +1591,25 @@ fn handle_handshake(
     wheel: &mut TimerWheel,
 ) -> Action {
     // Pull all available bytes into the head-accumulation buffer (`inbuf`).
-    if drain_into(&mut entry.conn, &mut entry.inbuf) == ReadOutcome::Closed {
-        return Action::Close;
+    // G2: `NeedsWrite` means a TLS handshake flight could not be fully written
+    // (the peer's receive window filled mid-handshake). Nothing can be parsed
+    // out of it either — the plaintext pull inside `drain_head_bytes` is
+    // skipped when the flight write blocks — so fall through to the arm point
+    // below (`NeedMore ⇒ arm_handshake_interest`), which registers
+    // READABLE | WRITABLE so the next writable event completes the flight.
+    // A readable event arriving while the flight is still blocked is unaffected:
+    // it lands here first and processes any new TLS records before the write
+    // retry inside `drain_head_bytes`.
+    match entry.conn.drain_head_bytes(&mut entry.inbuf) {
+        DrainStatus::Closed => return Action::Close,
+        DrainStatus::Ok | DrainStatus::NeedsWrite => {}
     }
 
-    match handshake::read_head(&entry.inbuf) {
-        HeadResult::NeedMore => Action::Keep,
+    match handshake::read_head(&entry.inbuf, cfg.max_head_bytes) {
+        // No complete head yet. Reconcile poll interest with the TLS flight
+        // state (G2): arms WRITABLE when a flight write blocked, clears it
+        // once the flight is done.
+        HeadResult::NeedMore => arm_handshake_interest(poll, entry, now_ns),
         HeadResult::WsUpgrade { key: ws_key, path } => {
             let response = handshake::accept_response(&ws_key).into_boxed_slice();
             // Drop-head queue never rejects; the 101 response always enqueues.
@@ -1445,6 +1729,11 @@ fn handle_handshake(
                             .conn
                             .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
                         entry.session = Some(session);
+                        // Session established: the G3 handshake deadline has
+                        // served its purpose — clear it so the absolute
+                        // (activity-immune) reap can never fire on a live
+                        // session.
+                        wheel.clear_handshake(key);
                         // Session established: arm the ABSOLUTE
                         // max-connection-lifetime deadline (close 4202) from
                         // this moment. Activity on the connection never pushes
@@ -2082,6 +2371,7 @@ fn drain_dirty_sessions(
     wheel: &mut TimerWheel,
     inflight_bytes: &mut u64,
     codel_total: &mut u64,
+    drophead_total: &mut u64,
     now_ns: u64,
     conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
     app_registry: &Arc<AppRegistry>,
@@ -2118,6 +2408,7 @@ fn drain_dirty_sessions(
         // queued bytes are then subtracted by `remove`).
         fold_delta(conns, key, inflight_bytes);
         fold_codel(conns, key, codel_total);
+        fold_drophead(conns, key, drophead_total);
         if result.action == Action::Close {
             remove(
                 poll,
@@ -2178,6 +2469,7 @@ fn drain_resolved(
     wheel: &mut TimerWheel,
     inflight_bytes: &mut u64,
     codel_total: &mut u64,
+    drophead_total: &mut u64,
     now_ns: u64,
     conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
     app_registry: &Arc<AppRegistry>,
@@ -2249,6 +2541,7 @@ fn drain_resolved(
                 // INCREMENTAL INFLIGHT: the established frame was queued + flushed.
                 fold_delta(conns, token, inflight_bytes);
                 fold_codel(conns, token, codel_total);
+                fold_drophead(conns, token, drophead_total);
                 wrote_any = true;
                 if action == Action::Close {
                     remove(
@@ -2277,6 +2570,10 @@ fn drain_resolved(
                     // The max-connection-lifetime clock also starts at THIS establish
                     // moment (the park is not part of the connection's life).
                     arm_lifetime(wheel, env, token, now_ns / 1_000_000);
+                    // G3: and the handshake deadline's job is done — the
+                    // session is established (mirrors the synchronous path's
+                    // clear at `entry.session = Some(..)` above).
+                    wheel.clear_handshake(token);
                 }
             }
             Err(reject) => {
@@ -2289,6 +2586,7 @@ fn drain_resolved(
                 // subtracts the connection's still-queued bytes.
                 fold_delta(conns, token, inflight_bytes);
                 fold_codel(conns, token, codel_total);
+                fold_drophead(conns, token, drophead_total);
                 wrote_any = true;
                 remove(
                     poll,
@@ -2309,9 +2607,47 @@ fn drain_resolved(
 }
 
 /// Handle a writable event: flush and, when drained, drop writable interest.
-fn handle_writable(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) -> Action {
+/// In the `Handshaking` state (G2) the writable event instead re-drives the
+/// handshake itself.
+///
+/// A Handshaking TLS connection only holds WRITABLE interest because its
+/// handshake-flight write blocked (see [`arm_handshake_interest`]). The
+/// writable event means the send buffer drained, so re-running
+/// [`handle_handshake`] completes the flight, pulls any plaintext that was
+/// waiting behind it, and — via `arm_handshake_interest` (`NeedMore`) or
+/// `flush_and_arm` (upgrade) — clears WRITABLE once `!tls.wants_write()`. The
+/// read at the top of that path is a `WouldBlock` no-op when the event carried
+/// no data; a readable event arriving mid-block is handled by the normal
+/// readable path.
+#[allow(clippy::too_many_arguments)]
+fn handle_writable(
+    poll: &Poll,
+    conns: &mut slab::Slab<Entry>,
+    key: usize,
+    cfg: &WorkerConfig,
+    now_ns: u64,
+    dirty_tx: &std::sync::mpsc::Sender<usize>,
+    mailbox_waker: &Arc<mio::Waker>,
+    resolved_tx: &std::sync::mpsc::Sender<ResolvedApp>,
+    next_gen: &mut u64,
+    wheel: &mut TimerWheel,
+) -> Action {
     let entry = &mut conns[key];
-    flush_and_arm(poll, entry, now_ns)
+    match entry.conn.state {
+        ConnState::Handshaking => handle_handshake(
+            poll,
+            entry,
+            key,
+            cfg,
+            now_ns,
+            dirty_tx,
+            mailbox_waker,
+            resolved_tx,
+            next_gen,
+            wheel,
+        ),
+        ConnState::Open | ConnState::Closing => flush_and_arm(poll, entry, now_ns),
+    }
 }
 
 /// Flush the outbound queue and reconcile writable interest with what remains.
@@ -2319,6 +2655,10 @@ fn handle_writable(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_n
 /// * [`WriteStatus::Drained`] → re-arm `READABLE`-only (drop `WRITABLE`).
 /// * [`WriteStatus::WouldBlock`] → add `WRITABLE` so we get a writable event.
 /// * [`WriteStatus::Closed`] → close.
+///
+/// The tracked `writable_armed` mirror on the [`Connection`] is updated after
+/// every successful re-registration so the loop-top debug invariant ("queued
+/// bytes ⇒ WRITABLE armed") can verify the arm really happened.
 fn flush_and_arm(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action {
     // Read the token before the mutable stream borrow below.
     let token = entry.token;
@@ -2331,6 +2671,7 @@ fn flush_and_arm(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action {
             {
                 return Action::Close;
             }
+            entry.conn.set_writable_armed(false);
             Action::Keep
         }
         WriteStatus::WouldBlock => {
@@ -2345,27 +2686,56 @@ fn flush_and_arm(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action {
             {
                 return Action::Close;
             }
+            entry.conn.set_writable_armed(true);
             Action::Keep
         }
         WriteStatus::Closed => Action::Close,
     }
 }
 
-/// Read all currently-available bytes off the socket into `buf`, stopping on
-/// `WouldBlock` (socket drained) or EOF. Used only during the handshake, where
-/// we accumulate the raw head before any framing.
-#[derive(PartialEq, Eq)]
-enum ReadOutcome {
-    Ok,
-    Closed,
-}
-
-fn drain_into(conn: &mut Connection, buf: &mut BytesMut) -> ReadOutcome {
-    if conn.drain_head_bytes(buf) {
-        ReadOutcome::Ok
-    } else {
-        ReadOutcome::Closed
+/// G2: reconcile a `Handshaking` connection's poll interest with whatever it
+/// still has to write. Two things can be pending mid-handshake:
+///
+/// * a **blocked TLS flight** — rustls has ciphertext queued for the socket
+///   ([`Connection::tls_wants_write`]) because the flight write hit a full
+///   send buffer (the peer's receive window filled, e.g. a zero-window
+///   client); and
+/// * **queued frames** — the shutdown drain queues error/Close frames even on
+///   a still-Handshaking connection.
+///
+/// When either is present we flush via [`flush_and_arm`], which drives the
+/// pending TLS ciphertext FIRST (its Phase 1) and reconciles WRITABLE
+/// interest from the outcome: mio is level-triggered, so arming it means the
+/// kernel wakes the loop the moment the buffer drains and
+/// [`handle_writable`] re-drives the handshake. That also keeps the loop-top
+/// invariant ("queued bytes ⇒ WRITABLE armed") intact for the drain-path
+/// frames. With nothing pending, a previously-armed WRITABLE drops back to
+/// READABLE-only — mirroring `flush_and_arm`'s Drained arm — so the
+/// connection never spins on an always-ready writable socket; and a plain-TCP
+/// handshake (never pending writes) keeps its accept-time READABLE-only
+/// registration with zero extra syscalls.
+///
+/// Task 3.3 (G3 handshake deadline) ultimately did NOT hook here: the
+/// slowloris deadline is ABSOLUTE from accept (armed once in
+/// [`accept_ready`], cleared at session establish), so a connection blocked
+/// in this function on a stalled TLS flight is covered by that accept-time
+/// arm — activity and interest churn never postpone it.
+fn arm_handshake_interest(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action {
+    let token = entry.token;
+    if entry.conn.tls_wants_write() || entry.conn.has_pending_writes() {
+        return flush_and_arm(poll, entry, now_ns);
     }
+    if entry.conn.writable_armed() {
+        if poll
+            .registry()
+            .reregister(entry.conn.stream_mut(), token, Interest::READABLE)
+            .is_err()
+        {
+            return Action::Close;
+        }
+        entry.conn.set_writable_armed(false);
+    }
+    Action::Keep
 }
 
 /// Transfer a plain-HTTP connection to the tokio/axum REST plane (SP9 §3.4).
@@ -2448,6 +2818,22 @@ fn fold_codel(conns: &mut slab::Slab<Entry>, key: usize, codel_total: &mut u64) 
     }
 }
 
+/// G8: drain this connection's drop-head eviction accumulator into the
+/// worker-level total. Called at exactly the same sites as [`fold_codel`] so
+/// the shared `drophead_dropped_slot` (→ `pylon_drophead_dropped_total`)
+/// reflects actual evictions with zero per-frame cost on the normal path.
+/// Folding is UNIFORM (Keep and pre-teardown sites alike): an eviction right
+/// before a close would otherwise die with the slab entry, silently losing the
+/// count — the exact unobservability this counter exists to close.
+fn fold_drophead(conns: &mut slab::Slab<Entry>, key: usize, drophead_total: &mut u64) {
+    if let Some(entry) = conns.get_mut(key) {
+        let dropped = entry.conn.take_drophead_dropped();
+        if dropped > 0 {
+            *drophead_total = drophead_total.wrapping_add(dropped);
+        }
+    }
+}
+
 /// Remove a connection: drop it from the worker's sharded-broadcast indexes,
 /// run the protocol on-close hook (dispatch only), decrement the app's
 /// connection counter, deregister its socket, and drop the slab entry.
@@ -2503,9 +2889,25 @@ fn remove(
 }
 
 /// Drop a closing connection's `socket_id` from every `(app, channel)` it was
-/// indexed under, and from the reverse `socket_id → token` map. Uses the
-/// session's last-reconciled `subs` set (the channels recorded in `local_subs`),
-/// so it removes exactly the entries `reconcile_membership` inserted.
+/// indexed under, and from the reverse `socket_id → token` map.
+///
+/// G5: walks the UNION of the session's last-reconciled baseline (`subs`) and
+/// the live protocol set (`ctx.subscribed`). The baseline alone covers every
+/// entry `reconcile_membership` inserted — but a readable batch containing
+/// [subscribe, Close] (or a protocol-error/backpressure close right after a
+/// subscribe in the same batch) returns `Action::Close` from `dispatch_frames`
+/// BEFORE the `Action::Keep` arm's post-dispatch reconcile runs, so a
+/// subscription that reached the index by any path the baseline missed would
+/// otherwise stay indexed forever (dead socket ids accumulate; the channel's
+/// subscriber set never empties). Deindexing the union makes the close path
+/// self-sufficient: it cleans whatever the connection could still be indexed
+/// under, without trusting the reconcile bookkeeping.
+///
+/// Dedup is free: iterating `ctx.subscribed` chained with the channels of
+/// `subs` that `ctx.subscribed` lacks visits every union member exactly once,
+/// and the removal itself is idempotent anyway — removing an absent
+/// `(key, socket_id)` is a no-op, so a second pass over an overlapping channel
+/// cannot double-subtract the test gauge or disturb another subscriber.
 fn deindex_connection(
     session: &Session,
     local_subs: &mut HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
@@ -2513,10 +2915,20 @@ fn deindex_connection(
 ) {
     let app: Arc<str> = Arc::from(session.ctx.app.id.as_str());
     let sid = &session.ctx.socket_id;
-    for channel in &session.subs {
+    // `difference` yields the baseline-only channels, so the chain enumerates
+    // exactly the union — no duplicate keys, no temporary set allocation.
+    let union = session
+        .ctx
+        .subscribed
+        .iter()
+        .chain(session.subs.difference(&session.ctx.subscribed));
+    for channel in union {
         let k = (Arc::clone(&app), Arc::<str>::from(channel.as_str()));
         if let Some(set) = local_subs.get_mut(&k) {
-            set.remove(sid);
+            if set.remove(sid) {
+                #[cfg(any(test, feature = "test-hooks"))]
+                LOCAL_SUBS_SLOTS.fetch_sub(1, Ordering::Relaxed);
+            }
             if set.is_empty() {
                 local_subs.remove(&k);
             }
@@ -2546,16 +2958,23 @@ fn reconcile_membership(
 
     // Added channels: present in ctx.subscribed, absent from the recorded set.
     for channel in session.ctx.subscribed.difference(&session.subs) {
-        local_subs
+        let inserted = local_subs
             .entry((Arc::clone(&app), Arc::<str>::from(channel.as_str())))
             .or_default()
             .insert(*sid);
+        if inserted {
+            #[cfg(any(test, feature = "test-hooks"))]
+            LOCAL_SUBS_SLOTS.fetch_add(1, Ordering::Relaxed);
+        }
     }
     // Removed channels: were recorded, no longer subscribed.
     for channel in session.subs.difference(&session.ctx.subscribed) {
         let k = (Arc::clone(&app), Arc::<str>::from(channel.as_str()));
         if let Some(set) = local_subs.get_mut(&k) {
-            set.remove(sid);
+            if set.remove(sid) {
+                #[cfg(any(test, feature = "test-hooks"))]
+                LOCAL_SUBS_SLOTS.fetch_sub(1, Ordering::Relaxed);
+            }
             if set.is_empty() {
                 local_subs.remove(&k);
             }
@@ -2643,6 +3062,7 @@ fn drain_broadcasts(
     effective_budget: u64,
     inflight_bytes: &mut u64,
     codel_total: &mut u64,
+    drophead_total: &mut u64,
     saturated: Option<&Arc<AtomicBool>>,
     now_ns: u64,
     conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
@@ -2704,6 +3124,14 @@ fn drain_broadcasts(
             // (taken below) composes correctly without double-counting.
             let _dropped = entry.conn.queue(msg.frame.clone(), now_ns);
             *inflight_bytes = inflight_bytes.wrapping_add(entry.conn.take_inflight_delta() as u64);
+            // G8: the enqueue may have evicted older frames (drop-head) — fold
+            // the per-connection accumulator into the worker total NOW rather
+            // than deferring to the post-drain flush fold, so the counter is
+            // current even if the flush below closes the connection.
+            let dh = entry.conn.take_drophead_dropped();
+            if dh > 0 {
+                *drophead_total = drophead_total.wrapping_add(dh);
+            }
             touched.insert(token);
         }
     }
@@ -2724,6 +3152,12 @@ fn drain_broadcasts(
             let cd = entry.conn.take_codel_dropped();
             if cd > 0 {
                 *codel_total = codel_total.wrapping_add(cd);
+            }
+            // G8: fold any drop-head evictions the enqueue path left behind
+            // (belt-and-suspenders — the enqueue fold above usually took them).
+            let dh = entry.conn.take_drophead_dropped();
+            if dh > 0 {
+                *drophead_total = drophead_total.wrapping_add(dh);
             }
             if action == Action::Close {
                 to_close.push(token);
@@ -2775,6 +3209,8 @@ mod tests {
                     addr,
                     max_payload: 1 << 20,
                     max_message_bytes: 1 << 20,
+                    max_head_bytes: 16_384,
+                    handshake_timeout_ms: 10_000,
                     high_water: 1 << 20,
                     mode: Mode::Echo,
                     rest_handoff: None,
@@ -2784,6 +3220,7 @@ mod tests {
                     inflight_slot: None,
                     accepted_slot: None,
                     codel_dropped_slot: None,
+                    drophead_dropped_slot: None,
                     mailbox_dropped_slot: None,
                     codel: crate::transport::conn::CodelParams::DISABLED,
                     budget_factor: None,
@@ -2932,5 +3369,194 @@ mod tests {
         );
         // No path at all → 4005.
         assert_eq!(parse_app_path("/"), (None, None, None));
+    }
+
+    // ---- G2: TLS handshake flight blocked on a full send buffer ---------------
+
+    /// The WS upgrade head the raw TLS client sends once its TLS handshake is
+    /// complete (RFC 6455 §4.2.1 sample key).
+    const G2_UPGRADE_HEAD: &str = "GET /app/g2-key?protocol=7 HTTP/1.1\r\n\
+        Host: localhost\r\n\
+        Upgrade: websocket\r\n\
+        Connection: Upgrade\r\n\
+        Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+        Sec-WebSocket-Version: 13\r\n\
+        \r\n";
+
+    /// THE G2 SCENARIO, driven through the REAL worker handlers: a TLS client
+    /// with a tiny receive window lets the server's ServerHello flight (a
+    /// deliberately bloated certificate) fill every socket buffer
+    /// mid-handshake, so `drain_head_bytes` exits with `tls.wants_write()`
+    /// still true. Pre-fix nothing re-armed `WRITABLE` — connections register
+    /// READABLE-only at accept — so the flight was never completed and the
+    /// handshake hung forever (a zero-window client pins it). This test runs
+    /// the worker's own event dispatch (`handle_readable` / `handle_writable`)
+    /// over a real `mio::Poll` and asserts the handshake — and the WS 101
+    /// upgrade behind it — completes within a bounded wait once the client
+    /// starts draining.
+    ///
+    /// Forced at this level rather than in `tests/tls.rs` because a real
+    /// server's accepted socket keeps the kernel-default `SO_SNDBUF` (128 KiB
+    /// on this macOS loopback, auto-growing), which a TLS flight can never
+    /// exceed: rustls caps inbound handshake messages at 64 KiB, so even a
+    /// maximally bloated flight always fits and the write never blocks.
+    /// Shrinking the accepted socket's `SO_SNDBUF` from the test process is
+    /// impossible (the accept happens inside the worker), so the deterministic
+    /// reproduction needs a socket pair the test owns — driven here through the
+    /// production handlers.
+    #[test]
+    fn tls_handshake_completes_when_flight_write_blocks() {
+        use crate::transport::conn::tls_test_support as tlsup;
+        use std::io::Read as _;
+
+        let (server_stream, mut client_sock) = tlsup::pair_tiny_tls();
+        let (server_cfg, cert_der) = tlsup::bloated_server_config();
+        let tls = rustls::server::ServerConnection::new(server_cfg).unwrap();
+        let mut conn = Connection::new_tls(server_stream, Box::new(tls), 1 << 20);
+        let mut client = tlsup::tls_client(&cert_der);
+
+        // Real poll + slab entry, registered READABLE-only exactly as
+        // `accept_ready` does (mirrors the worker-loop preconditions of G2).
+        let mut poll = Poll::new().unwrap();
+        let mut events = Events::with_capacity(16);
+        let mut conns: slab::Slab<Entry> = slab::Slab::new();
+        let vacant = conns.vacant_entry();
+        let key = vacant.key();
+        poll.registry()
+            .register(conn.stream_mut(), Token(key), Interest::READABLE)
+            .unwrap();
+        vacant.insert(Entry {
+            conn,
+            inbuf: BytesMut::new(),
+            token: Token(key),
+            session: None,
+            fragment: None,
+            pending_establish: None,
+        });
+
+        // Echo-mode worker config + the notifier plumbing handle_handshake
+        // needs (unused on the happy path, but part of its signature).
+        let cfg = WorkerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            max_payload: 1 << 20,
+            max_message_bytes: 1 << 20,
+            max_head_bytes: 16_384,
+            handshake_timeout_ms: 10_000,
+            high_water: 1 << 20,
+            mode: Mode::Echo,
+            rest_handoff: None,
+            worker_id: 0,
+            broadcast: None,
+            per_worker_budget: 0,
+            inflight_slot: None,
+            accepted_slot: None,
+            codel_dropped_slot: None,
+            drophead_dropped_slot: None,
+            mailbox_dropped_slot: None,
+            codel: crate::transport::conn::CodelParams::DISABLED,
+            budget_factor: None,
+            shutdown_grace_ms: 0,
+            tls: None,
+        };
+        let (dirty_tx, _dirty_rx) = std::sync::mpsc::channel::<usize>();
+        let mailbox_waker = Arc::new(mio::Waker::new(poll.registry(), WORKER_WAKER).unwrap());
+        let (resolved_tx, _resolved_rx) = std::sync::mpsc::channel::<ResolvedApp>();
+        let mut next_gen = 0u64;
+        let mut wheel = TimerWheel::with_timeouts(0, 0);
+
+        // The client writes its ClientHello (small — the bloated SAN list is
+        // only in the server's certificate).
+        while client.wants_write() {
+            client.write_tls(&mut client_sock).unwrap();
+        }
+
+        // Drive exactly like `run`'s event loop: readable → handle_readable,
+        // writable → handle_writable; pump the raw client between polls.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut writable_drives = 0usize;
+        let mut sent_head = false;
+        let mut plaintext = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "blocked TLS handshake never completed: the mid-flight write was \
+                 never re-driven (G2: WRITABLE not armed in Handshaking state)"
+            );
+            poll.poll(&mut events, Some(Duration::from_millis(5)))
+                .unwrap();
+            for ev in events.iter() {
+                if ev.token() == WORKER_WAKER {
+                    continue;
+                }
+                let k = ev.token().0;
+                if ev.is_readable() {
+                    let action = handle_readable(
+                        &poll,
+                        &mut conns,
+                        k,
+                        &cfg,
+                        0,
+                        &dirty_tx,
+                        &mailbox_waker,
+                        &resolved_tx,
+                        &mut next_gen,
+                        &mut wheel,
+                    );
+                    assert_ne!(action, Action::Close, "handshake readable handling");
+                }
+                if ev.is_writable() && conns.contains(k) {
+                    writable_drives += 1;
+                    let action = handle_writable(
+                        &poll,
+                        &mut conns,
+                        k,
+                        &cfg,
+                        0,
+                        &dirty_tx,
+                        &mailbox_waker,
+                        &resolved_tx,
+                        &mut next_gen,
+                        &mut wheel,
+                    );
+                    assert_ne!(action, Action::Close, "handshake writable handling");
+                }
+            }
+            // Pump the raw client: ingest ciphertext, run TLS, send its flight.
+            tlsup::pump_client(&mut client, &mut client_sock);
+            // TLS done → send the WS upgrade head as TLS application data.
+            if !client.is_handshaking() && !sent_head {
+                use std::io::Write as _;
+                client
+                    .writer()
+                    .write_all(G2_UPGRADE_HEAD.as_bytes())
+                    .expect("queue WS upgrade head");
+                sent_head = true;
+            }
+            // Collect any server plaintext (the 101 response).
+            loop {
+                match client.reader().read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => plaintext.extend_from_slice(&chunk[..n]),
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(e) => panic!("client plaintext read failed: {e}"),
+                }
+            }
+            if sent_head && plaintext.starts_with(b"HTTP/1.1 101") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(
+            writable_drives > 0,
+            "the blocked flight must be completed by writable-event drives"
+        );
+        assert_eq!(conns[key].conn.state, ConnState::Open);
+        assert!(
+            !conns[key].conn.writable_armed(),
+            "WRITABLE interest cleared once the flight + 101 drained"
+        );
     }
 }

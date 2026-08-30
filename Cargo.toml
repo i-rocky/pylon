@@ -85,7 +85,7 @@ rayon = "1"
 # SQL app store backend (sqlx Any driver: SQLite now, MySQL/Postgres later by DSN)
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "any", "sqlite", "mysql", "postgres", "macros"] }
 # Two-tier app-manager cache: bounded in-process L1 with async single-flight + TTL.
-moka = { version = "0.12", features = ["future"] }
+moka = { version = "0.12", features = ["future", "sync"] }
 # MongoDB app store backend (rustls, no OpenSSL; bson-2 + compat markers required by 3.x)
 mongodb = { version = "3", default-features = false, features = ["rustls-tls", "bson-2", "compat-3-3-0"] }
 

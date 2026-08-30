@@ -36,13 +36,16 @@ mod pylon_dispatcher_helpers {
         let handle = spawn(
             apps,
             // RecordingTransport doesn't count outcomes; it ignores the metrics.
-            move |_metrics| recorded as Arc<dyn WebhookTransport>,
+            move |_metrics| {
+                Ok::<_, std::convert::Infallible>(recorded as Arc<dyn WebhookTransport>)
+            },
             Arc::new(FixedClock(1700000000000)),
             batch_ms,
             1024,
             0,    // local path: vacated fires immediately (no grace)
             None, // no cluster occupancy source
-        );
+        )
+        .expect("recording transport factory is infallible");
         (handle, recorder)
     }
 }

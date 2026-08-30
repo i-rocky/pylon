@@ -155,6 +155,15 @@ pub fn encode(snapshot: &MetricsSnapshot) -> String {
             let _ = writeln!(out, "pylon_codel_dropped_total{{worker=\"{i}\"}} {codel}");
         }
 
+        out.push_str("# HELP pylon_drophead_dropped_total Frames evicted by the per-connection drop-head queue per worker (cumulative)\n");
+        out.push_str("# TYPE pylon_drophead_dropped_total counter\n");
+        for (i, &drophead) in pc.drophead_dropped.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "pylon_drophead_dropped_total{{worker=\"{i}\"}} {drophead}"
+            );
+        }
+
         out.push_str("# HELP pylon_mailbox_dropped_total Frames dropped due to per-connection mailbox full per worker (cumulative)\n");
         out.push_str("# TYPE pylon_mailbox_dropped_total counter\n");
         for (i, &mb) in pc.mailbox_dropped.iter().enumerate() {
@@ -407,6 +416,7 @@ mod tests {
             dropped: vec![5, 3],
             accepted: vec![10, 20],
             codel_dropped: vec![1, 2],
+            drophead_dropped: vec![0, 0],
             mailbox_dropped: vec![0, 0],
             inflight_total: 300,
             budget_factor: 0.9,
@@ -502,6 +512,7 @@ mod tests {
             dropped: vec![0, 0],
             accepted: vec![42, 17],
             codel_dropped: vec![3, 0],
+            drophead_dropped: vec![0, 0],
             mailbox_dropped: vec![0, 0],
             inflight_total: 0,
             budget_factor: 1.0,
@@ -540,6 +551,52 @@ mod tests {
             text.contains("# TYPE pylon_codel_dropped_total counter"),
             "type counter codel: {text}"
         );
+    }
+
+    #[test]
+    fn encode_percore_drophead_present_when_some() {
+        use crate::transport::PercoreMetricsSnapshot;
+        let pc = PercoreMetricsSnapshot {
+            inflight: vec![0, 0],
+            dropped: vec![0, 0],
+            accepted: vec![0, 0],
+            codel_dropped: vec![0, 0],
+            drophead_dropped: vec![7, 0],
+            mailbox_dropped: vec![0, 0],
+            inflight_total: 0,
+            budget_factor: 1.0,
+            worker_budget_bytes: 1,
+        };
+        let s = MetricsSnapshot {
+            apps: HashMap::new(),
+            saturation: None,
+            percore: Some(pc),
+            webhook: None,
+            webhook_queue_depth: None,
+            cluster: None,
+        };
+        let text = encode(&s);
+        assert!(
+            text.contains("pylon_drophead_dropped_total{worker=\"0\"} 7\n"),
+            "drophead_dropped w0: {text}"
+        );
+        assert!(
+            text.contains("pylon_drophead_dropped_total{worker=\"1\"} 0\n"),
+            "drophead_dropped w1 must be present at 0 (quiescent convention, like codel): {text}"
+        );
+        assert!(
+            text.contains("# HELP pylon_drophead_dropped_total "),
+            "missing HELP drophead: {text}"
+        );
+        assert!(
+            text.contains("# TYPE pylon_drophead_dropped_total counter"),
+            "type counter drophead: {text}"
+        );
+        // HELP/TYPE precede the series (format invariant).
+        let help_pos = text.find("# HELP pylon_drophead_dropped_total").unwrap();
+        let type_pos = text.find("# TYPE pylon_drophead_dropped_total").unwrap();
+        let series_pos = text.find("pylon_drophead_dropped_total{").unwrap();
+        assert!(help_pos < type_pos && type_pos < series_pos);
     }
 
     #[test]

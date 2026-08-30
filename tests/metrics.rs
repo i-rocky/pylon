@@ -274,3 +274,35 @@ async fn metrics_accepted_connections_counter_increases() {
         "accepted_connections_total{{worker=\"0\"}} must be >= 1 after a connection, got {value}"
     );
 }
+
+/// G8 (drop-head observability): a QUIESCENT server exposes
+/// `pylon_drophead_dropped_total` at 0 from startup — the exact convention
+/// `pylon_codel_dropped_total` follows (per-worker series, present whenever the
+/// percore fleet runs, not only once drops occur) — so an operator's scrape/
+/// alerting config never breaks when the metric first fires.
+#[tokio::test]
+async fn metrics_drophead_dropped_total_present_at_zero_when_quiescent() {
+    let addr = spawn().await;
+    // Give the worker a moment to start and install the registry.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let body = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    // The metric must exist from startup with value 0 (no traffic was sent).
+    assert!(
+        body.contains(r#"pylon_drophead_dropped_total{worker="0"} 0"#),
+        "quiescent server must expose pylon_drophead_dropped_total{{worker=\"0\"}} 0:\n{body}"
+    );
+    // Convention lock: the CoDel counter follows the same present-at-0 rule.
+    assert!(
+        body.contains(r#"pylon_codel_dropped_total{worker="0"} 0"#),
+        "pylon_codel_dropped_total must also be present at 0 (convention anchor):\n{body}"
+    );
+}

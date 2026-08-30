@@ -149,14 +149,26 @@ pub(super) async fn reap_member(
         }
     };
     if conn <= 0 {
-        let _ = pool
+        // Best-effort de-index on the →0 user edge (log-only on error). These side
+        // tables carry no TTL backstop and the token is already gone, so the next
+        // sweep will not revisit this user; a stale field self-heals when the user
+        // next joins/leaves (the refcount field is reused, and PRESENCE_LEAVE's →0
+        // edge re-HDELs both). Until then this warn is the only signal of the ghost
+        // roster/refcount entry.
+        if let Err(e) = pool
             .next()
             .hdel::<i64, _, _>(keys.presusers(app, channel), user_id.clone())
-            .await;
-        let _ = pool
+            .await
+        {
+            tracing::warn!(error = %e, app, channel, user_id, "sweeper: HDEL presusers failed");
+        }
+        if let Err(e) = pool
             .next()
             .hdel::<i64, _, _>(keys.presinfo(app, channel), user_id.clone())
-            .await;
+            .await
+        {
+            tracing::warn!(error = %e, app, channel, user_id, "sweeper: HDEL presinfo failed");
+        }
         let dead_node = token
             .split_once(':')
             .map(|(n, _)| n.to_string())

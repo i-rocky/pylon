@@ -123,21 +123,23 @@ async fn spawn_pylon_apps(
     let webhooks = pylon::webhook::spawn(
         apps.clone(),
         move |metrics| {
-            Arc::new(HttpTransport::new(
+            HttpTransport::new(
                 backoff_base_ms,
                 backoff_cap_ms,
                 retry_budget_ms,
                 5000,
                 100,
                 metrics,
-            )) as Arc<dyn WebhookTransport>
+            )
+            .map(|t| Arc::new(t) as Arc<dyn WebhookTransport>)
         },
         Arc::new(SystemClock),
         30, // 30ms batch window
         1024,
         0,    // local path: vacated fires immediately (no grace)
         None, // no cluster occupancy source
-    );
+    )
+    .expect("webhook transport builds in tests");
     let config = ServerConfig {
         webhook_batch_ms: 30,
         ..ServerConfig::default()

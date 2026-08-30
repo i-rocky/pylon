@@ -47,6 +47,19 @@ pub struct ServerConfig {
     /// activity. Mirrors Pusher's 24-hour maximum connection lifetime.
     /// `0` disables the lifetime close. `PYLON_MAX_CONN_LIFETIME_SECS`.
     pub max_conn_lifetime_secs: u64,
+    /// G3 (slowloris): maximum accepted HTTP request-head size (bytes) — the
+    /// bytes accumulated while sniffing the WS upgrade / REST request head. A
+    /// connection whose head exceeds this is closed (a client dribbling
+    /// headerless bytes can no longer grow `inbuf` without bound). Generous
+    /// against any legitimate head. `0` disables the cap.
+    /// `PYLON_MAX_HEAD_BYTES` (default 16384).
+    pub max_head_bytes: usize,
+    /// G3 (slowloris): absolute deadline (ms) from ACCEPT within which a
+    /// connection must complete its handshake (HTTP head + TLS + WS upgrade +
+    /// session establish). On expiry the connection is closed and its slot
+    /// reclaimed — inbound dribble does NOT postpone it. `0` disables the
+    /// deadline. `PYLON_HANDSHAKE_TIMEOUT_MS` (default 10000).
+    pub handshake_timeout_ms: u64,
     pub strict_protocol: bool,
     pub apps_path: String,
     pub max_presence_members: usize,
@@ -205,6 +218,8 @@ impl Default for ServerConfig {
             activity_timeout: 120,
             pong_timeout: 30,
             max_conn_lifetime_secs: 86_400,
+            max_head_bytes: 16_384,
+            handshake_timeout_ms: 10_000,
             strict_protocol: false,
             apps_path: "apps.json".into(),
             max_presence_members: 100,
@@ -293,6 +308,16 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("PYLON_MAX_CONN_LIFETIME_SECS") {
             if let Ok(p) = v.parse() {
                 c.max_conn_lifetime_secs = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_MAX_HEAD_BYTES") {
+            if let Ok(p) = v.parse() {
+                c.max_head_bytes = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_HANDSHAKE_TIMEOUT_MS") {
+            if let Ok(p) = v.parse() {
+                c.handshake_timeout_ms = p;
             }
         }
         if let Ok(v) = std::env::var("PYLON_STRICT_PROTOCOL") {
@@ -671,6 +696,9 @@ mod tests {
         assert_eq!(c.pong_timeout, 30);
         // Max connection lifetime: Pusher parity — 24h default, 0 = disabled.
         assert_eq!(c.max_conn_lifetime_secs, 86_400);
+        // G3 slowloris hardening: 16 KiB head cap, 10s handshake deadline.
+        assert_eq!(c.max_head_bytes, 16_384);
+        assert_eq!(c.handshake_timeout_ms, 10_000);
         assert!(!c.strict_protocol);
         assert_eq!(c.max_presence_members, 100);
         assert_eq!(c.max_event_payload_bytes, 10_240);
@@ -789,6 +817,24 @@ mod tests {
         let c = ServerConfig::from_env();
         assert_eq!(c.max_conn_lifetime_secs, 0);
         std::env::remove_var("PYLON_MAX_CONN_LIFETIME_SECS");
+    }
+
+    #[test]
+    fn slowloris_env_overrides_apply() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("PYLON_MAX_HEAD_BYTES", "4096");
+        std::env::set_var("PYLON_HANDSHAKE_TIMEOUT_MS", "2500");
+        let c = ServerConfig::from_env();
+        assert_eq!(c.max_head_bytes, 4096);
+        assert_eq!(c.handshake_timeout_ms, 2500);
+        // The explicit disable values (0 = no cap / no deadline).
+        std::env::set_var("PYLON_MAX_HEAD_BYTES", "0");
+        std::env::set_var("PYLON_HANDSHAKE_TIMEOUT_MS", "0");
+        let c = ServerConfig::from_env();
+        assert_eq!(c.max_head_bytes, 0);
+        assert_eq!(c.handshake_timeout_ms, 0);
+        std::env::remove_var("PYLON_MAX_HEAD_BYTES");
+        std::env::remove_var("PYLON_HANDSHAKE_TIMEOUT_MS");
     }
 
     #[test]

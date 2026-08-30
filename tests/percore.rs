@@ -44,6 +44,9 @@ struct Harness {
     port: u16,
     adapter: Arc<dyn Adapter>,
     conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>>,
+    /// The node-level live-connection counter handed to the worker's env —
+    /// exposed so tests can assert it nets to zero across reap paths.
+    node_conns: Arc<AtomicUsize>,
     app_registry: Arc<AppRegistry>,
     shutdown: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -85,6 +88,7 @@ async fn spawn_with_apps(config: ServerConfig, apps_json: &str) -> Harness {
     let app_registry = Arc::new(AppRegistry::new());
     let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry, app_registry.clone()));
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
+    let node_conns = Arc::new(AtomicUsize::new(0));
     let env = Arc::new(DispatchEnv {
         apps,
         adapter: adapter.clone(),
@@ -94,7 +98,7 @@ async fn spawn_with_apps(config: ServerConfig, apps_json: &str) -> Harness {
         max_conn_lifetime_secs: config.max_conn_lifetime_secs,
         strict_protocol: config.strict_protocol,
         conn_counts: conn_counts.clone(),
-        node_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        node_conns: node_conns.clone(),
         webhooks: pylon::webhook::WebhookHandle::null(),
         saturated: None,
         clustered: false,
@@ -114,6 +118,11 @@ async fn spawn_with_apps(config: ServerConfig, apps_json: &str) -> Harness {
                 addr,
                 max_payload: 1 << 20,
                 max_message_bytes: 1 << 20,
+                // G3 (slowloris) knobs: from the config so the env-var tests
+                // (`PYLON_MAX_HEAD_BYTES` / `PYLON_HANDSHAKE_TIMEOUT_MS`)
+                // reach the worker.
+                max_head_bytes: config.max_head_bytes,
+                handshake_timeout_ms: config.handshake_timeout_ms,
                 high_water: 1 << 20,
                 mode: Mode::Dispatch(env),
                 rest_handoff: None,
@@ -123,6 +132,7 @@ async fn spawn_with_apps(config: ServerConfig, apps_json: &str) -> Harness {
                 inflight_slot: None,
                 accepted_slot: None,
                 codel_dropped_slot: None,
+                drophead_dropped_slot: None,
                 mailbox_dropped_slot: None,
                 codel: pylon::transport::conn::CodelParams::DEFAULT,
                 budget_factor: None,
@@ -141,6 +151,7 @@ async fn spawn_with_apps(config: ServerConfig, apps_json: &str) -> Harness {
         port,
         adapter,
         conn_counts,
+        node_conns,
         app_registry,
         shutdown,
         handle: Some(handle),
@@ -305,6 +316,7 @@ async fn spawn_with_node_ceiling(max_connections: usize) -> Harness {
     let app_registry = Arc::new(AppRegistry::new());
     let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry, app_registry.clone()));
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
+    let node_conns = Arc::new(AtomicUsize::new(0));
     let env = Arc::new(DispatchEnv {
         apps,
         adapter: adapter.clone(),
@@ -316,7 +328,7 @@ async fn spawn_with_node_ceiling(max_connections: usize) -> Harness {
         max_conn_lifetime_secs: 0,
         strict_protocol: false,
         conn_counts: conn_counts.clone(),
-        node_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        node_conns: node_conns.clone(),
         webhooks: pylon::webhook::WebhookHandle::null(),
         saturated: None,
         clustered: false,
@@ -336,6 +348,8 @@ async fn spawn_with_node_ceiling(max_connections: usize) -> Harness {
                 addr,
                 max_payload: 1 << 20,
                 max_message_bytes: 1 << 20,
+                max_head_bytes: 16_384,
+                handshake_timeout_ms: 10_000,
                 high_water: 1 << 20,
                 mode: Mode::Dispatch(env),
                 rest_handoff: None,
@@ -345,6 +359,7 @@ async fn spawn_with_node_ceiling(max_connections: usize) -> Harness {
                 inflight_slot: None,
                 accepted_slot: None,
                 codel_dropped_slot: None,
+                drophead_dropped_slot: None,
                 mailbox_dropped_slot: None,
                 codel: pylon::transport::conn::CodelParams::DEFAULT,
                 budget_factor: None,
@@ -362,6 +377,7 @@ async fn spawn_with_node_ceiling(max_connections: usize) -> Harness {
         port,
         adapter,
         conn_counts,
+        node_conns,
         app_registry,
         shutdown,
         handle: Some(handle),
@@ -515,6 +531,7 @@ async fn spawn_with_saturation_flag() -> (Harness, Arc<AtomicBool>) {
     ));
     let sat_flag = Arc::new(AtomicBool::new(false));
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
+    let node_conns = Arc::new(AtomicUsize::new(0));
     let env = Arc::new(DispatchEnv {
         apps,
         adapter: adapter.clone(),
@@ -526,7 +543,7 @@ async fn spawn_with_saturation_flag() -> (Harness, Arc<AtomicBool>) {
         max_conn_lifetime_secs: 0,
         strict_protocol: false,
         conn_counts: conn_counts.clone(),
-        node_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        node_conns: node_conns.clone(),
         webhooks: pylon::webhook::WebhookHandle::null(),
         saturated: Some(sat_flag.clone()),
         clustered: false,
@@ -546,6 +563,8 @@ async fn spawn_with_saturation_flag() -> (Harness, Arc<AtomicBool>) {
                 addr,
                 max_payload: 1 << 20,
                 max_message_bytes: 1 << 20,
+                max_head_bytes: 16_384,
+                handshake_timeout_ms: 10_000,
                 high_water: 1 << 20,
                 mode: Mode::Dispatch(env),
                 rest_handoff: None,
@@ -555,6 +574,7 @@ async fn spawn_with_saturation_flag() -> (Harness, Arc<AtomicBool>) {
                 inflight_slot: None,
                 accepted_slot: None,
                 codel_dropped_slot: None,
+                drophead_dropped_slot: None,
                 mailbox_dropped_slot: None,
                 codel: pylon::transport::conn::CodelParams::DEFAULT,
                 budget_factor: None,
@@ -572,6 +592,7 @@ async fn spawn_with_saturation_flag() -> (Harness, Arc<AtomicBool>) {
         port,
         adapter,
         conn_counts,
+        node_conns,
         app_registry,
         shutdown,
         handle: Some(handle),
@@ -825,4 +846,420 @@ async fn max_conn_lifetime_zero_disables_the_close() {
         next_event_named(&mut ws, "pusher:pong").await["event"],
         "pusher:pong"
     );
+}
+
+// ── Scenario 9: G3 slowloris hardening (head cap + handshake deadline) ───────
+
+/// Open a RAW TCP connection to the worker (no WS handshake bytes sent).
+async fn raw_tcp(port: u16) -> tokio::net::TcpStream {
+    tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("raw tcp connect")
+}
+
+/// Wait until the server closes its side (read EOF or error), bounded by
+/// `budget`. Returns `Some(elapsed)` when the close was observed, `None` when
+/// the budget expired with the connection still open (the pre-fix behaviour).
+async fn wait_server_close(
+    rd: &mut tokio::net::tcp::OwnedReadHalf,
+    budget: Duration,
+) -> Option<std::time::Duration> {
+    use tokio::io::AsyncReadExt;
+    let start = std::time::Instant::now();
+    let mut buf = [0u8; 64];
+    let closed = tokio::time::timeout(budget, async {
+        loop {
+            match rd.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    closed.ok().map(|_| start.elapsed())
+}
+
+/// Pre-session connections never take any counter (both `node_conns` and the
+/// per-app `conn_counts` increment only in `finish_establish`); a reap that
+/// decremented what it never took would drift them. Pin the net-zero invariant
+/// on both reap paths.
+fn assert_counters_net_zero(h: &Harness) {
+    assert_eq!(
+        h.node_conns.load(Ordering::SeqCst),
+        0,
+        "node_conns must net to zero after the pre-session reap"
+    );
+    assert!(
+        h.conn_counts.is_empty(),
+        "conn_counts must hold no entries after the pre-session reap"
+    );
+}
+
+/// (a) A client dribbling HEADERLESS bytes slowly grows `inbuf` forever
+/// pre-fix. With the default 16 KiB head cap, the connection must be CLOSED
+/// once the accumulated head exceeds the cap — well within the bounded wait —
+/// and the counters must net to zero.
+#[tokio::test]
+async fn head_cap_closes_a_dribbling_slowloris() {
+    let h = spawn(ServerConfig::default()).await;
+    let (mut rd, mut wr) = raw_tcp(h.port).await.into_split();
+
+    // Dribble 32 KiB of headerless bytes in 1 KiB chunks (~650 ms total): the
+    // cap trips after ~17 chunks, long before the stream ends. If every chunk
+    // lands (pre-fix), HOLD the write side open — the only close the read side
+    // may then observe is the server's, never our own EOF.
+    let writer = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let chunk = [b'x'; 1024];
+        for _ in 0..32 {
+            if wr.write_all(&chunk).await.is_err() {
+                return; // server already closed — exactly what we want
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        futures_util::future::pending::<()>().await;
+    });
+
+    let closed = wait_server_close(&mut rd, Duration::from_secs(3)).await;
+    assert!(
+        closed.is_some(),
+        "server must close the connection once the head cap trips (pre-fix: unbounded buffer, close never comes)"
+    );
+    writer.abort();
+    let _ = writer.await;
+    tokio::time::sleep(Duration::from_millis(100)).await; // reap settles
+    assert_counters_net_zero(&h);
+}
+
+/// (b) A TCP connection that sends NOTHING never completes its handshake and
+/// (pre-fix) leaks its fd + slab slot forever. With
+/// `PYLON_HANDSHAKE_TIMEOUT_MS=500` the server must close it within ~1.5s.
+#[tokio::test]
+async fn handshake_timeout_reaps_a_silent_connection() {
+    std::env::set_var("PYLON_HANDSHAKE_TIMEOUT_MS", "500");
+    let _guard = EnvVarGuard("PYLON_HANDSHAKE_TIMEOUT_MS");
+    let h = spawn(ServerConfig::from_env()).await;
+
+    let (mut rd, _wr) = raw_tcp(h.port).await.into_split();
+    let start = std::time::Instant::now();
+    let closed = wait_server_close(&mut rd, Duration::from_millis(1500)).await;
+    assert!(
+        closed.is_some(),
+        "silent pre-session connection must be reaped within ~1.5s (pre-fix: leaked forever)"
+    );
+    assert!(
+        start.elapsed() >= Duration::from_millis(300),
+        "the reap must respect the 500ms deadline, not close instantly"
+    );
+    assert_counters_net_zero(&h);
+}
+
+/// (c) The slowloris limits are generous for real handshakes: under the same
+/// `PYLON_HANDSHAKE_TIMEOUT_MS=500` + `PYLON_MAX_HEAD_BYTES=1024` config, a
+/// normal WS connect still establishes, and stays established + responsive.
+#[tokio::test]
+async fn normal_connect_survives_the_slowloris_limits() {
+    std::env::set_var("PYLON_HANDSHAKE_TIMEOUT_MS", "500");
+    let _g_timeout = EnvVarGuard("PYLON_HANDSHAKE_TIMEOUT_MS");
+    std::env::set_var("PYLON_MAX_HEAD_BYTES", "1024");
+    let _g_head = EnvVarGuard("PYLON_MAX_HEAD_BYTES");
+    let h = spawn(ServerConfig::from_env()).await;
+
+    let mut ws = connect(h.port, "?protocol=7").await;
+    let sid = established_socket_id(&mut ws).await;
+    assert!(
+        sid.contains('.'),
+        "handshake must complete under the cap+deadline"
+    );
+
+    // Still established and responsive a second later (the deadline is
+    // pre-session only — it never touches a live session).
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    send_json(&mut ws, json!({ "event": "pusher:ping", "data": {} })).await;
+    assert_eq!(
+        next_event_named(&mut ws, "pusher:pong").await["event"],
+        "pusher:pong"
+    );
+}
+
+/// (d) The handshake deadline is ABSOLUTE from accept: dribbling one byte every
+/// 100ms for 1s (continuous activity) must NOT postpone the 500ms deadline —
+/// the connection closes at ~500ms anyway, unlike the idle timer.
+#[tokio::test]
+async fn handshake_deadline_is_not_postponed_by_activity() {
+    std::env::set_var("PYLON_HANDSHAKE_TIMEOUT_MS", "500");
+    let _guard = EnvVarGuard("PYLON_HANDSHAKE_TIMEOUT_MS");
+    let h = spawn(ServerConfig::from_env()).await;
+
+    let (mut rd, mut wr) = raw_tcp(h.port).await.into_split();
+    let start = std::time::Instant::now();
+    let writer = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        for _ in 0..10 {
+            if wr.write_all(b"x").await.is_err() {
+                return; // server closed mid-dribble — the expected outcome
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // All 1s of dribble landed (pre-fix): hold the write side open so the
+        // only close the read side can observe is the server's reap.
+        futures_util::future::pending::<()>().await;
+    });
+
+    let closed = wait_server_close(&mut rd, Duration::from_millis(1200)).await;
+    assert!(
+        closed.is_some(),
+        "connection must be reaped at the deadline despite constant dribble"
+    );
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "closed at {elapsed:?}; the deadline was postponed by activity (expected ~500ms)"
+    );
+    writer.abort();
+    let _ = writer.await;
+    assert_counters_net_zero(&h);
+}
+
+// ── Scenario 10: G5 same-burst subscribe + close deindexing ─────────────────
+
+/// Build one masked client→server WS frame (RFC 6455 §5.3): FIN=1, `opcode`,
+/// payload XOR-masked with the fixed 4-byte `mask`. Client frames MUST be
+/// masked (the worker rejects unmasked ones as a protocol error).
+fn masked_client_frame(opcode: u8, payload: &[u8], mask: [u8; 4]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + 14);
+    out.push(0x80 | opcode); // FIN=1 + opcode
+    let len = payload.len();
+    if len < 126 {
+        out.push(0x80 | len as u8); // MASK=1 + 7-bit length
+    } else {
+        assert!(
+            len <= u16::MAX as usize,
+            "test helper: extended-64 lengths unneeded"
+        );
+        out.push(0x80 | 126); // MASK=1 + 16-bit extended length
+        out.extend_from_slice(&(len as u16).to_be_bytes());
+    }
+    out.extend_from_slice(&mask);
+    for (i, b) in payload.iter().enumerate() {
+        out.push(b ^ mask[i % 4]);
+    }
+    out
+}
+
+/// Complete a raw WS upgrade BY HAND (no tungstenite) so the test owns every
+/// byte on the wire after the 101 — tungstenite would frame and flush each
+/// message separately, letting the worker process the subscribe and the Close
+/// in different readable batches. Returns the socket halves with the server's
+/// HTTP head consumed (any bytes already past it, e.g. the
+/// `connection_established` frame, are server→client noise we may drop).
+async fn raw_ws_upgrade(
+    port: u16,
+) -> (
+    tokio::net::tcp::OwnedReadHalf,
+    tokio::net::tcp::OwnedWriteHalf,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let stream = raw_tcp(port).await;
+    let (mut rd, mut wr) = stream.into_split();
+    let req = "GET /app/app-key?protocol=7 HTTP/1.1\r\n\
+               Host: 127.0.0.1\r\n\
+               Upgrade: websocket\r\n\
+               Connection: Upgrade\r\n\
+               Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+               Sec-WebSocket-Version: 13\r\n\r\n";
+    wr.write_all(req.as_bytes()).await.expect("write upgrade");
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 1024];
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let n = rd.read(&mut chunk).await.expect("read upgrade response");
+            assert!(n > 0, "EOF before the 101");
+            buf.extend_from_slice(&chunk[..n]);
+            // The FIRST CRLFCRLF in the byte stream is the head terminator.
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf);
+                assert!(
+                    head.starts_with("HTTP/1.1 101"),
+                    "unexpected upgrade response: {head}"
+                );
+                return;
+            }
+        }
+    })
+    .await
+    .expect("101 within 5s");
+    (rd, wr)
+}
+
+/// G5: a readable batch containing [subscribe, Close] — written as ONE TCP
+/// burst — makes `dispatch_frames` return `Action::Close` for the Close frame
+/// right after the subscribe took, so the worker's post-dispatch
+/// `reconcile_membership` (which runs only on the `Action::Keep` path) never
+/// saw the new channel. The close path must still fully deindex the
+/// freshly-subscribed channel: the adapter's channel view (what REST
+/// `GET /apps/{id}/channels` serves) must not report `leak-ch` as occupied or
+/// list it, and the worker-local `local_subs` delivery index must be empty —
+/// otherwise the index entry lingers forever (dead socket ids accumulate; the
+/// channel's subscriber set never empties; monotonic growth with churn).
+///
+/// A witness subscriber (`a`) proves the burst is not vacuous: it observes the
+/// subscription_count 1→2 edge from the burst connection's subscribe (so the
+/// subscribe really was dispatched in the same readable batch as the Close)
+/// and the 2→1 edge from its on-close unsubscribe. Repeating the burst three
+/// times guards the accumulation claim directly.
+#[tokio::test]
+async fn same_burst_subscribe_then_close_deindexes_membership() {
+    use tokio::io::AsyncWriteExt;
+    let h = spawn(ServerConfig::default()).await;
+
+    // Witness: a subscribes to leak-ch and drains its own count=1 frame.
+    let mut a = connect(h.port, "?protocol=7").await;
+    let _ = established_socket_id(&mut a).await;
+    send_json(
+        &mut a,
+        json!({ "event": "pusher:subscribe", "data": { "channel": "leak-ch" } }),
+    )
+    .await;
+    let _ = next_event_named(&mut a, "pusher_internal:subscription_succeeded").await;
+    let count1 = next_event_named(&mut a, "pusher_internal:subscription_count").await;
+    let c1: Value = serde_json::from_str(count1["data"].as_str().unwrap()).unwrap();
+    assert_eq!(c1["subscription_count"], 1);
+
+    for _ in 0..3 {
+        let (mut rd, mut wr) = raw_ws_upgrade(h.port).await;
+
+        // ONE write: the subscribe Text frame immediately followed by the
+        // Close frame (code 1000). The worker parses both into the same
+        // readable batch.
+        const MASK: [u8; 4] = [0x37, 0xfa, 0x21, 0x3d];
+        let subscribe = br#"{"event":"pusher:subscribe","data":{"channel":"leak-ch"}}"#;
+        let mut burst = masked_client_frame(0x1, subscribe, MASK);
+        burst.extend(masked_client_frame(0x8, &[0x03, 0xe8], MASK)); // Close, code 1000
+        wr.write_all(&burst).await.expect("burst write");
+
+        // The server completes the closing handshake (echoed Close + TCP
+        // EOF), bounded — the same-batch Close takes the `Action::Close` path
+        // before any reconcile ran for the subscribe.
+        let closed = wait_server_close(&mut rd, Duration::from_secs(5)).await;
+        assert!(
+            closed.is_some(),
+            "server must close after the same-burst Close frame"
+        );
+
+        // The witness saw the burst connection's membership come AND go: the
+        // 1→2 edge proves the subscribe dispatched inside the same batch as
+        // the Close (not dropped as post-handshake noise); the 2→1 edge
+        // proves the close path's on-close unsubscribe ran.
+        let count2 = next_event_named(&mut a, "pusher_internal:subscription_count").await;
+        let c2: Value = serde_json::from_str(count2["data"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            c2["subscription_count"], 2,
+            "the burst subscribe must take effect"
+        );
+        let count_back = next_event_named(&mut a, "pusher_internal:subscription_count").await;
+        let cb: Value = serde_json::from_str(count_back["data"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            cb["subscription_count"], 1,
+            "the same-batch close must unsubscribe"
+        );
+    }
+
+    // While a stays subscribed the worker index holds exactly its ONE slot —
+    // none of the three burst connections leaked a dead socket id into it.
+    let slots = pylon::transport::worker::percore_local_subs_len();
+    assert_eq!(slots, 1, "only the witness's member slot may remain");
+
+    drop(a);
+
+    // Bounded settle: channel-occupied state propagates through the worker
+    // immediately on Close; poll so the budget is generous but finite. After
+    // a's own close the channel must be gone from the adapter view (what GET
+    // /apps/{id}/channels serves) and the index fully empty.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let summary = h.adapter.channel("app", "leak-ch").await;
+        let listed = h
+            .adapter
+            .channels("app", None)
+            .await
+            .iter()
+            .any(|s| s.name == "leak-ch");
+        let slots = pylon::transport::worker::percore_local_subs_len();
+        if !summary.occupied && !listed && slots == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "leak-ch must be fully deindexed after the same-burst close \
+             (occupied={}, listed={}, local_subs slots={})",
+            summary.occupied,
+            listed,
+            slots
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Counters net zero (establish → close): no leaked per-app entries either.
+    assert_counters_net_zero(&h);
+}
+
+/// G5 control: the NORMAL close path (subscribe settled, THEN a separate
+/// Close) keeps deindexing exactly as before — the union deindex must not
+/// double-remove or miss on the reconciled path. A second connection on the
+/// same channel proves the surviving subscriber is untouched.
+#[tokio::test]
+async fn normal_close_still_deindexes_and_is_idempotent() {
+    let h = spawn(ServerConfig::default()).await;
+
+    // a subscribes and receives subscription_succeeded (reconcile ran).
+    let mut a = connect(h.port, "?protocol=7").await;
+    let _ = established_socket_id(&mut a).await;
+    send_json(
+        &mut a,
+        json!({ "event": "pusher:subscribe", "data": { "channel": "my-channel" } }),
+    )
+    .await;
+    let _ = next_event_named(&mut a, "pusher_internal:subscription_succeeded").await;
+    // Drain a's own count=1 frame.
+    let _ = next_event_named(&mut a, "pusher_internal:subscription_count").await;
+
+    // b subscribes to the same channel, then closes NORMALLY (its own TCP
+    // close after the subscribe settled).
+    let mut b = connect(h.port, "?protocol=7").await;
+    let _ = established_socket_id(&mut b).await;
+    send_json(
+        &mut b,
+        json!({ "event": "pusher:subscribe", "data": { "channel": "my-channel" } }),
+    )
+    .await;
+    let _ = next_event_named(&mut b, "pusher_internal:subscription_succeeded").await;
+    drop(b);
+
+    // a sees the count fall back to 1 — b's membership was deindexed once.
+    // (First consume b's join count=2, exactly like
+    // `disconnect_cleans_up_subscription` above.)
+    let count2 = next_event_named(&mut a, "pusher_internal:subscription_count").await;
+    let c2: Value = serde_json::from_str(count2["data"].as_str().unwrap()).unwrap();
+    assert_eq!(c2["subscription_count"], 2);
+    let count_after = next_event_named(&mut a, "pusher_internal:subscription_count").await;
+    let ca: Value = serde_json::from_str(count_after["data"].as_str().unwrap()).unwrap();
+    assert_eq!(ca["subscription_count"], 1);
+
+    // The local index holds exactly a's slot (not zero, not two, not negative:
+    // a double-remove would have eaten a's entry, a missed one b's).
+    let slots = pylon::transport::worker::percore_local_subs_len();
+    assert_eq!(slots, 1, "exactly one member slot must remain (a's)");
+    drop(a);
+
+    // …and drains to zero on a's normal close too.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while pylon::transport::worker::percore_local_subs_len() != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "local_subs must empty after both normal closes"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_counters_net_zero(&h);
 }

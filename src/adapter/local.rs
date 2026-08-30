@@ -12,7 +12,7 @@ use crate::user::registry::UserRegistry;
 use crate::user::{UserJoinOutcome, UserLeaveOutcome};
 use async_trait::async_trait;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Send error (4009) + close (4009) frames to every handle in `handles` and
 /// return their socket ids. Shared by `terminate_user` and `purge_app` so the
@@ -192,27 +192,16 @@ impl Adapter for LocalAdapter {
     }
 
     async fn cache_set(&self, app: &str, channel: &str, event: CachedEvent, ttl: Duration) {
-        let expiry = Instant::now() + ttl;
-        self.cache
-            .insert((app.to_string(), channel.to_string()), (event, expiry));
+        // The store stamps the per-entry TTL itself (moka evicts once it passes,
+        // even if the entry is never read again — G7).
+        self.cache.set(app, channel, event, ttl);
     }
 
     async fn cache_get(&self, app: &str, channel: &str) -> Option<CachedEvent> {
-        let key = (app.to_string(), channel.to_string());
-        {
-            // Hold the shard read-guard only inside this block. On the live path
-            // we return the clone while still holding it (safe); the expired path
-            // falls through, dropping the guard BEFORE the remove() write-lock
-            // below so DashMap cannot self-deadlock on the same shard.
-            let entry = self.cache.get(&key)?;
-            // `<` (not `<=`): an entry whose expiry instant has been reached is
-            // treated as expired — a ttl of 0 is therefore immediately expired.
-            if Instant::now() < entry.1 {
-                return Some(entry.0.clone());
-            }
-        }
-        self.cache.remove(&key);
-        None
+        // TTL-aware: moka checks the entry's deadline on read, so an expired
+        // (not yet evicted) entry reads as a miss. A ttl of 0 is immediately
+        // expired.
+        self.cache.get(app, channel)
     }
 
     async fn signin_user(

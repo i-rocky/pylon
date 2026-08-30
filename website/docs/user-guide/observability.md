@@ -41,6 +41,7 @@ labels**.
 | `pylon_accepted_connections_total` | counter | `worker` | Cumulative connections accepted by each worker since start |
 | `pylon_broadcast_dropped_total` | counter | `worker` | Broadcasts dropped because the worker hand-off channel was full |
 | `pylon_codel_dropped_total` | counter | `worker` | Frames discarded by the CoDel staleness check (stale frames removed from the queue before sending) |
+| `pylon_drophead_dropped_total` | counter | `worker` | Frames evicted by the per-connection drop-head queue: when a slow consumer's outbound queue is at its byte cap, the oldest queued frames are dropped to make room for newer ones (freshest-wins) |
 | `pylon_inflight_bytes` | gauge | `worker` | Bytes currently queued in each worker's outbound buffer |
 | `pylon_inflight_bytes_sum` | gauge | — | Sum of `pylon_inflight_bytes` across all workers |
 | `pylon_worker_budget_bytes` | gauge | — | Per-worker memory budget in bytes |
@@ -90,8 +91,10 @@ Import the series above into Grafana dashboards. Useful panel ideas:
 
 - **Connection density**: `pylon_connections{app="…"}` per app, plus
   `sum(pylon_inflight_bytes_sum)` for buffer pressure.
-- **Drop rates**: rate of `pylon_broadcast_dropped_total` and
-  `pylon_codel_dropped_total` — non-zero values indicate backpressure.
+- **Drop rates**: rate of `pylon_broadcast_dropped_total`,
+  `pylon_codel_dropped_total`, and `pylon_drophead_dropped_total` — non-zero
+  values indicate backpressure (drop-head evictions mean slow consumers are
+  losing their oldest queued frames).
 - **Webhook health**: `pylon_webhook_dropped_total` rate and
   `pylon_webhook_queue_depth` — rising queue depth signals a slow upstream.
 - **Redis health**: `pylon_redis_connected` as a status panel; alert on `< 1`.

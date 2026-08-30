@@ -23,7 +23,9 @@
 //! * `TlsRestStream` — an `AsyncRead`/`AsyncWrite` adapter that drives the
 //!   synchronous rustls `ServerConnection` over a tokio `TcpStream`. It replays
 //!   `prefix` (the already-decrypted HTTP head bytes) first, then pulls further
-//!   plaintext from the TLS session. Waker-driven: uses
+//!   plaintext from the TLS session. Reads process EVERY TLS record found in a
+//!   single socket read ([`drain_tls_records`], G4) and stash any plaintext
+//!   that overflows the caller's buffer. Waker-driven: uses
 //!   `poll_read_ready`/`poll_write_ready` + `try_read`/`try_write` and returns
 //!   `Poll::Pending` (never busy-loops) when the TCP socket isn't ready.
 //! * [`serve`] — the tokio task: loop on the handoff channel, wrap each
@@ -174,6 +176,15 @@ impl AsyncWrite for Rewind {
 /// `out_ct` and resume writing on the next wakeup. `poll_flush_ct` owns the
 /// full drain loop: pull from rustls → write to socket → repeat until both
 /// `out_ct` is empty AND `!tls.wants_write()`.
+///
+/// # Inbound record draining (G4 fix)
+///
+/// One TCP read can carry several complete TLS records (pipelined requests, a
+/// body split across records) plus a partial tail. Every record must be
+/// processed — [`drain_tls_records`] owns that loop — and the plaintext it
+/// decrypts may exceed the caller's `ReadBuf`, so it lands in `in_pt`/`in_pos`
+/// (the read-side mirror of `out_ct`/`out_pos`) and is handed over across
+/// successive `poll_read` calls.
 struct TlsRestStream {
     tcp: tokio::net::TcpStream,
     tls: Box<TlsConn>,
@@ -183,6 +194,12 @@ struct TlsRestStream {
     out_ct: Vec<u8>,
     /// Write cursor into `out_ct`; bytes `[..out_pos]` have been sent.
     out_pos: usize,
+    /// Plaintext decrypted by [`drain_tls_records`] but not yet handed to the
+    /// caller: one socket read can decode more than the caller's `ReadBuf`
+    /// accepts (`ReadBuf::put_slice` would panic past `remaining()`).
+    in_pt: Vec<u8>,
+    /// Read cursor into `in_pt`; bytes `[..in_pos]` have been delivered.
+    in_pos: usize,
 }
 
 impl TlsRestStream {
@@ -241,6 +258,88 @@ impl TlsRestStream {
             }
         }
     }
+
+    /// Move buffered plaintext into `buf`, capped at `buf.remaining()`
+    /// (`ReadBuf::put_slice` panics past that, and the excess must survive for
+    /// the next `poll_read`). Returns the number of bytes delivered. When the
+    /// buffer empties, its memory is released (like `prefix` above).
+    fn take_in_pt(&mut self, buf: &mut ReadBuf<'_>) -> usize {
+        if self.in_pos >= self.in_pt.len() {
+            return 0;
+        }
+        let remaining = &self.in_pt[self.in_pos..];
+        let n = remaining.len().min(buf.remaining());
+        buf.put_slice(&remaining[..n]);
+        self.in_pos += n;
+        if self.in_pos >= self.in_pt.len() {
+            self.in_pt = Vec::new();
+            self.in_pos = 0;
+        }
+        n
+    }
+}
+
+/// Process EVERY TLS record contained in a ciphertext buffer (G4).
+///
+/// A single TCP read (`poll_read` pulls up to 16 KiB) can carry several
+/// complete TLS records — pipelined HTTP requests, or a request body split
+/// across records arriving together — plus a trailing partial record. Rustls's
+/// `read_tls` moves at most ~4 KiB per call from the source into its internal
+/// deframer (a trailing partial record is kept safely buffered INSIDE rustls
+/// until its remaining bytes arrive), and `process_new_packets` then parses
+/// every complete record it buffered. The pre-fix handoff called `read_tls`
+/// ONCE and dropped the cursor, silently discarding every ciphertext byte past
+/// that first ~4 KiB — the second record of a burst lost its tail mid-stream
+/// and the HTTP byte stream corrupted (hangs / parse errors).
+///
+/// This loops until the cursor is exhausted. Per iteration:
+///
+/// * `read_tls` — ingest the next ~4 KiB of ciphertext. `Ok(0)` here means
+///   `close_notify` was already received (the loop guard rules out an
+///   exhausted cursor); per RFC 8446 §6.1 data after `close_notify` is
+///   ignored, so the drain stops without error.
+/// * `process_new_packets` — decrypt every complete record just ingested.
+/// * pull the round's plaintext out via `tls.reader()` into `plaintext`.
+///   Draining per round also keeps rustls's 16 KiB `received_plaintext` buffer
+///   from filling up and back-pressure-erroring the next `read_tls`.
+///
+/// Error mapping matches the single-record path this replaces: `read_tls`
+/// I/O errors propagate as-is; `process_new_packets` failures become
+/// `InvalidData` I/O errors; `reader()` errors other than `WouldBlock`
+/// propagate as-is. A trailing partial record is NOT an error: its bytes are
+/// already inside rustls's deframer and complete on the next read.
+fn drain_tls_records(
+    tls: &mut TlsConn,
+    cursor: &mut std::io::Cursor<&[u8]>,
+    plaintext: &mut Vec<u8>,
+) -> io::Result<()> {
+    let mut chunk = [0u8; 16 * 1024];
+    while cursor.position() < cursor.get_ref().len() as u64 {
+        match tls.read_tls(cursor) {
+            // The loop guard rules out an exhausted cursor, so Ok(0) means
+            // close_notify was already received: stop (RFC 8446 §6.1 — data
+            // after close_notify is ignored), keeping what was decrypted.
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(e) => return Err(e),
+        }
+        if let Err(e) = tls.process_new_packets() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+        }
+        // Pull this round's plaintext out. Draining per round also keeps
+        // rustls's 16 KiB `received_plaintext` buffer from filling up and
+        // back-pressure-erroring the next `read_tls`.
+        loop {
+            match tls.reader().read(&mut chunk) {
+                // close_notify: no further plaintext can follow.
+                Ok(0) => return Ok(()),
+                Ok(n) => plaintext.extend_from_slice(&chunk[..n]),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
 }
 
 impl AsyncRead for TlsRestStream {
@@ -265,27 +364,37 @@ impl AsyncRead for TlsRestStream {
             return Poll::Ready(Ok(()));
         }
 
-        // 2. Try to pull plaintext already buffered inside rustls (from a prior
-        //    `read_tls` that decoded more than one TLS record).
+        // 2. Deliver plaintext stashed by a previous round: one socket read
+        //    can decrypt more than a single caller ReadBuf accepts.
+        if this.take_in_pt(buf) > 0 {
+            return Poll::Ready(Ok(()));
+        }
+
         let mut chunk = [0u8; 16 * 1024];
+
+        // 3. Try to pull plaintext still buffered inside rustls (from a prior
+        //    `read_tls` that decoded more than one TLS record). It goes through
+        //    `in_pt` so delivery is bounded by the caller's buffer (a direct
+        //    `put_slice` could panic on a small ReadBuf).
         match this.tls.reader().read(&mut chunk) {
             Ok(0) => {} // no buffered plaintext; fall through to read ciphertext
             Ok(n) => {
-                buf.put_slice(&chunk[..n]);
+                this.in_pt.extend_from_slice(&chunk[..n]);
+                this.take_in_pt(buf);
                 return Poll::Ready(Ok(()));
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
             Err(e) => return Poll::Ready(Err(e)),
         }
 
-        // 3. Need more ciphertext from the TCP socket. Wait until readable.
+        // 4. Need more ciphertext from the TCP socket. Wait until readable.
         match this.tcp.poll_read_ready(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Ready(Ok(())) => {}
         }
 
-        // 4. Read ciphertext into a temp buffer and feed it to rustls.
+        // 5. Read ciphertext into a temp buffer.
         let mut ct_buf = [0u8; 16 * 1024];
         let n = match this.tcp.try_read(&mut ct_buf) {
             Ok(0) => {
@@ -312,28 +421,35 @@ impl AsyncRead for TlsRestStream {
             Err(e) => return Poll::Ready(Err(e)),
         };
 
-        // Feed the raw ciphertext into rustls.
-        let mut cursor = &ct_buf[..n];
-        match this.tls.read_tls(&mut cursor) {
-            Ok(_) => {}
-            Err(e) => return Poll::Ready(Err(e)),
-        }
-        match this.tls.process_new_packets() {
-            Ok(_) => {}
-            Err(e) => {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e)));
-            }
+        // 6. Feed ALL of it to rustls (G4): one read can carry several
+        //    complete records plus a partial tail; every record must be
+        //    processed or the HTTP stream loses bytes.
+        let mut cursor = std::io::Cursor::new(&ct_buf[..n]);
+        if let Err(e) = drain_tls_records(&mut this.tls, &mut cursor, &mut this.in_pt) {
+            return Poll::Ready(Err(e));
         }
 
-        // After processing, drive any pending TLS writes (e.g. alerts, key-update).
-        // Best-effort: a write-side error here doesn't affect the read result.
+        // 7. After processing, drive any pending TLS writes (e.g. alerts,
+        //    key-update). Best-effort: a write-side error here doesn't affect
+        //    the read result.
         let _ = this.poll_flush_ct(cx);
 
-        // 5. Pull the freshly decrypted plaintext out of rustls.
+        // 8. Hand the freshly decrypted plaintext to the caller (bounded by
+        //    the caller's buffer; any excess stays in `in_pt`).
+        if this.take_in_pt(buf) > 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        // 9. Nothing decrypted: either close_notify (clean EOF) or the records
+        //    in this read carried no new plaintext (need more ciphertext).
         match this.tls.reader().read(&mut chunk) {
             Ok(0) => Poll::Ready(Ok(())), // TLS close_notify received
             Ok(n) => {
-                buf.put_slice(&chunk[..n]);
+                // Defensive: plaintext that appeared between the drain and now
+                // (e.g. a post-handshake message with app data piggybacked).
+                // Deliver bounded, like every other path.
+                this.in_pt.extend_from_slice(&chunk[..n]);
+                this.take_in_pt(buf);
                 Poll::Ready(Ok(()))
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -479,6 +595,8 @@ async fn serve_one(
                 prefix_pos: 0,
                 out_ct: Vec::new(),
                 out_pos: 0,
+                in_pt: Vec::new(),
+                in_pos: 0,
             };
             let io = hyper_util::rt::TokioIo::new(tls_stream);
             builder.serve_connection(io, service).await?;
@@ -486,4 +604,198 @@ async fn serve_one(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustls::ClientConnection;
+    use std::sync::Arc;
+
+    /// Build an in-memory rustls pair with the handshake already complete: the
+    /// server end is exactly what `TlsRestStream` drives (a
+    /// `ServerConnection`), and the paired raw client is what produces its
+    /// ciphertext. Follows the conn.rs `tls_test_support` conventions (raw
+    /// client/server pairs driven by hand) but stays fully in memory — no
+    /// sockets, so record boundaries are exactly what the test writes.
+    fn tls_pair() -> (TlsConn, ClientConnection) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("rcgen: generate self-signed cert");
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.cert.der().clone()], key)
+            .expect("build rustls server config");
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).expect("trust test cert");
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("parse name");
+
+        let mut server = TlsConn::new(Arc::new(server_config)).expect("server connection");
+        let mut client =
+            ClientConnection::new(Arc::new(client_config), name).expect("client connection");
+        complete_handshake(&mut server, &mut client);
+        (server, client)
+    }
+
+    /// Shuttle handshake flights between the pair through a scratch buffer
+    /// until neither side is handshaking. Feeding the server reuses
+    /// [`drain_tls_records`] (dogfooding: the same record-drain the fix owns);
+    /// feeding the client loops `read_tls`/`process_new_packets` until the
+    /// flight's bytes are exhausted — `read_tls` ingests at most ~4 KiB per
+    /// call, the exact chunking G4 is about.
+    fn complete_handshake(server: &mut TlsConn, client: &mut ClientConnection) {
+        let mut wire = Vec::new();
+        for _ in 0..20 {
+            if !server.is_handshaking() && !client.is_handshaking() {
+                return;
+            }
+            if client.wants_write() {
+                client.write_tls(&mut wire).expect("client flight");
+                let mut scratch = Vec::new();
+                drain_tls_records(server, &mut io::Cursor::new(&wire), &mut scratch)
+                    .expect("server ingests client flight");
+                assert!(scratch.is_empty(), "no plaintext during handshake");
+                wire.clear();
+            }
+            if server.wants_write() {
+                server.write_tls(&mut wire).expect("server flight");
+                let mut cursor = io::Cursor::new(&wire);
+                while cursor.position() < wire.len() as u64 {
+                    client
+                        .read_tls(&mut cursor)
+                        .expect("client read_tls of flight");
+                    client
+                        .process_new_packets()
+                        .expect("client TLS state machine");
+                }
+                wire.clear();
+            }
+        }
+        panic!("in-memory TLS handshake did not complete in 20 rounds");
+    }
+
+    /// Have the client emit one application-data record per `write_tls` call:
+    /// `writer().write_all` buffers the plaintext, `write_tls` drains it into
+    /// exactly one record on the wire (payloads stay under the 16 KiB max
+    /// fragment). Consecutive calls append, so one buffer ends up holding
+    /// several complete records back-to-back — like one big TCP read.
+    fn emit_record(client: &mut ClientConnection, wire: &mut Vec<u8>, payload: &[u8]) {
+        client
+            .writer()
+            .write_all(payload)
+            .expect("client buffers plaintext");
+        client.write_tls(wire).expect("client emits record");
+    }
+
+    /// G4: a single buffer holding TWO complete records — both plaintexts must
+    /// surface, in order, with nothing lost. The payloads are 4 KiB each so the
+    /// combined wire size exceeds the ~4 KiB chunk `read_tls` ingests per call:
+    /// this is exactly the burst the single-record handoff truncated (it
+    /// dropped every ciphertext byte past the first chunk, cutting the second
+    /// record's tail out of the HTTP byte stream).
+    #[test]
+    fn drain_tls_records_yields_every_record_in_a_multi_record_buffer() {
+        let (mut server, mut client) = tls_pair();
+
+        let p1: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+        let p2: Vec<u8> = (0..4000u32).map(|i| 0x80 | (i % 128) as u8).collect();
+
+        let mut wire = Vec::new();
+        emit_record(&mut client, &mut wire, &p1);
+        emit_record(&mut client, &mut wire, &p2);
+        assert!(
+            wire.len() > 4096,
+            "precondition: two records must exceed one read_tls chunk, wire={}B",
+            wire.len()
+        );
+
+        let mut plaintext = Vec::new();
+        drain_tls_records(&mut server, &mut io::Cursor::new(&wire), &mut plaintext)
+            .expect("drain must not fail");
+
+        let mut expected = p1.clone();
+        expected.extend_from_slice(&p2);
+        assert_eq!(
+            plaintext,
+            expected,
+            "both records' plaintext must surface in order (got {} of {} bytes)",
+            plaintext.len(),
+            expected.len()
+        );
+    }
+
+    /// Two small pipelined requests in one buffer (well under one ~4 KiB
+    /// chunk) — the common pipelining case: `process_new_packets` parses both
+    /// records in one go and the drain must keep both plaintexts surfacing.
+    #[test]
+    fn drain_tls_records_yields_both_small_pipelined_records() {
+        let (mut server, mut client) = tls_pair();
+
+        let p1 = b"GET /apps/tls-app/channels HTTP/1.1\r\nHost: pylon\r\n\r\n";
+        let p2 = b"GET /apps/tls-app/channels?filter=prefix HTTP/1.1\r\nHost: pylon\r\n\r\n";
+
+        let mut wire = Vec::new();
+        emit_record(&mut client, &mut wire, p1);
+        emit_record(&mut client, &mut wire, p2);
+        assert!(wire.len() <= 4096, "precondition: small pipelined pair");
+
+        let mut plaintext = Vec::new();
+        drain_tls_records(&mut server, &mut io::Cursor::new(&wire), &mut plaintext)
+            .expect("drain must not fail");
+
+        assert!(plaintext.starts_with(p1), "first request first");
+        assert!(plaintext.ends_with(p2), "second request second");
+        assert_eq!(plaintext.len(), p1.len() + p2.len(), "nothing lost");
+    }
+
+    /// A complete record followed by a PARTIAL second record: the first must
+    /// surface now; the partial bytes live inside rustls's deframer and must
+    /// complete — not be lost or double-fed — when the remainder arrives
+    /// (models a request split across TCP segments). The two feeds go through
+    /// SEPARATE cursors exactly like two `try_read` calls in `poll_read`.
+    #[test]
+    fn drain_tls_records_partial_tail_completes_on_next_feed() {
+        let (mut server, mut client) = tls_pair();
+
+        let p1 = b"first complete record";
+        let p2: Vec<u8> = (0..2000u32).map(|i| (i % 199) as u8).collect();
+
+        let mut wire = Vec::new();
+        emit_record(&mut client, &mut wire, p1);
+        let rec1_len = wire.len();
+        emit_record(&mut client, &mut wire, &p2);
+        // Split the second record's wire bytes 30 bytes in (a partial record),
+        // keeping the large majority for the second feed.
+        let split = rec1_len + 30;
+
+        let mut plaintext = Vec::new();
+        drain_tls_records(
+            &mut server,
+            &mut io::Cursor::new(&wire[..split]),
+            &mut plaintext,
+        )
+        .expect("first drain");
+        assert_eq!(plaintext, p1, "only the complete record surfaces");
+
+        let mut rest = Vec::new();
+        drain_tls_records(&mut server, &mut io::Cursor::new(&wire[split..]), &mut rest)
+            .expect("second drain");
+        assert_eq!(rest, p2, "the partial record completes from its remainder");
+    }
+
+    /// An empty ciphertext buffer is a no-op: Ok(()), nothing appended, no
+    /// state consumed.
+    #[test]
+    fn drain_tls_records_empty_buffer_is_noop() {
+        let (mut server, _client) = tls_pair();
+        let mut plaintext = vec![1u8, 2, 3]; // pre-filled: must stay untouched
+        drain_tls_records(&mut server, &mut io::Cursor::new(&[]), &mut plaintext)
+            .expect("empty drain");
+        assert_eq!(plaintext, vec![1, 2, 3]);
+    }
 }
