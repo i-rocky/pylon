@@ -59,13 +59,15 @@ jobs:
             --test rest --test signin --test tls --test watchlist --test webhooks \
             -- --test-threads=1
 
-      # Cross-node cluster / Redis tests: validated locally, but they assert on
-      # short Redis round-trip timing windows that race on the shared CI Redis
-      # service. Run them for visibility, but don't block the build on a flake.
-      - name: Test (cluster / Redis — non-blocking)
-        continue-on-error: true
+      # Cross-node cluster / Redis tests (real Redis service container, random
+      # key prefixes per run). The former flake sources are fixed: the vacate-CAS
+      # in the sweeper/unsubscribe path (no duplicate channel_vacated) and
+      # event-based waits in the suites (no wall-clock timing windows), so this
+      # step is blocking. `--no-fail-fast` so every suite reports its result
+      # instead of halting at the first failing binary.
+      - name: Test (cluster / Redis)
         run: |
-          cargo test --locked \
+          cargo test --locked --no-fail-fast \
             --test cluster_bridge --test cluster_subscribe \
             --test percore_cluster --test percore_cluster_cache \
             --test percore_cluster_presence --test percore_cluster_user \
