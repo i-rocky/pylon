@@ -8,6 +8,7 @@ use crate::protocol::event::ServerEvent;
 use crate::protocol::socket_id::SocketId;
 use crate::server::router::AppState;
 use axum::body::Bytes;
+use axum::extract::rejection::BytesRejection;
 use axum::extract::{OriginalUri, Path, Query, State};
 use axum::Json;
 use serde::Deserialize;
@@ -149,8 +150,11 @@ pub async fn post_events(
     Path(app_id): Path<String>,
     OriginalUri(uri): OriginalUri,
     Query(params): Query<HashMap<String, String>>,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<Value>, RestError> {
+    // Map the body-limit rejection (413) into a RestError so it renders the
+    // same JSON error body as every other REST error.
+    let body = body.map_err(|e| RestError::from_rejection(e.status(), e.body_text()))?;
     let app = authenticate(&state, &app_id, "POST", uri.path(), &params, &body).await?;
     // SP10 admission control: under sustained overload the percore broadcast
     // pipeline is saturated — reject the publish (503 + Retry-After) instead of
@@ -235,8 +239,10 @@ pub async fn post_batch(
     Path(app_id): Path<String>,
     OriginalUri(uri): OriginalUri,
     Query(params): Query<HashMap<String, String>>,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<Value>, RestError> {
+    // Map the body-limit rejection (413) into a RestError (see `post_events`).
+    let body = body.map_err(|e| RestError::from_rejection(e.status(), e.body_text()))?;
     let app = authenticate(&state, &app_id, "POST", uri.path(), &params, &body).await?;
     // SP10 admission control: reject under saturation (see `post_events`).
     if state.is_saturated() {

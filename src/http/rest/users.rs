@@ -7,6 +7,7 @@ use crate::http::error::RestError;
 use crate::http::rest::auth::authenticate;
 use crate::server::router::AppState;
 use axum::body::Bytes;
+use axum::extract::rejection::BytesRejection;
 use axum::extract::{OriginalUri, Path, Query, State};
 use axum::Json;
 use serde_json::{json, Value};
@@ -40,8 +41,10 @@ pub async fn terminate_user_connections(
     Path((app_id, user_id)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,
     Query(params): Query<HashMap<String, String>>,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<Value>, RestError> {
+    // Map the body-limit rejection (413) into a RestError (JSON error body).
+    let body = body.map_err(|e| RestError::from_rejection(e.status(), e.body_text()))?;
     let app = authenticate(&state, &app_id, "POST", uri.path(), &params, &body).await?;
     state.adapter.terminate_user(&app.id, &user_id).await;
     Ok(Json(json!({})))

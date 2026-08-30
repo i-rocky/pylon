@@ -984,6 +984,121 @@ async fn rest_batch_event_name_over_200_is_400() {
     );
 }
 
+// ── R2 parity tests — REST errors render JSON bodies {error, status} ────────
+
+/// Assert an error response carries the Pusher-style JSON error body: the body
+/// parses as JSON, `error` is a non-empty string, `status` mirrors the HTTP
+/// status code, and the content-type is `application/json`.
+async fn assert_json_error(resp: reqwest::Response, expected: u16) {
+    assert_eq!(resp.status(), expected);
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        content_type.starts_with("application/json"),
+        "error body content-type must be application/json, got: {content_type}"
+    );
+    let v: Value = resp.json().await.unwrap();
+    assert!(
+        v.get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|e| !e.is_empty()),
+        "error body must carry a non-empty `error` string, got: {v}"
+    );
+    assert_eq!(
+        v["status"],
+        json!(expected),
+        "error body `status` field must mirror the HTTP status, got: {v}"
+    );
+}
+
+/// R2: 400 (invalid body) renders a JSON error body.
+#[tokio::test]
+async fn rest_error_body_400_is_json() {
+    let addr = spawn().await;
+    // Correctly signed request whose body is not valid JSON.
+    let body = "definitely not json".to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_json_error(resp, 400).await;
+}
+
+/// R2: 401 (bad auth signature) renders a JSON error body.
+#[tokio::test]
+async fn rest_error_body_401_is_json() {
+    let addr = spawn().await;
+    let body = json!({"name":"e","data":"{}","channels":["c"]}).to_string();
+    let mut q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    q = q.replace(
+        &q[q.rfind("auth_signature=").unwrap()..],
+        "auth_signature=deadbeef",
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_json_error(resp, 401).await;
+}
+
+/// R2: handler-produced 404 (admin API disabled — the app-scoped 404 a handler
+/// can emit; the unknown-route 404 shape is Task 2.9's scope) renders JSON.
+#[tokio::test]
+async fn rest_error_body_404_admin_disabled_is_json() {
+    let addr = spawn().await;
+    // No PYLON_ADMIN_TOKEN configured → the admin endpoint is disabled (404).
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/admin/apps/app1/invalidate"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_json_error(resp, 404).await;
+}
+
+/// R2: 413 from the handler validation (event data over the per-event cap).
+#[tokio::test]
+async fn rest_error_body_413_event_data_is_json() {
+    let addr = spawn().await;
+    let big_data = "x".repeat(10_241);
+    let body = json!({"name":"e","data": big_data,"channels":["c"]}).to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_json_error(resp, 413).await;
+}
+
+/// R2: 413 from the request body limit (axum `Bytes` rejection, mapped into
+/// `RestError` so it renders the JSON body too).
+#[tokio::test]
+async fn rest_error_body_413_body_limit_is_json() {
+    let addr = spawn().await;
+    // Default limits → body cap = 10*10240 + 64KiB ≈ 164KiB; exceed it.
+    let big = "x".repeat(200 * 1024);
+    let body = json!({"name": "e", "data": big, "channels": ["c"]}).to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_json_error(resp, 413).await;
+}
+
 // ── P13 parity tests — pre-handshake reject must carry Pusher 4xxx close code ─
 
 /// Connecting to an unknown app key triggers a 4001 rejection.  The WebSocket Close
