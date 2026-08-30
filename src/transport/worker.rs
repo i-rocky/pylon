@@ -607,8 +607,9 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     let worker_epoch = Instant::now();
 
     // C2a: graceful-drain state. `drain_started` gates the one-time setup (deregister
-    // listener, queue Close 1001 on all open connections). `drain_deadline` is the
-    // absolute Instant after which we force-close regardless of inflight bytes.
+    // listener, queue a `pusher:error` 4200 + WS Close(4200) on all open connections).
+    // `drain_deadline` is the absolute Instant after which we force-close regardless
+    // of inflight bytes.
     let mut drain_started = false;
     let mut drain_deadline: Option<Instant> = None;
 
