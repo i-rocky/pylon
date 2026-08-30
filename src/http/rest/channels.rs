@@ -3,10 +3,21 @@
 use crate::http::error::RestError;
 use crate::http::rest::auth::authenticate;
 use crate::server::router::AppState;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{OriginalUri, Path, Query, State};
 use axum::Json;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
+
+/// Unwrap the `Result<Query<..>, QueryRejection>` extractor: a query-string
+/// rejection (R15) renders the same JSON `{"error","status"}` body as every
+/// other REST error instead of axum's plain text.
+fn query_params(
+    q: Result<Query<HashMap<String, String>>, QueryRejection>,
+) -> Result<HashMap<String, String>, RestError> {
+    q.map(|Query(p)| p)
+        .map_err(|e| RestError::from_rejection(e.status(), e.body_text()))
+}
 
 fn wants(params: &HashMap<String, String>, attr: &str) -> bool {
     params
@@ -18,8 +29,9 @@ pub async fn get_channels(
     State(state): State<AppState>,
     Path(app_id): Path<String>,
     OriginalUri(uri): OriginalUri,
-    Query(params): Query<HashMap<String, String>>,
+    query: Result<Query<HashMap<String, String>>, QueryRejection>,
 ) -> Result<Json<Value>, RestError> {
+    let params = query_params(query)?;
     let app = authenticate(&state, &app_id, "GET", uri.path(), &params, &[]).await?;
     let prefix = params.get("filter_by_prefix").map(String::as_str);
     let want_user_count = wants(&params, "user_count");
@@ -52,8 +64,9 @@ pub async fn get_channel(
     State(state): State<AppState>,
     Path((app_id, channel)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,
-    Query(params): Query<HashMap<String, String>>,
+    query: Result<Query<HashMap<String, String>>, QueryRejection>,
 ) -> Result<Json<Value>, RestError> {
+    let params = query_params(query)?;
     let app = authenticate(&state, &app_id, "GET", uri.path(), &params, &[]).await?;
     let s = state.adapter.channel(&app.id, &channel).await;
     let mut out = Map::new();

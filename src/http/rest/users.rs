@@ -7,18 +7,29 @@ use crate::http::error::RestError;
 use crate::http::rest::auth::authenticate;
 use crate::server::router::AppState;
 use axum::body::Bytes;
-use axum::extract::rejection::BytesRejection;
+use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::extract::{OriginalUri, Path, Query, State};
 use axum::Json;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+/// Unwrap the `Result<Query<..>, QueryRejection>` extractor: a query-string
+/// rejection (R15) renders the same JSON `{"error","status"}` body as every
+/// other REST error instead of axum's plain text.
+fn query_params(
+    q: Result<Query<HashMap<String, String>>, QueryRejection>,
+) -> Result<HashMap<String, String>, RestError> {
+    q.map(|Query(p)| p)
+        .map_err(|e| RestError::from_rejection(e.status(), e.body_text()))
+}
+
 pub async fn get_users(
     State(state): State<AppState>,
     Path((app_id, channel)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,
-    Query(params): Query<HashMap<String, String>>,
+    query: Result<Query<HashMap<String, String>>, QueryRejection>,
 ) -> Result<Json<Value>, RestError> {
+    let params = query_params(query)?;
     let app = authenticate(&state, &app_id, "GET", uri.path(), &params, &[]).await?;
     // Pusher: "Only presence channels allow this functionality."
     if ChannelInfo::of(&channel).auth != AuthKind::Presence {
@@ -40,11 +51,12 @@ pub async fn terminate_user_connections(
     State(state): State<AppState>,
     Path((app_id, user_id)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,
-    Query(params): Query<HashMap<String, String>>,
+    query: Result<Query<HashMap<String, String>>, QueryRejection>,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<Value>, RestError> {
     // Map the body-limit rejection (413) into a RestError (JSON error body).
     let body = body.map_err(|e| RestError::from_rejection(e.status(), e.body_text()))?;
+    let params = query_params(query)?;
     let app = authenticate(&state, &app_id, "POST", uri.path(), &params, &body).await?;
     state.adapter.terminate_user(&app.id, &user_id).await;
     Ok(Json(json!({})))

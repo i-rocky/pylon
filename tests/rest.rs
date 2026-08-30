@@ -1191,6 +1191,36 @@ async fn ws_disabled_app_key_close_frame_carries_4001() {
     );
 }
 
+// ── R15 carry-in — malformed query strings ────────────────────────────────────
+
+/// R15: a malformed percent-escape (`%zz`) in the query string is parsed
+/// LOSSILY by serde_urlencoded for `HashMap<String, String>` targets — it does
+/// NOT reject (verified against serde_urlencoded 0.7: every input parses), so
+/// the request flows into auth and, correctly signed including the odd param,
+/// succeeds. Pin that the extractor wiring never turns it into a bare-text 400.
+#[tokio::test]
+async fn rest_malformed_query_percent_escape_is_parsed_lossily() {
+    let addr = spawn().await;
+    let body = json!({"name":"e","data":"{}","channels":["c"]}).to_string();
+    let q = signed_query(
+        "POST",
+        "/apps/app1/events",
+        body.as_bytes(),
+        &[("x", "%zz")],
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "a lossily-parsed percent escape must not break the request"
+    );
+}
+
 // ── P13 parity tests — pre-handshake reject must carry Pusher 4xxx close code ─
 
 /// Connecting to an unknown app key triggers a 4001 rejection.  The WebSocket Close
