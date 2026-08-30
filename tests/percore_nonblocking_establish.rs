@@ -143,6 +143,7 @@ async fn spawn_slow(delay: Duration) -> Harness {
                 inflight_slot: None,
                 accepted_slot: None,
                 codel_dropped_slot: None,
+                drophead_dropped_slot: None,
                 mailbox_dropped_slot: None,
                 codel: pylon::transport::conn::CodelParams::DEFAULT,
                 budget_factor: None,

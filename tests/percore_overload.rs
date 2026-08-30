@@ -368,6 +368,25 @@ fn seq_of(data: &str) -> u64 {
     data.split_once(':').unwrap().0.parse().unwrap()
 }
 
+/// G8 (drop-head observability): scrape `/metrics` and return the value of
+/// `pylon_drophead_dropped_total{worker="0"}` (None when the series is absent).
+/// The harness serves REST on the same port the WS clients connect to, so the
+/// percore registry backing this flood is the one being read.
+async fn drophead_dropped_total(port: u16, client: &reqwest::Client) -> Option<u64> {
+    let body = client
+        .get(format!("http://127.0.0.1:{port}/metrics"))
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    body.lines()
+        .find(|l| l.starts_with(r#"pylon_drophead_dropped_total{worker="0"}"#))
+        .and_then(|l| l.split_whitespace().last())
+        .and_then(|v| v.parse().ok())
+}
+
 /// Task 2.3 — TARGETED SHED + FRESHEST-WINS. On a single-worker percore server
 /// with a tiny budget, flood a channel with sequence-numbered frames. A FAST
 /// subscriber that drains continuously keeps its out-queue empty, so the
@@ -490,6 +509,29 @@ async fn overload_targeted_shed_fast_gets_all_slow_gets_freshest() {
             slow_max, N_PUB,
             "slow subscriber missed the NEWEST frame (max seq {slow_max} != {N_PUB}) — \
              drop-head must keep the freshest"
+        );
+
+        // ── G8: the drop-head evictions are OBSERVABLE. The slow subscriber's
+        // loss above proves drop-head evictions occurred (freshest-wins is only
+        // reachable through `Connection::queue` evicting the oldest frames);
+        // that loss must be reflected in `pylon_drophead_dropped_total` — silent
+        // frame loss is the finding this metric exists to close. Poll briefly:
+        // the worker mirrors its local total into the shared slot at loop top,
+        // so the value is visible within a few iterations after the flood.
+        let mut drophead: Option<u64> = None;
+        for _ in 0..10 {
+            drophead = drophead_dropped_total(h.port, &client).await;
+            if drophead.unwrap_or(0) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let drophead = drophead.unwrap_or(0);
+        assert!(
+            drophead > 0,
+            "pylon_drophead_dropped_total{{worker=\"0\"}} must be > 0 after a flood that \
+             evicted {}+ frames via drop-head (got {drophead}); silent frame loss",
+            N_PUB - slow_got.len() as u64
         );
 
         drop(slow);

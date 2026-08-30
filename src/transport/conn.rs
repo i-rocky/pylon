@@ -198,6 +198,13 @@ pub struct Connection {
     /// Count of frames dropped by CoDel on dequeue for being stale (sojourn
     /// `> 2 * target` while overloaded). Distinct from drop-head evictions.
     codel_dropped: u64,
+    /// Count of frames evicted by drop-head at ENQUEUE time (the oldest
+    /// droppable frame removed so a new one fits under `high_water`). Distinct
+    /// from CoDel staleness drops (which happen at dequeue). Accumulated here
+    /// exactly like `codel_dropped` so the owning worker can fold it into its
+    /// worker-level total (→ `pylon_drophead_dropped_total`) via
+    /// [`take_drophead_dropped`](Self::take_drophead_dropped).
+    drophead_dropped: u64,
     /// Whether this connection's `mio` poll registration currently includes
     /// [`mio::Interest::WRITABLE`] — the tracked mirror of the actual registry
     /// interest, maintained by the worker at every re-registration site
@@ -235,6 +242,7 @@ impl Connection {
             codel: CodelParams::DISABLED,
             codel_state: CodelState::default(),
             codel_dropped: 0,
+            drophead_dropped: 0,
             writable_armed: false,
             inflight_delta: 0,
         }
@@ -254,6 +262,7 @@ impl Connection {
             codel: CodelParams::DISABLED,
             codel_state: CodelState::default(),
             codel_dropped: 0,
+            drophead_dropped: 0,
             writable_armed: false,
             inflight_delta: 0,
         }
@@ -284,6 +293,23 @@ impl Connection {
     /// after each flush, so the shared slot stays current without per-iteration cost.
     pub fn take_codel_dropped(&mut self) -> u64 {
         std::mem::take(&mut self.codel_dropped)
+    }
+
+    /// Total frames this connection has had evicted by drop-head (the oldest
+    /// droppable frame removed at enqueue so a new one fits `high_water`).
+    /// Read by the worker to fold into its drop-head-dropped counter.
+    pub fn drophead_dropped(&self) -> u64 {
+        self.drophead_dropped
+    }
+
+    /// Take and reset the drop-head eviction counter: returns the count of
+    /// frames evicted since the last call and resets the per-connection
+    /// accumulator to 0. Mirrors [`take_codel_dropped`](Self::take_codel_dropped):
+    /// the worker adds the returned delta to its worker-level
+    /// `drophead_dropped_total` at the same fold sites, so the shared slot
+    /// stays current without per-iteration cost.
+    pub fn take_drophead_dropped(&mut self) -> u64 {
+        std::mem::take(&mut self.drophead_dropped)
     }
 
     /// Consume the connection and return ownership of its underlying socket.
@@ -449,6 +475,11 @@ impl Connection {
             // worker total then) and is now gone without being sent, so fold the
             // negative delta in so the worker's incremental total tracks it.
             self.inflight_delta -= victim.len() as i64;
+            // G8: count the eviction on the connection accumulator (mirroring
+            // `codel_dropped`) so the worker can fold it into
+            // `pylon_drophead_dropped_total` — every `queue` call site is
+            // covered by construction, no per-site threading needed.
+            self.drophead_dropped += 1;
             dropped += 1;
         }
         self.out_bytes += flen;

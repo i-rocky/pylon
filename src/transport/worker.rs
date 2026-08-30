@@ -253,6 +253,11 @@ pub struct WorkerConfig {
     /// B1: cumulative CoDel-dropped-frames counter for this worker. Updated after
     /// each flush by folding `conn.take_codel_dropped()`; `None` for test workers.
     pub codel_dropped_slot: Option<Arc<AtomicU64>>,
+    /// G8: cumulative drop-head-evicted-frames counter for this worker. Updated
+    /// at the same fold sites as `codel_dropped_slot` by folding
+    /// `conn.take_drophead_dropped()`; `None` for test workers. Under overload
+    /// drop-head is a PRIMARY frame-loss mechanism, so it must be observable.
+    pub drophead_dropped_slot: Option<Arc<AtomicU64>>,
     /// Task 4: cumulative mailbox-full-drop counter for this worker. Incremented
     /// inside each connection's [`crate::connection::handle::Mailbox::send`] on a `try_send` full-error.
     /// Shared (via `Arc` clone) with every `Mailbox` created by this worker's
@@ -510,6 +515,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     let inflight_slot = cfg.inflight_slot.clone();
     let accepted_slot = cfg.accepted_slot.clone();
     let codel_dropped_slot = cfg.codel_dropped_slot.clone();
+    let drophead_dropped_slot = cfg.drophead_dropped_slot.clone();
     // SP10 §8: shared PSI budget factor (×1000 fixed-point). `None` ⇒ no backstop.
     let budget_factor = cfg.budget_factor.clone();
     // SP10 §7: CoDel parameters stamped onto every accepted connection.
@@ -521,6 +527,9 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     let mut inflight_bytes: u64 = 0;
     // B1: worker-local accumulator for CoDel drops; mirrored into `codel_dropped_slot`.
     let mut codel_dropped_total: u64 = 0;
+    // G8: worker-local accumulator for drop-head evictions; mirrored into
+    // `drophead_dropped_slot` (same pattern as the CoDel accumulator above).
+    let mut drophead_dropped_total: u64 = 0;
 
     // Worker-local subscription index: which of THIS worker's connections are in
     // each `(app, channel)`. Populated by reconciling `ctx.subscribed` after each
@@ -622,6 +631,12 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                     // is exact: the exit only fires when all Close frames are truly
                     // flushed, and the debug_assert_eq holds on a non-idle drain.
                     fold_delta(&mut conns, k, &mut inflight_bytes);
+                    // G8: fold this connection's drop counters too — the queued
+                    // 4200 frames may have evicted older frames (drop-head) and
+                    // the flush may have CoDel-dropped stale ones. Uniform with
+                    // every other queue/flush site.
+                    fold_codel(&mut conns, k, &mut codel_dropped_total);
+                    fold_drophead(&mut conns, k, &mut drophead_dropped_total);
                 }
                 tracing::info!(
                     worker = cfg.worker_id,
@@ -706,6 +721,13 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
         if codel_dropped_total > 0 {
             if let Some(slot) = &codel_dropped_slot {
                 slot.store(codel_dropped_total, Ordering::Relaxed);
+            }
+        }
+        // G8: mirror drop-head eviction total into the shared slot (O(1), only
+        // on actual evictions) — same pattern as the CoDel mirror above.
+        if drophead_dropped_total > 0 {
+            if let Some(slot) = &drophead_dropped_slot {
+                slot.store(drophead_dropped_total, Ordering::Relaxed);
             }
         }
         // Adaptive poll timeout (G1): poll non-blocking ONLY when the previous
@@ -843,6 +865,13 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             &mut wheel,
                         ) {
                             Action::Close => {
+                                // G8: fold this connection's drop counters before
+                                // teardown — the readable batch queued reject/close
+                                // frames and flushed them, which can evict
+                                // (drop-head) or CoDel-drop. Without this fold the
+                                // counts die with the slab entry.
+                                fold_codel(&mut conns, key, &mut codel_dropped_total);
+                                fold_drophead(&mut conns, key, &mut drophead_dropped_total);
                                 remove(
                                     &poll,
                                     &mut conns,
@@ -863,6 +892,8 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                 // REST head queued nothing, so any folded delta is
                                 // 0; fold anyway so a removed conn never leaks.
                                 fold_delta(&mut conns, key, &mut inflight_bytes);
+                                fold_codel(&mut conns, key, &mut codel_dropped_total);
+                                fold_drophead(&mut conns, key, &mut drophead_dropped_total);
                                 wheel.remove(key);
                                 handoff_rest(&poll, &mut conns, key, &cfg, prefix);
                                 continue;
@@ -874,6 +905,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                 // net delta into the running total.
                                 fold_delta(&mut conns, key, &mut inflight_bytes);
                                 fold_codel(&mut conns, key, &mut codel_dropped_total);
+                                fold_drophead(&mut conns, key, &mut drophead_dropped_total);
                                 // A subscribe/unsubscribe in this readable batch
                                 // may have changed channel membership; reconcile
                                 // this connection's worker-local subscription
@@ -910,6 +942,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         // is exact.
                         fold_delta(&mut conns, key, &mut inflight_bytes);
                         fold_codel(&mut conns, key, &mut codel_dropped_total);
+                        fold_drophead(&mut conns, key, &mut drophead_dropped_total);
                         match action {
                             Action::Close => {
                                 remove(
@@ -972,6 +1005,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 effective_budget,
                 &mut inflight_bytes,
                 &mut codel_dropped_total,
+                &mut drophead_dropped_total,
                 saturated.as_ref(),
                 now_ns,
                 &conn_counts,
@@ -1018,6 +1052,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 &mut wheel,
                 &mut inflight_bytes,
                 &mut codel_dropped_total,
+                &mut drophead_dropped_total,
                 now_ns,
                 &conn_counts,
                 &app_registry,
@@ -1043,6 +1078,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                     &mut wheel,
                     &mut inflight_bytes,
                     &mut codel_dropped_total,
+                    &mut drophead_dropped_total,
                     now_ns,
                     &conn_counts,
                     &app_registry,
@@ -1079,6 +1115,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                     // interest that never fires for a dead
                                     // socket.
                                     fold_codel(&mut conns, key, &mut codel_dropped_total);
+                                    fold_drophead(&mut conns, key, &mut drophead_dropped_total);
                                     remove(
                                         &poll,
                                         &mut conns,
@@ -1117,6 +1154,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         // bytes still queued on the connection being torn down.
                         fold_delta(&mut conns, key, &mut inflight_bytes);
                         fold_codel(&mut conns, key, &mut codel_dropped_total);
+                        fold_drophead(&mut conns, key, &mut drophead_dropped_total);
                         remove(
                             &poll,
                             &mut conns,
@@ -1144,6 +1182,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         // connection's still-queued bytes.
                         fold_delta(&mut conns, key, &mut inflight_bytes);
                         fold_codel(&mut conns, key, &mut codel_dropped_total);
+                        fold_drophead(&mut conns, key, &mut drophead_dropped_total);
                         remove(
                             &poll,
                             &mut conns,
@@ -2332,6 +2371,7 @@ fn drain_dirty_sessions(
     wheel: &mut TimerWheel,
     inflight_bytes: &mut u64,
     codel_total: &mut u64,
+    drophead_total: &mut u64,
     now_ns: u64,
     conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
     app_registry: &Arc<AppRegistry>,
@@ -2368,6 +2408,7 @@ fn drain_dirty_sessions(
         // queued bytes are then subtracted by `remove`).
         fold_delta(conns, key, inflight_bytes);
         fold_codel(conns, key, codel_total);
+        fold_drophead(conns, key, drophead_total);
         if result.action == Action::Close {
             remove(
                 poll,
@@ -2428,6 +2469,7 @@ fn drain_resolved(
     wheel: &mut TimerWheel,
     inflight_bytes: &mut u64,
     codel_total: &mut u64,
+    drophead_total: &mut u64,
     now_ns: u64,
     conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
     app_registry: &Arc<AppRegistry>,
@@ -2499,6 +2541,7 @@ fn drain_resolved(
                 // INCREMENTAL INFLIGHT: the established frame was queued + flushed.
                 fold_delta(conns, token, inflight_bytes);
                 fold_codel(conns, token, codel_total);
+                fold_drophead(conns, token, drophead_total);
                 wrote_any = true;
                 if action == Action::Close {
                     remove(
@@ -2543,6 +2586,7 @@ fn drain_resolved(
                 // subtracts the connection's still-queued bytes.
                 fold_delta(conns, token, inflight_bytes);
                 fold_codel(conns, token, codel_total);
+                fold_drophead(conns, token, drophead_total);
                 wrote_any = true;
                 remove(
                     poll,
@@ -2770,6 +2814,22 @@ fn fold_codel(conns: &mut slab::Slab<Entry>, key: usize, codel_total: &mut u64) 
         let dropped = entry.conn.take_codel_dropped();
         if dropped > 0 {
             *codel_total = codel_total.wrapping_add(dropped);
+        }
+    }
+}
+
+/// G8: drain this connection's drop-head eviction accumulator into the
+/// worker-level total. Called at exactly the same sites as [`fold_codel`] so
+/// the shared `drophead_dropped_slot` (→ `pylon_drophead_dropped_total`)
+/// reflects actual evictions with zero per-frame cost on the normal path.
+/// Folding is UNIFORM (Keep and pre-teardown sites alike): an eviction right
+/// before a close would otherwise die with the slab entry, silently losing the
+/// count — the exact unobservability this counter exists to close.
+fn fold_drophead(conns: &mut slab::Slab<Entry>, key: usize, drophead_total: &mut u64) {
+    if let Some(entry) = conns.get_mut(key) {
+        let dropped = entry.conn.take_drophead_dropped();
+        if dropped > 0 {
+            *drophead_total = drophead_total.wrapping_add(dropped);
         }
     }
 }
@@ -3002,6 +3062,7 @@ fn drain_broadcasts(
     effective_budget: u64,
     inflight_bytes: &mut u64,
     codel_total: &mut u64,
+    drophead_total: &mut u64,
     saturated: Option<&Arc<AtomicBool>>,
     now_ns: u64,
     conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
@@ -3063,6 +3124,14 @@ fn drain_broadcasts(
             // (taken below) composes correctly without double-counting.
             let _dropped = entry.conn.queue(msg.frame.clone(), now_ns);
             *inflight_bytes = inflight_bytes.wrapping_add(entry.conn.take_inflight_delta() as u64);
+            // G8: the enqueue may have evicted older frames (drop-head) — fold
+            // the per-connection accumulator into the worker total NOW rather
+            // than deferring to the post-drain flush fold, so the counter is
+            // current even if the flush below closes the connection.
+            let dh = entry.conn.take_drophead_dropped();
+            if dh > 0 {
+                *drophead_total = drophead_total.wrapping_add(dh);
+            }
             touched.insert(token);
         }
     }
@@ -3083,6 +3152,12 @@ fn drain_broadcasts(
             let cd = entry.conn.take_codel_dropped();
             if cd > 0 {
                 *codel_total = codel_total.wrapping_add(cd);
+            }
+            // G8: fold any drop-head evictions the enqueue path left behind
+            // (belt-and-suspenders — the enqueue fold above usually took them).
+            let dh = entry.conn.take_drophead_dropped();
+            if dh > 0 {
+                *drophead_total = drophead_total.wrapping_add(dh);
             }
             if action == Action::Close {
                 to_close.push(token);
@@ -3145,6 +3220,7 @@ mod tests {
                     inflight_slot: None,
                     accepted_slot: None,
                     codel_dropped_slot: None,
+                    drophead_dropped_slot: None,
                     mailbox_dropped_slot: None,
                     codel: crate::transport::conn::CodelParams::DISABLED,
                     budget_factor: None,
@@ -3375,6 +3451,7 @@ mod tests {
             inflight_slot: None,
             accepted_slot: None,
             codel_dropped_slot: None,
+            drophead_dropped_slot: None,
             mailbox_dropped_slot: None,
             codel: crate::transport::conn::CodelParams::DISABLED,
             budget_factor: None,

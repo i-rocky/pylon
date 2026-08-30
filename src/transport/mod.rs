@@ -50,6 +50,8 @@ struct PercoreRegistry {
     accepted_slots: Vec<Arc<AtomicU64>>,
     /// Per-worker cumulative CoDel-dropped-frames counter (B1).
     codel_dropped_slots: Vec<Arc<AtomicU64>>,
+    /// Per-worker cumulative drop-head-evicted-frames counter (G8).
+    drophead_dropped_slots: Vec<Arc<AtomicU64>>,
     /// Task 4: per-worker cumulative mailbox-full-drop counter.
     mailbox_dropped_slots: Vec<Arc<AtomicU64>>,
     budget_factor: Arc<AtomicU32>,
@@ -66,6 +68,10 @@ pub struct PercoreMetricsSnapshot {
     pub accepted: Vec<u64>,
     /// Per-worker cumulative CoDel-dropped-frames count (B1).
     pub codel_dropped: Vec<u64>,
+    /// Per-worker cumulative drop-head-evicted-frames count (G8). Distinct from
+    /// CoDel: these frames were evicted at ENQUEUE time (oldest dropped so a new
+    /// frame fits the per-connection byte cap), not at dequeue for staleness.
+    pub drophead_dropped: Vec<u64>,
     /// Task 4: per-worker cumulative mailbox-full-drop count.
     pub mailbox_dropped: Vec<u64>,
     /// Sum of all workers' inflight bytes.
@@ -106,6 +112,11 @@ pub fn percore_metrics_snapshot() -> Option<PercoreMetricsSnapshot> {
         .iter()
         .map(|s| s.load(Ordering::Relaxed))
         .collect();
+    let drophead_dropped: Vec<u64> = guard
+        .drophead_dropped_slots
+        .iter()
+        .map(|s| s.load(Ordering::Relaxed))
+        .collect();
     let mailbox_dropped: Vec<u64> = guard
         .mailbox_dropped_slots
         .iter()
@@ -119,6 +130,7 @@ pub fn percore_metrics_snapshot() -> Option<PercoreMetricsSnapshot> {
         dropped,
         accepted,
         codel_dropped,
+        drophead_dropped,
         mailbox_dropped,
         inflight_total,
         budget_factor,
@@ -278,6 +290,12 @@ pub fn run_percore(
     let codel_dropped_slots: Vec<Arc<AtomicU64>> = (0..worker_count)
         .map(|_| Arc::new(AtomicU64::new(0)))
         .collect();
+    // G8: per-worker drop-head-evicted-frames counters (same pattern as the
+    // CoDel slots above): each worker mirrors its local total into its slot,
+    // which `/metrics` emits as `pylon_drophead_dropped_total`.
+    let drophead_dropped_slots: Vec<Arc<AtomicU64>> = (0..worker_count)
+        .map(|_| Arc::new(AtomicU64::new(0)))
+        .collect();
     // Task 4: per-worker mailbox-full-drop counters. Each worker's counter Arc is
     // cloned into every `Mailbox` created on that worker, so the counter tracks
     // all mailbox drops attributable to that worker.
@@ -389,6 +407,7 @@ pub fn run_percore(
                     worker_slots: Vec::new(),
                     accepted_slots: Vec::new(),
                     codel_dropped_slots: Vec::new(),
+                    drophead_dropped_slots: Vec::new(),
                     mailbox_dropped_slots: Vec::new(),
                     budget_factor: budget_factor.clone(),
                     worker_budget_bytes: per_worker_budget,
@@ -406,6 +425,9 @@ pub fn run_percore(
         g.codel_dropped_slots.clear();
         g.codel_dropped_slots
             .extend(codel_dropped_slots.iter().cloned());
+        g.drophead_dropped_slots.clear();
+        g.drophead_dropped_slots
+            .extend(drophead_dropped_slots.iter().cloned());
         g.mailbox_dropped_slots.clear();
         g.mailbox_dropped_slots
             .extend(mailbox_dropped_slots.iter().cloned());
@@ -433,6 +455,7 @@ pub fn run_percore(
             inflight_slot: Some(inflight_slots[i].clone()),
             accepted_slot: Some(accepted_slots[i].clone()),
             codel_dropped_slot: Some(codel_dropped_slots[i].clone()),
+            drophead_dropped_slot: Some(drophead_dropped_slots[i].clone()),
             mailbox_dropped_slot: Some(mailbox_dropped_slots[i].clone()),
             codel,
             budget_factor: Some(budget_factor.clone()),
