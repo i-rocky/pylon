@@ -315,9 +315,16 @@ async fn run_redis_percore(
         app_registry.clone(),
     ));
 
+    // Per-app live connection counters (shared with the worker fleet AND the bridge —
+    // see the bridge start below). Created BEFORE the bridge so both hold the same Arc.
+    let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
+
     // Start the bridge: builds the node's single `RedisAdapter` (sharing `local`) on its own
-    // runtime and returns once Redis is connected, or `Err` if the connect failed.
-    let bridge = pylon::cluster::bridge::start(&config, local.clone(), apps.clone())?;
+    // runtime and returns once Redis is connected, or `Err` if the connect failed. The
+    // `conn_counts` Arc lets the node heartbeat re-seed this node's per-app capacity
+    // counts in Redis after an outage longer than the nodeconns TTL (self-heal).
+    let bridge =
+        pylon::cluster::bridge::start(&config, local.clone(), apps.clone(), conn_counts.clone())?;
 
     // REST + occupancy drive the node's single `RedisAdapter` through the bridge.
     let adapter: Arc<dyn Adapter> = bridge.adapter();
@@ -339,9 +346,9 @@ async fn run_redis_percore(
     // webhooks share one dispatcher). This closes the startup cycle.
     bridge.attach_webhooks(webhooks.clone());
 
-    let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
     // Node-level live connection counter for the ceiling check — one per process,
-    // shared across all of this node's workers. Created alongside `conn_counts`.
+    // shared across all of this node's workers. Created alongside `conn_counts`
+    // (which was created BEFORE the bridge so both share the one Arc).
     let node_conns: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 
     // Build the AppPurger + invalidation subscriber once the adapter + conn_counts

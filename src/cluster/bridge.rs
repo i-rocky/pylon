@@ -536,9 +536,11 @@ impl ClusterHandle {
 
     /// Cluster-wide per-app capacity RELEASE for a closing connection. Fire-and-forget,
     /// drop-on-full/closed exactly like [`publish`](ClusterHandle::publish): a dropped
-    /// release leaks at most one capacity unit until the sweeper reclaims it when this
-    /// node dies, and the script itself floors at 0 — never negative, never stealing
-    /// another node's units.
+    /// release leaks at most one capacity unit, reclaimed when this node dies (its
+    /// `nodeconns` hash still holding the unit) — or, if a Redis outage expires that
+    /// hash first, restored by the heartbeat's live-count re-seed (see
+    /// [`node_heartbeat_loop`](crate::adapter::redis)). The script itself floors at 0 —
+    /// never negative, never stealing another node's units.
     pub fn release_app(&self, app: &str) {
         let cmd = ClusterCmd::ReleaseApp {
             app: Arc::from(app),
@@ -651,10 +653,18 @@ impl Drop for ClusterBridge {
 /// `local` MUST be the same `LocalAdapter` the percore workers broadcast through, so the
 /// adapter's pub/sub receive loop's `local.broadcast(Raw(..))` shards remote frames to the
 /// workers' sink.
+///
+/// `conn_counts` MUST be the same per-app live connection counters the worker fleet
+/// bumps at establish / rolls back at close (the `DispatchEnv::conn_counts` Arc). The
+/// bridge hands it to the adapter's node heartbeat, which uses it to RE-SEED this
+/// node's `nodeconns` capacity hash after a Redis outage longer than the hash's TTL
+/// backstop — without the re-seed, pre-outage capacity units would drift in the
+/// cluster totals forever (Task 4.2 fix).
 pub fn start(
     cfg: &ServerConfig,
     local: Arc<LocalAdapter>,
     apps: Arc<dyn AppManager>,
+    conn_counts: Arc<dashmap::DashMap<String, Arc<std::sync::atomic::AtomicUsize>>>,
 ) -> anyhow::Result<ClusterBridge> {
     let (tx, mut rx) = mpsc::channel::<ClusterCmd>(CMD_CHANNEL_CAPACITY);
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -707,16 +717,23 @@ pub fn start(
                 // Connect the adapter sharing the workers' `LocalAdapter`. On failure, hand
                 // the error back so `start` returns `Err` instead of hanging.
                 // Pass `thread_redis_connected` so the node-heartbeat loop inside the adapter
-                // updates it after each tick (true = ok, false = error).
-                let adapter =
-                    match RedisAdapter::with_local(&cfg, local, Some(thread_redis_connected)).await
-                    {
-                        Ok(a) => Arc::new(a),
-                        Err(e) => {
-                            let _ = ready_tx.send(Err(e));
-                            return;
-                        }
-                    };
+                // updates it after each tick (true = ok, false = error), and the fleet's
+                // `conn_counts` so that loop can re-seed the node's capacity hash after a
+                // Redis outage (self-heal — see `node_heartbeat_loop`).
+                let adapter = match RedisAdapter::with_local(
+                    &cfg,
+                    local,
+                    Some(thread_redis_connected),
+                    Some(conn_counts),
+                )
+                .await
+                {
+                    Ok(a) => Arc::new(a),
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                };
 
                 // The sweeper + the drain loop's occupied/vacated webhooks both need the
                 // `WebhookHandle`, but it may not exist yet (the dispatcher's occupancy

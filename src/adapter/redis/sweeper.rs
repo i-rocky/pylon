@@ -239,7 +239,15 @@ pub(crate) async fn sweep_once(
     for node in nodes {
         match pool.next().exists::<i64, _>(keys.node(&node)).await {
             Ok(0) => {
-                // Dead: reclaim its capacity counts from the cluster totals.
+                // Dead: reclaim its capacity counts from the cluster totals, and
+                // only then forget the node. On a reclaim error we SKIP the SREM:
+                // the `nodes` entry is the enumeration source for the retry — the
+                // next sweep pass sees the node still dead and retries the
+                // reclaim (which is idempotent: floor-0 subtract + DEL). SREM-ing
+                // anyway would forget the node while its counts still sit in
+                // `appconns`, and NOTHING reclaims them after that — the hash's
+                // TTL backstop removes the HASH, not the cluster-total residue.
+                let mut reclaimed_ok = false;
                 match scripts
                     .reclaim_node
                     .evalsha_with_reload::<i64, _, _>(
@@ -250,6 +258,7 @@ pub(crate) async fn sweep_once(
                     .await
                 {
                     Ok(reclaimed) => {
+                        reclaimed_ok = true;
                         if reclaimed > 0 {
                             tracing::debug!(
                                 node,
@@ -259,13 +268,11 @@ pub(crate) async fn sweep_once(
                         }
                     }
                     Err(e) => {
-                        // Log + STILL prune: the hash's TTL backstop eventually
-                        // removes the residue, and re-running the sweep would retry
-                        // a reclaim whose subtract is idempotent-ish (floored at 0)
-                        // — but the set entry is the enumeration source, so keep
-                        // the set tidy exactly like the pre-capacity behavior.
-                        tracing::warn!(error = %e, node, "sweeper: dead-node capacity reclaim failed; relying on TTL backstop");
+                        tracing::warn!(error = %e, node, "sweeper: dead-node capacity reclaim failed; keeping the nodes entry so the next sweep retries");
                     }
+                }
+                if !reclaimed_ok {
+                    continue;
                 }
                 if let Err(e) = pool
                     .next()

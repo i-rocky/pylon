@@ -97,7 +97,10 @@ async fn cluster_bridge_starts_clones_publishes_and_drops_cleanly() {
         // 1. Start: a real connect to the test Redis must succeed. Webhooks are attached
         //    AFTER start (mirroring `main.rs`'s deferred-webhooks wiring); here the null
         //    sink is fine — the smoke publish below fires no webhook-bearing command.
-        let bridge = bridge::start(&cfg, local, apps)
+        //    No worker fleet backs this bridge, so an empty per-app counter map is the
+        //    correct `conn_counts` (the heartbeat's outage re-seed then has nothing to
+        //    re-seed, which is exactly right for a fleet-less bridge).
+        let bridge = bridge::start(&cfg, local, apps, Arc::new(Default::default()))
             .expect("ClusterBridge::start must connect to the test Redis and report ready");
         bridge.attach_webhooks(webhooks);
 

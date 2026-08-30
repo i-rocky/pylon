@@ -27,10 +27,11 @@ use crate::protocol::socket_id::SocketId;
 use crate::server::config::ServerConfig;
 use crate::user::{UserJoinOutcome, UserLeaveOutcome};
 use async_trait::async_trait;
+use dashmap::DashMap;
 use fred::clients::Pool;
 use fred::interfaces::{EventInterface, HashesInterface, KeysInterface, SetsInterface};
 use fred::types::Expiration;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
@@ -119,6 +120,23 @@ async fn heartbeat_loop(
 /// The TTL sizing is [`RedisConfig::node_conns_ttl_secs`] — long enough that the
 /// sweeper reclaims a dead node BEFORE the backstop expires it.
 ///
+/// SELF-HEAL (Task 4.2 fix): if Redis was unreachable for longer than that TTL,
+/// the hash expires while this node (and its connections) live on — and the plain
+/// `EXPIRE` below is a no-op on the missing key. Without more, every pre-outage
+/// unit would sit in `appconns` FOREVER: the release guard treats each surviving
+/// connection's close as a phantom (this node holds no recorded unit), and the
+/// sweeper reclaims nothing when the node eventually dies (its hash is gone). So
+/// when the EXPIRE reports the hash missing, the tick RE-SEEDS it from
+/// `conn_counts` — the worker fleet's AUTHORITATIVE live per-app counts, shared
+/// into the bridge at construction (the same `DashMap` the workers bump at
+/// establish and roll back at close/reject). Once the hash mirrors live truth
+/// again, the release guard and the dead-node reclaim both work exactly as on the
+/// never-outage path. Residual, bounded: connections that CLOSED during the
+/// outage leak their single unit (nothing knows they existed — the same ≤1-unit
+/// leak as a dropped release), and an admission racing the snapshot→HSET
+/// round-trip can leave a ±1 residue for its app (`conn_counts` leads Redis — it
+/// is incremented before the admit fires — so the window is one round trip).
+///
 /// One Redis error is logged and skipped, never fatal — the loop runs for the
 /// adapter's lifetime.
 ///
@@ -132,6 +150,7 @@ async fn node_heartbeat_loop(
     interval_secs: u64,
     ttl_secs: u64,
     connected: Option<Arc<AtomicBool>>,
+    conn_counts: Option<Arc<DashMap<String, Arc<AtomicUsize>>>>,
 ) {
     let interval = interval_secs.max(1);
     let ttl = (3 * interval) as i64;
@@ -167,16 +186,59 @@ async fn node_heartbeat_loop(
             tracing::warn!(error = %e, node_id, "redis node heartbeat SADD nodes failed; skipping this tick");
             continue;
         }
-        // Task 4.2: re-arm this node's per-app capacity hash TTL. `EXPIRE` on a
-        // missing key (a node with no connections yet) is a harmless no-op; a
-        // failure here only shortens the backstop window, so it is logged and
-        // retried next tick rather than failing the whole heartbeat.
-        if let Err(e) = pool
-            .next()
-            .expire::<(), _>(keys.nodeconns(&node_id), ttl_secs as i64, None)
-            .await
-        {
-            tracing::warn!(error = %e, node_id, "redis nodeconns TTL refresh failed; retrying next tick");
+        // Task 4.2: re-arm this node's per-app capacity hash TTL. EXPIRE answers
+        // 0 only when the key does NOT exist — either the node simply has no
+        // connections yet (nothing to do) or the hash TTL-lapsed during a Redis
+        // outage while connections live on (re-seed, see the loop doc). A failure
+        // here only shortens the backstop window, so it is logged and retried
+        // next tick rather than failing the whole heartbeat.
+        let nodeconns = keys.nodeconns(&node_id);
+        let armed: Result<i64, _> = pool.next().expire(&nodeconns, ttl_secs as i64, None).await;
+        match armed {
+            Ok(1) => {}
+            Ok(_) => {
+                // Hash missing: re-seed it from the live per-app counts. One
+                // multi-field HSET (all-or-nothing at the command level, so a
+                // failure leaves the hash missing and the NEXT tick retries the
+                // whole re-seed), then re-arm the TTL.
+                if let Some(counts) = conn_counts.as_ref() {
+                    let snapshot: Vec<(String, i64)> = counts
+                        .iter()
+                        .filter_map(|e| {
+                            let v = e.value().load(Ordering::SeqCst) as i64;
+                            (v > 0).then(|| (e.key().clone(), v))
+                        })
+                        .collect();
+                    if !snapshot.is_empty() {
+                        let seeded = pool
+                            .next()
+                            .hset::<(), _, _>(&nodeconns, snapshot.clone())
+                            .await;
+                        match seeded {
+                            Ok(()) => {
+                                if let Err(e) = pool
+                                    .next()
+                                    .expire::<(), _>(&nodeconns, ttl_secs as i64, None)
+                                    .await
+                                {
+                                    tracing::warn!(error = %e, node_id, "redis nodeconns re-seed EXPIRE failed; retrying next tick");
+                                }
+                                tracing::info!(
+                                    node_id,
+                                    apps = snapshot.len(),
+                                    "re-seeded this node's per-app capacity counts after the nodeconns hash expired (Redis outage self-heal)"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, node_id, "redis nodeconns re-seed HSET failed; retrying next tick");
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, node_id, "redis nodeconns TTL refresh failed; retrying next tick");
+            }
         }
         // Both ops succeeded: mark connected.
         if let Some(ref c) = connected {
@@ -275,6 +337,10 @@ impl RedisAdapter {
                 Arc::new(crate::adapter::app_registry::AppRegistry::new()),
             )),
             None,
+            // No worker fleet is attached to a standalone adapter, so there are
+            // no live per-app counts to re-seed from (and no capacity admission
+            // happens without a bridge — see `cluster_admit_app`'s callers).
+            None,
         )
         .await
     }
@@ -291,12 +357,18 @@ impl RedisAdapter {
     /// after a successful tick and `false` on error, providing an accurate health gauge
     /// for the `/metrics` handler.
     ///
+    /// `conn_counts` — the worker fleet's shared per-app live connection counters.
+    /// The node heartbeat uses them to RE-SEED this node's `nodeconns` hash after a
+    /// Redis outage longer than the hash's TTL backstop (self-heal; see
+    /// [`node_heartbeat_loop`]). `None` when no worker fleet backs this adapter.
+    ///
     /// [`new`]: RedisAdapter::new
     /// [`ClusterBridge`]: crate::cluster::bridge::ClusterBridge
     pub async fn with_local(
         cfg: &ServerConfig,
         local: Arc<LocalAdapter>,
         redis_connected: Option<Arc<AtomicBool>>,
+        conn_counts: Option<Arc<DashMap<String, Arc<AtomicUsize>>>>,
     ) -> anyhow::Result<Self> {
         let node_id = uuid::Uuid::new_v4().to_string();
         let keys = keys::Keys::new(&cfg.redis_prefix);
@@ -353,6 +425,7 @@ impl RedisAdapter {
                 nh_interval,
                 nh_conns_ttl,
                 redis_connected,
+                conn_counts,
             )
             .await
         });
@@ -941,11 +1014,19 @@ impl RedisAdapter {
 
     /// Cluster-wide per-app capacity release (Task 4.2 / finding D2): the
     /// floor-0, node-guarded give-back of one unit (see [`RELEASE_APP_LUA`]).
-    /// Best-effort like the bridge's other commands — a dropped release leaks
-    /// at most one unit, and the sweeper reclaims the residue when the node
-    /// dies. Called by the bridge's `ClusterCmd::ReleaseApp` arm.
+    /// Best-effort like the bridge's other commands — a dropped/failed release
+    /// leaks at most one unit per affected connection. That residue IS
+    /// reclaimable, but only while this node's `nodeconns` hash still holds it:
+    /// a script error leaves the hash unchanged (the sweeper subtracts it when
+    /// the node dies), and if a Redis outage outlasts the hash's TTL, the
+    /// heartbeat's re-seed (see [`node_heartbeat_loop`]) restores the hash from
+    /// the live counts first — EXCEPT for connections that closed during the
+    /// outage itself, whose single unit nobody can account for (the same ≤1-unit
+    /// leak as a dropped release). Called by the bridge's `ClusterCmd::ReleaseApp`
+    /// arm.
     ///
     /// [`RELEASE_APP_LUA`]: crate::adapter::redis::client::RELEASE_APP_LUA
+    /// [`node_heartbeat_loop`]: crate::adapter::redis::node_heartbeat_loop
     #[doc(hidden)]
     pub async fn cluster_release_app(&self, app: &str) {
         if let Err(e) = self
@@ -958,7 +1039,7 @@ impl RedisAdapter {
             )
             .await
         {
-            tracing::warn!(error = %e, app, "redis app release script failed; sweeper will reclaim");
+            tracing::warn!(error = %e, app, "redis app release script failed; the unit stays on this node's hash until the sweeper reclaims it at node death (heartbeat re-seed covers a hash-expiring outage)");
         }
     }
 

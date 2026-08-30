@@ -317,8 +317,10 @@ pub async fn spawn_percore_cluster_with_apps(
     // on its own runtime. `start` is sync (it owns its runtime thread) and returns
     // once Redis is connected, or panics here with a clear message if it isn't.
     // Webhooks are attached AFTER start (deferred, mirroring `main.rs`): this sets the
-    // drain loop's handle AND starts the Redis sweeper with it.
-    let bridge = bridge::start(&config, local.clone(), apps.clone())
+    // drain loop's handle AND starts the Redis sweeper with it. The `conn_counts` Arc
+    // is the SAME one handed to `run_percore` below, so the node heartbeat can
+    // re-seed this node's per-app capacity counts after a Redis outage (self-heal).
+    let bridge = bridge::start(&config, local.clone(), apps.clone(), conn_counts.clone())
         .expect("ClusterBridge::start must connect to the test Redis and report ready");
     bridge.attach_webhooks(webhooks.clone());
 

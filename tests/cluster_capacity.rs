@@ -407,8 +407,16 @@ async fn admission_fails_open_when_bridge_unavailable() {
         Arc::new(pylon::adapter::app_registry::AppRegistry::new()),
     ));
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(CAP1_APPS).unwrap());
-    let bridge = bridge::start(&redis_test_config(&prefix), local.clone(), apps.clone())
-        .expect("bridge must start against the test Redis");
+    // The fleet's per-app counters (shared with `run_percore` below, mirroring the
+    // harness wiring; the bridge is dropped immediately so its heartbeat never runs).
+    let conn_counts: Arc<dashmap::DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
+    let bridge = bridge::start(
+        &redis_test_config(&prefix),
+        local.clone(),
+        apps.clone(),
+        conn_counts.clone(),
+    )
+    .expect("bridge must start against the test Redis");
     let stale_handle = bridge.handle();
     drop(bridge);
 
@@ -450,7 +458,7 @@ async fn admission_fails_open_when_bridge_unavailable() {
             worker_config,
             worker_apps,
             worker_adapter,
-            Arc::new(Default::default()),
+            conn_counts,
             Arc::new(pylon::adapter::app_registry::AppRegistry::new()),
             Arc::new(AtomicUsize::new(0)),
             worker_webhooks,
@@ -480,6 +488,87 @@ async fn admission_fails_open_when_bridge_unavailable() {
     // Stop the worker; join it so the test leaves no spinning thread behind.
     shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = worker.join();
+
+    use fred::interfaces::ClientLike;
+    let _ = client.quit().await;
+}
+
+// ── 5. Self-heal: the heartbeat re-seeds the node's counts after a Redis outage ──
+
+/// If Redis is unreachable for longer than the `nodeconns:{node}` TTL backstop,
+/// the hash expires while the node (and its connections) live on. Without a
+/// re-seed, every pre-outage unit would sit in `appconns` FOREVER: the release
+/// guard treats each surviving connection's close as a phantom (this node holds
+/// no recorded unit), and the sweeper reclaims nothing when the node eventually
+/// dies (its hash is gone). The heartbeat must SELF-HEAL: when its EXPIRE finds
+/// the hash missing, it re-seeds the node's CURRENT live per-app counts from the
+/// worker fleet's shared `conn_counts`. Simulated here by DELeting the hash
+/// mid-life; asserted by the re-seeded counts AND by a subsequent close actually
+/// giving the capacity unit back.
+#[tokio::test]
+async fn heartbeat_reseeds_nodeconns_after_hash_expiry() {
+    let prefix = random_prefix();
+    let keys = Keys::new(&prefix);
+    // Short heartbeat so the re-seed lands within ~1 tick.
+    let (addr, _guard) = spawn_percore_cluster_with_apps(&prefix, CAP1_APPS, |c| {
+        c.redis_node_heartbeat_secs = 1;
+    })
+    .await;
+
+    // One admitted connection: appconns=1 and this node's nodeconns app=1.
+    let mut ws = connect(addr, "?protocol=7").await;
+    let _sid = established_socket_id(&mut ws).await;
+    let client = fred_client().await;
+
+    // Exactly one node in this cluster (the lone node) → its nodeconns hash.
+    use fred::interfaces::SetsInterface;
+    let nodes: Vec<String> = client
+        .smembers(keys.nodes())
+        .await
+        .expect("SMEMBERS must not error");
+    assert_eq!(
+        nodes.len(),
+        1,
+        "the test spawns exactly one node (got {nodes:?})"
+    );
+    let nodeconns = keys.nodeconns(&nodes[0]);
+    assert_eq!(
+        hget_i64(&client, &nodeconns, "app").await,
+        1,
+        "the admission must record the node's unit"
+    );
+
+    // Simulate the TTL lapse: the hash vanishes while the node lives on.
+    use fred::interfaces::KeysInterface;
+    let _: () = client.del(&nodeconns).await.expect("DEL must not error");
+
+    // Bounded wait: the next heartbeat tick must RE-SEED the hash with the
+    // node's live per-app count (1), re-arming the TTL backstop.
+    let reseeded = wait_until(Duration::from_secs(10), || async {
+        hget_i64(&client, &nodeconns, "app").await == 1
+    })
+    .await;
+    assert!(
+        reseeded,
+        "the heartbeat must re-seed nodeconns with the live count within 10s of the hash expiring"
+    );
+
+    // The re-seed restores the release guard: closing the connection gives the
+    // cluster unit back (pre-fix this close was a phantom and appconns stayed 1).
+    drop(ws);
+    let released = wait_until(Duration::from_secs(10), || async {
+        hget_i64(&client, &keys.appconns(), "app").await == 0
+    })
+    .await;
+    assert!(
+        released,
+        "after the re-seed, the close must release the cluster unit (no permanent drift)"
+    );
+
+    // …and the freed slot is immediately usable again.
+    let mut ws2 = connect(addr, "?protocol=7").await;
+    let _sid2 = established_socket_id(&mut ws2).await;
+    drop(ws2);
 
     use fred::interfaces::ClientLike;
     let _ = client.quit().await;
