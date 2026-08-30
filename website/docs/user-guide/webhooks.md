@@ -181,14 +181,16 @@ Following Channels' documented behavior ("If a non 2XX status code is returned, 
 retry sending the webhook, with exponential backoff, for 5 minutes"), pylon retries **every
 non-2xx response and every transport error** (timeout, connection refused, DNS failure, …):
 
-- The delay before the first retry is `PYLON_WEBHOOK_BACKOFF_BASE_MS` (default 1 s).
+- The delay before the first retry is `PYLON_WEBHOOK_BACKOFF_BASE_MS` (default 1 s), also
+  clamped to `PYLON_WEBHOOK_BACKOFF_CAP_MS`.
 - Each subsequent delay doubles, up to `PYLON_WEBHOOK_BACKOFF_CAP_MS` (default 60 s).
 - Retrying stops once `PYLON_WEBHOOK_RETRY_BUDGET_MS` (default 300 000 ms = 5 minutes) of total
   elapsed time — attempts included — has passed since the first attempt; the delivery is then
-  counted as failed. `0` disables retries (single attempt).
+  counted as failed. `0` disables retries (single attempt). The final backoff is shortened to
+  the budget's remaining time, so give-up happens at (not after) the budget.
 
 With the defaults and an unresponsive endpoint, attempts are made at roughly 0, 1, 3, 7, 15, 31,
-63, 123, 183, 243, and 303 seconds (11 attempts).
+63, 123, 183, 243, and 300 seconds (11 attempts, giving up at the 5-minute mark).
 
 ### Deprecated variables
 

@@ -106,20 +106,17 @@ impl WebhookDispatcher {
     /// Partition by app, then per configured endpoint filter by `event_types`,
     /// build+sign one envelope, and deliver.
     ///
-    /// There is deliberately NO opposing-pair coalescing within a batch
-    /// (audit R12a, resolved 2026-08-30). Pusher's webhooks doc
-    /// (https://pusher.com/docs/channels/server_api/webhooks/) states: "There
-    /// is a delay of up to three seconds between a client disconnecting and
-    /// channel_vacated or member_removed webhooks being sent. If the client
-    /// reconnects within this delay, no webhooks will be sent." Nothing in the
-    /// documented model cancels an already-fired `channel_occupied` (the delay
-    /// applies only to the vacate/remove side, and suppression happens only on
-    /// reconnect) — so a channel created and vacated within one window still
-    /// gets BOTH events on hosted Channels. The former 1:1
-    /// occupied↔vacated / member_added↔member_removed cancellation delivered
-    /// NEITHER and was removed for parity; reconnect suppression is provided
-    /// by the cluster-path vacated grace + occupancy recheck below (and see
-    /// docs/superpowers/specs/2026-08-30-audit-findings.md, R12a).
+    /// There is deliberately NO opposing-pair coalescing within a batch: the
+    /// hosted Channels webhooks doc
+    /// (https://pusher.com/docs/channels/server_api/webhooks/) scopes its
+    /// "delay of up to three seconds" and its reconnect-only suppression to
+    /// `channel_vacated` / `member_removed` — an already-fired
+    /// `channel_occupied` is never cancelled. So a channel created and vacated
+    /// within one window still gets BOTH events on hosted Channels. The former
+    /// 1:1 occupied↔vacated / member_added↔member_removed cancellation (audit
+    /// finding R12a) delivered NEITHER and was removed for parity; reconnect
+    /// suppression is provided by the cluster-path vacated grace + occupancy
+    /// recheck below.
     ///
     /// On the cluster path (`vacated_grace_ms > 0` and `occupancy.is_some()`)
     /// each surviving `channel_vacated` is NOT delivered inline; instead a

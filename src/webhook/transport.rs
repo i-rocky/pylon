@@ -135,10 +135,13 @@ impl AttemptSender for ReqwestSender {
 /// documented behavior — "If a non 2XX status code is returned, Channels will
 /// retry sending the webhook, with exponential backoff, for 5 minutes" — is
 /// modeled as: every non-2xx response AND every transport error is retried;
-/// delays grow `backoff_base_ms * 2^n` capped at `backoff_cap_ms`; the loop
-/// gives up once `retry_budget_ms` of total elapsed time (attempts included)
-/// has passed. `deliver` spawns the attempt loop and returns immediately — it
-/// never blocks the caller.
+/// delays grow `backoff_base_ms * 2^n` clamped to `[1ms, backoff_cap_ms]` (the
+/// final sleep is additionally clamped to the budget's remaining time); the
+/// loop gives up once `retry_budget_ms` of total elapsed time (attempts
+/// included) has passed. The semaphore permit is held per ATTEMPT — released
+/// across backoff sleeps — so `max_concurrency` bounds in-flight HTTP requests
+/// without letting a dead endpoint starve healthy ones. `deliver` spawns the
+/// attempt loop and returns immediately — it never blocks the caller.
 pub struct HttpTransport {
     sender: Arc<dyn AttemptSender>,
     backoff_base_ms: u64,
@@ -190,7 +193,9 @@ impl HttpTransport {
         Self {
             sender,
             backoff_base_ms,
-            backoff_cap_ms,
+            // Floor the cap at 1ms so a degenerate 0 can't instant-fire
+            // retries for the whole budget.
+            backoff_cap_ms: backoff_cap_ms.max(1),
             retry_budget_ms,
             semaphore: Arc::new(Semaphore::new(max_concurrency)),
             metrics,
@@ -202,10 +207,13 @@ impl HttpTransport {
 impl WebhookTransport for HttpTransport {
     /// Spawn the attempt loop (retry + backoff) and return immediately —
     /// the caller (dispatcher) is never blocked, so it keeps draining its
-    /// mailbox. Concurrent deliveries are bounded by the `Semaphore` acquired
-    /// *inside* the spawned task. When the loop resolves, the task bumps
-    /// `delivered_ok` (2xx) or `delivered_failed` (retry budget exhausted /
-    /// closed semaphore) exactly once.
+    /// mailbox. Concurrent IN-FLIGHT attempts are bounded by the `Semaphore`
+    /// acquired *per attempt, inside* the spawned task: the permit is held
+    /// only while the HTTP request is in flight and released before each
+    /// backoff sleep, so a dead endpoint parked in backoff cannot starve
+    /// deliveries to healthy endpoints. When the loop resolves, the task
+    /// bumps `delivered_ok` (2xx) or `delivered_failed` (retry budget
+    /// exhausted / closed semaphore) exactly once.
     async fn deliver(&self, delivery: WebhookDelivery) {
         let sender = self.sender.clone();
         let base = self.backoff_base_ms;
@@ -215,20 +223,22 @@ impl WebhookTransport for HttpTransport {
         let metrics = self.metrics.clone();
 
         tokio::spawn(async move {
-            // Concurrency cap: if the broker is saturated this awaits a permit.
-            let _permit = match sem.acquire().await {
+            // First permit before the clock starts: the budget bounds time
+            // spent RETRYING, not time queued behind a saturated semaphore.
+            // (semaphore closed = shutdown: the delivery never went out)
+            let mut permit = match sem.acquire().await {
                 Ok(p) => p,
                 Err(_) => {
-                    // semaphore closed (shutdown): the delivery never went out.
                     metrics.delivered_failed.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
             };
 
             let start = tokio::time::Instant::now();
-            // First backoff delay: `base` (clamped to >= 1ms so a degenerate 0
-            // can't hot-spin), doubling per attempt, capped at `cap`.
-            let mut delay_ms = base.max(1);
+            // First backoff delay: `base`, clamped to [1ms, cap] (so neither a
+            // degenerate 0 base nor a base > cap can violate the bounds),
+            // doubling per attempt, capped at `cap`.
+            let mut delay_ms = base.max(1).min(cap);
             let mut attempt: u32 = 0;
             loop {
                 match sender.post(&delivery).await {
@@ -255,10 +265,14 @@ impl WebhookTransport for HttpTransport {
                         );
                     }
                 }
+                // Release the permit for the backoff (and any permit wait):
+                // sleeping is not "in flight" — a dead endpoint must not hold
+                // one of the global concurrency slots while it backs off.
+                drop(permit);
                 // The budget bounds TOTAL elapsed time — attempts included —
-                // not the sleep schedule alone: once `retry_budget_ms` has
-                // passed since the first attempt began, give up. `0` therefore
-                // means "no retries" (single attempt).
+                // not just the sleep schedule alone: once `retry_budget_ms`
+                // has passed since the first attempt began, give up. `0`
+                // therefore means "no retries" (single attempt).
                 if start.elapsed() >= Duration::from_millis(budget) {
                     tracing::warn!(
                         url = %delivery.url,
@@ -269,9 +283,21 @@ impl WebhookTransport for HttpTransport {
                     metrics.delivered_failed.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                // Clamp the sleep so the FINAL backoff cannot overshoot the
+                // budget: give-up time stays exact (worst overshoot is one
+                // attempt's duration, not cap + timeout).
+                let remaining_ms = budget - start.elapsed().as_millis() as u64;
+                tokio::time::sleep(Duration::from_millis(delay_ms.min(remaining_ms))).await;
                 delay_ms = delay_ms.saturating_mul(2).min(cap);
                 attempt += 1;
+                // Re-acquire for the next attempt (closed = shutdown).
+                permit = match sem.acquire().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        metrics.delivered_failed.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                };
             }
         });
     }
@@ -290,20 +316,18 @@ mod tests {
         vec![json!({ "name": "channel_occupied", "channel": "ch" })]
     }
 
-    fn delivery() -> WebhookDelivery {
-        build_signed_delivery(
-            "https://e.test/wh",
-            "k",
-            "s",
-            1,
-            &events(),
-            &BTreeMap::new(),
-        )
+    fn delivery_to(url: &str) -> WebhookDelivery {
+        build_signed_delivery(url, "k", "s", 1, &events(), &BTreeMap::new())
     }
 
-    /// Mock [`AttemptSender`]: every call invokes `respond(attempt_index)` and
-    /// records the (paused) instant it ran, so tests can pin the exact retry
-    /// schedule under `start_paused = true` tokio time.
+    fn delivery() -> WebhookDelivery {
+        delivery_to("https://e.test/wh")
+    }
+
+    /// Mock [`AttemptSender`]: every call invokes `respond(attempt_index,
+    /// delivery)` and records the (paused) instant it ran, so tests can pin the
+    /// exact retry schedule under `start_paused = true` tokio time (and route
+    /// canned responses per URL).
     struct MockSender<F> {
         respond: F,
         calls: Arc<AtomicUsize>,
@@ -313,12 +337,12 @@ mod tests {
     #[async_trait]
     impl<F> AttemptSender for MockSender<F>
     where
-        F: Fn(u32) -> Result<u16, String> + Send + Sync,
+        F: Fn(u32, &WebhookDelivery) -> Result<u16, String> + Send + Sync,
     {
-        async fn post(&self, _delivery: &WebhookDelivery) -> Result<u16, String> {
+        async fn post(&self, delivery: &WebhookDelivery) -> Result<u16, String> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst) as u32;
             self.times.lock().unwrap().push(tokio::time::Instant::now());
-            (self.respond)(n)
+            (self.respond)(n, delivery)
         }
     }
 
@@ -332,7 +356,7 @@ mod tests {
 
     fn mock<F>(respond: F) -> MockEndpoint<F>
     where
-        F: Fn(u32) -> Result<u16, String> + Send + Sync + 'static,
+        F: Fn(u32, &WebhookDelivery) -> Result<u16, String> + Send + Sync + 'static,
     {
         let calls = Arc::new(AtomicUsize::new(0));
         let times = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -375,13 +399,14 @@ mod tests {
     }
 
     /// R4 (a): a permanently-failing endpoint is retried with exponential
-    /// backoff — 1s doubling to the 60s cap — and gives up only once the
-    /// 5-minute total budget has elapsed. With instant (mock) attempts the
-    /// default schedule is: attempts at t = 0, 1, 3, 7, 15, 31, 63, 123, 183,
-    /// 243, 303 s → exactly 11 attempts, giving up just past the 300 s budget.
+    /// backoff — 1s doubling to the 60s cap — and gives up once the 5-minute
+    /// total budget elapses. With instant (mock) attempts the default schedule
+    /// is: attempts at t = 0, 1, 3, 7, 15, 31, 63, 123, 183, 243 s, then a
+    /// FINAL backoff clamped to the budget's remaining 57 s → the 11th attempt
+    /// lands exactly at the 300 s budget and the loop gives up there.
     #[tokio::test(start_paused = true)]
     async fn retry_budget_is_five_minutes_of_exponential_backoff() {
-        let m = mock(|_| Ok(500u16));
+        let m = mock(|_, _| Ok(500u16));
         let metrics = Arc::new(WebhookMetrics::new(64));
         let t = HttpTransport::with_sender(m.sender, 1000, 60_000, 300_000, 10, metrics.clone());
         t.deliver(delivery()).await;
@@ -390,7 +415,7 @@ mod tests {
         // Drive time forward one backoff gap at a time: each step lands exactly
         // on the next attempt's scheduled deadline.
         let schedule = [
-            1000u64, 2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000, 60000,
+            1000u64, 2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000, 57_000,
         ];
         let mut expected = 1;
         for gap in schedule {
@@ -404,7 +429,8 @@ mod tests {
         await_failed(&metrics).await;
         assert_eq!(metrics.delivered_ok.load(Ordering::Relaxed), 0);
 
-        // The recorded attempt instants pin the exponential schedule + cap.
+        // The recorded attempt instants pin the exponential schedule + cap; the
+        // final gap is the backoff clamped to the budget's remaining 57 s.
         let times = m.times.lock().unwrap().clone();
         let gaps: Vec<u128> = times
             .windows(2)
@@ -412,15 +438,20 @@ mod tests {
             .collect();
         assert_eq!(
             gaps,
-            vec![1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000, 60000],
-            "1s doubling, capped at 60s"
+            vec![1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000, 57000],
+            "1s doubling, capped at 60s, final sleep clamped to the budget"
         );
-        // Give-up happens only AFTER the full budget of virtual time elapsed
-        // (303 s ≥ 300 s budget — the budget bounds total time incl. attempts).
+        // Give-up time is EXACT (within paused-time scheduling epsilon): the
+        // budget bounds total elapsed time incl. attempts, and the final sleep
+        // is clamped so it cannot overshoot by up to cap + timeout.
         let gave_up_after = tokio::time::Instant::now() - times[0];
         assert!(
             gave_up_after >= Duration::from_millis(300_000),
             "gave up after only {gave_up_after:?}"
+        );
+        assert!(
+            gave_up_after <= Duration::from_millis(300_000 + 5),
+            "gave up late: {gave_up_after:?}"
         );
     }
 
@@ -428,7 +459,7 @@ mod tests {
     /// still retrying (10 attempts done by t = 243 s, no failure recorded).
     #[tokio::test(start_paused = true)]
     async fn still_retrying_just_inside_the_budget() {
-        let m = mock(|_| Ok(500u16));
+        let m = mock(|_, _| Ok(500u16));
         let metrics = Arc::new(WebhookMetrics::new(64));
         let t = HttpTransport::with_sender(m.sender, 1000, 60_000, 300_000, 10, metrics.clone());
         t.deliver(delivery()).await;
@@ -450,10 +481,113 @@ mod tests {
         assert_eq!(metrics.delivered_ok.load(Ordering::Relaxed), 0);
     }
 
+    /// Yield until the delivery loop has resolved a success (bounded).
+    async fn await_ok(metrics: &WebhookMetrics) {
+        for _ in 0..10_000 {
+            if metrics.delivered_ok.load(Ordering::Relaxed) == 1 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("delivery task did not resolve delivered_ok");
+    }
+
+    /// Regression (fix round): the concurrency permit must be held PER ATTEMPT,
+    /// not across backoff sleeps. With `max_concurrency = 1` and a dead
+    /// endpoint parked mid-backoff, a delivery to a HEALTHY endpoint must still
+    /// proceed during the sleep window — otherwise one dead endpoint starves
+    /// the whole semaphore and healthy endpoints stop receiving webhooks.
+    #[tokio::test(start_paused = true)]
+    async fn permit_released_during_backoff_lets_other_deliveries_proceed() {
+        let t0 = tokio::time::Instant::now();
+        let m = mock(|_, d| {
+            if d.url.ends_with("/dead") {
+                Ok(500u16)
+            } else {
+                Ok(200u16)
+            }
+        });
+        let metrics = Arc::new(WebhookMetrics::new(64));
+        // ONE transport, ONE permit (max_concurrency = 1), shared by both URLs.
+        let t = HttpTransport::with_sender(m.sender, 100, 200, 400, 1, metrics.clone());
+
+        // The dead endpoint goes first: attempt 1 fails, the permit is released,
+        // and the task parks on its 100ms backoff sleep.
+        t.deliver(delivery_to("https://e.test/dead")).await;
+        await_attempts(&m.calls, 1).await;
+
+        // The healthy endpoint is delivered while the clock has NOT advanced
+        // past the dead endpoint's backoff window: it acquires the (released)
+        // permit, gets its 200, and resolves ok — all before t = 100ms.
+        t.deliver(delivery_to("https://e.test/healthy")).await;
+        await_ok(&metrics).await;
+        assert_eq!(
+            m.calls.load(Ordering::SeqCst),
+            2,
+            "healthy delivery attempted exactly once"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_millis(100),
+            "healthy delivery proceeded during the dead endpoint's backoff, got {}ms",
+            t0.elapsed().as_millis()
+        );
+        assert_eq!(metrics.delivered_failed.load(Ordering::Relaxed), 0);
+
+        // Drive the dead delivery to its (small) budget: attempts at
+        // 0, 100, 300, then a final sleep clamped to the remaining 100ms →
+        // attempt 4 at exactly t = 400ms gives up.
+        for gap in [100u64, 200, 100] {
+            tokio::time::advance(Duration::from_millis(gap)).await;
+            tokio::task::yield_now().await;
+        }
+        await_failed(&metrics).await;
+        assert_eq!(
+            m.calls.load(Ordering::SeqCst),
+            5,
+            "dead endpoint: 4 attempts + the healthy delivery's 1"
+        );
+    }
+
+    /// The FIRST backoff delay is clamped to the cap too: a `base > cap`
+    /// configuration must not overshoot the documented per-delay upper bound,
+    /// and a degenerate `cap = 0` must not instant-fire retries (floor 1ms).
+    #[tokio::test(start_paused = true)]
+    async fn first_delay_is_clamped_to_cap() {
+        // base 5000 > cap 100: the first delay must be the cap (100ms), not base.
+        let m = mock(|_, _| Ok(500u16));
+        let metrics = Arc::new(WebhookMetrics::new(64));
+        let t = HttpTransport::with_sender(m.sender, 5000, 100, 10_000, 10, metrics.clone());
+        t.deliver(delivery()).await;
+        await_attempts(&m.calls, 1).await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        await_attempts(&m.calls, 2).await;
+        let times = m.times.lock().unwrap().clone();
+        assert_eq!(
+            (times[1] - times[0]).as_millis(),
+            100,
+            "first delay clamped to cap"
+        );
+
+        // cap = 0 is clamped to 1ms: retries are paced, not instant-fire.
+        let m2 = mock(|_, _| Ok(500u16));
+        let metrics2 = Arc::new(WebhookMetrics::new(64));
+        let t2 = HttpTransport::with_sender(m2.sender, 50, 0, 10_000, 10, metrics2);
+        t2.deliver(delivery()).await;
+        await_attempts(&m2.calls, 1).await;
+        tokio::time::advance(Duration::from_millis(1)).await;
+        await_attempts(&m2.calls, 2).await;
+        let times2 = m2.times.lock().unwrap().clone();
+        assert_eq!(
+            (times2[1] - times2[0]).as_millis(),
+            1,
+            "cap=0 floored to 1ms"
+        );
+    }
+
     /// R4 (b): a 404 (non-2xx that is neither 5xx nor 429) is retried.
     #[tokio::test(start_paused = true)]
     async fn non_2xx_404_is_retried() {
-        let m = mock(|_| Ok(404u16));
+        let m = mock(|_, _| Ok(404u16));
         let metrics = Arc::new(WebhookMetrics::new(64));
         let t = HttpTransport::with_sender(m.sender, 50, 100, 300, 10, metrics.clone());
         t.deliver(delivery()).await;
@@ -475,7 +609,7 @@ mod tests {
     /// R4 (c): a 2xx resolves immediately with exactly one attempt.
     #[tokio::test(start_paused = true)]
     async fn success_is_exactly_one_attempt() {
-        let m = mock(|_| Ok(200u16));
+        let m = mock(|_, _| Ok(200u16));
         let metrics = Arc::new(WebhookMetrics::new(64));
         let t = HttpTransport::with_sender(m.sender, 1000, 60_000, 300_000, 10, metrics.clone());
         t.deliver(delivery()).await;
@@ -494,7 +628,7 @@ mod tests {
     /// budget-bounded schedule.
     #[tokio::test(start_paused = true)]
     async fn transport_errors_are_retried() {
-        let m = mock(|_| Err("connection refused".into()));
+        let m = mock(|_, _| Err("connection refused".into()));
         let metrics = Arc::new(WebhookMetrics::new(64));
         let t = HttpTransport::with_sender(m.sender, 10, 20, 50, 10, metrics.clone());
         t.deliver(delivery()).await;
