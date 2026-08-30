@@ -967,20 +967,11 @@ fn queue_ping(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u6
     true
 }
 
-/// Send a WebSocket Close frame with the given `code` and `reason` text, then
-/// let the caller handle the connection (either `remove` it immediately or wait
-/// for flush). Mirrors the `ServerEvent::Close` arm of [`drain_session`].
-fn send_close(
-    poll: &Poll,
-    conns: &mut slab::Slab<Entry>,
-    key: usize,
-    now_ns: u64,
-    code: u16,
-    reason: &str,
-) {
-    let Some(entry) = conns.get_mut(key) else {
-        return;
-    };
+/// Queue a single WebSocket Close frame (`code` + `reason`) onto `entry`'s
+/// out-queue (no flush). Shared core of every outbound Close frame: the
+/// server-initiated closes ([`send_close_reply`], [`close_fragment_violation`],
+/// the drain path) and the RFC 6455 §5.5.1 echo of a client-initiated Close.
+fn queue_close_frame(entry: &mut Entry, code: u16, reason: &str, now_ns: u64) {
     let mut frame_body = Vec::with_capacity(2 + reason.len());
     frame_body.extend_from_slice(&code.to_be_bytes());
     frame_body.extend_from_slice(reason.as_bytes());
@@ -989,6 +980,25 @@ fn send_close(
     let _ = entry
         .conn
         .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+}
+
+/// Send a WebSocket Close frame with the given `code` and `reason` text —
+/// queue it and flush so it actually reaches the peer — then let the caller
+/// handle the connection (either `remove` it immediately or wait for flush).
+/// The single generalized Close-reply helper; [`send_close_4200`] and
+/// [`send_close_4201`] are thin callers.
+fn send_close_reply(
+    poll: &Poll,
+    conns: &mut slab::Slab<Entry>,
+    key: usize,
+    code: u16,
+    reason: &str,
+    now_ns: u64,
+) {
+    let Some(entry) = conns.get_mut(key) else {
+        return;
+    };
+    queue_close_frame(entry, code, reason, now_ns);
     // Flush so the Close frame actually reaches the peer before we deregister.
     let _ = flush_and_arm(poll, entry, now_ns);
 }
@@ -996,13 +1006,13 @@ fn send_close(
 /// SP11 §4: send a WebSocket Close frame with code `4201` (pong-timeout) with the
 /// canonical Pusher v7 reason text, then let the caller `remove` the connection.
 fn send_close_4201(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) {
-    send_close(
+    send_close_reply(
         poll,
         conns,
         key,
-        now_ns,
         4201,
         "Pong reply not received: ping was sent to the client, but no reply was received",
+        now_ns,
     );
 }
 
@@ -1012,13 +1022,13 @@ fn send_close_4201(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_n
 /// client disruption on a rolling restart compared to the 1001 generic-gone-away.
 /// The caller is responsible for the subsequent `fold_delta` + eventual `remove`.
 fn send_close_4200(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) {
-    send_close(
+    send_close_reply(
         poll,
         conns,
         key,
-        now_ns,
         4200,
         "Server is shutting down; please reconnect",
+        now_ns,
     );
 }
 
@@ -1549,8 +1559,9 @@ fn echo_frames(poll: &Poll, entry: &mut Entry, frames: Vec<frame::Frame>, now_ns
 }
 
 /// [`Mode::Dispatch`]: decode each complete Text message to a [`ClientCommand`]
-/// and drive `ctx.dispatch`, answer pings with pongs, close on a Close frame,
-/// then drain this connection's mailbox so any self-directed replies go out.
+/// and drive `ctx.dispatch`, answer pings with pongs, echo a client-initiated
+/// Close per RFC 6455 §5.5.1, then drain this connection's mailbox so any
+/// self-directed replies go out.
 ///
 /// Fragmented text messages (RFC 6455 §5.4) are reassembled in
 /// [`Entry::fragment`] before dispatch: a FIN=0 Text frame opens the
@@ -1649,7 +1660,12 @@ fn dispatch_frames(
             // Binary is not part of the Pusher protocol; ignore (an open
             // fragment was already failed by the guard arm above).
             OpCode::Binary => {}
-            OpCode::Close => return Action::Close,
+            // RFC 6455 §5.5.1: a client-initiated Close completes the closing
+            // handshake — echo a Close frame (flushed before teardown, which
+            // `remove()` does not do) carrying the client's code when present.
+            OpCode::Close => {
+                return close_handshake_reply(poll, entry, &f.payload, now_ns);
+            }
         }
     }
 
@@ -1693,16 +1709,36 @@ fn dispatch_text_message(entry: &mut Entry, payload: &[u8]) -> Action {
 /// explicit here even though the entry is torn down immediately after.
 fn close_fragment_violation(poll: &Poll, entry: &mut Entry, now_ns: u64, reason: &str) -> Action {
     entry.fragment = None;
-    let mut frame_body = Vec::with_capacity(2 + reason.len());
-    frame_body.extend_from_slice(&1002u16.to_be_bytes());
-    frame_body.extend_from_slice(reason.as_bytes());
-    let mut out = BytesMut::new();
-    frame::encode(&mut out, true, OpCode::Close, &frame_body);
-    let _ = entry
-        .conn
-        .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+    queue_close_frame(entry, 1002, reason, now_ns);
     let _ = flush_and_arm(poll, entry, now_ns);
     Action::Close
+}
+
+/// RFC 6455 §5.5.1: complete the closing handshake on a client-initiated
+/// Close. The server MUST send a Close frame in response before closing the
+/// connection, so queue the echo and flush it (teardown via `remove()` does
+/// not flush — same mechanics as [`close_fragment_violation`]). The echo
+/// carries the client's status code when its Close payload has one, else code
+/// 1000 (normal closure), per [`echo_close_code`].
+fn close_handshake_reply(poll: &Poll, entry: &mut Entry, payload: &[u8], now_ns: u64) -> Action {
+    queue_close_frame(entry, echo_close_code(payload), "", now_ns);
+    let _ = flush_and_arm(poll, entry, now_ns);
+    Action::Close
+}
+
+/// The status code for the §5.5.1 echo of a client Close: the client's own
+/// code when its payload carries one, else 1000 (normal closure). Codes an
+/// endpoint must never put on the wire (RFC 6455 §7.4: the 1005/1006/1015
+/// sentinels, codes below 1000 or above 4999) fall back to 1000 so the echo
+/// is always a well-formed Close frame.
+fn echo_close_code(payload: &[u8]) -> u16 {
+    if payload.len() >= 2 {
+        let code = u16::from_be_bytes([payload[0], payload[1]]);
+        if (1000..=4999).contains(&code) && !matches!(code, 1005 | 1006 | 1015) {
+            return code;
+        }
+    }
+    1000
 }
 
 /// Run one command through the (async) protocol handler synchronously.

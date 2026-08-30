@@ -13,6 +13,7 @@ use pylon::server::config::ServerConfig;
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::Data as WsData;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::OpCode as WsOpCode;
+use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::Frame as WsFrame;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -643,5 +644,62 @@ async fn text_frame_while_fragment_open_closes_1002() {
             cf.code
         ),
         other => panic!("expected Close(1002) on interleaved Text frame, got {other:?}"),
+    }
+}
+
+// ── P2 parity tests — closing handshake (RFC 6455 §5.5.1) ───────────────────
+
+/// P2: on a client-initiated Close the server MUST echo a Close frame back
+/// before tearing the socket down, carrying the client's close code.
+#[tokio::test]
+async fn client_initiated_close_is_echoed_before_teardown() {
+    let addr = spawn(ServerConfig::default()).await;
+    let mut ws = connect(addr, "?protocol=7").await;
+    let _ = established_socket_id(&mut ws).await;
+
+    ws.send(Message::Close(Some(CloseFrame {
+        code: 1000.into(),
+        reason: "bye".into(),
+    })))
+    .await
+    .unwrap();
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        .await
+        .expect("a frame within 5s")
+        .expect("stream open");
+    match first {
+        Ok(Message::Close(Some(cf))) => assert_eq!(
+            u16::from(cf.code),
+            1000,
+            "expected the echoed Close to carry the client's code 1000, got {}",
+            cf.code
+        ),
+        other => panic!("expected Close(1000) echo before teardown, got {other:?}"),
+    }
+}
+
+/// P2: a parameterless Close (no status code in the payload) is echoed with
+/// code 1000 (normal closure) before teardown.
+#[tokio::test]
+async fn parameterless_close_is_echoed_with_1000() {
+    let addr = spawn(ServerConfig::default()).await;
+    let mut ws = connect(addr, "?protocol=7").await;
+    let _ = established_socket_id(&mut ws).await;
+
+    ws.send(Message::Close(None)).await.unwrap();
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        .await
+        .expect("a frame within 5s")
+        .expect("stream open");
+    match first {
+        Ok(Message::Close(Some(cf))) => assert_eq!(
+            u16::from(cf.code),
+            1000,
+            "expected Close(1000) echo for a parameterless Close, got {}",
+            cf.code
+        ),
+        other => panic!("expected Close(1000) echo before teardown, got {other:?}"),
     }
 }
