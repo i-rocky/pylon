@@ -48,7 +48,7 @@ The apps list must be **identical** on every node; pylon does not replicate it t
 | `PYLON_REDIS_MEMBERSHIP_TTL` | `60` | Seconds before a node's membership entry expires if it stops heartbeating. |
 | `PYLON_REDIS_NODE_HEARTBEAT` | `5` | Heartbeat interval (seconds) each node publishes to Redis. |
 | `PYLON_REDIS_PRESENCE_HEARTBEAT` | `25` | Interval (seconds) at which presence-member entries are refreshed. |
-| `PYLON_REDIS_SHARDED_PUBSUB` | `false` | Enable Redis 7+ sharded Pub/Sub for higher-throughput clusters. |
+| `PYLON_REDIS_SHARDED_PUBSUB` | `false` | Use Redis 7+ sharded Pub/Sub (`SSUBSCRIBE`/`SPUBLISH`) for higher-throughput clusters. Requires Redis 7.0+, and **every** node must set the same value — sharded and ordinary Pub/Sub are separate namespaces. |
 
 See [Configuration](configuration.md) for the full variable reference.
 

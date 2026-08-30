@@ -28,7 +28,7 @@ mod common;
 
 use common::{
     auth_token, connect, established_socket_id, next_event_named, next_json, next_json_within,
-    send_json, spawn_percore_cluster, spawn_percore_cluster_with, Ws,
+    send_json, spawn_percore_cluster, spawn_percore_cluster_with_apps, Ws,
 };
 use serde_json::{json, Value};
 use std::net::SocketAddr;
@@ -40,6 +40,18 @@ use uuid::Uuid;
 fn random_prefix() -> String {
     format!("pylontest:{}", Uuid::new_v4())
 }
+
+/// The harness `APPS` app with UNLIMITED connection capacity. The
+/// `cross_node_presence_capacity_enforced` test holds FOUR concurrent connections
+/// (u1, u2, a rejected u3 that stays connected, and u2's second conn); the shared
+/// `APPS` app's `capacity: 2` — enforced CLUSTER-WIDE since Task 4.2 — would
+/// reject the third CONNECTION at establish, before the presence cap this test
+/// exercises is ever reached. This app isolates the PRESENCE cap from the
+/// per-app CONNECTION cap (which `cluster_capacity` covers on its own).
+const UNLIMITED_CONN_APPS: &str = r#"[
+    {"name":"Test","id":"app","key":"app-key","secret":"app-secret",
+     "capacity":0,"client_messages_enabled":true}
+]"#;
 
 /// Connect a WS presence client to `addr` as `user_id` (with `user_info`), drain its
 /// `connection_established`, subscribe it to `channel`, and return the live socket
@@ -275,11 +287,14 @@ async fn next_subscription_outcome(ws: &mut Ws) -> Value {
 #[tokio::test]
 async fn cross_node_presence_capacity_enforced() {
     let prefix = random_prefix();
-    // Inject a small cluster-wide cap of 2 members on BOTH nodes.
+    // Inject a small cluster-wide cap of 2 members on BOTH nodes, and use an
+    // UNLIMITED-connection app (see `UNLIMITED_CONN_APPS`): this test holds 4
+    // concurrent connections, more than the default app's connection capacity.
+    let tune = |c: &mut pylon::server::config::ServerConfig| c.max_presence_members = 2;
     let (addr_a, _guard_a) =
-        spawn_percore_cluster_with(&prefix, |c| c.max_presence_members = 2).await;
+        spawn_percore_cluster_with_apps(&prefix, UNLIMITED_CONN_APPS, tune).await;
     let (addr_b, _guard_b) =
-        spawn_percore_cluster_with(&prefix, |c| c.max_presence_members = 2).await;
+        spawn_percore_cluster_with_apps(&prefix, UNLIMITED_CONN_APPS, tune).await;
 
     let channel = "presence-cap";
 

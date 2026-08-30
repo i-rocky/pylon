@@ -1633,7 +1633,9 @@ async fn purge_app_closes_connections_and_removes_from_redis_apps_set() {
             Arc::new(pylon::channel::registry::Registry::new()),
             app_registry.clone(),
         ));
-        let adapter = RedisAdapter::with_local(&cfg, local, None)
+        // No worker fleet backs this standalone adapter → `None` conn_counts (the
+        // heartbeat's outage re-seed has nothing to re-seed, which is correct).
+        let adapter = RedisAdapter::with_local(&cfg, local, None, None)
             .await
             .expect("with_local must connect to the test Redis");
 

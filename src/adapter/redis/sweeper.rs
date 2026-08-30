@@ -17,6 +17,12 @@
 //!
 //! Every Redis error is logged and skipped; one failure must never abort the whole
 //! sweep. Nothing here panics or unwraps.
+//!
+//! Task 4.2 (finding D2) adds a second reclaim duty: a dead node's per-app
+//! capacity counts (`nodeconns:{node}`) are subtracted from the cluster totals
+//! (`appconns`, floored at 0) and the hash deleted, in the SAME dead-node prune
+//! pass — so capacity held by a crashed node frees within a heartbeat window
+//! instead of leaking until a manual flush.
 
 use super::client::Scripts;
 use super::keys::Keys;
@@ -40,16 +46,21 @@ pub(crate) struct SweepReport {
 
 /// Run one deterministic sweep pass. `now` is the current wall-clock millis used to
 /// decide which members are stale (passed in so tests can drive time precisely).
+/// `sharded` is the cluster-wide `PYLON_REDIS_SHARDED_PUBSUB` setting, threading
+/// into the reap paths' WatchOffline/member_removed publishes so they ride the
+/// same pub/sub namespace (SPUBLISH vs PUBLISH) the live nodes subscribe on.
 ///
 /// Lease protocol: try `SET sweeplock node_id NX PX lease_ms`. If acquired, sweep.
 /// If not, `GET sweeplock`: if we already own it, renew (`SET … PX lease_ms`, no NX)
 /// and sweep; otherwise yield (another node sweeps) and return `acquired = false`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn sweep_once(
     pool: &Pool,
     scripts: &Scripts,
     keys: &Keys,
     node_id: &str,
     lease_ms: u64,
+    sharded: bool,
     webhooks: &WebhookHandle,
     now: u64,
 ) -> SweepReport {
@@ -113,7 +124,10 @@ pub(crate) async fn sweep_once(
             // users still live on another node are handled correctly.
             if super::presence::is_presence(&channel) {
                 for token in &stale {
-                    super::presence::reap_member(pool, keys, &app, &channel, token, webhooks).await;
+                    super::presence::reap_member(
+                        pool, keys, &app, &channel, token, sharded, webhooks,
+                    )
+                    .await;
                 }
             }
 
@@ -200,12 +214,21 @@ pub(crate) async fn sweep_once(
             }
         };
         for user_id in users {
-            super::user::reap_user(pool, keys, app, &user_id, now).await;
+            super::user::reap_user(pool, keys, app, &user_id, sharded, now).await;
         }
     }
 
     // Secondary: prune dead nodes from the nodes set (their `node` key TTL-expired).
     // Member reaping above is the real cleanup; this just keeps the set tidy.
+    // Task 4.2 (finding D2): BEFORE forgetting a dead node, RECLAIM its per-app
+    // capacity counts — RECLAIM_NODE_LUA atomically subtracts each app's count on
+    // the dead node's `nodeconns` hash from the cluster `appconns` total (floored
+    // at 0), then deletes the hash. Without this, a crashed node's held capacity
+    // units would leak forever (a release can only come from the node itself).
+    // Order matters: the reclaim MUST precede the SREM — once the id leaves the
+    // `nodes` set, nothing enumerates its hash again (the hash's TTL backstop is
+    // then the only GC). Still under the sweep lease, so exactly one node
+    // reclaims per dead node.
     let nodes: Vec<String> = match pool.next().smembers(keys.nodes()).await {
         Ok(n) => n,
         Err(e) => {
@@ -216,6 +239,41 @@ pub(crate) async fn sweep_once(
     for node in nodes {
         match pool.next().exists::<i64, _>(keys.node(&node)).await {
             Ok(0) => {
+                // Dead: reclaim its capacity counts from the cluster totals, and
+                // only then forget the node. On a reclaim error we SKIP the SREM:
+                // the `nodes` entry is the enumeration source for the retry — the
+                // next sweep pass sees the node still dead and retries the
+                // reclaim (which is idempotent: floor-0 subtract + DEL). SREM-ing
+                // anyway would forget the node while its counts still sit in
+                // `appconns`, and NOTHING reclaims them after that — the hash's
+                // TTL backstop removes the HASH, not the cluster-total residue.
+                let mut reclaimed_ok = false;
+                match scripts
+                    .reclaim_node
+                    .evalsha_with_reload::<i64, _, _>(
+                        pool.next(),
+                        vec![keys.appconns(), keys.nodeconns(&node)],
+                        Vec::<String>::new(),
+                    )
+                    .await
+                {
+                    Ok(reclaimed) => {
+                        reclaimed_ok = true;
+                        if reclaimed > 0 {
+                            tracing::debug!(
+                                node,
+                                apps = reclaimed,
+                                "sweeper: reclaimed dead node's per-app capacity counts"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, node, "sweeper: dead-node capacity reclaim failed; keeping the nodes entry so the next sweep retries");
+                    }
+                }
+                if !reclaimed_ok {
+                    continue;
+                }
                 if let Err(e) = pool
                     .next()
                     .srem::<i64, _, _>(keys.nodes(), node.clone())
@@ -292,13 +350,16 @@ async fn acquire_lease(pool: &Pool, keys: &Keys, node_id: &str, lease_ms: u64) -
 /// Background sweep loop. Ticks every `interval_secs` and runs one `sweep_once` with
 /// the current wall-clock millis. The lease (`lease_ms`) is sized to outlive a tick so
 /// the holder keeps sweeping, but auto-frees (PX expiry) if the holder dies — letting
-/// another node take over within a couple of ticks.
+/// another node take over within a couple of ticks. `sharded` threads the cluster's
+/// pub/sub mode into the reap publishes (see [`sweep_once`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn sweeper_loop(
     pool: Pool,
     keys: Keys,
     node_id: String,
     lease_ms: u64,
     interval_secs: u64,
+    sharded: bool,
     webhooks: WebhookHandle,
 ) {
     // Compiled once (pure local SHA-1 hashing, no Redis round-trip); reused by
@@ -313,6 +374,7 @@ pub(crate) async fn sweeper_loop(
             &keys,
             &node_id,
             lease_ms,
+            sharded,
             &webhooks,
             super::now_ms(),
         )

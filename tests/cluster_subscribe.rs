@@ -273,7 +273,9 @@ fn start_node(prefix: &str, apps: Arc<dyn AppManager>) -> Node {
         Arc::new(pylon::adapter::app_registry::AppRegistry::new()),
     ));
     let (webhooks, transport) = recording_webhooks(apps.clone());
-    let bridge = bridge::start(&cfg, local.clone(), apps)
+    // No worker fleet backs these bridge-only nodes → an empty counter map is the
+    // correct `conn_counts` (see the Task 4.2 heartbeat outage re-seed).
+    let bridge = bridge::start(&cfg, local.clone(), apps, Arc::new(Default::default()))
         .expect("ClusterBridge::start must connect to the test Redis and report ready");
     bridge.attach_webhooks(webhooks);
     Node {

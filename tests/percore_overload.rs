@@ -155,6 +155,7 @@ async fn spawn_with(config: ServerConfig) -> Harness {
             worker_shutdown,
             Some(local),
             false, // not clustered
+            None,  // no cluster bridge handle
             None,
             worker_runtime,
         )

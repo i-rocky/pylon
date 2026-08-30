@@ -175,6 +175,12 @@ pub struct DispatchEnv {
     /// connection handler suppresses its node-local emits. `false` ⇒ the
     /// not-yet-clustered percore path keeps the node-local handler emits.
     pub clustered: bool,
+    /// Task 4.2 (finding D2): the node's cluster bridge handle, for CLUSTER-WIDE
+    /// per-app capacity admission. `Some` only on a clustered node (the same
+    /// wiring that sets [`clustered`](DispatchEnv::clustered) = `true`); `None` ⇒
+    /// no cluster admission — the per-app `capacity` check below stays purely
+    /// node-local (single-node percore and the test workers).
+    pub cluster: Option<crate::cluster::bridge::ClusterHandle>,
     /// Node-level connection ceiling enforced before the per-app `capacity` check.
     /// `0` = unlimited (no ceiling check). When non-zero, the connection that
     /// pushes [`node_conns`](DispatchEnv::node_conns) to or above this limit is
@@ -574,6 +580,13 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
         ),
     };
 
+    // Task 4.2 (D2): the cluster bridge handle for the close-side capacity
+    // release. `None` for echo workers and non-clustered dispatch workers.
+    let cluster: Option<crate::cluster::bridge::ClusterHandle> = match &cfg.mode {
+        Mode::Dispatch(env) => env.cluster.clone(),
+        Mode::Echo => None,
+    };
+
     let mut events = Events::with_capacity(1024);
     let mut conns: slab::Slab<Entry> = slab::Slab::new();
 
@@ -664,6 +677,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         &conn_counts,
                         &app_registry,
                         &node_conns,
+                        &cluster,
                     );
                 }
                 tracing::debug!(
@@ -839,6 +853,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             &conn_counts,
                             &app_registry,
                             &node_conns,
+                            &cluster,
                         );
                         continue;
                     }
@@ -883,6 +898,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                     &conn_counts,
                                     &app_registry,
                                     &node_conns,
+                                    &cluster,
                                 );
                                 continue;
                             }
@@ -956,6 +972,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                     &conn_counts,
                                     &app_registry,
                                     &node_conns,
+                                    &cluster,
                                 );
                             }
                             // G2: a TLS handshake that completed on the WRITABLE
@@ -1011,6 +1028,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 &conn_counts,
                 &app_registry,
                 &node_conns,
+                &cluster,
             ) {
                 work = true;
             }
@@ -1057,6 +1075,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 &conn_counts,
                 &app_registry,
                 &node_conns,
+                &cluster,
             )
         {
             work = true;
@@ -1083,6 +1102,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                     &conn_counts,
                     &app_registry,
                     &node_conns,
+                    &cluster,
                 ) {
                     work = true;
                 }
@@ -1127,6 +1147,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                         &conn_counts,
                                         &app_registry,
                                         &node_conns,
+                                        &cluster,
                                     );
                                 } else {
                                     // Ping queued: arm the pong-timeout close
@@ -1166,6 +1187,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             &conn_counts,
                             &app_registry,
                             &node_conns,
+                            &cluster,
                         );
                         work = true;
                     }
@@ -1194,6 +1216,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             &conn_counts,
                             &app_registry,
                             &node_conns,
+                            &cluster,
                         );
                         work = true;
                     }
@@ -1224,6 +1247,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                 &conn_counts,
                                 &app_registry,
                                 &node_conns,
+                                &cluster,
                             );
                         } else {
                             // Established or gone: with the wheel's eager
@@ -1835,6 +1859,41 @@ fn finish_establish(
         });
     }
 
+    // Task 4.2 (finding D2): CLUSTER-WIDE per-app capacity admission. The local
+    // check above only sees THIS node (`conn_counts`), so N nodes each admitted
+    // up to `capacity` connections — the docs promise one cluster-wide ceiling.
+    // On a clustered node the check is completed in Redis: ADMIT_APP_LUA on the
+    // bridge atomically compares the CLUSTER count (`appconns`) against the
+    // capacity and takes a unit for this connection. This is the ONE place a
+    // worker deliberately blocks on the bridge (bounded by the handle's reply
+    // timeout): the establish cannot proceed before the cluster-wide decision.
+    // Only apps WITH a capacity pay the round trip — an unlimited app
+    // (`capacity == 0`) needs no cluster check, and the close-side release
+    // mirrors this same condition off the SAME `App` snapshot, so every unit
+    // taken here is given back exactly once.
+    if app.capacity != 0 {
+        if let Some(bridge) = env.cluster.as_ref() {
+            if bridge.admit_app(&app.id, app.capacity) == Some(false) {
+                // At capacity CLUSTER-WIDE: reject with the same 4004 the local
+                // check sends, rolling back BOTH local counters exactly like the
+                // local-reject path above (the Redis unit was NOT taken — the
+                // script rejects without incrementing).
+                counter.fetch_sub(1, Ordering::SeqCst);
+                env.node_conns.fetch_sub(1, Ordering::SeqCst);
+                return Err(Reject {
+                    error: PusherError::over_capacity(),
+                    codec: Some(codec),
+                });
+            }
+            // `Some(true)` = admitted (unit taken). `None` = the bridge is
+            // unavailable (channel full/closed, verdict timed out, or Redis
+            // errored): FAIL OPEN — admit. A degraded bridge must not lock
+            // clients out of a node whose local checks already passed; no Redis
+            // unit was taken, and this connection's close-side release is a
+            // floor-0 no-op, so the counts stay consistent.
+        }
+    }
+
     let socket_id = SocketId::generate();
     // Task 4: bounded mailbox — capacity from config (default 256). Under extreme
     // overload, `Mailbox::send` uses `try_send` and drops on full, bumping the
@@ -2376,6 +2435,7 @@ fn drain_dirty_sessions(
     conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
     app_registry: &Arc<AppRegistry>,
     node_conns: &Arc<AtomicUsize>,
+    cluster: &Option<crate::cluster::bridge::ClusterHandle>,
 ) -> bool {
     // Drain the dirty-token queue into the reused set (dedup). Cheap + O(1) when
     // empty (the idle case). The set is cleared at the end so it never grows
@@ -2421,6 +2481,7 @@ fn drain_dirty_sessions(
                 conn_counts,
                 app_registry,
                 node_conns,
+                cluster,
             );
             continue;
         }
@@ -2474,6 +2535,7 @@ fn drain_resolved(
     conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
     app_registry: &Arc<AppRegistry>,
     node_conns: &Arc<AtomicUsize>,
+    cluster: &Option<crate::cluster::bridge::ClusterHandle>,
 ) -> bool {
     use crate::protocol::error::PusherError;
     let mut wrote_any = false;
@@ -2555,6 +2617,7 @@ fn drain_resolved(
                         conn_counts,
                         app_registry,
                         node_conns,
+                        cluster,
                     );
                 } else {
                     // Re-arm this resumed connection's idle deadline from NOW. The
@@ -2599,6 +2662,7 @@ fn drain_resolved(
                     conn_counts,
                     app_registry,
                     node_conns,
+                    cluster,
                 );
             }
         }
@@ -2854,6 +2918,7 @@ fn remove(
     conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
     app_registry: &Arc<AppRegistry>,
     node_conns: &Arc<AtomicUsize>,
+    cluster: &Option<crate::cluster::bridge::ClusterHandle>,
 ) {
     // SP11 §4: drop the connection from the liveness wheel BEFORE the slab slot
     // (and thus its token) can be recycled by a future accept, so a new
@@ -2883,6 +2948,20 @@ fn remove(
             // registries so even an idle app that is never deleted leaves no zombie.
             conn_counts.remove_if(app_id, |_, c| c.load(Ordering::SeqCst) == 0);
             node_conns.fetch_sub(1, Ordering::SeqCst);
+            // Task 4.2 (finding D2): cluster-wide per-app capacity release —
+            // give back the unit this connection's establish took in Redis
+            // (ADMIT_APP_LUA). Fire-and-forget at the bridge, exactly like the
+            // other close-time cluster edges. The SAME `App` snapshot taken at
+            // establish gates both sides (`capacity != 0`), so the release
+            // matches the admission exactly once; the floor-0, node-guarded
+            // RELEASE script makes it a no-op when this node holds no recorded
+            // unit (an admission that failed open), so firing on every
+            // clustered close is always safe.
+            if session.ctx.app.capacity != 0 {
+                if let Some(bridge) = cluster {
+                    bridge.release_app(app_id);
+                }
+            }
         }
         let _ = poll.registry().deregister(entry.conn.stream_mut());
     }
@@ -3068,6 +3147,7 @@ fn drain_broadcasts(
     conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
     app_registry: &Arc<AppRegistry>,
     node_conns: &Arc<AtomicUsize>,
+    cluster: &Option<crate::cluster::bridge::ClusterHandle>,
 ) -> bool {
     let mut touched: HashSet<usize> = HashSet::new();
     // Connections that backpressured during delivery; closed after the drain so
@@ -3178,6 +3258,7 @@ fn drain_broadcasts(
             conn_counts,
             app_registry,
             node_conns,
+            cluster,
         );
     }
     wrote

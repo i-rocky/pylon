@@ -255,6 +255,8 @@ async fn main() -> anyhow::Result<()> {
             // its own harness (`run_redis_percore`); this standalone `main` percore
             // path is not clustered.
             false,
+            // Not clustered ⇒ no cluster-wide capacity admission handle.
+            None,
             tls,
             worker_runtime,
         )
@@ -313,9 +315,16 @@ async fn run_redis_percore(
         app_registry.clone(),
     ));
 
+    // Per-app live connection counters (shared with the worker fleet AND the bridge —
+    // see the bridge start below). Created BEFORE the bridge so both hold the same Arc.
+    let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
+
     // Start the bridge: builds the node's single `RedisAdapter` (sharing `local`) on its own
-    // runtime and returns once Redis is connected, or `Err` if the connect failed.
-    let bridge = pylon::cluster::bridge::start(&config, local.clone(), apps.clone())?;
+    // runtime and returns once Redis is connected, or `Err` if the connect failed. The
+    // `conn_counts` Arc lets the node heartbeat re-seed this node's per-app capacity
+    // counts in Redis after an outage longer than the nodeconns TTL (self-heal).
+    let bridge =
+        pylon::cluster::bridge::start(&config, local.clone(), apps.clone(), conn_counts.clone())?;
 
     // REST + occupancy drive the node's single `RedisAdapter` through the bridge.
     let adapter: Arc<dyn Adapter> = bridge.adapter();
@@ -337,9 +346,9 @@ async fn run_redis_percore(
     // webhooks share one dispatcher). This closes the startup cycle.
     bridge.attach_webhooks(webhooks.clone());
 
-    let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
     // Node-level live connection counter for the ceiling check — one per process,
-    // shared across all of this node's workers. Created alongside `conn_counts`.
+    // shared across all of this node's workers. Created alongside `conn_counts`
+    // (which was created BEFORE the bridge so both share the one Arc).
     let node_conns: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 
     // Build the AppPurger + invalidation subscriber once the adapter + conn_counts
@@ -426,6 +435,10 @@ async fn run_redis_percore(
     let worker_shutdown = shutdown.clone();
     let worker_config = config.clone();
     let worker_local = local.clone();
+    // Task 4.2 (D2): a clone of the bridge handle for the worker's cluster-wide
+    // per-app capacity admission. Cloned BEFORE the move-closure so `bridge`
+    // itself stays alive here until after the worker joins.
+    let worker_cluster = bridge.handle();
     // Phase 7: capture the runtime handle here (async context) before spawn_blocking.
     let worker_runtime = tokio::runtime::Handle::current();
     let worker = tokio::task::spawn_blocking(move || {
@@ -442,6 +455,8 @@ async fn run_redis_percore(
             Some(worker_local),
             // This IS a clustered node: defer the single-emit cluster edges.
             true,
+            // …and gate per-app capacity cluster-wide via the bridge.
+            Some(worker_cluster),
             tls,
             worker_runtime,
         )

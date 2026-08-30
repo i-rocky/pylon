@@ -87,6 +87,7 @@ async fn spawn(activity_timeout: u32, pong_timeout: u32) -> Harness {
         webhooks: pylon::webhook::WebhookHandle::null(),
         saturated: None,
         clustered: false,
+        cluster: None,
         max_connections: 0,
         mailbox_capacity: 256,
         app_registry: Arc::new(pylon::adapter::app_registry::AppRegistry::new()),

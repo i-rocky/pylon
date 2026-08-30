@@ -107,10 +107,10 @@ jobs:
       - name: Test (cluster / Redis)
         run: |
           cargo test --locked --no-fail-fast \
-            --test cluster_bridge --test cluster_subscribe \
+            --test cluster_bridge --test cluster_capacity --test cluster_subscribe \
             --test percore_cluster --test percore_cluster_cache \
             --test percore_cluster_presence --test percore_cluster_user \
-            --test redis_cluster \
+            --test redis_cluster --test redis_sharded \
             -- --test-threads=1
 
       # DB-backed AppManager backends (MySQL/Postgres/Mongo service containers).

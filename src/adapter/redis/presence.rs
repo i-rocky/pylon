@@ -2,6 +2,7 @@
 //! roster read. All return `anyhow::Result`; callers fall back to the node-local
 //! adapter on error. (members/user_count/reap land in later SP7b tasks.)
 
+use super::client;
 use super::client::Scripts;
 use super::envelope::{Envelope, EnvelopeKind};
 use super::keys::{member_token, Keys};
@@ -11,7 +12,7 @@ use crate::protocol::socket_id::SocketId;
 use crate::webhook::event::WebhookEvent;
 use crate::webhook::WebhookHandle;
 use fred::clients::Pool;
-use fred::interfaces::{HashesInterface, PubsubInterface};
+use fred::interfaces::HashesInterface;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
@@ -119,6 +120,7 @@ pub(super) async fn reap_member(
     app: &str,
     channel: &str,
     token: &str,
+    sharded: bool,
     webhooks: &WebhookHandle,
 ) {
     let presmembers = keys.presmembers(app, channel);
@@ -186,10 +188,8 @@ pub(super) async fn reap_member(
             except: None,
         };
         if let Ok(payload) = String::from_utf8(env.encode()) {
-            if let Err(e) = pool
-                .next()
-                .publish::<(), _, _>(keys.msg(app, channel), payload)
-                .await
+            if let Err(e) =
+                client::publish_channel(pool, &keys.msg(app, channel), payload, sharded).await
             {
                 tracing::warn!(error = %e, app, channel, "sweeper: PUBLISH member_removed failed");
             }

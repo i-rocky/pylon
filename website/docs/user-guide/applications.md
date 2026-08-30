@@ -218,8 +218,29 @@ The `capacity` field sets a hard ceiling on concurrent WebSocket connections for
 When a new connection would push the count over the limit, Pylon sends a WebSocket close frame
 with code **4004** (capacity exceeded) and refuses the connection.
 
-This limit is enforced cluster-wide when using the Redis adapter — each node checks the
-cluster-level count, not just its local count.
+In single-node mode the limit is enforced by that node's local connection count for the app.
+With the Redis adapter the limit is enforced **cluster-wide**: after the fast node-local check
+passes, the admission decision is completed in Redis — an atomic check-and-increment against a
+per-app cluster counter (`{prefix}:appconns`) shared by every node — so N nodes jointly hold
+the app to `capacity` connections, not `N × capacity`.
+
+Two operational notes for clustered deployments:
+
+* **Bridge fail-open.** The Redis admission runs on the node's cluster bridge. If that bridge is
+  momentarily unavailable (channel saturated, bridge stalled, or a transient Redis error), the
+  connection is **admitted anyway** rather than locked out — during such a blip each node falls
+  back to enforcing its local count only, so the cluster-wide ceiling may be exceeded by up to
+  the blip's worth of admissions. If a Redis outage outlasts the per-node capacity-hash TTL
+  (~65s at the defaults), the counters **self-heal** when Redis comes back: each node's
+  heartbeat re-seeds its per-app counts in Redis from that node's live local connections, so
+  the cluster totals resume from truth. (Connections that closed *during* the outage still
+  leak their single unit each — the same bounded one-unit leak as any dropped release.)
+* **Crashed nodes.** A node that dies without closing its connections still holds its capacity
+  units in Redis until the sweeper reclaims them. Reclaim timing is heartbeat-based: the dead
+  node's heartbeat key expires (`3 × PYLON_REDIS_NODE_HEARTBEAT` after its last beat), the
+  sweep lease it may still hold expires after that, and the next sweep pass frees its counts —
+  worst case `3 × heartbeat + lease + one sweep interval` ≈ **55 seconds at the defaults**
+  (5s heartbeat, 10s sweep; the lease is `max(3 × sweep, 5s)`), typically faster.
 
 Set `capacity` to `0` to disable the limit (unrestricted). For most production deployments,
 sizing capacity to match your expected peak concurrent users plus a comfortable headroom is
