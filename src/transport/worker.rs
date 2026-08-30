@@ -63,7 +63,7 @@ use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -103,6 +103,28 @@ pub static POLL_ZERO_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 #[cfg(any(test, feature = "test-hooks"))]
 pub fn percore_poll_zero_timeouts() -> u64 {
     POLL_ZERO_TIMEOUTS.load(Ordering::Relaxed)
+}
+
+/// Test-hooks instrumentation (G5): a live gauge of the worker-local delivery
+/// indexes across this process — the number of `(app, channel) → socket_id`
+/// membership slots held in every worker's `local_subs` (the sum of every
+/// channel set's length). Maintained exactly at the two `local_subs` mutation
+/// sites (`reconcile_membership`'s insert/remove and `deindex_connection`'s
+/// remove, both keyed off the boolean return of the set operation), so a test
+/// can assert the index fully EMPTIES when a connection closes — including the
+/// same-batch [subscribe, Close] case, where the close path runs before any
+/// reconcile ever saw the subscription. Signed so a bookkeeping bug surfaces as
+/// a negative instead of a near-`u64::MAX` positive. Behind `test-hooks` so it
+/// is free in release builds.
+#[cfg(any(test, feature = "test-hooks"))]
+pub static LOCAL_SUBS_SLOTS: AtomicI64 = AtomicI64::new(0);
+
+/// Test-hooks accessor: the current number of `(app, channel) → socket_id`
+/// membership slots across this process's workers' `local_subs` indexes (see
+/// [`LOCAL_SUBS_SLOTS`]). 0 when every connection has been deindexed.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn percore_local_subs_len() -> i64 {
+    LOCAL_SUBS_SLOTS.load(Ordering::Relaxed)
 }
 
 /// Reserved token for this worker's single [`mio::Waker`]. One below [`LISTENER`];
@@ -2805,9 +2827,25 @@ fn remove(
 }
 
 /// Drop a closing connection's `socket_id` from every `(app, channel)` it was
-/// indexed under, and from the reverse `socket_id → token` map. Uses the
-/// session's last-reconciled `subs` set (the channels recorded in `local_subs`),
-/// so it removes exactly the entries `reconcile_membership` inserted.
+/// indexed under, and from the reverse `socket_id → token` map.
+///
+/// G5: walks the UNION of the session's last-reconciled baseline (`subs`) and
+/// the live protocol set (`ctx.subscribed`). The baseline alone covers every
+/// entry `reconcile_membership` inserted — but a readable batch containing
+/// [subscribe, Close] (or a protocol-error/backpressure close right after a
+/// subscribe in the same batch) returns `Action::Close` from `dispatch_frames`
+/// BEFORE the `Action::Keep` arm's post-dispatch reconcile runs, so a
+/// subscription that reached the index by any path the baseline missed would
+/// otherwise stay indexed forever (dead socket ids accumulate; the channel's
+/// subscriber set never empties). Deindexing the union makes the close path
+/// self-sufficient: it cleans whatever the connection could still be indexed
+/// under, without trusting the reconcile bookkeeping.
+///
+/// Dedup is free: iterating `ctx.subscribed` chained with the channels of
+/// `subs` that `ctx.subscribed` lacks visits every union member exactly once,
+/// and the removal itself is idempotent anyway — removing an absent
+/// `(key, socket_id)` is a no-op, so a second pass over an overlapping channel
+/// cannot double-subtract the test gauge or disturb another subscriber.
 fn deindex_connection(
     session: &Session,
     local_subs: &mut HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
@@ -2815,10 +2853,20 @@ fn deindex_connection(
 ) {
     let app: Arc<str> = Arc::from(session.ctx.app.id.as_str());
     let sid = &session.ctx.socket_id;
-    for channel in &session.subs {
+    // `difference` yields the baseline-only channels, so the chain enumerates
+    // exactly the union — no duplicate keys, no temporary set allocation.
+    let union = session
+        .ctx
+        .subscribed
+        .iter()
+        .chain(session.subs.difference(&session.ctx.subscribed));
+    for channel in union {
         let k = (Arc::clone(&app), Arc::<str>::from(channel.as_str()));
         if let Some(set) = local_subs.get_mut(&k) {
-            set.remove(sid);
+            if set.remove(sid) {
+                #[cfg(any(test, feature = "test-hooks"))]
+                LOCAL_SUBS_SLOTS.fetch_sub(1, Ordering::Relaxed);
+            }
             if set.is_empty() {
                 local_subs.remove(&k);
             }
@@ -2848,16 +2896,23 @@ fn reconcile_membership(
 
     // Added channels: present in ctx.subscribed, absent from the recorded set.
     for channel in session.ctx.subscribed.difference(&session.subs) {
-        local_subs
+        let inserted = local_subs
             .entry((Arc::clone(&app), Arc::<str>::from(channel.as_str())))
             .or_default()
             .insert(*sid);
+        if inserted {
+            #[cfg(any(test, feature = "test-hooks"))]
+            LOCAL_SUBS_SLOTS.fetch_add(1, Ordering::Relaxed);
+        }
     }
     // Removed channels: were recorded, no longer subscribed.
     for channel in session.subs.difference(&session.ctx.subscribed) {
         let k = (Arc::clone(&app), Arc::<str>::from(channel.as_str()));
         if let Some(set) = local_subs.get_mut(&k) {
-            set.remove(sid);
+            if set.remove(sid) {
+                #[cfg(any(test, feature = "test-hooks"))]
+                LOCAL_SUBS_SLOTS.fetch_sub(1, Ordering::Relaxed);
+            }
             if set.is_empty() {
                 local_subs.remove(&k);
             }

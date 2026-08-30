@@ -1017,3 +1017,246 @@ async fn handshake_deadline_is_not_postponed_by_activity() {
     let _ = writer.await;
     assert_counters_net_zero(&h);
 }
+
+// ── Scenario 10: G5 same-burst subscribe + close deindexing ─────────────────
+
+/// Build one masked client→server WS frame (RFC 6455 §5.3): FIN=1, `opcode`,
+/// payload XOR-masked with the fixed 4-byte `mask`. Client frames MUST be
+/// masked (the worker rejects unmasked ones as a protocol error).
+fn masked_client_frame(opcode: u8, payload: &[u8], mask: [u8; 4]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + 14);
+    out.push(0x80 | opcode); // FIN=1 + opcode
+    let len = payload.len();
+    if len < 126 {
+        out.push(0x80 | len as u8); // MASK=1 + 7-bit length
+    } else {
+        assert!(
+            len <= u16::MAX as usize,
+            "test helper: extended-64 lengths unneeded"
+        );
+        out.push(0x80 | 126); // MASK=1 + 16-bit extended length
+        out.extend_from_slice(&(len as u16).to_be_bytes());
+    }
+    out.extend_from_slice(&mask);
+    for (i, b) in payload.iter().enumerate() {
+        out.push(b ^ mask[i % 4]);
+    }
+    out
+}
+
+/// Complete a raw WS upgrade BY HAND (no tungstenite) so the test owns every
+/// byte on the wire after the 101 — tungstenite would frame and flush each
+/// message separately, letting the worker process the subscribe and the Close
+/// in different readable batches. Returns the socket halves with the server's
+/// HTTP head consumed (any bytes already past it, e.g. the
+/// `connection_established` frame, are server→client noise we may drop).
+async fn raw_ws_upgrade(
+    port: u16,
+) -> (
+    tokio::net::tcp::OwnedReadHalf,
+    tokio::net::tcp::OwnedWriteHalf,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let stream = raw_tcp(port).await;
+    let (mut rd, mut wr) = stream.into_split();
+    let req = "GET /app/app-key?protocol=7 HTTP/1.1\r\n\
+               Host: 127.0.0.1\r\n\
+               Upgrade: websocket\r\n\
+               Connection: Upgrade\r\n\
+               Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+               Sec-WebSocket-Version: 13\r\n\r\n";
+    wr.write_all(req.as_bytes()).await.expect("write upgrade");
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 1024];
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let n = rd.read(&mut chunk).await.expect("read upgrade response");
+            assert!(n > 0, "EOF before the 101");
+            buf.extend_from_slice(&chunk[..n]);
+            // The FIRST CRLFCRLF in the byte stream is the head terminator.
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf);
+                assert!(
+                    head.starts_with("HTTP/1.1 101"),
+                    "unexpected upgrade response: {head}"
+                );
+                return;
+            }
+        }
+    })
+    .await
+    .expect("101 within 5s");
+    (rd, wr)
+}
+
+/// G5: a readable batch containing [subscribe, Close] — written as ONE TCP
+/// burst — makes `dispatch_frames` return `Action::Close` for the Close frame
+/// right after the subscribe took, so the worker's post-dispatch
+/// `reconcile_membership` (which runs only on the `Action::Keep` path) never
+/// saw the new channel. The close path must still fully deindex the
+/// freshly-subscribed channel: the adapter's channel view (what REST
+/// `GET /apps/{id}/channels` serves) must not report `leak-ch` as occupied or
+/// list it, and the worker-local `local_subs` delivery index must be empty —
+/// otherwise the index entry lingers forever (dead socket ids accumulate; the
+/// channel's subscriber set never empties; monotonic growth with churn).
+///
+/// A witness subscriber (`a`) proves the burst is not vacuous: it observes the
+/// subscription_count 1→2 edge from the burst connection's subscribe (so the
+/// subscribe really was dispatched in the same readable batch as the Close)
+/// and the 2→1 edge from its on-close unsubscribe. Repeating the burst three
+/// times guards the accumulation claim directly.
+#[tokio::test]
+async fn same_burst_subscribe_then_close_deindexes_membership() {
+    use tokio::io::AsyncWriteExt;
+    let h = spawn(ServerConfig::default()).await;
+
+    // Witness: a subscribes to leak-ch and drains its own count=1 frame.
+    let mut a = connect(h.port, "?protocol=7").await;
+    let _ = established_socket_id(&mut a).await;
+    send_json(
+        &mut a,
+        json!({ "event": "pusher:subscribe", "data": { "channel": "leak-ch" } }),
+    )
+    .await;
+    let _ = next_event_named(&mut a, "pusher_internal:subscription_succeeded").await;
+    let count1 = next_event_named(&mut a, "pusher_internal:subscription_count").await;
+    let c1: Value = serde_json::from_str(count1["data"].as_str().unwrap()).unwrap();
+    assert_eq!(c1["subscription_count"], 1);
+
+    for _ in 0..3 {
+        let (mut rd, mut wr) = raw_ws_upgrade(h.port).await;
+
+        // ONE write: the subscribe Text frame immediately followed by the
+        // Close frame (code 1000). The worker parses both into the same
+        // readable batch.
+        const MASK: [u8; 4] = [0x37, 0xfa, 0x21, 0x3d];
+        let subscribe = br#"{"event":"pusher:subscribe","data":{"channel":"leak-ch"}}"#;
+        let mut burst = masked_client_frame(0x1, subscribe, MASK);
+        burst.extend(masked_client_frame(0x8, &[0x03, 0xe8], MASK)); // Close, code 1000
+        wr.write_all(&burst).await.expect("burst write");
+
+        // The server completes the closing handshake (echoed Close + TCP
+        // EOF), bounded — the same-batch Close takes the `Action::Close` path
+        // before any reconcile ran for the subscribe.
+        let closed = wait_server_close(&mut rd, Duration::from_secs(5)).await;
+        assert!(
+            closed.is_some(),
+            "server must close after the same-burst Close frame"
+        );
+
+        // The witness saw the burst connection's membership come AND go: the
+        // 1→2 edge proves the subscribe dispatched inside the same batch as
+        // the Close (not dropped as post-handshake noise); the 2→1 edge
+        // proves the close path's on-close unsubscribe ran.
+        let count2 = next_event_named(&mut a, "pusher_internal:subscription_count").await;
+        let c2: Value = serde_json::from_str(count2["data"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            c2["subscription_count"], 2,
+            "the burst subscribe must take effect"
+        );
+        let count_back = next_event_named(&mut a, "pusher_internal:subscription_count").await;
+        let cb: Value = serde_json::from_str(count_back["data"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            cb["subscription_count"], 1,
+            "the same-batch close must unsubscribe"
+        );
+    }
+
+    // While a stays subscribed the worker index holds exactly its ONE slot —
+    // none of the three burst connections leaked a dead socket id into it.
+    let slots = pylon::transport::worker::percore_local_subs_len();
+    assert_eq!(slots, 1, "only the witness's member slot may remain");
+
+    drop(a);
+
+    // Bounded settle: channel-occupied state propagates through the worker
+    // immediately on Close; poll so the budget is generous but finite. After
+    // a's own close the channel must be gone from the adapter view (what GET
+    // /apps/{id}/channels serves) and the index fully empty.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let summary = h.adapter.channel("app", "leak-ch").await;
+        let listed = h
+            .adapter
+            .channels("app", None)
+            .await
+            .iter()
+            .any(|s| s.name == "leak-ch");
+        let slots = pylon::transport::worker::percore_local_subs_len();
+        if !summary.occupied && !listed && slots == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "leak-ch must be fully deindexed after the same-burst close \
+             (occupied={}, listed={}, local_subs slots={})",
+            summary.occupied,
+            listed,
+            slots
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Counters net zero (establish → close): no leaked per-app entries either.
+    assert_counters_net_zero(&h);
+}
+
+/// G5 control: the NORMAL close path (subscribe settled, THEN a separate
+/// Close) keeps deindexing exactly as before — the union deindex must not
+/// double-remove or miss on the reconciled path. A second connection on the
+/// same channel proves the surviving subscriber is untouched.
+#[tokio::test]
+async fn normal_close_still_deindexes_and_is_idempotent() {
+    let h = spawn(ServerConfig::default()).await;
+
+    // a subscribes and receives subscription_succeeded (reconcile ran).
+    let mut a = connect(h.port, "?protocol=7").await;
+    let _ = established_socket_id(&mut a).await;
+    send_json(
+        &mut a,
+        json!({ "event": "pusher:subscribe", "data": { "channel": "my-channel" } }),
+    )
+    .await;
+    let _ = next_event_named(&mut a, "pusher_internal:subscription_succeeded").await;
+    // Drain a's own count=1 frame.
+    let _ = next_event_named(&mut a, "pusher_internal:subscription_count").await;
+
+    // b subscribes to the same channel, then closes NORMALLY (its own TCP
+    // close after the subscribe settled).
+    let mut b = connect(h.port, "?protocol=7").await;
+    let _ = established_socket_id(&mut b).await;
+    send_json(
+        &mut b,
+        json!({ "event": "pusher:subscribe", "data": { "channel": "my-channel" } }),
+    )
+    .await;
+    let _ = next_event_named(&mut b, "pusher_internal:subscription_succeeded").await;
+    drop(b);
+
+    // a sees the count fall back to 1 — b's membership was deindexed once.
+    // (First consume b's join count=2, exactly like
+    // `disconnect_cleans_up_subscription` above.)
+    let count2 = next_event_named(&mut a, "pusher_internal:subscription_count").await;
+    let c2: Value = serde_json::from_str(count2["data"].as_str().unwrap()).unwrap();
+    assert_eq!(c2["subscription_count"], 2);
+    let count_after = next_event_named(&mut a, "pusher_internal:subscription_count").await;
+    let ca: Value = serde_json::from_str(count_after["data"].as_str().unwrap()).unwrap();
+    assert_eq!(ca["subscription_count"], 1);
+
+    // The local index holds exactly a's slot (not zero, not two, not negative:
+    // a double-remove would have eaten a's entry, a missed one b's).
+    let slots = pylon::transport::worker::percore_local_subs_len();
+    assert_eq!(slots, 1, "exactly one member slot must remain (a's)");
+    drop(a);
+
+    // …and drains to zero on a's normal close too.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while pylon::transport::worker::percore_local_subs_len() != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "local_subs must empty after both normal closes"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_counters_net_zero(&h);
+}
