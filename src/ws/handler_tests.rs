@@ -99,10 +99,36 @@ fn raw_json(ev: &ServerEvent) -> serde_json::Value {
 /// True if `ev` is a `Raw` broadcast frame whose wire `event` field equals `name`.
 fn raw_event_is(ev: &ServerEvent, name: &str) -> bool {
     matches!(ev, ServerEvent::Raw(f)
-        if serde_json::from_str::<serde_json::Value>(f)
-            .ok()
-            .and_then(|v| v.get("event").and_then(|e| e.as_str()).map(str::to_owned))
-            .as_deref() == Some(name))
+            if serde_json::from_str::<serde_json::Value>(f)
+                .ok()
+                .and_then(|v| v.get("event").and_then(|e| e.as_str()).map(str::to_owned))
+                .as_deref() == Some(name))
+}
+
+/// Task 1.8 (P8) strict-shape check: encode `ev` with the v7 codec and assert
+/// the wire frame's top-level object has EXACTLY `expected_keys` and its
+/// `event` field equals `expected_event`. The protocol page defines
+/// `pusher:error` as `{ "event": "pusher:error", "data": { "message": String,
+/// "code": Integer } }` — NO top-level `channel` (unlike
+/// `pusher:subscription_error`, which is its own event type that legitimately
+/// carries `channel` at top level).
+fn assert_frame_shape(ev: &ServerEvent, expected_event: &str, expected_keys: &[&str]) {
+    let wire = crate::protocol::v7::frames::encode(ev);
+    let j: serde_json::Value = serde_json::from_str(&wire).expect("wire frame must be valid JSON");
+    assert_eq!(j["event"], expected_event, "wire frame: {wire}");
+    let mut got: Vec<&str> = j
+        .as_object()
+        .expect("frame must be a JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    got.sort_unstable();
+    let mut want: Vec<&str> = expected_keys.to_vec();
+    want.sort_unstable();
+    assert_eq!(
+        got, want,
+        "{expected_event} top-level keys must be exactly {want:?}, got {got:?}; frame: {wire}"
+    );
 }
 
 #[tokio::test]
@@ -181,12 +207,22 @@ async fn private_subscribe_without_auth_errors_non_fatally() {
         channel_data: None,
     })
     .await;
-    match rx.try_recv().map(|b| *b) {
-        Ok(ServerEvent::SubscriptionError {
-            channel, status, ..
-        }) => {
+    match &rx.try_recv().map(|b| *b) {
+        Ok(
+            ev @ ServerEvent::SubscriptionError {
+                channel, status, ..
+            },
+        ) => {
+            // 1.8 strict shape: subscription_error is its OWN event type and
+            // legitimately carries `channel` at top level — exactly
+            // {event, channel, data}. (pusher:error frames do NOT.)
+            assert_frame_shape(
+                ev,
+                "pusher:subscription_error",
+                &["event", "channel", "data"],
+            );
             assert_eq!(channel, "private-x");
-            assert_eq!(status, 401);
+            assert_eq!(*status, 401);
         }
         other => panic!("expected SubscriptionError, got {other:?}"),
     }
@@ -367,12 +403,14 @@ async fn client_event_rejected_when_messaging_disabled() {
         data: serde_json::json!({}),
     })
     .await;
-    match rx.try_recv().map(|b| *b) {
-        Ok(ServerEvent::ClientEventError { code, message, .. }) => {
+    match &rx.try_recv().map(|b| *b) {
+        Ok(ev @ ServerEvent::ClientEventError { code, message, .. }) => {
+            // 1.8 strict shape: exactly {event, data} — no top-level channel.
+            assert_frame_shape(ev, "pusher:error", &["event", "data"]);
             // 1.7 verification: hosted Pusher documents no code/message for this
             // class (docs only say client events "must be enabled for the
             // application") → 4301 kept deliberately; message is soketi parity.
-            assert_eq!(code, 4301);
+            assert_eq!(*code, 4301);
             assert_eq!(
                 message, "The app does not have client messaging enabled.",
                 "messaging-disabled message must stay byte-stable"
@@ -382,7 +420,8 @@ async fn client_event_rejected_when_messaging_disabled() {
     }
 }
 
-// P11 — oversize payload → 4301 (was: silent drop) + channel on client-event errors
+// P11 — oversize payload → 4301 (was: silent drop); 1.8 — pusher:error frames
+// carry NO top-level channel (strict Pusher parity).
 
 #[tokio::test]
 async fn client_event_oversize_payload_returns_4301() {
@@ -407,18 +446,15 @@ async fn client_event_oversize_payload_returns_4301() {
     })
     .await;
     // Must receive pusher:error 4301 (was: silence)
-    match rx.try_recv().map(|b| *b) {
-        Ok(ServerEvent::ClientEventError {
-            code,
-            channel,
-            message,
-        }) => {
+    match &rx.try_recv().map(|b| *b) {
+        Ok(ev @ ServerEvent::ClientEventError { code, message, .. }) => {
+            // 1.8 strict shape: exactly {event, data} — no top-level channel.
+            assert_frame_shape(ev, "pusher:error", &["event", "data"]);
             // 1.7 verification: hosted Pusher documents no code/message for the
             // oversize-data class (neither the protocol error table nor the
             // client-events page lists one) → 4301 kept deliberately; message
             // is Pylon's own and pinned byte-stable.
-            assert_eq!(code, 4301, "oversize payload must return 4301");
-            assert_eq!(channel, "private-x", "error frame must carry the channel");
+            assert_eq!(*code, 4301, "oversize payload must return 4301");
             assert_eq!(
                 message, "Client event rejected - the data is too large",
                 "oversize-payload message must stay byte-stable"
@@ -429,8 +465,10 @@ async fn client_event_oversize_payload_returns_4301() {
 }
 
 #[tokio::test]
-async fn client_event_messaging_disabled_error_carries_channel() {
-    // The 4301 for messaging-disabled must carry the `channel` field (soketi parity).
+async fn client_event_messaging_disabled_error_frame_has_no_channel() {
+    // 1.8 (P8): the 4301 for messaging-disabled must encode to EXACTLY
+    // {"event":"pusher:error","data":{...}} — the protocol defines no
+    // top-level `channel` on pusher:error.
     let (mut c, mut rx) = ctx(app_with_client_messages(false));
     c.dispatch(ClientCommand::ClientEvent {
         event: "client-x".into(),
@@ -438,23 +476,16 @@ async fn client_event_messaging_disabled_error_carries_channel() {
         data: serde_json::json!({}),
     })
     .await;
-    match rx.try_recv().map(|b| *b) {
-        Ok(ServerEvent::ClientEventError {
-            code,
-            channel,
-            message,
-        }) => {
-            assert_eq!(code, 4301);
-            assert_eq!(
-                channel, "private-x",
-                "messaging-disabled 4301 must carry channel"
-            );
+    match &rx.try_recv().map(|b| *b) {
+        Ok(ev @ ServerEvent::ClientEventError { code, message, .. }) => {
+            assert_frame_shape(ev, "pusher:error", &["event", "data"]);
+            assert_eq!(*code, 4301);
             assert_eq!(
                 message, "The app does not have client messaging enabled.",
                 "messaging-disabled message must stay byte-stable"
             );
         }
-        other => panic!("expected ClientEventError with channel, got {other:?}"),
+        other => panic!("expected ClientEventError 4301, got {other:?}"),
     }
 }
 
@@ -1741,18 +1772,15 @@ async fn client_event_oversize_name_returns_4301_and_does_not_broadcast() {
         .await;
 
     // Sender must receive a 4301 ClientEventError.
-    match rx_sender.try_recv().map(|b| *b) {
-        Ok(ServerEvent::ClientEventError {
-            code,
-            channel: ch,
-            message,
-        }) => {
+    match &rx_sender.try_recv().map(|b| *b) {
+        Ok(ev @ ServerEvent::ClientEventError { code, message, .. }) => {
+            // 1.8 strict shape: exactly {event, data} — no top-level channel.
+            assert_frame_shape(ev, "pusher:error", &["event", "data"]);
             // 1.7 verification: hosted Pusher documents no code/message for the
             // oversize-name class (the protocol page only requires the
             // `client-` prefix) → 4301 kept deliberately; message is soketi
             // parity with the default max_event_name_length of 200.
-            assert_eq!(code, 4301, "oversize event name must return 4301 (P16)");
-            assert_eq!(ch, channel, "error must carry the channel name");
+            assert_eq!(*code, 4301, "oversize event name must return 4301 (P16)");
             assert_eq!(
                 message, "Event name is too long. Maximum allowed size is 200.",
                 "oversize-name message must stay byte-stable"
@@ -2015,18 +2043,14 @@ async fn client_event_rate_limit_returns_4301_and_drops() {
     // Sender must have received exactly one 4301 ClientEventError.
     let mut rate_errors = 0;
     while let Ok(ev) = rx_sender.try_recv().map(|b| *b) {
-        if let ServerEvent::ClientEventError {
-            code,
-            channel: ch,
-            message,
-        } = ev
-        {
+        if let ServerEvent::ClientEventError { code, message, .. } = &ev {
+            // 1.8 strict shape: exactly {event, data} — no top-level channel.
+            assert_frame_shape(&ev, "pusher:error", &["event", "data"]);
             // 1.7 verification: hosted Pusher's protocol error table documents
             // exactly one client-event code — "4301: Client event rejected due
             // to rate limit" — so code AND message are pinned byte-identical
             // to that row (no trailing period).
-            assert_eq!(code, 4301, "rate-limit error must be code 4301");
-            assert_eq!(ch, channel, "error must carry the channel name");
+            assert_eq!(*code, 4301, "rate-limit error must be code 4301");
             assert_eq!(
                 message, "Client event rejected due to rate limit",
                 "rate-limit message must match the documented 4301 row verbatim"

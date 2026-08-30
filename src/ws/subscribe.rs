@@ -387,7 +387,6 @@ impl ConnectionContext {
         // frames is surfaced to app error handlers without disconnecting.
         if !self.app.client_messages_enabled {
             self.send_self(ServerEvent::ClientEventError {
-                channel,
                 code: 4301,
                 message: "The app does not have client messaging enabled.".into(),
             });
@@ -406,7 +405,6 @@ impl ConnectionContext {
         if event.len() > self.limits.max_event_name_length {
             let max = self.limits.max_event_name_length;
             self.send_self(ServerEvent::ClientEventError {
-                channel,
                 code: 4301,
                 message: format!("Event name is too long. Maximum allowed size is {max}."),
             });
@@ -416,7 +414,6 @@ impl ConnectionContext {
         if serde_json::to_string(&data).map_or(0, |s| s.len()) > self.limits.max_event_payload_bytes
         {
             self.send_self(ServerEvent::ClientEventError {
-                channel,
                 code: 4301,
                 message: "Client event rejected - the data is too large".into(),
             });
@@ -434,7 +431,6 @@ impl ConnectionContext {
         // window is exhausted (Pusher parity: 10 client events/sec/connection).
         if !self.client_event_rate.check() {
             self.send_self(ServerEvent::ClientEventError {
-                channel,
                 code: 4301,
                 message: "Client event rejected due to rate limit".to_string(),
             });
