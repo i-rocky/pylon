@@ -21,6 +21,15 @@ impl ConnectionContext {
         // Per-connection subscription cap: reject new subscriptions once the limit
         // is reached. `0` means unlimited. Checked after the idempotency guard so
         // re-subscribing an already-held channel is always exempt and never errors.
+        //
+        // P10: hosted Pusher documents NO per-connection subscription limit (checked
+        // 2026-08-30 — channels doc + WS protocol reference are both silent; Pusher's
+        // limits FAQ only covers channels per app). This cap is therefore a
+        // deliberate pylon-specific memory guard, NOT parity: each subscription
+        // holds server-side state, so an uncapped connection could grow memory
+        // without bound. Rejection is non-fatal (`pusher:subscription_error`,
+        // LimitReached/4004 — connection stays open). Documented in
+        // website/docs/user-guide/channels.md, "Per-connection subscription cap".
         let cap = self.limits.max_subscriptions_per_connection;
         if cap != 0 && self.subscribed.len() >= cap {
             return self.send_subscription_error(

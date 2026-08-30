@@ -106,6 +106,28 @@ channel.bind("stats-updated", (data) => render(data));
 
 ---
 
+## Per-connection subscription cap
+
+A single connection may hold at most 200 simultaneous channel subscriptions, configurable with
+`PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION` (set `0` to disable the cap). A subscribe that would exceed
+the cap is rejected with a non-fatal `pusher:subscription_error` (`LimitReached`, status `4004`) —
+the connection stays open and every subscription already held remains live. Re-subscribing to a
+channel the connection already holds is exempt from the cap and never errors.
+
+This is a deliberate pylon-specific resource guard, not Pusher parity. Hosted Pusher documents no
+per-connection subscription limit: the [channels doc][pusher-channels] and the
+[WebSocket protocol reference][pusher-protocol] specify no cap on subscriptions per connection, and
+Pusher's limits FAQ only states there is no restriction on the number of channels per app —
+subscriptions are multiplexed over one connection. Pylon needs the cap because every subscription
+holds server-side state (registry membership, presence rosters, per-channel bookkeeping), so an
+uncapped connection could grow memory without bound. The default of 200 comfortably exceeds what a
+well-behaved client uses while bounding per-connection memory.
+
+[pusher-channels]: https://pusher.com/docs/channels/using_channels/channels/
+[pusher-protocol]: https://pusher.com/docs/channels/library_auth_reference/pusher-websockets-protocol/
+
+---
+
 ## Subscription count events
 
 When the app has `subscription_count_enabled` set (via the REST `info` parameter), Pylon can
