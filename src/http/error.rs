@@ -28,6 +28,16 @@ impl RestError {
             message: message.into(),
         }
     }
+    /// R10: a matched path with an unsupported method. Rendered by the
+    /// router-wide `method_not_allowed_fallback` (src/server/router.rs), so a
+    /// 405 carries the same JSON shape as every other REST error. Pusher's
+    /// docs say nothing about wrong-method bodies — the wording is ours.
+    pub fn method_not_allowed(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::METHOD_NOT_ALLOWED,
+            message: message.into(),
+        }
+    }
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -127,6 +137,7 @@ mod tests {
             (RestError::unauthorized("no"), 401),
             (RestError::forbidden("app is disabled"), 403),
             (RestError::not_found("gone"), 404),
+            (RestError::method_not_allowed("no"), 405),
             (RestError::payload_too_large("big"), 413),
             (RestError::service_unavailable("busy"), 503),
         ] {
@@ -185,6 +196,10 @@ mod tests {
             StatusCode::PAYLOAD_TOO_LARGE
         );
         assert_eq!(RestError::not_found("x").status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            RestError::method_not_allowed("x").status,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
         assert_eq!(
             RestError::service_unavailable("x").status,
             StatusCode::SERVICE_UNAVAILABLE

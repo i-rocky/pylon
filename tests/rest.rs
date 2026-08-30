@@ -1887,15 +1887,12 @@ async fn rest_unknown_route_is_json_404() {
     assert_fallback_404(resp).await;
 }
 
-/// A wrong method on a VALID path (`DELETE /apps/{id}/channels/{name}`) is
-/// answered by axum's MethodRouter with **405** — a method mismatch does NOT
-/// flow through the router fallback, so it keeps axum's default empty body.
-///
-/// Deliberate, documented decision (R10 scope): Pusher's REST docs define the
-/// JSON error shape for handler-level 4xx errors and say nothing about
-/// wrong-method requests; covering 405 would require a per-route
-/// `MethodRouter::fallback` on every route. This test pins the honest current
-/// behavior — 405 with an empty body — so it is intentional, not accidental.
+/// A wrong method on a VALID path is a **405**, and — like every other REST
+/// error (Task 2.2's class) — it renders the Pusher JSON shape. axum's
+/// MethodRouter does NOT send method mismatches through the router fallback;
+/// they are answered by `Router::method_not_allowed_fallback`, wired once in
+/// `build_router` for all registered routes. Pusher's REST docs say nothing
+/// about wrong-method bodies, so the `Method not allowed` wording is ours.
 #[tokio::test]
 async fn rest_wrong_method_on_valid_path_is_405() {
     let addr = spawn().await;
@@ -1909,9 +1906,32 @@ async fn rest_wrong_method_on_valid_path_is_405() {
         405,
         "a matched path with an unsupported method must be 405, not 404"
     );
-    let body = resp.text().await.unwrap();
-    assert!(
-        body.is_empty(),
-        "405 keeps axum's default empty body (documented non-goal of R10), got: {body}"
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        content_type, "application/json",
+        "405 must be application/json, got: {content_type}"
+    );
+    assert_eq!(
+        resp.text().await.unwrap(),
+        r#"{"error":"Method not allowed","status":405}"#,
+        "405 must carry the Pusher JSON error shape"
+    );
+
+    // The router-wide wiring must cover EVERY route plane, not just the REST
+    // endpoints: a wrong method on a probe route 405s in the same JSON shape.
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 405);
+    assert_eq!(
+        resp.text().await.unwrap(),
+        r#"{"error":"Method not allowed","status":405}"#
     );
 }

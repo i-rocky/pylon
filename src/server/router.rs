@@ -63,17 +63,24 @@ impl AppState {
 ///   request to an unknown path still gets the JSON 404.
 /// * Handler-level 404s (e.g. the admin API's disabled 404) are unaffected:
 ///   they render the same shape through `RestError::not_found` on their own.
-/// * A wrong METHOD on a matched path is NOT routed here: axum's MethodRouter
-///   answers 405 directly (with an empty body). Pusher's REST docs define the
-///   JSON error shape for handler-level 4xx only and say nothing about
-///   wrong-method requests, so 405 is deliberately left as axum's default —
-///   covering it would need a per-route `MethodRouter::fallback` on every
-///   route. Pinned by `rest_wrong_method_on_valid_path_is_405`.
 /// * The WS plane is unaffected: the per-core worker answers WS upgrades
 ///   (including bad-path 4005 rejects) before the REST handoff, so those never
 ///   reach this router.
 async fn not_found_fallback() -> crate::http::error::RestError {
     crate::http::error::RestError::not_found("Not found")
+}
+
+/// R10: a matched path with an unsupported METHOD renders the same JSON shape
+/// with 405 (`{"error":"Method not allowed","status":405}`). A method mismatch
+/// does NOT flow through the router fallback — axum's `MethodRouter` answers it
+/// — so this is wired via `Router::method_not_allowed_fallback`, which applies
+/// one handler to every registered route (axum 0.8; it only touches routes
+/// added BEFORE the call, hence the position after `merge`). It replaces each
+/// `MethodRouter`'s DEFAULT 405 (empty body) without touching valid-method
+/// routing. Pusher's docs say nothing about wrong-method bodies; the wording
+/// follows the "every REST error is JSON" bar (Task 2.2's class).
+async fn method_not_allowed_fallback() -> crate::http::error::RestError {
+    crate::http::error::RestError::method_not_allowed("Method not allowed")
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -89,5 +96,6 @@ pub fn build_router(state: AppState) -> Router {
     let router = Router::new().route("/", get(crate::http::root));
     crate::http::rest::merge(router, body_limit)
         .fallback(not_found_fallback)
+        .method_not_allowed_fallback(method_not_allowed_fallback)
         .with_state(state)
 }
