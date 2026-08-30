@@ -50,6 +50,12 @@ async fn spawn() -> SocketAddr {
 
 /// [`spawn`] with a custom apps.json fixture (e.g. [`APPS_WITH_DISABLED`]).
 async fn spawn_with_apps(apps_json: &str) -> SocketAddr {
+    spawn_configured(apps_json, |_| {}).await
+}
+
+/// [`spawn_with_apps`] plus a [`ServerConfig`] tuning hook — e.g. a short
+/// `cache_ttl_secs` for expired-cache tests.
+async fn spawn_configured(apps_json: &str, with: impl FnOnce(&mut ServerConfig)) -> SocketAddr {
     use std::sync::atomic::AtomicBool;
 
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(apps_json).unwrap());
@@ -68,12 +74,13 @@ async fn spawn_with_apps(apps_json: &str) -> SocketAddr {
         l.local_addr().unwrap().port()
     };
     // One worker keeps subscribe/broadcast ordering a single sequential stream.
-    let config = ServerConfig {
+    let mut config = ServerConfig {
         bind: "127.0.0.1".into(),
         port,
         workers: 1,
         ..ServerConfig::default()
     };
+    with(&mut config);
 
     // REST handoff plane: the worker hands plain-HTTP connections to this axum
     // router via `rest_tx`; `rest::serve` drives them on the tokio runtime.
@@ -326,6 +333,108 @@ async fn rest_get_channel_subscription_count_enabled() {
     assert_eq!(
         v["subscription_count"], 1,
         "subscription_count must be 1 when flag is on, got: {v}"
+    );
+}
+
+/// R7: trigger an event on a cache channel, then GET info=cache — the response
+/// carries the doc shape `{"cache": {"data": ..., "ttl": ...}}` with the cached
+/// payload (verbatim data string) and the channel's cache TTL in seconds.
+#[tokio::test]
+async fn rest_get_channel_cache_info_returns_cached_payload() {
+    let addr = spawn().await;
+    let body = json!({"name":"my-event","data":"{\"hi\":1}","channels":["cache-feed"]}).to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let q = signed_query(
+        "GET",
+        "/apps/app1/channels/cache-feed",
+        b"",
+        &[("info", "cache")],
+    );
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/apps/app1/channels/cache-feed?{q}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["occupied"], false, "no subscriber is attached");
+    // Doc: "Cached data and TTL (in seconds) for this channel or null in case
+    // the cache is empty." — the data is the verbatim event payload string.
+    assert_eq!(v["cache"]["data"], "{\"hi\":1}", "got: {v}");
+    // The channel's cache TTL (default `cache_ttl_secs`) in seconds.
+    assert_eq!(v["cache"]["ttl"], 1800, "got: {v}");
+}
+
+/// R7: GET info=cache on a cache channel that never saw an event → the doc's
+/// empty case: `"cache": null`.
+#[tokio::test]
+async fn rest_get_channel_cache_info_null_when_cache_empty() {
+    let addr = spawn().await;
+    let q = signed_query(
+        "GET",
+        "/apps/app1/channels/cache-empty",
+        b"",
+        &[("info", "cache")],
+    );
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/apps/app1/channels/cache-empty?{q}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["occupied"], false);
+    assert!(v["cache"].is_null(), "empty cache must be null, got: {v}");
+}
+
+/// R7: after the cache TTL elapses the entry reads as empty ("null in case the
+/// cache is empty") — `cache_get` is TTL-aware on every adapter.
+#[tokio::test]
+async fn rest_get_channel_cache_info_null_after_ttl_expiry() {
+    let addr = spawn_configured(APPS, |c| c.cache_ttl_secs = 1).await;
+    let body = json!({"name":"my-event","data":"{\"hi\":1}","channels":["cache-feed"]}).to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let get = || async {
+        let q = signed_query(
+            "GET",
+            "/apps/app1/channels/cache-feed",
+            b"",
+            &[("info", "cache")],
+        );
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/apps/app1/channels/cache-feed?{q}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        resp.json::<Value>().await.unwrap()
+    };
+
+    // Fresh cache: payload present.
+    let fresh = get().await;
+    assert_eq!(fresh["cache"]["data"], "{\"hi\":1}", "got: {fresh}");
+    // Past the 1s TTL: expired reads as empty → null.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let expired = get().await;
+    assert!(
+        expired["cache"].is_null(),
+        "expired cache must be null, got: {expired}"
     );
 }
 

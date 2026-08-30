@@ -1,5 +1,6 @@
 //! GET /apps/{app_id}/channels and /channels/{name}.
 
+use crate::channel::kind::ChannelInfo;
 use crate::http::error::RestError;
 use crate::http::rest::auth::authenticate;
 use crate::server::router::AppState;
@@ -78,6 +79,23 @@ pub async fn get_channel(
         if let Some(uc) = s.user_count {
             out.insert("user_count".into(), uc.into());
         }
+    }
+    // Pusher info-attributes table: `cache` — Cache channels only — "Cached
+    // data and TTL (in seconds) for this channel or null in case the cache is
+    // empty." `cache_get` is TTL-aware (local: lazy expiry check; redis: PX
+    // key expiry), so an expired entry already reads as the doc's empty case.
+    // The reported `ttl` is the channel's cache TTL (`cache_ttl_secs`), the
+    // same value the REST trigger cached the event with.
+    //
+    // Requesting `cache` on a non-cache channel is the inapplicable-attribute
+    // 400 (Task 2.7); until that lands the attribute is simply omitted.
+    if wants(&params, "cache") && ChannelInfo::of(&channel).cache {
+        let cached = state.adapter.cache_get(&app.id, &channel).await;
+        let v = match cached {
+            Some(e) => json!({ "data": e.data, "ttl": state.config.cache_ttl_secs }),
+            None => Value::Null,
+        };
+        out.insert("cache".into(), v);
     }
     Ok(Json(Value::Object(out)))
 }
