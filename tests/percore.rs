@@ -620,3 +620,62 @@ async fn conn_counts_and_registry_self_clean_on_last_disconnect() {
         "AppRegistry entry must be removed when the app's last connection closes"
     );
 }
+
+// ── Scenario 7: connection-path rejection (4005 / 4001) ──────────────────────
+
+/// Connect to an arbitrary request path (not just `/app/app-key`). A malformed
+/// path must still complete the 101 handshake so the server can deliver its
+/// `pusher:error` + Close rejection frames over the WebSocket (Pusher parity).
+async fn connect_path(port: u16, path: &str) -> Ws {
+    let url = format!("ws://127.0.0.1:{port}{path}");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(url),
+    )
+    .await
+    .expect("connect within 5s")
+    .expect("ws handshake")
+    .0
+}
+
+/// Assert the connection is rejected: exactly one `pusher:error` Text frame
+/// carrying `code` + `message`, followed by a WS Close with the same code.
+async fn assert_rejected_with(ws: &mut Ws, code: u16, message: &str) {
+    let frame = next_json(ws).await;
+    assert_eq!(frame["event"], "pusher:error", "frame: {frame}");
+    assert_eq!(frame["data"]["code"], code, "frame: {frame}");
+    assert_eq!(frame["data"]["message"], message, "frame: {frame}");
+    let close_code = wait_close_code(ws).await;
+    assert_eq!(
+        close_code,
+        Some(code),
+        "WS Close after pusher:error {code} must carry the same code"
+    );
+}
+
+/// A WS connection to a path that is not `/app/{key}` must be rejected with
+/// 4005 "Path not found" (NOT 4001 — that is reserved for a well-formed path
+/// with an unknown app key).
+#[tokio::test]
+async fn non_app_path_errors_4005_path_not_found() {
+    let h = spawn(ServerConfig::default()).await;
+    let mut ws = connect_path(h.port, "/nope/?protocol=7").await;
+    assert_rejected_with(&mut ws, 4005, "Path not found").await;
+}
+
+/// `/app/` with an empty key does not match the `/app/{key}` shape → 4005.
+#[tokio::test]
+async fn empty_app_key_errors_4005_path_not_found() {
+    let h = spawn(ServerConfig::default()).await;
+    let mut ws = connect_path(h.port, "/app/?protocol=7").await;
+    assert_rejected_with(&mut ws, 4005, "Path not found").await;
+}
+
+/// Regression pin: a WELL-FORMED path whose key is unknown keeps 4001 — the
+/// 4005 fix must not swallow the unknown-app case.
+#[tokio::test]
+async fn unknown_app_key_still_errors_4001() {
+    let h = spawn(ServerConfig::default()).await;
+    let mut ws = connect_path(h.port, "/app/no-such-key?protocol=7").await;
+    assert_rejected_with(&mut ws, 4001, "Could not find app by key").await;
+}

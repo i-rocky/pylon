@@ -1232,9 +1232,10 @@ fn handle_handshake(
 
             // For a dispatch worker, build the v7 session now: resolve the app,
             // check capacity, create the mailbox + ConnectionContext, and queue
-            // the connection_established frame. On a rejection (unknown app 4001,
-            // unsupported protocol 4007, over-capacity 4004) emit the `pusher:error`
-            // frame + a WS Close carrying the error code.
+            // the connection_established frame. On a rejection (malformed path
+            // 4005, unknown app 4001, unsupported protocol 4007, over-capacity
+            // 4004) emit the `pusher:error` frame + a WS Close carrying the
+            // error code.
             if let Mode::Dispatch(env) = &cfg.mode {
                 // Stamp this connection's slab token + the worker's notifier inputs
                 // into the session so a cross-connection `Mailbox::send` marks this
@@ -1250,6 +1251,25 @@ fn handle_handshake(
                     Ok(c) => c,
                     Err(error) => {
                         queue_reject(entry, &Reject { error, codec: None }, now_ns);
+                        let _ = flush_and_arm(poll, entry, now_ns);
+                        return Action::Close;
+                    }
+                };
+                // 4005 "Path not found": the path must match the `/app/{key}`
+                // shape (non-empty single-segment key) BEFORE any app lookup —
+                // Pusher reserves 4001 for a well-formed path with an UNKNOWN
+                // key (see the protocol's error-code table).
+                let app_key = match app_key {
+                    Some(key) => key,
+                    None => {
+                        queue_reject(
+                            entry,
+                            &Reject {
+                                error: PusherError::path_not_found(),
+                                codec: Some(codec),
+                            },
+                            now_ns,
+                        );
                         let _ = flush_and_arm(poll, entry, now_ns);
                         return Action::Close;
                     }
@@ -1504,12 +1524,20 @@ fn queue_reject(entry: &mut Entry, reject: &Reject, now_ns: u64) {
 
 /// Split a `/app/{key}` path (with an optional `?protocol=N&...` query) into the
 /// app key and the `protocol` query value.
-fn parse_app_path(path: &str) -> (String, Option<String>) {
+///
+/// The key is `None` when the path does not match the single-segment
+/// `/app/{key}` shape — no `/app/` prefix, an empty key, or a multi-segment
+/// key. Callers reject those with 4005 "Path not found" (Pusher parity);
+/// 4001 stays reserved for a well-formed path with an unknown key.
+fn parse_app_path(path: &str) -> (Option<String>, Option<String>) {
     let (raw_path, query) = match path.split_once('?') {
         Some((p, q)) => (p, Some(q)),
         None => (path, None),
     };
-    let key = raw_path.strip_prefix("/app/").unwrap_or("").to_string();
+    let key = raw_path
+        .strip_prefix("/app/")
+        .filter(|k| !k.is_empty() && !k.contains('/'))
+        .map(str::to_string);
     let protocol = query.and_then(|q| {
         q.split('&').find_map(|pair| {
             let (k, v) = pair.split_once('=')?;
@@ -2728,15 +2756,36 @@ mod tests {
     fn parse_app_path_extracts_key_and_protocol() {
         assert_eq!(
             parse_app_path("/app/app-key?protocol=7"),
-            ("app-key".to_string(), Some("7".to_string()))
+            (Some("app-key".to_string()), Some("7".to_string()))
         );
         assert_eq!(
             parse_app_path("/app/app-key"),
-            ("app-key".to_string(), None)
+            (Some("app-key".to_string()), None)
         );
         assert_eq!(
             parse_app_path("/app/k?foo=1&protocol=7&bar=2"),
-            ("k".to_string(), Some("7".to_string()))
+            (Some("k".to_string()), Some("7".to_string()))
         );
+    }
+
+    #[test]
+    fn parse_app_path_rejects_non_app_shapes_with_none() {
+        // No `/app/` prefix → 4005, not an empty-key app lookup (4001).
+        assert_eq!(
+            parse_app_path("/nope/?protocol=7"),
+            (None, Some("7".to_string()))
+        );
+        // Empty key → 4005.
+        assert_eq!(
+            parse_app_path("/app/?protocol=7"),
+            (None, Some("7".to_string()))
+        );
+        // Multi-segment key (a `/` inside the key) → 4005.
+        assert_eq!(
+            parse_app_path("/app/a/b?protocol=7"),
+            (None, Some("7".to_string()))
+        );
+        // No path at all → 4005.
+        assert_eq!(parse_app_path("/"), (None, None));
     }
 }

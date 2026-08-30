@@ -21,6 +21,12 @@ impl PusherError {
     pub fn over_capacity() -> Self {
         Self::new(4004, "App connection limit reached")
     }
+    /// Malformed connection path (not the `/app/{key}` shape, e.g. an empty
+    /// key). Kept distinct from 4001, which is reserved for a well-formed path
+    /// whose app key is unknown.
+    pub fn path_not_found() -> Self {
+        Self::new(4005, "Path not found")
+    }
     pub fn invalid_version() -> Self {
         Self::new(4006, "Invalid version string format")
     }
@@ -47,6 +53,8 @@ mod tests {
     fn constructors_carry_spec_codes() {
         assert_eq!(PusherError::app_not_found().code, 4001);
         assert_eq!(PusherError::over_capacity().code, 4004);
+        assert_eq!(PusherError::path_not_found().code, 4005);
+        assert_eq!(PusherError::path_not_found().message, "Path not found");
         assert_eq!(PusherError::invalid_version().code, 4006);
         assert_eq!(PusherError::unsupported_protocol().code, 4007);
         assert_eq!(PusherError::no_protocol().code, 4008);

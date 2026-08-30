@@ -5,8 +5,10 @@
 //! HTTP request head out of the connection's initial bytes. This module is the
 //! pure, socket-free logic that decides what that head *is*:
 //!
-//! * a WebSocket upgrade on `/app/{key}` → [`HeadResult::WsUpgrade`], for which
-//!   the worker replies with [`accept_response`] and keeps the connection; or
+//! * a WebSocket upgrade (any path — a wrong path still completes the 101 and
+//!   is rejected with 4005 "Path not found" by the worker's path parsing) →
+//!   [`HeadResult::WsUpgrade`], for which the worker replies with
+//!   [`accept_response`] and keeps the connection; or
 //! * any other complete HTTP request (the REST API `/apps/...`) →
 //!   [`HeadResult::Rest`], which the worker hands off to the tokio/axum control
 //!   plane (replaying the consumed head bytes).
@@ -41,9 +43,13 @@ pub enum HeadResult {
 /// A WS upgrade is: method `GET`, an `Upgrade: websocket` header
 /// (case-insensitive), a `Connection: Upgrade` header (case-insensitive, may be
 /// a comma list), a `Sec-WebSocket-Version: 13` header, and a
-/// `Sec-WebSocket-Key` header. Path must start with `/app/`. Anything else
-/// complete is [`HeadResult::Rest`]. An incomplete head is
-/// [`HeadResult::NeedMore`].
+/// `Sec-WebSocket-Key` header. The path may be anything: a WS client targeting
+/// a path that is not the `/app/{key}` shape still completes the 101 here and
+/// is rejected by the worker with 4005 "Path not found" (Pusher parity). A
+/// `GET` targeting `/app/...` whose upgrade headers are missing or malformed is
+/// a bad upgrade, not a REST request. Anything else complete (any non-GET
+/// method, or a plain GET without the upgrade header set) is
+/// [`HeadResult::Rest`]. An incomplete head is [`HeadResult::NeedMore`].
 pub fn read_head(buf: &[u8]) -> HeadResult {
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = httparse::Request::new(&mut headers);
@@ -57,16 +63,16 @@ pub fn read_head(buf: &[u8]) -> HeadResult {
     let method = req.method.unwrap_or("");
     let path = req.path.unwrap_or("");
 
-    // Only `GET /app/...` is a candidate for a WebSocket upgrade. Everything
-    // else complete is REST and is handed off verbatim to the control plane.
-    let looks_like_ws_target = method == "GET" && path.starts_with("/app/");
-    if !looks_like_ws_target {
+    // Only `GET` can be a WebSocket upgrade (RFC 6455 §4.2.1). Everything else
+    // complete is REST and is handed off verbatim to the control plane.
+    if method != "GET" {
         return HeadResult::Rest { consumed };
     }
 
-    // From here the request targets `/app/...` with GET, so the client is
-    // *trying* to open a WebSocket. If the upgrade headers are missing or
-    // malformed it's a bad upgrade, not a REST request.
+    // From here the request is a GET, so the client may be *trying* to open a
+    // WebSocket. Whether it succeeds depends only on the upgrade headers — a
+    // WS client with a wrong path (e.g. `/nope/`) still deserves the 101 + a
+    // protocol-level 4005 rejection rather than an opaque REST 404.
     let mut upgrade_ok = false;
     let mut connection_upgrade = false;
     let mut version_ok = false;
@@ -106,7 +112,11 @@ pub fn read_head(buf: &[u8]) -> HeadResult {
             key,
             path: path.to_owned(),
         },
-        _ => HeadResult::Bad("invalid websocket upgrade"),
+        // A GET targeting `/app/...` with broken upgrade headers is a bad
+        // upgrade (the client clearly wanted a WebSocket), not a REST request.
+        _ if path.starts_with("/app/") => HeadResult::Bad("invalid websocket upgrade"),
+        // A plain GET (no complete WS-upgrade header set) elsewhere is REST.
+        _ => HeadResult::Rest { consumed },
     }
 }
 
@@ -208,6 +218,42 @@ mod tests {
     #[test]
     fn parses_rest_request() {
         let req = b"POST /apps/app/events HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(
+            read_head(req),
+            HeadResult::Rest {
+                consumed: req.len()
+            }
+        );
+    }
+
+    /// 3b. A WS upgrade to a path outside `/app/{key}` is STILL a `WsUpgrade`:
+    /// the 101 completes and the worker rejects the path with 4005 (Pusher
+    /// parity) — the client asked for a WebSocket, so it gets a
+    /// protocol-level rejection, not a REST handoff.
+    #[test]
+    fn ws_upgrade_off_app_path_still_upgrades() {
+        let req = b"GET /nope/?protocol=7 HTTP/1.1\r\n\
+            Host: example.com\r\n\
+            Upgrade: websocket\r\n\
+            Connection: Upgrade\r\n\
+            Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+            Sec-WebSocket-Version: 13\r\n\
+            \r\n";
+        assert_eq!(
+            read_head(req),
+            HeadResult::WsUpgrade {
+                key: "dGhlIHNhbXBsZSBub25jZQ==".to_owned(),
+                path: "/nope/?protocol=7".to_owned(),
+            }
+        );
+    }
+
+    /// 3c. A plain GET (no complete WS-upgrade header set) to a non-`/app/`
+    /// path stays REST — health checks / metrics probes are unaffected by the
+    /// 4005 path rejection.
+    #[test]
+    fn plain_get_off_app_path_is_rest() {
+        let req = b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n";
         assert_eq!(
             read_head(req),
             HeadResult::Rest {
