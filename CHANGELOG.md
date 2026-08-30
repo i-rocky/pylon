@@ -141,3 +141,15 @@ pre-1.0 and versions track `Cargo.toml`.
 - **`pylon_drophead_dropped_total`** (G8): drop-head frame evictions are now
   observable in `/metrics` alongside the CoDel counter (three CoDel fold gaps
   closed too).
+
+### Phase 4 — Features the docs promised (audit remediation)
+
+#### Added
+- **Redis 7 sharded pub/sub is real** (D1): `PYLON_REDIS_SHARDED_PUBSUB=1` now selects
+  SSUBSCRIBE/SPUBLISH across every adapter subscribe/publish path (previously a
+  documented knob with zero effect). All nodes must share the flag; wired into CI.
+- **Per-app capacity is enforced cluster-wide** (D2): Redis admission (atomic
+  `ADMIT_APP_LUA` cap-check), node-guarded release, sweeper reclaim of dead nodes'
+  counts (with retry), bridge fail-open on unavailability, and heartbeat re-seeding
+  of a node's counts after a long Redis outage (self-heal). Docs describe the real
+  semantics including the ~55s worst-case reclaim timing.
