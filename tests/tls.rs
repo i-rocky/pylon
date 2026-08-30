@@ -18,6 +18,7 @@ use pylon::webhook::WebhookHandle;
 use rcgen::generate_simple_self_signed;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
@@ -677,6 +678,178 @@ async fn rest_large_response_over_native_tls() {
     println!(
         "[rest_large_response_over_native_tls] channels={n}, body_size={body_len}B ({:.1}KB)",
         body_len as f64 / 1024.0,
+    );
+
+    let _ = std::fs::remove_file(&cert_path);
+    let _ = std::fs::remove_file(&key_path);
+}
+
+// ── Pipelined / multi-record request test (G4 regression) ──────────────────────
+
+/// A raw rustls client over a blocking std TCP stream. No async client in
+/// between, so the test controls exactly when (and how much) ciphertext hits
+/// the wire — record boundaries are the ones the test writes.
+struct RawTlsClient {
+    conn: rustls::ClientConnection,
+    sock: std::net::TcpStream,
+}
+
+impl RawTlsClient {
+    /// Connect to `port` and drive the TLS handshake to completion.
+    fn connect(port: u16, cert_der: &[u8]) -> Self {
+        let cfg = tls_client_config(cert_der);
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+        let mut conn = rustls::ClientConnection::new(cfg, name).expect("client connection");
+        let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).expect("tcp connect");
+        // Short read timeout: makes handshake/response polling non-blocking-ish
+        // while keeping writes simple (blocking, always complete).
+        sock.set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        while conn.is_handshaking() {
+            if conn.wants_write() {
+                conn.write_tls(&mut sock).expect("client flight write");
+            }
+            match conn.read_tls(&mut sock) {
+                Ok(0) => panic!("server closed during TLS handshake"),
+                Ok(_) => {
+                    conn.process_new_packets().expect("client TLS state");
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => panic!("client read_tls failed: {e}"),
+            }
+        }
+        // Flush anything still queued (e.g. the client Finished).
+        while conn.wants_write() {
+            conn.write_tls(&mut sock).expect("client final write");
+        }
+        Self { conn, sock }
+    }
+
+    /// Write `bytes` through the TLS session, fully (one `write_all` may span
+    /// several TLS records; a blocking socket accepts them all).
+    fn send(&mut self, bytes: &[u8]) {
+        self.conn
+            .writer()
+            .write_all(bytes)
+            .expect("buffer request plaintext");
+        while self.conn.wants_write() {
+            self.conn.write_tls(&mut self.sock).expect("wire write");
+        }
+    }
+
+    /// One non-blocking-ish pass: ingest whatever ciphertext is currently
+    /// readable and pull any plaintext it decrypted into `out`. Returns
+    /// whether anything was ingested.
+    fn read_available(&mut self, out: &mut Vec<u8>) -> bool {
+        let mut chunk = [0u8; 16 * 1024];
+        let mut got = false;
+        loop {
+            match self.conn.read_tls(&mut self.sock) {
+                Ok(0) => return got,
+                Ok(_) => {
+                    got = true;
+                    self.conn.process_new_packets().expect("client TLS state");
+                    loop {
+                        match self.conn.reader().read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => out.extend_from_slice(&chunk[..n]),
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(e) => panic!("client plaintext read: {e}"),
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return got,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => panic!("client read_tls failed: {e}"),
+            }
+        }
+    }
+}
+
+/// Count complete "HTTP/1.1 200" status lines in a raw response stream.
+fn count_200s(bytes: &[u8]) -> usize {
+    const STATUS: &[u8] = b"HTTP/1.1 200";
+    bytes.windows(STATUS.len()).filter(|w| *w == STATUS).count()
+}
+
+/// G4: two HTTP requests written back-to-back over ONE TLS connection through
+/// the REST handoff, the second big enough that its ciphertext bursts well past
+/// the ~4 KiB chunk `read_tls` ingests per call. Pre-fix,
+/// `TlsRestStream::poll_read` processed only that first chunk and silently
+/// dropped the rest of the socket read, so the second request's stream
+/// corrupted (hang / parse error) and it was never answered. Post-fix every
+/// record in the buffer is processed and both requests get 200s.
+///
+/// Request 1 is sent alone first and fully answered while the socket is quiet,
+/// so request 2's burst is read exclusively by the `TlsRestStream` under test
+/// (the mio worker's head-peek only ever saw request 1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rest_pipelined_requests_over_native_tls() {
+    let (cert_der, cert_path, key_path) = gen_cert();
+    let harness = spawn_tls_server(&cert_path, &key_path).await;
+    let port = harness.port;
+
+    // Request 1: a small GET (single small TLS record).
+    let get_path = format!("/apps/{APP_ID}/channels");
+    let get_q = tls_signed_query("GET", &get_path, &[]);
+    let req1 = format!(
+        "GET {get_path}?{get_q} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n"
+    );
+
+    // Request 2: a POST whose ~9 KiB body keeps it just under the app's 10 KiB
+    // event cap (so the answer is a 200) while its wire size still bursts far
+    // past the ~4 KiB `read_tls` chunk — the exact loss window of G4.
+    let big: String = "x".repeat(9 * 1024);
+    let body = json!({"name":"g4-pipelined","channels":[CHANNEL],"data":big}).to_string();
+    let post_path = format!("/apps/{APP_ID}/events");
+    let post_q = tls_signed_query("POST", &post_path, body.as_bytes());
+    let req2 = format!(
+        "POST {post_path}?{post_q} HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+
+    // The raw client drives a blocking socket — keep it off the async workers.
+    let seen = tokio::task::spawn_blocking(move || {
+        let mut client = RawTlsClient::connect(port, &cert_der);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+
+        client.send(req1.as_bytes());
+        let mut seen = Vec::new();
+        while count_200s(&seen) < 1 && std::time::Instant::now() < deadline {
+            client.read_available(&mut seen);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            count_200s(&seen),
+            1,
+            "request 1 must be answered first, got:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+
+        client.send(req2.as_bytes());
+        while count_200s(&seen) < 2 && std::time::Instant::now() < deadline {
+            client.read_available(&mut seen);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        seen
+    })
+    .await
+    .expect("blocking wire driver");
+
+    let n200 = count_200s(&seen);
+    assert_eq!(
+        n200,
+        2,
+        "BOTH pipelined requests must be answered (got {n200}):\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+    // Sanity: the POST's response body fully arrived — `/events` answers `{}`.
+    let text = String::from_utf8_lossy(&seen);
+    assert!(
+        text.trim_end().ends_with("{}"),
+        "POST /events response must end with its complete JSON body, got:\n{text}"
     );
 
     let _ = std::fs::remove_file(&cert_path);
