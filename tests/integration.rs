@@ -822,6 +822,97 @@ async fn parameterless_close_is_echoed_with_1000() {
             "expected Close(1000) echo for a parameterless Close, got {}",
             cf.code
         ),
-        other => panic!("expected Close(1000) echo before teardown, got {other:?}"),
+        other => panic!("expected Close(1000) echo for a parameterless Close, got {other:?}"),
     }
+}
+
+// ── P3 parity tests — invalid UTF-8 text messages (RFC 6455 §8.1) ───────────
+
+/// Assert the connection is torn down after a fatal Close: the stream must
+/// end (EOF or a transport error) with no further data frame after the Close.
+async fn assert_stream_ends_after_close(ws: &mut Ws) {
+    let tail = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await;
+    match tail {
+        Ok(None) | Ok(Some(Err(_))) | Err(_) => {} // stream ended / errored: torn down
+        Ok(Some(Ok(msg))) => panic!("connection must end after the fatal Close, got {msg:?}"),
+    }
+}
+
+/// P3 / RFC 6455 §8.1: a Text frame whose payload is not valid UTF-8 must fail
+/// the CONNECTION — a WebSocket Close carrying code 1007 (invalid frame payload
+/// data). 1007 is a WS-level failure, not a Pusher protocol error, so no
+/// `pusher:error` text frame may precede the Close: the Close must be the very
+/// first frame the client receives, and the connection must be torn down.
+#[tokio::test]
+async fn non_utf8_text_frame_closes_1007() {
+    let addr = spawn(ServerConfig::default()).await;
+    let mut ws = connect(addr, "?protocol=7").await;
+    let _ = established_socket_id(&mut ws).await;
+
+    // A raw Text frame with a payload that can never be valid UTF-8 (0xFF is
+    // not a valid UTF-8 byte at all). Sent as a raw frame so the client
+    // library's own UTF-8 validation does not reject it first.
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(vec![0xFF, 0xFE], WsOpCode::Data(WsData::Text), true),
+    )
+    .await;
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        .await
+        .expect("a frame within 5s")
+        .expect("stream open");
+    match first {
+        // Receiving the Close as the first frame also proves no pusher:error
+        // frame was emitted for this WS-level failure.
+        Ok(Message::Close(Some(cf))) => assert_eq!(
+            u16::from(cf.code),
+            1007,
+            "expected Close(1007) for non-UTF-8 text, got {}",
+            cf.code
+        ),
+        other => panic!("expected Close(1007) on non-UTF-8 text frame, got {other:?}"),
+    }
+    assert_stream_ends_after_close(&mut ws).await;
+}
+
+/// P3 / RFC 6455 §8.1 + §5.4: the UTF-8 validity check runs on the ASSEMBLED
+/// payload of a fragmented text message. A message whose fragments reassemble
+/// into invalid UTF-8 (here: an incomplete 3-byte sequence followed by 0xFF)
+/// must fail the connection with Close 1007 once the FIN=1 Continuation
+/// completes it — with no `pusher:error` frame and teardown afterwards.
+#[tokio::test]
+async fn fragmented_non_utf8_text_closes_1007() {
+    let addr = spawn(ServerConfig::default()).await;
+    let mut ws = connect(addr, "?protocol=7").await;
+    let _ = established_socket_id(&mut ws).await;
+
+    // FIN=0 Text: 0xE2 0x82 is a truncated 3-byte sequence (invalid alone);
+    // FIN=1 Continuation: 0xFF can never continue any sequence. Assembled the
+    // message [0xE2, 0x82, 0xFF] is invalid UTF-8 as a WHOLE.
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(vec![0xE2, 0x82], WsOpCode::Data(WsData::Text), false),
+    )
+    .await;
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(vec![0xFF], WsOpCode::Data(WsData::Continue), true),
+    )
+    .await;
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        .await
+        .expect("a frame within 5s")
+        .expect("stream open");
+    match first {
+        Ok(Message::Close(Some(cf))) => assert_eq!(
+            u16::from(cf.code),
+            1007,
+            "expected Close(1007) for non-UTF-8 assembled text, got {}",
+            cf.code
+        ),
+        other => panic!("expected Close(1007) on non-UTF-8 assembled text, got {other:?}"),
+    }
+    assert_stream_ends_after_close(&mut ws).await;
 }

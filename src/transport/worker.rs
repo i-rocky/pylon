@@ -986,7 +986,8 @@ fn queue_ping(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u6
 /// Queue a single WebSocket Close frame (`code` + `reason`) onto `entry`'s
 /// out-queue (no flush). Shared core of every outbound Close frame: the
 /// server-initiated closes ([`send_close_reply`], [`close_fragment_violation`],
-/// the drain path) and the RFC 6455 §5.5.1 echo of a client-initiated Close.
+/// [`close_invalid_utf8`], the drain path) and the RFC 6455 §5.5.1 echo of a
+/// client-initiated Close.
 fn queue_close_frame(entry: &mut Entry, code: u16, reason: &str, now_ns: u64) {
     let mut frame_body = Vec::with_capacity(2 + reason.len());
     frame_body.extend_from_slice(&code.to_be_bytes());
@@ -1629,7 +1630,7 @@ fn dispatch_frames(
             }
             OpCode::Text => {
                 // A complete (unfragmented) message.
-                if dispatch_text_message(entry, &f.payload) == Action::Close {
+                if dispatch_text_message(poll, entry, &f.payload, now_ns) == Action::Close {
                     return Action::Close;
                 }
             }
@@ -1685,7 +1686,7 @@ fn dispatch_frames(
                             // Message complete: dispatch the assembled payload
                             // through the normal Text path (`fragment` stays
                             // `None`).
-                            if dispatch_text_message(entry, &buf) == Action::Close {
+                            if dispatch_text_message(poll, entry, &buf, now_ns) == Action::Close {
                                 return Action::Close;
                             }
                         } else {
@@ -1728,18 +1729,22 @@ fn dispatch_frames(
 }
 
 /// Dispatch one complete (reassembled or unfragmented) text payload through
-/// the v7 codec. Returns `Action::Close` only when the session is gone;
-/// malformed payloads (non-UTF-8, undecodable) are dropped silently, matching
-/// the pre-fragmentation behavior.
-fn dispatch_text_message(entry: &mut Entry, payload: &[u8]) -> Action {
+/// the v7 codec. Returns `Action::Close` when the session is gone or the
+/// payload is not valid UTF-8 (RFC 6455 §8.1 → Close 1007 via
+/// [`close_invalid_utf8`]); payloads that are valid UTF-8 but undecodable by
+/// the codec are dropped silently, matching the pre-fragmentation behavior.
+fn dispatch_text_message(poll: &Poll, entry: &mut Entry, payload: &[u8], now_ns: u64) -> Action {
+    // RFC 6455 §8.1: a Text message (unfragmented frame or assembled
+    // fragments) that is not valid UTF-8 is a fatal framing error — fail the
+    // connection, do not silently skip the message. Checked before the
+    // session borrow so the close path can take `entry` mutably.
+    let text = match std::str::from_utf8(payload) {
+        Ok(t) => t,
+        Err(_) => return close_invalid_utf8(poll, entry, now_ns),
+    };
     // The session always exists once Open on a dispatch worker.
     let Some(session) = entry.session.as_mut() else {
         return Action::Close;
-    };
-    let text = match std::str::from_utf8(payload) {
-        Ok(t) => t,
-        // A non-UTF-8 text frame is malformed; drop it.
-        Err(_) => return Action::Keep,
     };
     match session.codec.decode(text) {
         Ok(cmd) => dispatch_command(session, cmd),
@@ -1760,6 +1765,19 @@ fn dispatch_text_message(entry: &mut Entry, payload: &[u8]) -> Action {
 fn close_fragment_violation(poll: &Poll, entry: &mut Entry, now_ns: u64, reason: &str) -> Action {
     entry.fragment = None;
     queue_close_frame(entry, 1002, reason, now_ns);
+    let _ = flush_and_arm(poll, entry, now_ns);
+    Action::Close
+}
+
+/// Fail the connection for a non-UTF-8 Text payload (RFC 6455 §8.1): queue a
+/// WebSocket Close frame with status code 1007 (invalid frame payload data) +
+/// reason, flush it so it reaches the peer before teardown (`remove()` does
+/// not flush — same mechanics as [`close_fragment_violation`]), and report
+/// [`Action::Close`]. This is a WebSocket-level failure, NOT a Pusher protocol
+/// error: no `pusher:error` frame is sent (those carry 4xxx Pusher codes).
+fn close_invalid_utf8(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action {
+    entry.fragment = None;
+    queue_close_frame(entry, 1007, "invalid UTF-8 in a text message", now_ns);
     let _ = flush_and_arm(poll, entry, now_ns);
     Action::Close
 }
