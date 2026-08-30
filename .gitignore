@@ -19,3 +19,6 @@
 
 # MkDocs build output
 /website/site
+
+# Git worktrees for isolated development sessions
+/.worktrees
