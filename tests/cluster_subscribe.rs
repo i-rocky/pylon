@@ -211,11 +211,18 @@ async fn await_subscription_count(
 }
 
 /// Short timeout wrapper so a wedged Redis fails loud instead of hanging the suite.
+/// Sized ABOVE the sum of the slowest path's per-stage budgets (Test C: two 10s
+/// count awaits + 10s occupied-delivery gate + 10s vacated settle + 1s
+/// duplicate-exposure window ≈ 41s) so the anti-hang bound never clips a
+/// legitimately slow (shared-runner) delivery chain — it exists to fail loud on
+/// a WEDGED Redis, not to pace the test. A stage that exhausts its own budget
+/// fails its assert immediately; only passing (or slowly-passing) runs reach
+/// this bound.
 async fn with_timeout<F, T>(fut: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
-    tokio::time::timeout(Duration::from_secs(4), fut)
+    tokio::time::timeout(Duration::from_secs(60), fut)
         .await
         .expect("op must not hang (Redis up?)")
 }
@@ -273,7 +280,7 @@ async fn clustered_count_and_occupied_single_node() {
 
         // The bridge broadcasts the cluster subscription_count to the fake subscriber.
         assert!(
-            await_subscription_count(&mut rx, channel, 1, Duration::from_secs(3)).await,
+            await_subscription_count(&mut rx, channel, 1, WEBHOOK_CHAIN_BUDGET).await,
             "bridge must broadcast cluster subscription_count == 1"
         );
 
@@ -281,12 +288,16 @@ async fn clustered_count_and_occupied_single_node() {
         // until the webhook is DELIVERED (the 10ms batch window + flush are
         // asynchronous) instead of sleeping for a guessed settle time.
         assert!(
-            wait_until(Duration::from_secs(2), || async {
+            wait_until(WEBHOOK_CHAIN_BUDGET, || async {
                 count_webhook(&node.transport, "channel_occupied").await >= 1
             })
             .await,
             "channel_occupied must fire on the cluster 0→1 edge"
         );
+        // Duplicate-exposure window: hold for a further bounded 1s AFTER the
+        // first delivery so an illegal second emit (same chain, observed p99
+        // ≤75ms even under 10-core starvation) would be caught — then assert.
+        tokio::time::sleep(DUPLICATE_EXPOSURE_WINDOW).await;
         assert_eq!(
             count_webhook(&node.transport, "channel_occupied").await,
             1,
@@ -329,7 +340,7 @@ async fn cross_node_count_and_single_occupied_emit() {
             true,
         );
         assert!(
-            await_subscription_count(&mut rx_a, channel, 1, Duration::from_secs(3)).await,
+            await_subscription_count(&mut rx_a, channel, 1, WEBHOOK_CHAIN_BUDGET).await,
             "A's bridge broadcasts cluster count 1"
         );
 
@@ -345,14 +356,14 @@ async fn cross_node_count_and_single_occupied_emit() {
             true,
         );
         assert!(
-            await_subscription_count(&mut rx_b, channel, 2, Duration::from_secs(3)).await,
+            await_subscription_count(&mut rx_b, channel, 2, WEBHOOK_CHAIN_BUDGET).await,
             "B's bridge broadcasts the CLUSTER count 2 (not B's node-local 1)"
         );
 
         // Poll until occupied is delivered somewhere, then assert EXACTLY once
         // across BOTH nodes' sinks (single cluster-wide emit on the 0→1 edge).
         assert!(
-            wait_until(Duration::from_secs(2), || async {
+            wait_until(WEBHOOK_CHAIN_BUDGET, || async {
                 count_webhook(&node_a.transport, "channel_occupied").await
                     + count_webhook(&node_b.transport, "channel_occupied").await
                     >= 1
@@ -360,6 +371,8 @@ async fn cross_node_count_and_single_occupied_emit() {
             .await,
             "channel_occupied must fire somewhere cluster-wide"
         );
+        // Duplicate-exposure window (see Test A): catch an illegal second emit.
+        tokio::time::sleep(DUPLICATE_EXPOSURE_WINDOW).await;
         let occ_a = count_webhook(&node_a.transport, "channel_occupied").await;
         let occ_b = count_webhook(&node_b.transport, "channel_occupied").await;
         assert_eq!(
@@ -373,6 +386,27 @@ async fn cross_node_count_and_single_occupied_emit() {
     })
     .await;
 }
+
+/// Budget for one hop of the fire-and-forget delivery chain this suite observes
+/// (bridge cmd → Redis script → webhook enqueue → dispatcher 10ms batch → flush →
+/// recording transport, or the analogous mailbox path for subscription_count).
+/// Locally the chain measures 22-75ms end-to-end even under 10-core CPU
+/// starvation (p99 ≤75ms), but CI's shared 2-vCPU runner + service-container
+/// Redis stretches every hop; 10s is ≥130× the observed starved p99 —
+/// generous-but-bounded, and small next to the anti-hang `with_timeout`.
+///
+/// NOTE this budget alone does NOT make a `channel_vacated` "arrive eventually":
+/// per webhook spec §5, a `channel_occupied` and a `channel_vacated` for the same
+/// channel that land in ONE dispatcher batch window CANCEL 1:1 and are never
+/// delivered (proven deterministic: see the occupied-delivery gate in Test C and
+/// CI run 33303526290, where zero vacated webhooks appeared in the whole budget).
+const WEBHOOK_CHAIN_BUDGET: Duration = Duration::from_secs(10);
+
+/// How long to keep observing AFTER the first webhook delivery before asserting
+/// exactly-once — a deliberate duplicate-EXPOSURE window (an illegal second emit
+/// rides the same chain, observed p99 ≤75ms, so 1s ≈ 13× p99), not a settle
+/// sleep racing an async producer.
+const DUPLICATE_EXPOSURE_WINDOW: Duration = Duration::from_secs(1);
 
 /// Test C — vacated single-emit. With one member on each node, unsubscribe both: the
 /// non-cluster-last unsubscribe must NOT vacate; the cluster-last (count → 0) must fire
@@ -397,7 +431,7 @@ async fn cross_node_vacated_single_emit() {
             true,
         );
         assert!(
-            await_subscription_count(&mut rx_a, channel, 1, Duration::from_secs(3)).await,
+            await_subscription_count(&mut rx_a, channel, 1, WEBHOOK_CHAIN_BUDGET).await,
             "A's bridge broadcasts cluster count 1"
         );
 
@@ -410,8 +444,30 @@ async fn cross_node_vacated_single_emit() {
             true,
         );
         assert!(
-            await_subscription_count(&mut rx_b, channel, 2, Duration::from_secs(3)).await,
+            await_subscription_count(&mut rx_b, channel, 2, WEBHOOK_CHAIN_BUDGET).await,
             "B's bridge broadcasts the CLUSTER count 2"
+        );
+
+        // PRECONDITION GATE (the actual fix for CI run 33303526290's zero-delivery
+        // failure): wait until A's `channel_occupied` webhook (fired by A's
+        // subscribe, the cluster 0→1 edge) has been DELIVERED by A's dispatcher
+        // before firing any unsubscribe. Webhook spec §5 coalesces a
+        // `channel_occupied` and a `channel_vacated` for the same channel that
+        // share ONE batch window — they cancel 1:1 and NEITHER is ever delivered
+        // (deterministic: coalesce([occupied, vacated]) == [] is a unit-tested
+        // spec rule). If node A wins the vacate-CAS while its occupied is still
+        // pending in the same 10ms window (exactly what a stalled runner's
+        // scheduler gap produces), the vacated would be cancelled away and NO
+        // budget would ever observe it. With the occupied DELIVERED, A's batch is
+        // flushed and empty, so whichever node later wins the vacate lands in a
+        // fresh batch and is delivered. This gates the test's precondition; it
+        // changes no assertion.
+        assert!(
+            wait_until(WEBHOOK_CHAIN_BUDGET, || async {
+                count_webhook(&node_a.transport, "channel_occupied").await >= 1
+            })
+            .await,
+            "A's channel_occupied (cluster 0→1 edge) must be delivered before the unsubscribes"
         );
 
         // Unsubscribe A's member → node_last=true locally, but cluster count → 1, NOT
@@ -436,10 +492,11 @@ async fn cross_node_vacated_single_emit() {
         );
 
         // Poll until vacated is delivered somewhere (the batch window + flush are
-        // asynchronous), then assert EXACTLY once cluster-wide — the vacate-CAS
-        // guarantee: only the atomic SREM winner emits.
+        // asynchronous; generous slow-runner budget — see WEBHOOK_CHAIN_BUDGET),
+        // then assert EXACTLY once cluster-wide — the vacate-CAS guarantee: only
+        // the atomic SREM winner emits.
         assert!(
-            wait_until(Duration::from_secs(2), || async {
+            wait_until(WEBHOOK_CHAIN_BUDGET, || async {
                 count_webhook(&node_a.transport, "channel_vacated").await
                     + count_webhook(&node_b.transport, "channel_vacated").await
                     >= 1
@@ -447,6 +504,9 @@ async fn cross_node_vacated_single_emit() {
             .await,
             "channel_vacated must fire somewhere cluster-wide"
         );
+        // Duplicate-exposure window (see Test A): a second, CAS-losing emit would
+        // ride the same chain; hold 1s to expose it before asserting exactly-once.
+        tokio::time::sleep(DUPLICATE_EXPOSURE_WINDOW).await;
         let vac_a = count_webhook(&node_a.transport, "channel_vacated").await;
         let vac_b = count_webhook(&node_b.transport, "channel_vacated").await;
         assert_eq!(
