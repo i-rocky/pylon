@@ -1351,15 +1351,16 @@ fn handle_handshake(
                     waker: mailbox_waker.clone(),
                 };
                 use crate::protocol::error::PusherError;
-                let (app_key, protocol) = parse_app_path(&path);
-                let codec = match negotiate(protocol.as_deref(), env.strict_protocol) {
-                    Ok(c) => c,
-                    Err(error) => {
-                        queue_reject(entry, &Reject { error, codec: None }, now_ns);
-                        let _ = flush_and_arm(poll, entry, now_ns);
-                        return Action::Close;
-                    }
-                };
+                let (app_key, protocol, version) = parse_app_path(&path);
+                let codec =
+                    match negotiate(protocol.as_deref(), version.as_deref(), env.strict_protocol) {
+                        Ok(c) => c,
+                        Err(error) => {
+                            queue_reject(entry, &Reject { error, codec: None }, now_ns);
+                            let _ = flush_and_arm(poll, entry, now_ns);
+                            return Action::Close;
+                        }
+                    };
                 // 4005 "Path not found": the path must match the `/app/{key}`
                 // shape (non-empty single-segment key) BEFORE any app lookup —
                 // Pusher reserves 4001 for a well-formed path with an UNKNOWN
@@ -1632,14 +1633,15 @@ fn queue_reject(entry: &mut Entry, reject: &Reject, now_ns: u64) {
         .queue(Arc::from(close_out.to_vec().into_boxed_slice()), now_ns);
 }
 
-/// Split a `/app/{key}` path (with an optional `?protocol=N&...` query) into the
-/// app key and the `protocol` query value.
+/// Split a `/app/{key}` path (with an optional `?protocol=N&version=X&...`
+/// query) into the app key, the `protocol` query value, and the `version`
+/// query value.
 ///
 /// The key is `None` when the path does not match the single-segment
 /// `/app/{key}` shape — no `/app/` prefix, an empty key, or a multi-segment
 /// key. Callers reject those with 4005 "Path not found" (Pusher parity);
 /// 4001 stays reserved for a well-formed path with an unknown key.
-fn parse_app_path(path: &str) -> (Option<String>, Option<String>) {
+fn parse_app_path(path: &str) -> (Option<String>, Option<String>, Option<String>) {
     let (raw_path, query) = match path.split_once('?') {
         Some((p, q)) => (p, Some(q)),
         None => (path, None),
@@ -1648,13 +1650,19 @@ fn parse_app_path(path: &str) -> (Option<String>, Option<String>) {
         .strip_prefix("/app/")
         .filter(|k| !k.is_empty() && !k.contains('/'))
         .map(str::to_string);
-    let protocol = query.and_then(|q| {
+    let protocol = query_param(query, "protocol");
+    let version = query_param(query, "version");
+    (key, protocol, version)
+}
+
+/// First value of `name` in a raw query string (`None` when absent).
+fn query_param(query: Option<&str>, name: &str) -> Option<String> {
+    query.and_then(|q| {
         q.split('&').find_map(|pair| {
             let (k, v) = pair.split_once('=')?;
-            (k == "protocol").then(|| v.to_string())
+            (k == name).then(|| v.to_string())
         })
-    });
-    (key, protocol)
+    })
 }
 
 /// Read and process every complete frame currently buffered, per [`Mode`].
@@ -2866,18 +2874,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_app_path_extracts_key_and_protocol() {
+    fn parse_app_path_extracts_key_protocol_and_version() {
         assert_eq!(
-            parse_app_path("/app/app-key?protocol=7"),
-            (Some("app-key".to_string()), Some("7".to_string()))
+            parse_app_path("/app/app-key?protocol=7&version=7.4.1"),
+            (
+                Some("app-key".to_string()),
+                Some("7".to_string()),
+                Some("7.4.1".to_string())
+            )
         );
         assert_eq!(
             parse_app_path("/app/app-key"),
-            (Some("app-key".to_string()), None)
+            (Some("app-key".to_string()), None, None)
         );
         assert_eq!(
-            parse_app_path("/app/k?foo=1&protocol=7&bar=2"),
-            (Some("k".to_string()), Some("7".to_string()))
+            parse_app_path("/app/k?foo=1&protocol=7&version=8.2.0&bar=2"),
+            (
+                Some("k".to_string()),
+                Some("7".to_string()),
+                Some("8.2.0".to_string())
+            )
+        );
+        // `version` without `protocol` (the inference path's input shape).
+        assert_eq!(
+            parse_app_path("/app/k?version=7.4.1"),
+            (Some("k".to_string()), None, Some("7.4.1".to_string()))
         );
     }
 
@@ -2886,19 +2907,19 @@ mod tests {
         // No `/app/` prefix → 4005, not an empty-key app lookup (4001).
         assert_eq!(
             parse_app_path("/nope/?protocol=7"),
-            (None, Some("7".to_string()))
+            (None, Some("7".to_string()), None)
         );
         // Empty key → 4005.
         assert_eq!(
             parse_app_path("/app/?protocol=7"),
-            (None, Some("7".to_string()))
+            (None, Some("7".to_string()), None)
         );
         // Multi-segment key (a `/` inside the key) → 4005.
         assert_eq!(
             parse_app_path("/app/a/b?protocol=7"),
-            (None, Some("7".to_string()))
+            (None, Some("7".to_string()), None)
         );
         // No path at all → 4005.
-        assert_eq!(parse_app_path("/"), (None, None));
+        assert_eq!(parse_app_path("/"), (None, None, None));
     }
 }

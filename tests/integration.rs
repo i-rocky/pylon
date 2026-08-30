@@ -109,6 +109,31 @@ async fn unsupported_protocol_errors_4007() {
     assert_eq!(frame["data"]["code"], 4007);
 }
 
+/// `?version=` with no `?protocol=`: the server infers the protocol from the
+/// library version's major ("7.4.1" → 7, per the Pusher protocol spec's
+/// documented fallback for legacy JS clients) and the connection establishes.
+#[tokio::test]
+async fn version_param_infers_protocol_and_establishes() {
+    let addr = spawn(ServerConfig::default()).await;
+    let mut ws = connect(addr, "?version=7.4.1").await;
+    let frame = next_json(&mut ws).await;
+    assert_eq!(frame["event"], "pusher:connection_established");
+    let data: Value = serde_json::from_str(frame["data"].as_str().unwrap()).unwrap();
+    assert!(data["socket_id"].as_str().unwrap().contains('.'));
+}
+
+/// A malformed `version` string (no `protocol`) is a 4006 "Invalid version
+/// string format" — scoped to unparseable version strings.
+#[tokio::test]
+async fn unparseable_version_errors_4006() {
+    let addr = spawn(ServerConfig::default()).await;
+    let url = format!("ws://{addr}/app/app-key?version=banana");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let frame = next_json(&mut ws).await;
+    assert_eq!(frame["event"], "pusher:error");
+    assert_eq!(frame["data"]["code"], 4006);
+}
+
 #[tokio::test]
 async fn over_capacity_errors_4004() {
     let addr = spawn(ServerConfig::default()).await; // capacity = 2
