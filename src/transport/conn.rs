@@ -50,6 +50,23 @@ pub enum WriteStatus {
     Closed,
 }
 
+/// Outcome of a [`Connection::drain_head_bytes`] call (G2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainStatus {
+    /// The socket is drained for now (read hit `WouldBlock`) and, for TLS, any
+    /// pending handshake-flight write fully went out.
+    Ok,
+    /// A TLS handshake flight could not be fully written: `write_tls` hit
+    /// `WouldBlock` with `wants_write()` still true (the peer's receive window
+    /// filled mid-handshake — e.g. a zero-window client). The caller MUST arm
+    /// `WRITABLE` interest so the flight is completed on the next writable
+    /// event: nothing else ever re-drives it, so dropping this signal hangs the
+    /// handshake forever. Plain connections never produce this variant.
+    NeedsWrite,
+    /// EOF or a hard I/O error; close the connection.
+    Closed,
+}
+
 /// Error surfaced by the queue/read paths.
 #[derive(Debug, PartialEq)]
 pub enum ConnError {
@@ -323,54 +340,72 @@ impl Connection {
     /// socket; for TLS connections this drives the TLS state machine (ingesting
     /// ciphertext, running the handshake, and pulling any available plaintext).
     ///
-    /// Returns `true` when more data may arrive (ok/would-block),
-    /// `false` when the connection is closed (EOF or error).
-    pub fn drain_head_bytes(&mut self, buf: &mut BytesMut) -> bool {
+    /// Returns a [`DrainStatus`]: [`DrainStatus::Ok`] when drained for now,
+    /// [`DrainStatus::NeedsWrite`] when a TLS handshake flight write blocked
+    /// (the caller must arm WRITABLE interest — see the enum), and
+    /// [`DrainStatus::Closed`] when the connection is closed (EOF or error).
+    pub fn drain_head_bytes(&mut self, buf: &mut BytesMut) -> DrainStatus {
         let mut chunk = [0u8; 16 * 1024];
         match &mut self.io {
             Io::Plain(stream) => loop {
                 match stream.read(&mut chunk) {
-                    Ok(0) => return false,
+                    Ok(0) => return DrainStatus::Closed,
                     Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => return true,
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => return DrainStatus::Ok,
                     Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-                    Err(_) => return false,
+                    Err(_) => return DrainStatus::Closed,
                 }
             },
             Io::Tls(stream, tls) => {
                 // Read ciphertext from socket into rustls state machine.
                 loop {
                     match tls.read_tls(stream) {
-                        Ok(0) => return false,
+                        Ok(0) => return DrainStatus::Closed,
                         Ok(_) => {
                             if tls.process_new_packets().is_err() {
-                                return false;
+                                return DrainStatus::Closed;
                             }
                         }
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                         Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-                        Err(_) => return false,
+                        Err(_) => return DrainStatus::Closed,
                     }
                 }
-                // Drive pending TLS writes (handshake responses).
+                // Drive pending TLS writes (handshake responses). G2: breaking
+                // out on WouldBlock leaves the flight half-written with
+                // `wants_write()` still true — remember that and surface it as
+                // NeedsWrite so the caller arms WRITABLE and re-drives on the
+                // next writable event; nothing else would ever complete the
+                // flight, so the handshake (and the connection) would hang.
+                let mut flight_blocked = false;
                 while tls.wants_write() {
                     match tls.write_tls(stream) {
                         Ok(_) => {}
-                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                        Err(_) => return false,
+                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                            flight_blocked = true;
+                            break;
+                        }
+                        Err(_) => return DrainStatus::Closed,
                     }
                 }
                 // Pull available plaintext (empty during the handshake phase).
+                // Nothing new can appear here when the flight write blocked
+                // above: finishing the flight is the precondition for the peer
+                // to send anything else the session could decrypt.
                 loop {
                     match tls.reader().read(&mut chunk) {
                         Ok(0) => break,
                         Ok(n) => buf.extend_from_slice(&chunk[..n]),
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                         Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-                        Err(_) => return false,
+                        Err(_) => return DrainStatus::Closed,
                     }
                 }
-                true
+                if flight_blocked {
+                    DrainStatus::NeedsWrite
+                } else {
+                    DrainStatus::Ok
+                }
             }
         }
     }
@@ -804,6 +839,18 @@ impl Connection {
         !self.out.is_empty()
     }
 
+    /// Whether the TLS session still has ciphertext queued for the socket
+    /// (rustls `wants_write()`); always `false` for plain connections. Read by
+    /// the worker's handshake path (G2) to reconcile WRITABLE interest with a
+    /// blocked handshake flight: while true, the flight write blocked on a
+    /// full send buffer and must be completed on writable events.
+    pub fn tls_wants_write(&self) -> bool {
+        match &self.io {
+            Io::Tls(_, tls) => tls.wants_write(),
+            Io::Plain(_) => false,
+        }
+    }
+
     /// Whether WRITABLE interest is currently armed on this connection's poll
     /// registration (see the [`writable_armed`](Self::writable_armed) field
     /// doc). Read by the worker loop's debug invariant: a connection with
@@ -900,6 +947,132 @@ impl Connection {
     #[cfg(test)]
     pub fn is_overloaded(&self) -> bool {
         self.codel_state.overloaded
+    }
+}
+
+/// Shared TLS-handshake test support (G2): the raw materials for forcing a
+/// *blocked* handshake flight. A connected socket pair whose server end has a
+/// tiny `SO_SNDBUF` and whose peer end has a tiny `SO_RCVBUF`; a rustls server
+/// config whose certificate is deliberately bloated (thousands of SANs, still
+/// safely under rustls's 64 KiB inbound handshake-message cap) so the
+/// ServerHello flight exceeds both buffers; and a raw
+/// [`rustls::ClientConnection`] peer the test drives by hand (a real async
+/// client keeps reading, so it can never pin its own receive window).
+///
+/// Used by the unit tests here and by the worker-loop test in
+/// `transport::worker`.
+#[cfg(test)]
+pub(crate) mod tls_test_support {
+    use std::io::ErrorKind;
+    use std::net::TcpStream as StdTcpStream;
+    use std::sync::Arc;
+
+    /// `SO_SNDBUF` asked of the server (mio) end. Kernels clamp to a floor and
+    /// Linux doubles the ask, so the effective value lands in single-digit KiB —
+    /// far below the bloated flight either way.
+    const SERVER_SNDBUF: usize = 1024;
+    /// `SO_RCVBUF` asked of the peer end (same clamp story).
+    const PEER_RCVBUF: usize = 1024;
+    /// How many bloated SANs to put in the cert. Each is ~32 DER bytes, so the
+    /// cert DER lands around 50 KiB: well above every clamped buffer sum, well
+    /// below rustls's 64 KiB handshake-message cap.
+    const SAN_COUNT: usize = 1500;
+
+    /// A connected socket pair for the blocked-handshake tests: a non-blocking
+    /// mio server end with a tiny send buffer and a non-blocking std peer end
+    /// whose receive buffer was shrunk BEFORE connect (so the initial window is
+    /// tiny too). A handshake flight bigger than both buffers makes the
+    /// server's `write_tls` return `WouldBlock` mid-flight.
+    pub(crate) fn pair_tiny_tls() -> (mio::net::TcpStream, StdTcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Peer end: shrink the receive buffer BEFORE connecting so even the
+        // initial advertised window is tiny.
+        let peer_sock = socket2::Socket::new(
+            socket2::Domain::for_address(addr),
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
+        peer_sock.set_recv_buffer_size(PEER_RCVBUF).unwrap();
+        peer_sock.connect(&addr.into()).unwrap();
+        let peer = StdTcpStream::from(peer_sock);
+        peer.set_nonblocking(true).unwrap();
+
+        let (server, _) = listener.accept().unwrap();
+        socket2::SockRef::from(&server)
+            .set_send_buffer_size(SERVER_SNDBUF)
+            .unwrap();
+        server.set_nonblocking(true).unwrap();
+        (mio::net::TcpStream::from_std(server), peer)
+    }
+
+    /// A rustls server config whose certificate is bloated past every clamped
+    /// socket buffer, plus the DER of that (self-signed) certificate so a test
+    /// client can be built to trust exactly it.
+    pub(crate) fn bloated_server_config() -> (
+        Arc<rustls::ServerConfig>,
+        rustls::pki_types::CertificateDer<'static>,
+    ) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // "localhost" first (the client verifies that name); the rest is pure
+        // bloat to push the Certificate message past the tiny socket buffers.
+        let mut sans: Vec<String> = Vec::with_capacity(SAN_COUNT + 1);
+        sans.push("localhost".to_string());
+        sans.extend((0..SAN_COUNT).map(|i| format!("san-{i:04}-abcdefghijklmnopqrst")));
+        let params = rcgen::CertificateParams::new(sans).unwrap();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(key_pair.serialize_der().into());
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.der().clone()], key)
+            .expect("build rustls server config");
+        (Arc::new(config), cert.der().clone())
+    }
+
+    /// A raw rustls client that trusts only `cert` and connects as
+    /// "localhost" (the bloated SAN list includes it).
+    pub(crate) fn tls_client(
+        cert: &rustls::pki_types::CertificateDer<'static>,
+    ) -> rustls::ClientConnection {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.clone()).expect("trust test cert");
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("parse server name");
+        rustls::ClientConnection::new(Arc::new(config), name).expect("build client connection")
+    }
+
+    /// One non-blocking pump of the raw TLS client: ingest whatever ciphertext
+    /// is currently readable, advance the state machine, and write out anything
+    /// it wants to send. `WouldBlock` on either side just ends that side's
+    /// pass. Panics on hard errors (a failed handshake fails the test loudly).
+    pub(crate) fn pump_client(client: &mut rustls::ClientConnection, sock: &mut StdTcpStream) {
+        loop {
+            match client.read_tls(sock) {
+                Ok(0) => panic!("server closed the socket mid-handshake"),
+                Ok(_) => {
+                    client
+                        .process_new_packets()
+                        .expect("client TLS state machine");
+                }
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => panic!("client read_tls failed: {e}"),
+            }
+        }
+        while client.wants_write() {
+            match client.write_tls(sock) {
+                Ok(_) => {}
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => panic!("client write_tls failed: {e}"),
+            }
+        }
     }
 }
 
@@ -1515,5 +1688,83 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         panic!("did not collect {want} frame(s); got {}", collected.len());
+    }
+
+    // ---- G2: TLS handshake flight blocked on a full send buffer ---------------
+
+    /// The conn-level contract behind G2: when a TLS handshake flight write
+    /// hits `WouldBlock` with `wants_write()` still true, `drain_head_bytes`
+    /// must surface [`DrainStatus::NeedsWrite`] — the caller's cue to arm
+    /// WRITABLE — and a later re-drive (after the peer drains its window)
+    /// completes the flight ([`DrainStatus::Ok`], `!wants_write`). The
+    /// worker-level twin (`transport::worker::tests::
+    /// tls_handshake_completes_when_flight_write_blocks`) drives the same
+    /// scenario through the real event handlers.
+    #[test]
+    fn drain_head_bytes_signals_needs_write_when_flight_blocks() {
+        use crate::transport::conn::tls_test_support as tlsup;
+
+        let (server_stream, mut client_sock) = tlsup::pair_tiny_tls();
+        let (server_cfg, cert_der) = tlsup::bloated_server_config();
+        let tls = rustls::server::ServerConnection::new(server_cfg).unwrap();
+        let mut conn = Connection::new_tls(server_stream, Box::new(tls), 1 << 20);
+        let mut client = tlsup::tls_client(&cert_der);
+
+        // The client sends its ClientHello (small — only the server cert is
+        // bloated).
+        while client.wants_write() {
+            client.write_tls(&mut client_sock).unwrap();
+        }
+
+        // (a) The first drain that sees the ClientHello generates the flight
+        // and blocks mid-write: NeedsWrite with wants_write still true. (Loop
+        // until the hello has landed; earlier drains just return Ok.)
+        let mut buf = BytesMut::new();
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            assert!(attempts < 1000, "ClientHello never arrived");
+            match conn.drain_head_bytes(&mut buf) {
+                DrainStatus::NeedsWrite => break,
+                DrainStatus::Ok => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                DrainStatus::Closed => panic!("unexpected Closed mid-handshake"),
+            }
+        }
+        assert!(
+            conn.tls_wants_write(),
+            "NeedsWrite must mean the flight is half-written"
+        );
+
+        // (b) The worker's writable-drive behaviour: pump the client (opening
+        // its receive window) and re-drive the drain until the flight
+        // completes, bounded so a real stall fails fast.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "flight never completed across writable re-drives"
+            );
+            tlsup::pump_client(&mut client, &mut client_sock);
+            match conn.drain_head_bytes(&mut buf) {
+                DrainStatus::Ok => break,
+                DrainStatus::NeedsWrite => {}
+                DrainStatus::Closed => panic!("unexpected Closed completing the flight"),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!conn.tls_wants_write(), "flight fully written");
+        // The client now needs a final pump round (or two) to ingest the tail
+        // of the flight and finish its side of the handshake.
+        let client_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while client.is_handshaking() {
+            assert!(
+                std::time::Instant::now() < client_deadline,
+                "client never completed the handshake behind the completed flight"
+            );
+            tlsup::pump_client(&mut client, &mut client_sock);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }

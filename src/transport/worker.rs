@@ -9,7 +9,9 @@
 //!
 //! Readiness is managed edge-friendly: a connection is registered
 //! `READABLE`-only and only gains `WRITABLE` interest when a [`Connection::flush`] returns
-//! [`WriteStatus::WouldBlock`]; the interest is dropped back to `READABLE` once
+//! [`WriteStatus::WouldBlock`] or (G2) a TLS handshake flight write blocks
+//! mid-handshake (see [`crate::transport::conn::DrainStatus::NeedsWrite`]);
+//! the interest is dropped back to `READABLE` once
 //! the queue drains. This keeps the loop from spinning on a writable socket with
 //! nothing to send. It is also what lets the loop poll with a real (50ms)
 //! timeout whenever the previous iteration did no work: a backpressured
@@ -50,7 +52,7 @@ use crate::protocol::command::ClientCommand;
 use crate::protocol::event::ServerEvent;
 use crate::protocol::socket_id::SocketId;
 use crate::protocol::{codec::Codec, negotiate};
-use crate::transport::conn::{ConnError, ConnState, Connection, WriteStatus};
+use crate::transport::conn::{ConnError, ConnState, Connection, DrainStatus, WriteStatus};
 use crate::transport::frame::{self, OpCode};
 use crate::transport::handshake::{self, HeadResult};
 use crate::transport::timer::{Due, TimerWheel};
@@ -834,24 +836,62 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                     }
 
                     if event.is_writable() && conns.contains(key) {
-                        let action = handle_writable(&poll, &mut conns, key, now_ns);
+                        let action = handle_writable(
+                            &poll,
+                            &mut conns,
+                            key,
+                            &cfg,
+                            now_ns,
+                            &dirty_tx,
+                            &mailbox_waker,
+                            &resolved_tx,
+                            &mut next_gen,
+                            &mut wheel,
+                        );
                         // INCREMENTAL INFLIGHT: the flush sent bytes out; fold the
-                        // (negative) delta before any close so the count is exact.
+                        // (negative) delta before any close/handoff so the count
+                        // is exact.
                         fold_delta(&mut conns, key, &mut inflight_bytes);
                         fold_codel(&mut conns, key, &mut codel_dropped_total);
-                        if action == Action::Close {
-                            remove(
-                                &poll,
-                                &mut conns,
-                                key,
-                                &mut local_subs,
-                                &mut sid_to_token,
-                                &mut wheel,
-                                &mut inflight_bytes,
-                                &conn_counts,
-                                &app_registry,
-                                &node_conns,
-                            );
+                        match action {
+                            Action::Close => {
+                                remove(
+                                    &poll,
+                                    &mut conns,
+                                    key,
+                                    &mut local_subs,
+                                    &mut sid_to_token,
+                                    &mut wheel,
+                                    &mut inflight_bytes,
+                                    &conn_counts,
+                                    &app_registry,
+                                    &node_conns,
+                                );
+                            }
+                            // G2: a TLS handshake that completed on the WRITABLE
+                            // path can yield a REST head exactly as the readable
+                            // path does — its plaintext was waiting behind the
+                            // blocked flight.
+                            Action::Handoff(prefix) => {
+                                wheel.remove(key);
+                                handoff_rest(&poll, &mut conns, key, &cfg, prefix);
+                            }
+                            Action::Keep => {
+                                // A session established by the writable-path
+                                // handshake drive: reconcile its (empty initial)
+                                // membership the same way the readable arm does,
+                                // keeping the paths symmetric.
+                                if let Some(entry) = conns.get_mut(key) {
+                                    if let Some(session) = entry.session.as_mut() {
+                                        reconcile_membership(
+                                            session,
+                                            key,
+                                            &mut local_subs,
+                                            &mut sid_to_token,
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1397,12 +1437,25 @@ fn handle_handshake(
     wheel: &mut TimerWheel,
 ) -> Action {
     // Pull all available bytes into the head-accumulation buffer (`inbuf`).
-    if drain_into(&mut entry.conn, &mut entry.inbuf) == ReadOutcome::Closed {
-        return Action::Close;
+    // G2: `NeedsWrite` means a TLS handshake flight could not be fully written
+    // (the peer's receive window filled mid-handshake). Nothing can be parsed
+    // out of it either — the plaintext pull inside `drain_head_bytes` is
+    // skipped when the flight write blocks — so fall through to the arm point
+    // below (`NeedMore ⇒ arm_handshake_interest`), which registers
+    // READABLE | WRITABLE so the next writable event completes the flight.
+    // A readable event arriving while the flight is still blocked is unaffected:
+    // it lands here first and processes any new TLS records before the write
+    // retry inside `drain_head_bytes`.
+    match entry.conn.drain_head_bytes(&mut entry.inbuf) {
+        DrainStatus::Closed => return Action::Close,
+        DrainStatus::Ok | DrainStatus::NeedsWrite => {}
     }
 
     match handshake::read_head(&entry.inbuf) {
-        HeadResult::NeedMore => Action::Keep,
+        // No complete head yet. Reconcile poll interest with the TLS flight
+        // state (G2): arms WRITABLE when a flight write blocked, clears it
+        // once the flight is done.
+        HeadResult::NeedMore => arm_handshake_interest(poll, entry, now_ns),
         HeadResult::WsUpgrade { key: ws_key, path } => {
             let response = handshake::accept_response(&ws_key).into_boxed_slice();
             // Drop-head queue never rejects; the 101 response always enqueues.
@@ -2386,9 +2439,47 @@ fn drain_resolved(
 }
 
 /// Handle a writable event: flush and, when drained, drop writable interest.
-fn handle_writable(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) -> Action {
+/// In the `Handshaking` state (G2) the writable event instead re-drives the
+/// handshake itself.
+///
+/// A Handshaking TLS connection only holds WRITABLE interest because its
+/// handshake-flight write blocked (see [`arm_handshake_interest`]). The
+/// writable event means the send buffer drained, so re-running
+/// [`handle_handshake`] completes the flight, pulls any plaintext that was
+/// waiting behind it, and — via `arm_handshake_interest` (`NeedMore`) or
+/// `flush_and_arm` (upgrade) — clears WRITABLE once `!tls.wants_write()`. The
+/// read at the top of that path is a `WouldBlock` no-op when the event carried
+/// no data; a readable event arriving mid-block is handled by the normal
+/// readable path.
+#[allow(clippy::too_many_arguments)]
+fn handle_writable(
+    poll: &Poll,
+    conns: &mut slab::Slab<Entry>,
+    key: usize,
+    cfg: &WorkerConfig,
+    now_ns: u64,
+    dirty_tx: &std::sync::mpsc::Sender<usize>,
+    mailbox_waker: &Arc<mio::Waker>,
+    resolved_tx: &std::sync::mpsc::Sender<ResolvedApp>,
+    next_gen: &mut u64,
+    wheel: &mut TimerWheel,
+) -> Action {
     let entry = &mut conns[key];
-    flush_and_arm(poll, entry, now_ns)
+    match entry.conn.state {
+        ConnState::Handshaking => handle_handshake(
+            poll,
+            entry,
+            key,
+            cfg,
+            now_ns,
+            dirty_tx,
+            mailbox_waker,
+            resolved_tx,
+            next_gen,
+            wheel,
+        ),
+        ConnState::Open | ConnState::Closing => flush_and_arm(poll, entry, now_ns),
+    }
 }
 
 /// Flush the outbound queue and reconcile writable interest with what remains.
@@ -2434,21 +2525,48 @@ fn flush_and_arm(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action {
     }
 }
 
-/// Read all currently-available bytes off the socket into `buf`, stopping on
-/// `WouldBlock` (socket drained) or EOF. Used only during the handshake, where
-/// we accumulate the raw head before any framing.
-#[derive(PartialEq, Eq)]
-enum ReadOutcome {
-    Ok,
-    Closed,
-}
-
-fn drain_into(conn: &mut Connection, buf: &mut BytesMut) -> ReadOutcome {
-    if conn.drain_head_bytes(buf) {
-        ReadOutcome::Ok
-    } else {
-        ReadOutcome::Closed
+/// G2: reconcile a `Handshaking` connection's poll interest with whatever it
+/// still has to write. Two things can be pending mid-handshake:
+///
+/// * a **blocked TLS flight** — rustls has ciphertext queued for the socket
+///   ([`Connection::tls_wants_write`]) because the flight write hit a full
+///   send buffer (the peer's receive window filled, e.g. a zero-window
+///   client); and
+/// * **queued frames** — the shutdown drain queues error/Close frames even on
+///   a still-Handshaking connection.
+///
+/// When either is present we flush via [`flush_and_arm`], which drives the
+/// pending TLS ciphertext FIRST (its Phase 1) and reconciles WRITABLE
+/// interest from the outcome: mio is level-triggered, so arming it means the
+/// kernel wakes the loop the moment the buffer drains and
+/// [`handle_writable`] re-drives the handshake. That also keeps the loop-top
+/// invariant ("queued bytes ⇒ WRITABLE armed") intact for the drain-path
+/// frames. With nothing pending, a previously-armed WRITABLE drops back to
+/// READABLE-only — mirroring `flush_and_arm`'s Drained arm — so the
+/// connection never spins on an always-ready writable socket; and a plain-TCP
+/// handshake (never pending writes) keeps its accept-time READABLE-only
+/// registration with zero extra syscalls.
+///
+/// Task 3.3 (handshake deadline, not yet implemented) hooks HERE: a connection
+/// leaving this function with WRITABLE armed is precisely the one a
+/// stalled-handshake deadline must cover, so arm/re-arm that deadline wherever
+/// this arms interest.
+fn arm_handshake_interest(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action {
+    let token = entry.token;
+    if entry.conn.tls_wants_write() || entry.conn.has_pending_writes() {
+        return flush_and_arm(poll, entry, now_ns);
     }
+    if entry.conn.writable_armed() {
+        if poll
+            .registry()
+            .reregister(entry.conn.stream_mut(), token, Interest::READABLE)
+            .is_err()
+        {
+            return Action::Close;
+        }
+        entry.conn.set_writable_armed(false);
+    }
+    Action::Keep
 }
 
 /// Transfer a plain-HTTP connection to the tokio/axum REST plane (SP9 §3.4).
@@ -3015,5 +3133,191 @@ mod tests {
         );
         // No path at all → 4005.
         assert_eq!(parse_app_path("/"), (None, None, None));
+    }
+
+    // ---- G2: TLS handshake flight blocked on a full send buffer ---------------
+
+    /// The WS upgrade head the raw TLS client sends once its TLS handshake is
+    /// complete (RFC 6455 §4.2.1 sample key).
+    const G2_UPGRADE_HEAD: &str = "GET /app/g2-key?protocol=7 HTTP/1.1\r\n\
+        Host: localhost\r\n\
+        Upgrade: websocket\r\n\
+        Connection: Upgrade\r\n\
+        Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+        Sec-WebSocket-Version: 13\r\n\
+        \r\n";
+
+    /// THE G2 SCENARIO, driven through the REAL worker handlers: a TLS client
+    /// with a tiny receive window lets the server's ServerHello flight (a
+    /// deliberately bloated certificate) fill every socket buffer
+    /// mid-handshake, so `drain_head_bytes` exits with `tls.wants_write()`
+    /// still true. Pre-fix nothing re-armed `WRITABLE` — connections register
+    /// READABLE-only at accept — so the flight was never completed and the
+    /// handshake hung forever (a zero-window client pins it). This test runs
+    /// the worker's own event dispatch (`handle_readable` / `handle_writable`)
+    /// over a real `mio::Poll` and asserts the handshake — and the WS 101
+    /// upgrade behind it — completes within a bounded wait once the client
+    /// starts draining.
+    ///
+    /// Forced at this level rather than in `tests/tls.rs` because a real
+    /// server's accepted socket keeps the kernel-default `SO_SNDBUF` (128 KiB
+    /// on this macOS loopback, auto-growing), which a TLS flight can never
+    /// exceed: rustls caps inbound handshake messages at 64 KiB, so even a
+    /// maximally bloated flight always fits and the write never blocks.
+    /// Shrinking the accepted socket's `SO_SNDBUF` from the test process is
+    /// impossible (the accept happens inside the worker), so the deterministic
+    /// reproduction needs a socket pair the test owns — driven here through the
+    /// production handlers.
+    #[test]
+    fn tls_handshake_completes_when_flight_write_blocks() {
+        use crate::transport::conn::tls_test_support as tlsup;
+        use std::io::Read as _;
+
+        let (server_stream, mut client_sock) = tlsup::pair_tiny_tls();
+        let (server_cfg, cert_der) = tlsup::bloated_server_config();
+        let tls = rustls::server::ServerConnection::new(server_cfg).unwrap();
+        let mut conn = Connection::new_tls(server_stream, Box::new(tls), 1 << 20);
+        let mut client = tlsup::tls_client(&cert_der);
+
+        // Real poll + slab entry, registered READABLE-only exactly as
+        // `accept_ready` does (mirrors the worker-loop preconditions of G2).
+        let mut poll = Poll::new().unwrap();
+        let mut events = Events::with_capacity(16);
+        let mut conns: slab::Slab<Entry> = slab::Slab::new();
+        let vacant = conns.vacant_entry();
+        let key = vacant.key();
+        poll.registry()
+            .register(conn.stream_mut(), Token(key), Interest::READABLE)
+            .unwrap();
+        vacant.insert(Entry {
+            conn,
+            inbuf: BytesMut::new(),
+            token: Token(key),
+            session: None,
+            fragment: None,
+            pending_establish: None,
+        });
+
+        // Echo-mode worker config + the notifier plumbing handle_handshake
+        // needs (unused on the happy path, but part of its signature).
+        let cfg = WorkerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            max_payload: 1 << 20,
+            max_message_bytes: 1 << 20,
+            high_water: 1 << 20,
+            mode: Mode::Echo,
+            rest_handoff: None,
+            worker_id: 0,
+            broadcast: None,
+            per_worker_budget: 0,
+            inflight_slot: None,
+            accepted_slot: None,
+            codel_dropped_slot: None,
+            mailbox_dropped_slot: None,
+            codel: crate::transport::conn::CodelParams::DISABLED,
+            budget_factor: None,
+            shutdown_grace_ms: 0,
+            tls: None,
+        };
+        let (dirty_tx, _dirty_rx) = std::sync::mpsc::channel::<usize>();
+        let mailbox_waker = Arc::new(mio::Waker::new(poll.registry(), WORKER_WAKER).unwrap());
+        let (resolved_tx, _resolved_rx) = std::sync::mpsc::channel::<ResolvedApp>();
+        let mut next_gen = 0u64;
+        let mut wheel = TimerWheel::with_timeouts(0, 0);
+
+        // The client writes its ClientHello (small — the bloated SAN list is
+        // only in the server's certificate).
+        while client.wants_write() {
+            client.write_tls(&mut client_sock).unwrap();
+        }
+
+        // Drive exactly like `run`'s event loop: readable → handle_readable,
+        // writable → handle_writable; pump the raw client between polls.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut writable_drives = 0usize;
+        let mut sent_head = false;
+        let mut plaintext = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "blocked TLS handshake never completed: the mid-flight write was \
+                 never re-driven (G2: WRITABLE not armed in Handshaking state)"
+            );
+            poll.poll(&mut events, Some(Duration::from_millis(5)))
+                .unwrap();
+            for ev in events.iter() {
+                if ev.token() == WORKER_WAKER {
+                    continue;
+                }
+                let k = ev.token().0;
+                if ev.is_readable() {
+                    let action = handle_readable(
+                        &poll,
+                        &mut conns,
+                        k,
+                        &cfg,
+                        0,
+                        &dirty_tx,
+                        &mailbox_waker,
+                        &resolved_tx,
+                        &mut next_gen,
+                        &mut wheel,
+                    );
+                    assert_ne!(action, Action::Close, "handshake readable handling");
+                }
+                if ev.is_writable() && conns.contains(k) {
+                    writable_drives += 1;
+                    let action = handle_writable(
+                        &poll,
+                        &mut conns,
+                        k,
+                        &cfg,
+                        0,
+                        &dirty_tx,
+                        &mailbox_waker,
+                        &resolved_tx,
+                        &mut next_gen,
+                        &mut wheel,
+                    );
+                    assert_ne!(action, Action::Close, "handshake writable handling");
+                }
+            }
+            // Pump the raw client: ingest ciphertext, run TLS, send its flight.
+            tlsup::pump_client(&mut client, &mut client_sock);
+            // TLS done → send the WS upgrade head as TLS application data.
+            if !client.is_handshaking() && !sent_head {
+                use std::io::Write as _;
+                client
+                    .writer()
+                    .write_all(G2_UPGRADE_HEAD.as_bytes())
+                    .expect("queue WS upgrade head");
+                sent_head = true;
+            }
+            // Collect any server plaintext (the 101 response).
+            loop {
+                match client.reader().read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => plaintext.extend_from_slice(&chunk[..n]),
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(e) => panic!("client plaintext read failed: {e}"),
+                }
+            }
+            if sent_head && plaintext.starts_with(b"HTTP/1.1 101") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(
+            writable_drives > 0,
+            "the blocked flight must be completed by writable-event drives"
+        );
+        assert_eq!(conns[key].conn.state, ConnState::Open);
+        assert!(
+            !conns[key].conn.writable_armed(),
+            "WRITABLE interest cleared once the flight + 101 drained"
+        );
     }
 }
