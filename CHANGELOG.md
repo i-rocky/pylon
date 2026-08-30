@@ -106,3 +106,38 @@ pre-1.0 and versions track `Cargo.toml`.
   aware through local and Redis adapters.
 - **POST trigger params accepted from the query string** (body wins; batch excluded
   per the doc).
+
+### Phase 3 — Transport correctness (audit remediation)
+
+#### Fixed
+- **Busy-spin eliminated** (G1): the worker loop polls at 0ms only when the previous
+  iteration did work — one backpressured client no longer burns a whole core
+  (29,711 → ≤8 zero-timeout polls in the regression window); latent `queue_ping`
+  close-discard stranding fixed alongside.
+- **TLS handshakes complete when the flight blocks** (G2): `DrainStatus::NeedsWrite`
+  arms `WRITABLE` mid-handshake; a zero-window client can no longer pin it forever.
+- **Slowloris hardening** (G3): request heads capped (`PYLON_MAX_HEAD_BYTES`,
+  default 16 KiB) and never-established connections reaped by an absolute deadline
+  (`PYLON_HANDSHAKE_TIMEOUT_MS`, default 10s; activity does not postpone).
+- **TLS REST handoff processes every record** (G4): multi-record reads no longer
+  lose record tails (>4 KiB reads were corrupted pre-fix); latent `put_slice` panic
+  on small caller buffers removed.
+- **Timer wheel scrubs superseded entries on re-arm** (G6): chatty connections no
+  longer accrue ~120k stale timeline slots; all three timelines (liveness, lifetime,
+  handshake) scrub eagerly on re-arm/teardown.
+- **Cache-channel store evicts expired entries** (G7): moka TTL store replaces the
+  read-lazy DashMap (distinct-channel churn was an unbounded leak).
+- **Runtime panic sites removed** (G9): registry-mutex poisoning recovered;
+  webhook HTTP client build failure aborts startup with a real error; the dispatcher
+  degrades gracefully (fires without grace re-check + error log) instead of
+  panicking on a construction invariant.
+- **Redis reap failures now logged** (G10): user/presence cleanup DEL/SREM/HDEL
+  errors warn with key context instead of silently leaving ghost state.
+- **`local_subs` deindex hardened** (G5): close-path deindexes the union of the
+  reconciled baseline and the live subscription set (defense-in-depth; the exact
+  audit leak no longer manifests on the current tree).
+
+#### Added
+- **`pylon_drophead_dropped_total`** (G8): drop-head frame evictions are now
+  observable in `/metrics` alongside the CoDel counter (three CoDel fold gaps
+  closed too).
