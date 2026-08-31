@@ -224,6 +224,14 @@ impl Adapter for LocalAdapter {
     }
 
     async fn send_to_user(&self, app: &str, user_id: &str, event: ServerEvent) {
+        // F10 CONTRACT — do not pass `ServerEvent::Close` or `SubscriptionError`
+        // here: this path encodes once and flattens every non-`Raw` event to a
+        // shared `Raw` frame, which would strip the protocol semantics the
+        // worker's mailbox drain matches on for those variants (a real WS close
+        // frame + connection deindex for `Close`; the object-`data` shape for
+        // `SubscriptionError`). User events are data frames only — terminate a
+        // user's connections via `terminate_user` (which drives the proper
+        // error+close sequence through `close_handles_4009`).
         let handles = self.users.handles(app, user_id);
         if handles.is_empty() {
             return;
