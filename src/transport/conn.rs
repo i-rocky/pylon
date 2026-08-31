@@ -827,6 +827,20 @@ impl Connection {
             }
         }
 
+        // F14: a cycle that ends fully drained shrinks the scratch back toward
+        // the 8 KiB floor — the buffer is per-connection state, and a single
+        // large frame must not leave every connection holding a burst-sized
+        // allocation for the rest of its (possibly hours-long) lifetime. A
+        // no-op at or below the floor, so the common small-frame path pays only
+        // a capacity compare (and keeps its capacity: no re-growth churn). A
+        // cycle ending with a partial-frame remainder keeps its capacity: those
+        // bytes belong to a large frame in flight and the completing read needs
+        // the space. (bytes 1.11 has no `BytesMut::shrink_to`; with the buffer
+        // provably empty, a fresh floor-sized buffer IS the shrink.)
+        if scratch.is_empty() && scratch.capacity() > 8 * 1024 {
+            *scratch = BytesMut::with_capacity(8 * 1024);
+        }
+
         // 3. EOF with nothing to hand back means the peer is gone. With frames
         //    in hand we return them and let the caller hit EOF next time.
         if hit_eof && frames.is_empty() {
@@ -2633,6 +2647,81 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(&frames[0].payload[..], b"Hello");
         assert!(scratch.is_empty(), "buffer fully consumed");
+    }
+
+    // ---- read scratch capacity ------------------------------------------------
+    /// A masked client text frame (RFC 6455 §5.3): FIN+text, masked, with the
+    /// 16-bit extended length used by payloads >= 126 bytes.
+    fn masked_text_frame(payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() < 65536, "test helper: 16-bit length only");
+        let mut out = Vec::with_capacity(payload.len() + 8);
+        out.push(0x81); // FIN + text
+        out.push(0x80 | 126); // MASK + 16-bit extended length follows
+        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        let key = [0x37u8, 0xfa, 0x21, 0x3d];
+        out.extend_from_slice(&key);
+        for (i, b) in payload.iter().enumerate() {
+            out.push(b ^ key[i % 4]);
+        }
+        out
+    }
+
+    /// F14: the read scratch is per-connection state that must not pin a
+    /// burst-sized allocation forever. After a read cycle that ends FULLY
+    /// drained (no partial-frame remainder), the buffer's spare capacity must
+    /// shrink back toward the 8 KiB floor — otherwise every connection that
+    /// ever received one large frame holds that frame's buffer for its whole
+    /// (possibly hours-long) lifetime.
+    #[test]
+    fn read_scratch_shrinks_after_fully_drained_cycle() {
+        let (server, mut client) = pair();
+        let mut conn = Connection::new(server, 1 << 20);
+        let mut scratch = BytesMut::new();
+
+        // One 32 KiB text frame — well past the 8 KiB floor — so the parse
+        // pass must grow the scratch to hold it.
+        let payload = vec![b'x'; 32 * 1024];
+        client.write_all(&masked_text_frame(&payload)).unwrap();
+        client.flush().unwrap();
+
+        let frames = read_until_frames(&mut conn, &mut scratch, 1);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload.len(), 32 * 1024);
+
+        // The cycle ended fully drained: the oversized capacity must not persist.
+        assert!(scratch.is_empty(), "no remainder after the full frame");
+        assert!(
+            scratch.capacity() <= 8 * 1024,
+            "scratch capacity {} must shrink to the 8 KiB floor after a drained cycle",
+            scratch.capacity()
+        );
+    }
+
+    /// F14 counterpart: a cycle that ends with a partial-frame remainder must
+    /// KEEP its capacity — the buffered bytes belong to a large frame in flight
+    /// and the completion read needs the space.
+    #[test]
+    fn read_scratch_keeps_capacity_while_remainder_pending() {
+        let (server, mut client) = pair();
+        let mut conn = Connection::new(server, 1 << 20);
+        let mut scratch = BytesMut::new();
+
+        // Send a 32 KiB frame, then a second one of which only the header
+        // lands: the cycle ends with a partial remainder in the scratch.
+        let payload = vec![b'y'; 32 * 1024];
+        let mut wire = masked_text_frame(&payload);
+        let second = masked_text_frame(&payload);
+        wire.extend_from_slice(&second[..14]); // base header + ext len + mask key
+        client.write_all(&wire).unwrap();
+        client.flush().unwrap();
+
+        let frames = read_until_frames(&mut conn, &mut scratch, 1);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(scratch.len(), 14, "partial second frame buffered");
+        assert!(
+            scratch.capacity() > 8 * 1024,
+            "a pending large frame keeps its capacity"
+        );
     }
 
     // ---- read EOF -------------------------------------------------------------
