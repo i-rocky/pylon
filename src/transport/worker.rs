@@ -1503,6 +1503,14 @@ fn accept_ready(
                     tracing::debug!(error = %e, "failed to register accepted socket");
                     continue;
                 }
+                // F3 (Nagle): disable Nagle on the accepted socket. Small
+                // latency-critical frames (pong, subscription_succeeded,
+                // member_added) queued right after a partial write would
+                // otherwise sit in the kernel's Nagle buffer waiting for the
+                // peer's delayed ACK — the classic 40ms stall. Best-effort: a
+                // failure to set a socket option must not break or spam the
+                // accept loop.
+                let _ = stream.set_nodelay(true);
                 let mut conn = if let Some(tls_cfg) = &cfg.tls {
                     match rustls::server::ServerConnection::new(tls_cfg.clone()) {
                         Ok(sc) => Connection::new_tls(stream, Box::new(sc), cfg.high_water),
@@ -3280,40 +3288,85 @@ mod tests {
         l.local_addr().unwrap().port()
     }
 
+    /// A plain-TCP `Mode::Echo` worker config for tests.
+    fn echo_worker_config(addr: std::net::SocketAddr) -> WorkerConfig {
+        WorkerConfig {
+            addr,
+            max_payload: 1 << 20,
+            max_message_bytes: 1 << 20,
+            max_head_bytes: 16_384,
+            handshake_timeout_ms: 10_000,
+            high_water: 1 << 20,
+            mode: Mode::Echo,
+            rest_handoff: None,
+            worker_id: 0,
+            broadcast: None,
+            per_worker_budget: 0,
+            inflight_slot: None,
+            accepted_slot: None,
+            codel_dropped_slot: None,
+            drophead_dropped_slot: None,
+            mailbox_dropped_slot: None,
+            codel: crate::transport::conn::CodelParams::DISABLED,
+            budget_factor: None,
+            shutdown_grace_ms: 0,
+            tls: None,
+        }
+    }
+
     /// Spawn the worker on its own OS thread bound to `addr` in [`Mode::Echo`],
     /// returning the shutdown flag and the join handle.
     fn spawn_worker(addr: std::net::SocketAddr) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
         let shutdown = Arc::new(AtomicBool::new(false));
         let sd = shutdown.clone();
         let handle = std::thread::spawn(move || {
-            run(
-                WorkerConfig {
-                    addr,
-                    max_payload: 1 << 20,
-                    max_message_bytes: 1 << 20,
-                    max_head_bytes: 16_384,
-                    handshake_timeout_ms: 10_000,
-                    high_water: 1 << 20,
-                    mode: Mode::Echo,
-                    rest_handoff: None,
-                    worker_id: 0,
-                    broadcast: None,
-                    per_worker_budget: 0,
-                    inflight_slot: None,
-                    accepted_slot: None,
-                    codel_dropped_slot: None,
-                    drophead_dropped_slot: None,
-                    mailbox_dropped_slot: None,
-                    codel: crate::transport::conn::CodelParams::DISABLED,
-                    budget_factor: None,
-                    shutdown_grace_ms: 0,
-                    tls: None,
-                },
-                sd,
-            )
-            .expect("worker run failed");
+            run(echo_worker_config(addr), sd).expect("worker run failed");
         });
         (shutdown, handle)
+    }
+
+    /// F3 (Nagle): `accept_ready` must disable Nagle on every accepted
+    /// socket. The server-side socket isn't reachable through a client
+    /// connection (the client only sees its own half), and a loopback
+    /// ping/pong latency assertion is probabilistic — macOS loopback rarely
+    /// exhibits the Nagle+delayed-ACK stall the fix targets — so this asserts
+    /// the option observably on the accepted stream itself, driven through
+    /// the real accept path (no `run` loop needed: one pending connection,
+    /// then inspect the slab entry's stream).
+    #[test]
+    fn accept_ready_sets_nodelay_on_accepted_socket() {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // `mio::net::TcpListener::from_std` expects a listener already in
+        // nonblocking mode (as `reuseport_listener` arms it) — otherwise the
+        // drain loop's trailing `accept()` would block forever.
+        std_listener.set_nonblocking(true).unwrap();
+        let addr = std_listener.local_addr().unwrap();
+        let mut listener = TcpListener::from_std(std_listener);
+
+        // A pending client connection for accept_ready to drain.
+        let _client = std::net::TcpStream::connect(addr).unwrap();
+
+        let poll = Poll::new().unwrap();
+        let mut conns = slab::Slab::new();
+        let mut wheel = TimerWheel::new();
+        let cfg = echo_worker_config(addr);
+
+        let accepted = accept_ready(
+            &poll,
+            &mut listener,
+            &mut conns,
+            &cfg,
+            crate::transport::conn::CodelParams::DISABLED,
+            &mut wheel,
+            None,
+        );
+        assert_eq!(accepted, 1);
+        assert_eq!(conns.len(), 1);
+        let entry = conns.iter_mut().next().unwrap().1;
+        assert!(
+            entry.conn.stream_mut().nodelay().unwrap(),
+            "accepted socket must have TCP_NODELAY set (F3)"
+        );
     }
 
     /// THE GATE: a real `tokio-tungstenite` client completes the RFC 6455
