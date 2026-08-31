@@ -247,8 +247,11 @@ HTTP is sent, every delivery runs a pre-flight check:
    - IPv4 loopback (`127.0.0.0/8`), unspecified (`0.0.0.0`),
      link-local (`169.254.0.0/16` — includes the cloud metadata addresses),
      and RFC1918 (`10/8`, `172.16/12`, `192.168/16`).
+   - IPv4 shared/CGNAT (`100.64.0.0/10`, RFC 6598) — Tailscale and several
+     Kubernetes CNIs run real internal infrastructure there.
+   - IPv4 multicast (`224.0.0.0/4`) and broadcast (`255.255.255.255`).
    - IPv6 loopback (`::1`), unspecified (`::`), unique-local (`fc00::/7`),
-     and link-local (`fe80::/10`).
+     link-local (`fe80::/10`), and multicast (`ff00::/8`).
    - IPv4-mapped (`::ffff:10.0.0.5`) and IPv4-compatible (`::10.0.0.5`) IPv6
      forms are classified by their embedded IPv4 address.
 3. **Pinning**: for hostname URLs the delivery is pinned to the addresses the

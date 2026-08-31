@@ -30,7 +30,20 @@ use tokio::sync::{Mutex, Semaphore};
 pub fn is_private_target(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_unspecified() || v4.is_link_local() || v4.is_private()
+            v4.is_loopback()
+                || v4.is_unspecified()
+                || v4.is_link_local()
+                || v4.is_private()
+                // RFC 6598 shared/CGNAT space (100.64.0.0/10) — Tailscale and
+                // several k8s CNIs run real internal infrastructure there.
+                // (`Ipv4Addr::is_shared` is unstable at our MSRV, so the /10
+                // is matched on octets: 100.64.0.0 — 100.127.255.255.)
+                || (v4.octets()[0] == 100 && (0x40..=0x7f).contains(&v4.octets()[1]))
+                // Multicast and broadcast are never legitimate webhook
+                // receivers. (240.0.0.0/4 class-E and NAT64 64:ff9b::/96 are
+                // deliberately NOT classified here — ledgered only.)
+                || v4.is_multicast()
+                || v4.is_broadcast()
         }
         IpAddr::V6(v6) => {
             // The v6 special forms come FIRST: `to_ipv4` also converts the
@@ -51,6 +64,7 @@ pub fn is_private_target(ip: IpAddr) -> bool {
             }
             (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
                 || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                || v6.is_multicast() // ff00::/8
         }
     }
 }
@@ -1264,6 +1278,38 @@ mod tests {
     fn classifier_allows_public_v6() {
         assert!(!private("2001:4860:4860::8888"));
         assert!(!private("2606:4700:4700::1111"));
+    }
+
+    /// Fix-round 1 (Important 2): 100.64.0.0/10 — RFC 6598 shared/CGNAT
+    /// space. Tailscale and several k8s CNIs run real internal infrastructure
+    /// there, exactly the threat model, so it must classify as private.
+    #[test]
+    fn classifier_blocks_cgnat_shared_100_64_slash_10() {
+        assert!(!private("100.63.255.255"), "just below the /10");
+        assert!(private("100.64.0.0"), "bottom of the /10");
+        assert!(private("100.64.0.1"));
+        assert!(private("100.100.100.100"));
+        assert!(private("100.127.255.255"), "top of the /10");
+        assert!(!private("100.128.0.1"), "just above the /10");
+    }
+
+    /// Fix-round 1 (authorized extra): multicast and broadcast targets are
+    /// never legitimate webhook receivers — refuse them too. NAT64
+    /// (64:ff9b::/96) is deliberately NOT classified here (ledgered only).
+    #[test]
+    fn classifier_blocks_multicast_and_broadcast() {
+        // v4 multicast 224.0.0.0/4
+        assert!(!private("223.255.255.255"), "just below 224/4");
+        assert!(private("224.0.0.1"));
+        assert!(private("239.255.255.255"), "top of 224/4");
+        // 240.0.0.0/4 (class E reserved) is out of scope — stays public here.
+        assert!(!private("240.0.0.1"));
+        // v4 broadcast
+        assert!(private("255.255.255.255"));
+        // v6 multicast ff00::/8
+        assert!(private("ff02::1"));
+        assert!(private("ffff::1"), "top of ff00::/8");
+        assert!(!private("fe00::1"), "below ff00::/8");
     }
 
     // ── S2: SSRF guard — the pre-flight over a mock resolver ──────────────────
