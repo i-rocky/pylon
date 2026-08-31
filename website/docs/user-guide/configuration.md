@@ -50,6 +50,7 @@ per-connection and per-publish lookups stay fast. See
 | `PYLON_APP_CACHE_NEG_TTL` | `30` | L1 negative-entry TTL (seconds). Kept short. |
 | `PYLON_APP_CACHE_REDIS_URL` | _(none)_ | Optional Redis URL for the shared L2 cache + the cross-node invalidation channel. When set, a cold node reads warm apps from Redis instead of the database, and the admin invalidate API is enabled. |
 | `PYLON_ADMIN_TOKEN` | _(none)_ | Bearer token for the admin API (`POST /admin/apps/{id}/invalidate`). When unset, the admin API is **disabled** (returns 404). |
+| `PYLON_METRICS_TOKEN` | _(none)_ | Bearer token for `GET /metrics`. When unset, metrics are open (default). When set, a scrape must carry `Authorization: Bearer <token>`; anything else returns **404** (not 401 — no existence disclosure). `/health` and `/ready` are never gated. Empty string is treated as unset. See [Deployment: Protecting /metrics](deployment.md#protecting-metrics). |
 | `PYLON_APP_SWEEP_INTERVAL` | `0` | Interval (seconds) for the app-purge sweep backstop. `0` disables it. When set, the sweep periodically reconciles connected apps against the database and force-closes any that have been removed/disabled. |
 
 ---

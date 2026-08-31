@@ -230,7 +230,55 @@ pub fn encode(snapshot: &MetricsSnapshot) -> String {
     out
 }
 
-pub async fn get_metrics(State(state): State<AppState>) -> impl IntoResponse {
+/// Extract the bearer token from `Authorization: Bearer <token>`.
+/// Returns `""` when the header is absent, malformed, or not a Bearer scheme —
+/// the caller compares it against the configured token, so a missing token is
+/// simply "wrong" (and gets the same 404 as a wrong token).
+fn bearer_token(headers: &axum::http::HeaderMap) -> &str {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("")
+}
+
+/// Constant-time bearer-token compare with **no early exit**: the length
+/// difference folds into the same bytewise accumulation as content
+/// differences, so the compare always walks `max(len)` bytes regardless of
+/// where (or whether) the inputs diverge. Token LENGTHS are not secret (the
+/// operator picks them), but the discipline is kept anyway: no short-circuit
+/// on the first differing byte or on a length mismatch.
+fn token_matches(presented: &str, expected: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    let (p, e) = (presented.as_bytes(), expected.as_bytes());
+    let max = p.len().max(e.len());
+    // AND-fold: start from the identity (1 = "equal so far") with the length
+    // equality folded in as a Choice (0/1), not a branch; out-of-range bytes
+    // (only possible on a length mismatch) read as 0.
+    let mut eq = subtle::Choice::from(u8::from(p.len() == e.len()));
+    for i in 0..max {
+        let a = p.get(i).copied().unwrap_or(0);
+        let b = e.get(i).copied().unwrap_or(0);
+        eq &= a.ct_eq(&b);
+    }
+    eq.into()
+}
+
+pub async fn get_metrics(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    // S1: optional bearer gate. When `PYLON_METRICS_TOKEN` is set, a scrape
+    // must present it. Missing/wrong token → 404 (NOT 401): an
+    // unauthenticated prober must not distinguish "metrics exist but are
+    // protected" from "no such route" — the same existence-non-disclosure
+    // posture as the disabled admin API. `/health` + `/ready` stay open.
+    if let Some(expected) = state.config.metrics_token.as_deref() {
+        if !token_matches(bearer_token(&headers), expected) {
+            return crate::http::error::RestError::not_found("Not found").into_response();
+        }
+    }
+
     use std::sync::atomic::Ordering;
 
     // Collect per-app metrics.
@@ -721,5 +769,133 @@ mod tests {
             !text.contains("pylon_redis_connected"),
             "redis_connected must be absent: {text}"
         );
+    }
+
+    // ── S1: optional bearer-token gate on /metrics ────────────────────────────
+
+    /// Minimal `AppState` driving the handler directly, with an optional
+    /// `metrics_token` (mirrors admin.rs's `test_state` harness).
+    fn gate_state(token: Option<&str>) -> AppState {
+        let config = crate::server::config::ServerConfig {
+            metrics_token: token.map(|t| t.to_string()),
+            ..crate::server::config::ServerConfig::default()
+        };
+        AppState {
+            config,
+            apps: Arc::new(crate::app::static_file::StaticFileAppManager::from_json("[]").unwrap()),
+            adapter: Arc::new(crate::adapter::local::LocalAdapter::new(
+                Arc::new(crate::channel::registry::Registry::new()),
+                Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+            )),
+            conn_counts: Arc::new(Default::default()),
+            webhooks: crate::webhook::WebhookHandle::null(),
+            saturated: None,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cluster_metrics: None,
+            invalidator: None,
+        }
+    }
+
+    fn bearer(token: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        h
+    }
+
+    /// Token unset → metrics open (back-compat: the gate must be inert).
+    #[tokio::test]
+    async fn token_unset_metrics_open() {
+        let resp = get_metrics(State(gate_state(None)), axum::http::HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    /// Token set + no Authorization header → 404 (not 401: no existence disclosure).
+    #[tokio::test]
+    async fn token_set_missing_header_is_404_not_401() {
+        let resp = get_metrics(
+            State(gate_state(Some("sekrit"))),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "missing token must 404, not 401"
+        );
+    }
+
+    /// Token set + wrong token (same length) → 404.
+    #[tokio::test]
+    async fn token_set_wrong_token_is_404() {
+        let resp = get_metrics(
+            State(gate_state(Some("sekret"))),
+            bearer("sekrit"), // same length, differs in the last two bytes
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// Token set + correct token → 200 with the real metrics body.
+    #[tokio::test]
+    async fn token_set_correct_token_is_200_with_body() {
+        let resp = get_metrics(State(gate_state(Some("sekrit"))), bearer("sekrit"))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("pylon_up 1"), "body: {text}");
+    }
+
+    /// A non-Bearer Authorization scheme is treated as no token at all.
+    #[tokio::test]
+    async fn token_set_basic_scheme_is_404() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "Basic c2Vrcml0OnNla3JpdA==".parse().unwrap(),
+        );
+        let resp = get_metrics(State(gate_state(Some("sekrit"))), h)
+            .await
+            .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    // ── S1: the constant-time token compare (pure function) ───────────────────
+
+    #[test]
+    fn token_matches_accepts_identical() {
+        assert!(token_matches("sekrit", "sekrit"));
+        assert!(token_matches("", ""));
+    }
+
+    #[test]
+    fn token_matches_rejects_same_length_difference() {
+        assert!(!token_matches(
+            "sekrit",
+            "sekrit".replace('t', "x").as_str()
+        ));
+        // Differ only in the FIRST byte (an early-exit compare would return
+        // fastest here; the fold must behave identically for every position).
+        assert!(!token_matches("aekrit", "sekrit"));
+        // Differ only in the LAST byte.
+        assert!(!token_matches("sekris", "sekrit"));
+    }
+
+    #[test]
+    fn token_matches_rejects_length_mismatch_both_ways() {
+        assert!(!token_matches("", "sekrit"));
+        assert!(!token_matches("sekrit", ""));
+        assert!(!token_matches("sekrit-with-a-much-longer-length", "sekrit"));
+        assert!(!token_matches("s", "sekrit"));
     }
 }
