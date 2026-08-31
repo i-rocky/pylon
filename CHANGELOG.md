@@ -175,3 +175,46 @@ relay model; the `local: None` saturation-gate trap is called out in code (X2).
 
 #### Added
 - `pylon --version` / `--help` (unit-tested; unknown flags exit 1 with a hint).
+
+### Phase 6 — Performance & hot-path efficiency (audit remediation)
+
+#### Fixed
+- **TLS writes resuming after a partial flush could re-encrypt from a stale
+  cursor** (pre-existing): a WouldBlock mid-batch left the plaintext offset
+  un-advanced, so the retry re-sent already-flushed bytes. Surfaced and fixed by
+  the writev batching work; pinned by regression tests.
+- **Client-event rate limiting now enforces a true 10 messages/sec with a bounded
+  burst** (audit F13): the old fixed window admitted a 2× edge-aligned burst (20
+  events in ~1.001 s). Replaced with a token bucket — capacity 10, continuous
+  10/s refill, O(1) per check; a full idle second restores the whole burst.
+  Clients that relied on the window edge will now see the documented limit.
+
+#### Changed
+- Connection hot path: accepted sockets set `TCP_NODELAY`; queued frames coalesce
+  into single `writev` syscalls per flush batch (≤1024 slices / 256 KiB plain,
+  60 KiB TLS budget); the outbound queue carries shared `Bytes` frames — encode +
+  frame once per broadcast, refcount clones per connection (allocations per frame
+  dropped from one-per-subscriber to a constant); `ServerEvent::Raw` frames fan
+  out with zero per-subscriber copies via the new `Codec::encode_into` append
+  seam; worker drain hygiene — in-place subscription diffs instead of set clones,
+  close-set dedup, relaxed shutdown-flag ordering, read-buffer shrink toward 8 KiB
+  after fully-drained bursts; user-directed events encode once per fan-out.
+- Legacy registry fan-out no longer holds the shard lock across mailbox sends
+  (snapshot under the guard, send after): subscribe/unsubscribe throughput under a
+  broadcast storm went from ~115 ops/s lock-stepped to millions of ops/s in the
+  new churn bench, and the 1000-subscriber broadcast bench improved ~17%.
+- Presence rosters serialize straight from an incrementally-sorted member map —
+  no per-join deep-clone + re-sort (wire bytes unchanged, golden-pinned).
+- Cluster/Redis: membership heartbeats batch into one pipeline per tick
+  (multi-field HSETs, no per-socket string clones); cluster broadcasts encode
+  once and feed the same bytes to the local sink and the Redis publish halves.
+
+#### Added
+- **`frame_b64` cluster-envelope field (additive, rolling-upgrade safe)**:
+  relays now carry the finished frame as base64 alongside the existing string
+  field; receivers prefer it and fall back to the old field, so mixed-version
+  fleets interoperate in both directions.
+- `benches/fanout_sink.rs`: criterion bench for the production
+  BroadcastSink→drain path (typed and `Raw` events at 1k/10k/100k subscribers,
+  plus a registry-churn-under-broadcast-storm case); `benches/fanout.rs` now
+  documents that it covers the legacy registry path.
