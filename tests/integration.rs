@@ -56,7 +56,7 @@ async fn public_subscribe_succeeds() {
     let frame = next_json(&mut ws).await;
     assert_eq!(frame["event"], "pusher_internal:subscription_succeeded");
     assert_eq!(frame["channel"], "room");
-    assert_eq!(frame["data"], ""); // empty-string data for non-presence
+    assert_eq!(frame["data"], "{}"); // "{}" string for non-presence (P12)
 }
 
 #[tokio::test]
