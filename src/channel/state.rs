@@ -9,6 +9,7 @@ use crate::protocol::socket_id::SocketId;
 use rayon::prelude::*;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 /// Above this subscriber count, `broadcast` fans the per-mailbox enqueue out
 /// across the rayon pool; at or below it the serial loop is cheaper than the
@@ -30,10 +31,18 @@ struct PresenceUser {
     conn_count: usize,
 }
 
+/// Shared membership snapshot for fan-out: every `(socket_id, subscriber)` pair
+/// of a channel, behind one `Arc` so a broadcast can detach from the registry
+/// shard lock with a single refcount bump (F7).
+type SharedSnapshot = Arc<[(SocketId, Arc<Subscriber>)]>;
+
 #[derive(Default)]
 pub struct ChannelState {
-    subscribers: HashMap<SocketId, Subscriber>,
+    subscribers: HashMap<SocketId, Arc<Subscriber>>,
     users: HashMap<String, PresenceUser>, // user_id -> info + live connection count
+    /// Membership snapshot for fan-out, rebuilt lazily: `add`/`remove` reset it,
+    /// the next `fanout` rebuilds it under the caller's registry shard guard.
+    snapshot: OnceLock<SharedSnapshot>,
 }
 
 impl ChannelState {
@@ -61,7 +70,8 @@ impl ChannelState {
             }
         });
         self.subscribers
-            .insert(socket_id, Subscriber { handle, member });
+            .insert(socket_id, Arc::new(Subscriber { handle, member }));
+        self.snapshot.take(); // membership changed: next fan-out rebuilds
         join.map(|mut j| {
             j.roster = self.roster();
             j
@@ -72,7 +82,8 @@ impl ChannelState {
     /// presence member (with `last_for_user` set when its last connection left).
     pub fn remove(&mut self, socket_id: &SocketId) -> Option<PresenceLeave> {
         let sub = self.subscribers.remove(socket_id)?;
-        let member = sub.member?;
+        self.snapshot.take(); // membership changed: next fan-out rebuilds
+        let member = sub.member.clone()?;
         let last_for_user = match self.users.get_mut(&member.user_id) {
             Some(u) => {
                 u.conn_count -= 1;
@@ -140,51 +151,100 @@ impl ChannelState {
             .collect()
     }
 
-    /// Deliver `event` to every subscriber's mailbox except `except`.
+    /// Capture this channel's half of a broadcast as an owned [`Fanout`]
+    /// snapshot: the wire frame encoded ONCE here (reusing a pre-encoded
+    /// `Raw` event's `Arc` rather than re-encoding) plus the channel's shared
+    /// membership snapshot (rebuilt here under the caller's guard iff
+    /// membership changed since the last fan-out; `except` is applied at send
+    /// time). Control events (`Close`) never reach this path.
     ///
-    /// Encode the wire frame ONCE here and fan out cheap `Arc<str>` clones rather
-    /// than re-encoding in every connection task (was N encodes + N deep clones for
-    /// N local subscribers). If the event is already pre-encoded (`Raw`, e.g. a
-    /// broadcast relayed verbatim from another node), reuse its `Arc`. Control
-    /// events (`Close`) never reach `broadcast`.
+    /// MUST be called while the caller holds the registry shard read guard;
+    /// the returned snapshot is then executed via [`Fanout::send`] AFTER that
+    /// guard is dropped, so the shard is never held across mailbox enqueues
+    /// (finding F7 — see `Registry::broadcast`).
     ///
-    /// For large channels the serial per-subscriber `mailbox.send` loop becomes
-    /// the publish-side bottleneck (at N=10k it caps fan-out below the worker
-    /// ceiling). Above `PARALLEL_THRESHOLD` we fan the enqueue out across the
-    /// rayon work-stealing pool. This is correctness-safe: subscribers are keyed
-    /// by `SocketId`, so each distinct mailbox appears in `targets` at most once
-    /// and is sent to exactly once per broadcast — no two threads ever push to the
-    /// same mailbox, and per-channel send ordering is preserved (a connection only
-    /// receives via its own mailbox). Small broadcasts stay on the serial path so
-    /// presence/small channels pay zero pool overhead.
-    pub fn broadcast(&self, event: &ServerEvent, except: Option<&SocketId>) {
-        let frame: std::sync::Arc<str> = match event {
+    /// The snapshot is exactly the guard-time subscriber set: collect-then-send
+    /// races with concurrent subscribe/unsubscribe the same way the previous
+    /// send-under-guard loop did — a member removed after the snapshot may or
+    /// may not still receive the frame (at-most-once per mailbox, as ever).
+    pub fn fanout<'a>(&self, event: &ServerEvent, except: Option<&'a SocketId>) -> Fanout<'a> {
+        let frame: Arc<str> = match event {
             ServerEvent::Raw(f) => f.clone(),
-            other => std::sync::Arc::from(crate::protocol::v7::frames::encode(other).as_str()),
+            other => Arc::from(crate::protocol::v7::frames::encode(other).as_str()),
         };
-        if self.subscribers.len() <= PARALLEL_THRESHOLD {
-            for (sid, sub) in &self.subscribers {
+        Fanout {
+            frame,
+            except,
+            snapshot: self
+                .snapshot
+                .get_or_init(|| {
+                    let mut v = Vec::with_capacity(self.subscribers.len());
+                    for (sid, sub) in &self.subscribers {
+                        v.push((*sid, Arc::clone(sub)));
+                    }
+                    Arc::from(v.into_boxed_slice())
+                })
+                .clone(),
+            // Path choice stays keyed on the FULL subscriber count so the
+            // serial/parallel cutover is identical to the previous in-guard
+            // loop.
+            parallel: self.subscribers.len() > PARALLEL_THRESHOLD,
+        }
+    }
+}
+
+/// One broadcast's fan-out, detached from the registry shard lock (F7): the
+/// frame encoded once plus a shared membership snapshot (one refcount for the
+/// whole subscriber set, not one handle clone per subscriber per broadcast),
+/// with the send path (serial vs rayon) chosen at snapshot time.
+pub struct Fanout<'a> {
+    frame: Arc<str>,
+    snapshot: SharedSnapshot,
+    except: Option<&'a SocketId>,
+    parallel: bool,
+}
+
+impl Fanout<'_> {
+    /// Deliver the frame to every snapshotted mailbox — serially for small
+    /// snapshots, fanned out across the rayon work-stealing pool above
+    /// `PARALLEL_THRESHOLD`. Runs with NO registry shard guard held (that is
+    /// the point). For large channels the serial per-subscriber `mailbox.send`
+    /// loop is the publish-side bottleneck (at N=10k it caps fan-out below the
+    /// worker ceiling), hence the rayon path. This is correctness-safe:
+    /// subscribers are keyed by `SocketId`, so each distinct mailbox appears in
+    /// `snapshot` at most once and is sent to exactly once per broadcast — no
+    /// two threads ever push to the same mailbox, and per-channel send ordering
+    /// is preserved (a connection only receives via its own mailbox). Small
+    /// broadcasts stay on the serial path so presence/small channels pay zero
+    /// pool overhead.
+    pub fn send(self) {
+        let except = self.except;
+        if !self.parallel {
+            for (sid, sub) in &*self.snapshot {
                 if Some(sid) == except {
                     continue;
                 }
-                let _ = sub.handle.mailbox.send(ServerEvent::Raw(frame.clone()));
+                let _ = sub
+                    .handle
+                    .mailbox
+                    .send(ServerEvent::Raw(self.frame.clone()));
             }
             return;
         }
-        let targets: Vec<&crate::connection::handle::Mailbox> = self
-            .subscribers
-            .iter()
-            .filter(|(sid, _)| Some(*sid) != except)
-            .map(|(_, sub)| &sub.handle.mailbox)
-            .collect();
         // Chunk the fan-out so each rayon job does a meaningful batch of sends
         // (a single `Mailbox::send` is ~tens of ns; per-element rayon dispatch
-        // would otherwise dominate). The frame `Arc` is cloned once per batch
-        // closure entry and once per send. Each `send` also marks its target dirty
-        // + wakes that connection's worker (when the mailbox is wired).
-        targets.par_chunks(SEND_CHUNK).for_each(|chunk| {
-            for mb in chunk {
-                let _ = mb.send(ServerEvent::Raw(frame.clone()));
+        // would otherwise dominate). The frame `Arc` is cloned once per send.
+        // Each `send` also marks its target dirty + wakes that connection's
+        // worker (when the mailbox is wired).
+        self.snapshot.par_chunks(SEND_CHUNK).for_each(|chunk| {
+            for (sid, sub) in chunk {
+                if Some(sid) == except {
+                    continue;
+                }
+                let _ = sub
+                    .handle
+                    .mailbox
+                    .send(ServerEvent::Raw(self.frame.clone()));
             }
         });
     }
@@ -275,7 +335,7 @@ mod tests {
         };
         let expected = crate::protocol::v7::frames::encode(&original);
 
-        s.broadcast(&original, None);
+        s.fanout(&original, None).send();
 
         for rx in [&mut rx1, &mut rx2] {
             match rx
@@ -315,7 +375,7 @@ mod tests {
         };
         let expected = crate::protocol::v7::frames::encode(&original);
 
-        s.broadcast(&original, Some(&except));
+        s.fanout(&original, Some(&except)).send();
 
         let mut delivered = 0;
         for (i, rx) in &mut rxs {
@@ -334,6 +394,45 @@ mod tests {
             n - 1,
             "every subscriber except `except` receives the frame exactly once"
         );
+    }
+
+    #[test]
+    fn fanout_snapshot_is_the_guard_time_set_and_survives_later_mutation() {
+        // F7 contract: the snapshot is taken under the registry shard guard and
+        // the sends run after it is dropped — so a subscriber removed between
+        // snapshot and send STILL receives the frame (the race the old
+        // send-under-guard loop also allowed: removal could not complete before
+        // the sends finished, but delivery was never conditioned on the entry
+        // still being present). The NEXT fan-out must see the new membership:
+        // removal invalidates the cached snapshot, which is rebuilt under the
+        // next guard.
+        let mut s = ChannelState::default();
+        let (h1, mut rx1) = handle_with_rx();
+        let (h2, mut rx2) = handle_with_rx();
+        let s1 = h1.socket_id;
+        s.add(h1, None);
+        s.add(h2, None);
+
+        let plan = s.fanout(&ServerEvent::Pong, None);
+        s.remove(&s1); // unsubscribe lands between snapshot and send
+        plan.send();
+
+        for rx in [&mut rx1, &mut rx2] {
+            match rx.try_recv().map(|b| *b) {
+                Ok(ServerEvent::Raw(f)) => {
+                    assert_eq!(&*f, crate::protocol::v7::frames::encode(&ServerEvent::Pong))
+                }
+                other => panic!("expected Raw(Pong), got {other:?}"),
+            }
+        }
+
+        // Snapshot after the mutation: exactly the remaining subscriber.
+        s.fanout(&ServerEvent::Pong, None).send();
+        assert!(rx1.try_recv().is_err(), "removed member gets nothing");
+        assert!(matches!(
+            rx2.try_recv().map(|b| *b),
+            Ok(ServerEvent::Raw(_))
+        ));
     }
 
     #[test]

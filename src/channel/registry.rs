@@ -69,9 +69,19 @@ impl Registry {
         event: &ServerEvent,
         except: Option<&SocketId>,
     ) {
-        if let Some(state) = self.channels.get(&(app.to_string(), channel.to_string())) {
-            state.broadcast(event, except);
-        }
+        // Snapshot the fan-out under the shard read guard, then DROP the guard
+        // before any mailbox send (finding F7): each send can contend with the
+        // receiving worker, and holding the shard across the whole send loop
+        // serialized every subscribe/unsubscribe/broadcast hashing to the same
+        // shard behind an in-flight fan-out. The snapshot is exactly the
+        // guard-time subscriber set, so delivery semantics are unchanged.
+        let fanout = {
+            let Some(state) = self.channels.get(&(app.to_string(), channel.to_string())) else {
+                return;
+            };
+            state.fanout(event, except)
+        };
+        fanout.send();
     }
 
     pub fn channel_summary(&self, app: &str, channel: &str) -> ChannelSummary {
