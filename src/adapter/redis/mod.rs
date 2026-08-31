@@ -50,8 +50,19 @@ pub(crate) fn now_ms() -> u64 {
 /// whole-key TTL, so a live node never lets its members expire. A dead node simply
 /// stops ticking — its entries go stale and the per-key `EXPIRE` reaps them.
 ///
-/// One Redis error refreshes one member; it is logged and skipped, never fatal —
-/// the loop runs for the adapter's lifetime.
+/// F11 batching: ONE pipeline per tick carries every refresh. Members are grouped
+/// per channel hash into a single multi-field `HSET` (all of this node's member
+/// tokens → the tick's shared `expireAt`), followed immediately by that hash's
+/// whole-key `EXPIRE` re-arm; the user `usr(app,user)` hashes get the same
+/// treatment in the SAME pipeline. Redis-side state per tick is identical to the
+/// previous per-member pipelines: every command is an idempotent re-seed (field
+/// writes overwrite in place, `EXPIRE` re-arms idempotently, and per key the
+/// `EXPIRE` still follows its `HSET` in command order). A Redis error now fails
+/// the whole tick's batch rather than one member — the loop retries the FULL
+/// idempotent batch next tick, and the TTL (`membership_ttl_secs`, default 60s)
+/// spans multiple ticks (`presence_heartbeat_secs`, default 25s), so the re-seed
+/// semantics are unchanged. It is logged and skipped, never fatal — the loop runs
+/// for the adapter's lifetime.
 async fn heartbeat_loop(
     local: Arc<LocalAdapter>,
     pool: Pool,
@@ -63,48 +74,61 @@ async fn heartbeat_loop(
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
     loop {
         ticker.tick().await;
-        let expire_at = (now_ms() + ttl_secs * 1000).to_string();
-        for (app, channel, socket_id) in local.local_members() {
-            let occ = keys.occ(&app, &channel);
-            let token = keys::member_token(&node_id, socket_id.as_str());
-            // Pipeline: HSET occ token expire_at ; EXPIRE occ ttl_secs. Refreshes the
-            // per-member stamp and the whole-key TTL backstop in one round-trip.
-            let pipe = pool.next().pipeline();
-            if let Err(e) = async {
-                pipe.hset::<(), _, _>(&occ, (token.clone(), expire_at.clone()))
-                    .await?;
-                pipe.expire::<(), _>(&occ, ttl_secs as i64, None).await?;
-                pipe.all::<()>().await
-            }
-            .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    app, channel,
-                    "redis membership heartbeat refresh failed; skipping this member"
-                );
-            }
+        let members = local.local_members();
+        let bindings = local.local_user_bindings();
+        if members.is_empty() && bindings.is_empty() {
+            continue;
         }
+        let expire_at = (now_ms() + ttl_secs * 1000).to_string();
+        // One pipeline per tick: per occ/usr hash one multi-field HSET of all of
+        // this node's member tokens → expire_at, then the whole-key TTL re-arm —
+        // one round-trip for the entire tick instead of one per member.
+        let pipe = pool.next().pipeline();
+        let tick = async {
+            for ((app, channel), socket_ids) in &members {
+                let occ = keys.occ(app, channel);
+                let fields: Vec<(String, String)> = socket_ids
+                    .iter()
+                    .map(|sid| {
+                        (
+                            keys::member_token(&node_id, sid.as_str()),
+                            expire_at.clone(),
+                        )
+                    })
+                    .collect();
+                pipe.hset::<(), _, _>(&occ, fields).await?;
+                pipe.expire::<(), _>(&occ, ttl_secs as i64, None).await?;
+            }
 
-        // Re-stamp this node's own user bindings (the `usr(app,user)` HASH), exactly as
-        // for channel members above: a live node keeps its bindings' `expireAt` in the
-        // future so the sweeper never reaps them; a crashed node stops ticking and its
-        // bindings go stale, firing the cluster offline edge once the user's last
-        // cluster connection (on the dead node) is reaped.
-        for (app, user_id, socket_id) in local.local_user_bindings() {
-            let usr = keys.usr(&app, &user_id);
-            let token = keys::member_token(&node_id, socket_id.as_str());
-            let pipe = pool.next().pipeline();
-            if let Err(e) = async {
-                pipe.hset::<(), _, _>(&usr, (token.clone(), expire_at.clone()))
-                    .await?;
+            // Re-stamp this node's own user bindings (the `usr(app,user)` HASH),
+            // exactly as for channel members above: a live node keeps its
+            // bindings' `expireAt` in the future so the sweeper never reaps
+            // them; a crashed node stops ticking and its bindings go stale,
+            // firing the cluster offline edge once the user's last cluster
+            // connection (on the dead node) is reaped.
+            for ((app, user_id), socket_ids) in &bindings {
+                let usr = keys.usr(app, user_id);
+                let fields: Vec<(String, String)> = socket_ids
+                    .iter()
+                    .map(|sid| {
+                        (
+                            keys::member_token(&node_id, sid.as_str()),
+                            expire_at.clone(),
+                        )
+                    })
+                    .collect();
+                pipe.hset::<(), _, _>(&usr, fields).await?;
                 pipe.expire::<(), _>(&usr, ttl_secs as i64, None).await?;
-                pipe.all::<()>().await
             }
-            .await
-            {
-                tracing::warn!(error = %e, app, user_id, "redis user-binding heartbeat refresh failed; skipping");
-            }
+            pipe.all::<()>().await
+        };
+        if let Err(e) = tick.await {
+            tracing::warn!(
+                error = %e,
+                channels = members.len(),
+                users = bindings.len(),
+                "redis membership heartbeat refresh failed; retrying the whole batch next tick"
+            );
         }
     }
 }

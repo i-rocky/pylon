@@ -93,17 +93,19 @@ impl LocalAdapter {
         self.bcast_sink.get()
     }
 
-    /// Every local subscription as `(app, channel, socket_id)`. Exposed so the Redis
-    /// adapter's membership heartbeat can re-stamp each local member without reaching
-    /// into the private registry.
-    pub fn local_members(&self) -> Vec<(String, String, SocketId)> {
+    /// Every local subscription grouped per `(app, channel)`, with that channel's
+    /// subscriber socket ids. Exposed so the Redis adapter's membership heartbeat
+    /// can re-stamp each local member without reaching into the private registry;
+    /// the grouped shape lets it batch one multi-field HSET per channel hash.
+    pub fn local_members(&self) -> Vec<((String, String), Vec<SocketId>)> {
         self.registry.local_members()
     }
 
-    /// Every local user binding as `(app, user_id, socket_id)`. Exposed so the Redis
-    /// adapter's membership heartbeat can re-stamp each local user binding's `expireAt`
-    /// without reaching into the private user registry.
-    pub fn local_user_bindings(&self) -> Vec<(String, String, SocketId)> {
+    /// Every local user binding grouped per `(app, user_id)`, with that user's
+    /// signed-in socket ids. Exposed so the Redis adapter's membership heartbeat
+    /// can re-stamp each local user binding's `expireAt` without reaching into
+    /// the private user registry, batching one multi-field HSET per `usr` hash.
+    pub fn local_user_bindings(&self) -> Vec<((String, String), Vec<SocketId>)> {
         self.users.local_bindings()
     }
 

@@ -122,18 +122,24 @@ impl Registry {
             .unwrap_or_default()
     }
 
-    /// Every local subscription as `(app, channel, socket_id)`, across all channels.
-    /// One tuple per socket. Used by the Redis adapter's membership TTL heartbeat to
-    /// re-stamp each local member's `expireAt` so live nodes never expire.
-    pub fn local_members(&self) -> Vec<(String, String, SocketId)> {
-        let mut out = Vec::new();
-        for entry in self.channels.iter() {
-            let (app, channel) = entry.key();
-            for sid in entry.value().socket_ids() {
-                out.push((app.clone(), channel.clone(), sid));
-            }
-        }
-        out
+    /// Every local subscription grouped per `(app, channel)`: one entry per
+    /// channel carrying that channel's subscriber socket ids. Used by the Redis
+    /// adapter's membership TTL heartbeat to re-stamp each local member's
+    /// `expireAt` so live nodes never expire. Grouping (rather than one flat
+    /// `(app, channel, socket_id)` tuple per socket) lets the heartbeat batch
+    /// ONE multi-field HSET per channel hash per tick and clones the
+    /// `(app, channel)` Strings once per CHANNEL, not once per socket.
+    pub fn local_members(&self) -> Vec<((String, String), Vec<SocketId>)> {
+        self.channels
+            .iter()
+            .filter(|e| !e.value().is_empty())
+            .map(|e| {
+                (
+                    (e.key().0.clone(), e.key().1.clone()),
+                    e.value().socket_ids(),
+                )
+            })
+            .collect()
     }
 
     /// Number of tracked `(app, channel)` entries. Test-only.
@@ -230,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn local_members_enumerates_every_subscription_across_channels() {
+    fn local_members_groups_per_channel() {
         let reg = Registry::new();
         let (h1, _r1) = handle();
         let (h2, _r2) = handle();
@@ -238,20 +244,33 @@ mod tests {
         let s1 = h1.socket_id;
         let s2 = h2.socket_id;
         let s3 = h3.socket_id;
-        // Two channels: "c1" has two sockets, "c2" has one.
+        // Two channels: "c1" has two sockets, "c2" (under another app) has one.
         reg.subscribe("app", "c1", h1, None);
         reg.subscribe("app", "c1", h2, None);
-        reg.subscribe("app", "c2", h3, None);
+        reg.subscribe("other", "c2", h3, None);
 
+        // Grouped shape: exactly one (app, channel) entry per channel — no matter
+        // how many sockets subscribe — carrying every subscriber's socket id, so
+        // the Redis heartbeat batches one multi-field HSET per channel hash and
+        // the (app, channel) Strings never clone per socket.
         let mut got = reg.local_members();
         got.sort();
+        for (_, ids) in &mut got {
+            ids.sort();
+        }
+        let mut c1_ids = vec![s1, s2];
+        c1_ids.sort();
         let mut want = vec![
-            ("app".to_string(), "c1".to_string(), s1),
-            ("app".to_string(), "c1".to_string(), s2),
-            ("app".to_string(), "c2".to_string(), s3),
+            (("app".to_string(), "c1".to_string()), c1_ids),
+            (("other".to_string(), "c2".to_string()), vec![s3]),
         ];
         want.sort();
         assert_eq!(got, want);
+        assert_eq!(
+            got.len(),
+            2,
+            "one group per (app, channel), independent of subscriber count"
+        );
     }
 
     #[test]
