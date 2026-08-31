@@ -3,8 +3,9 @@
 //! A [`Connection`] wraps a single non-blocking [`mio::net::TcpStream`] and owns
 //! the two halves of a Pusher WebSocket session:
 //!
-//! * **Outbound.** A queue of pre-encoded frames ([`Arc<[u8]>`], so a broadcast
-//!   payload is encoded once and fanned out as cheap `Arc` clones). [`Connection::flush`]
+//! * **Outbound.** A queue of pre-encoded frames ([`Bytes`], so a broadcast
+//!   payload is encoded once, frozen zero-copy from the encoder's buffer, and
+//!   fanned out as cheap refcount clones). [`Connection::flush`]
 //!   drains the queue with *corked*, coalesced writes — whole queued frames are
 //!   gathered into `IoSlice` batches and handed to the socket in one
 //!   `writev(2)` per batch (bounded by an iovec count and a byte budget),
@@ -21,11 +22,10 @@
 //! worker re-arms epoll interest and calls back.
 
 use crate::transport::frame::{self, Frame, ParseError};
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use rustls::server::ServerConnection as TlsConn;
 use std::collections::VecDeque;
 use std::io::{ErrorKind, IoSlice, Read, Write};
-use std::sync::Arc;
 
 /// Lifecycle of a connection as seen by the transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,10 +141,13 @@ struct CodelState {
 /// The queued outbound element: a pre-encoded frame paired with its monotonic
 /// enqueue timestamp (for CoDel sojourn computation on dequeue).
 ///
-/// F4/6.3 seam: everything in the flush path touches the frame only via
-/// `len()`/indexing (no `Arc`-specific API), so swapping `Arc<[u8]>` for
-/// `bytes::Bytes` later is a one-line change to this alias.
-type OutFrame = (Arc<[u8]>, u64);
+/// F5: the frame is `bytes::Bytes` — frozen zero-copy from the encoder's
+/// `BytesMut` (`out.freeze()`), so producing a queued frame costs the encode
+/// buffer's allocations and nothing else (the pre-F5 shape copied via
+/// `to_vec()` and re-allocated into an `Arc<[u8]>`), and fan-out delivery is a
+/// refcount clone. Everything in the flush path touches the frame only via
+/// `len()`/indexing (`Bytes: Deref<Target = [u8]>`).
+type OutFrame = (Bytes, u64);
 
 /// F4: coalescing limits for the flush path.
 ///
@@ -278,17 +281,17 @@ pub struct Connection {
     io: Io,
     /// Current lifecycle state.
     pub state: ConnState,
-    /// Pending outbound frames (pre-encoded bytes, shared via `Arc` for
-    /// encode-once fan-out) paired with the monotonic enqueue time (ns since the
-    /// owning worker's epoch) used for CoDel sojourn computation on dequeue. The
-    /// front element is the one currently being written, possibly partially (see
-    /// `out_cursor`).
+    /// Pending outbound frames (pre-encoded bytes, shared via `Bytes`
+    /// refcounting for encode-once fan-out) paired with the monotonic enqueue
+    /// time (ns since the owning worker's epoch) used for CoDel sojourn
+    /// computation on dequeue. The front element is the one currently being
+    /// written, possibly partially (see `out_cursor`).
     out: VecDeque<OutFrame>,
     /// Byte offset into `out.front()` already written (partial-write resume
     /// point).
     out_cursor: usize,
     /// Total bytes still queued across all of `out` (drives the high-water
-    /// backpressure check without walking the deque). Counts only the `Arc`
+    /// backpressure check without walking the deque). Counts only the frame
     /// payload lengths, never the per-frame timestamp.
     out_bytes: usize,
     /// Backpressure threshold: if queuing a frame would push `out_bytes` over
@@ -575,7 +578,7 @@ impl Connection {
     /// `now_ns` is the monotonic enqueue time (ns since the worker's epoch),
     /// stamped onto the frame so [`flush`](Self::flush) can compute its sojourn
     /// (time-in-queue) for the CoDel freshness check on dequeue.
-    pub fn queue(&mut self, frame: Arc<[u8]>, now_ns: u64) -> usize {
+    pub fn queue(&mut self, frame: Bytes, now_ns: u64) -> usize {
         let flen = frame.len();
         let mut dropped = 0;
         // The frame currently mid-write (front when out_cursor>0) is "locked"; the
@@ -633,10 +636,10 @@ impl Connection {
     /// `writev(2)` batches — one syscall per batch instead of one per frame
     /// (F4; a subscriber catching up on 50 queued frames paid 50 syscalls
     /// before). Frames are MOVED into the reusable `writev_batch` vec (no
-    /// `Arc` clone, no per-flush allocation) and pushed back verbatim on any
-    /// non-writing exit, so the queue state is never lost; the batch iovecs
-    /// borrow that vec while the stream comes from `self.io` — disjoint
-    /// fields, borrowed simultaneously without cost.
+    /// refcount clone, no per-flush allocation) and pushed back verbatim on
+    /// any non-writing exit, so the queue state is never lost; the batch
+    /// iovecs borrow that vec while the stream comes from `self.io` —
+    /// disjoint fields, borrowed simultaneously without cost.
     fn flush_plain(&mut self, now_ns: u64) -> WriteStatus {
         let Io::Plain(stream) = &mut self.io else {
             unreachable!("flush_plain only called for Io::Plain")
@@ -1137,8 +1140,8 @@ fn flush_coalesced<W: WriteSink>(
             now_ns,
         );
         if out.is_empty() {
-            // Release the last batch's frames promptly (they are only Arc
-            // handles, but fan-out data should not outlive its send).
+            // Release the last batch's frames promptly (they are only shared
+            // `Bytes` handles, but fan-out data should not outlive its send).
             batch.clear();
             break;
         }
@@ -1220,8 +1223,8 @@ fn flush_coalesced<W: WriteSink>(
                     // fresh, not-yet-written frame — reset the cursor so it
                     // never points into a frame that has already gone out.
                     *out_cursor = 0;
-                    // Drop the sent frames' Arc handles now, not at the next
-                    // flush.
+                    // Drop the sent frames' `Bytes` handles now, not at the
+                    // next flush.
                     batch.clear();
                     // Cork on with the next batch.
                     continue;
@@ -1431,11 +1434,12 @@ mod tests {
         (mio_server, client)
     }
 
-    /// Encode an unmasked server text frame into a fresh `Arc<[u8]>`.
-    fn text_frame(payload: &[u8]) -> Arc<[u8]> {
+    /// Encode an unmasked server text frame into a fresh `Bytes` (frozen
+    /// zero-copy from the encode buffer, like the production producers).
+    fn text_frame(payload: &[u8]) -> Bytes {
         let mut out = BytesMut::new();
         frame::encode_text(&mut out, payload);
-        Arc::from(out.to_vec().into_boxed_slice())
+        out.freeze()
     }
 
     /// Read exactly `n` bytes from the blocking peer.
@@ -1575,7 +1579,7 @@ mod tests {
             }
         }
 
-        fn queue(&mut self, frame: Arc<[u8]>, now_ns: u64) {
+        fn queue(&mut self, frame: Bytes, now_ns: u64) {
             self.out_bytes += frame.len();
             self.inflight_delta += frame.len() as i64;
             self.out.push_back((frame, now_ns));
@@ -1802,7 +1806,7 @@ mod tests {
         let mut st = OutState::new();
         let mut expected = Vec::new();
         for tag in 1..=3u8 {
-            let f: Arc<[u8]> = Arc::from(vec![tag; 100 * 1024].into_boxed_slice());
+            let f: Bytes = Bytes::from(vec![tag; 100 * 1024]);
             expected.extend_from_slice(&f[..]);
             st.queue(f, 0);
         }
@@ -1954,7 +1958,7 @@ mod tests {
         let total = frame_bytes.len();
 
         let mut conn = Connection::new(server, total + 1);
-        assert_eq!(conn.queue(Arc::clone(&frame_bytes), 0), 0);
+        assert_eq!(conn.queue(frame_bytes.clone(), 0), 0);
 
         // First flush: the kernel send buffer fills and we stop partway.
         assert_eq!(conn.flush(0), WriteStatus::WouldBlock);
@@ -2033,9 +2037,7 @@ mod tests {
         let (mio_s, _peer) = pair(); // existing test helper
         let mut c = Connection::new(mio_s, 100); // 100-byte cap
                                                  // frames of 40 bytes each; 3 of them = 120 > 100 → oldest dropped, newest kept
-        let f = |n: u8| -> std::sync::Arc<[u8]> {
-            std::sync::Arc::from(vec![n; 40].into_boxed_slice())
-        };
+        let f = |n: u8| -> Bytes { Bytes::from(vec![n; 40]) };
         assert_eq!(c.queue(f(1), 0), 0); // returns dropped count = 0
         assert_eq!(c.queue(f(2), 0), 0); // out_bytes = 80
         let dropped = c.queue(f(3), 0); // 120 > 100 → drop oldest (f(1)) → out = [f2,f3], 80 bytes
@@ -2051,15 +2053,12 @@ mod tests {
     fn drop_head_never_evicts_the_partially_written_front() {
         let (mio_s, peer) = pair_tiny_sndbuf(); // tiny SO_SNDBUF so flush leaves a partial front
         let mut c = Connection::new(mio_s, 100);
-        c.queue(
-            std::sync::Arc::from(vec![1u8; 4_000_000].into_boxed_slice()),
-            0,
-        ); // huge → partial write
+        c.queue(Bytes::from(vec![1u8; 4_000_000]), 0); // huge → partial write
         let _ = c.flush(0); // out_cursor now > 0 on front
         assert!(c.out_cursor() > 0);
         // queue more small frames past the cap; the mid-write front MUST survive (peer would corrupt otherwise)
         for n in 0..50u8 {
-            let _ = c.queue(std::sync::Arc::from(vec![n; 40].into_boxed_slice()), 0);
+            let _ = c.queue(Bytes::from(vec![n; 40]), 0);
         }
         assert!(c.out_cursor() > 0, "front still mid-write");
         assert!(c.front_is_the_huge_frame()); // i.e. index 0 is untouched
@@ -2108,7 +2107,7 @@ mod tests {
         let mut c = Connection::new(server, 4_100_000);
         for i in 0..4096u32 {
             let tag = (i % 251) as u8 + 1;
-            let _ = c.queue(std::sync::Arc::from(vec![tag; 1000].into_boxed_slice()), 0);
+            let _ = c.queue(Bytes::from(vec![tag; 1000]), 0);
         }
         assert!(c.out_bytes() > 3_000_000, "a real backlog must remain");
 
@@ -2148,7 +2147,7 @@ mod tests {
         // oldest droppable slot; the MID-WRITE front must survive untouched.
         for i in 0..500u32 {
             let tag = (i % 251) as u8 + 1;
-            let _ = c.queue(std::sync::Arc::from(vec![tag; 1000].into_boxed_slice()), 0);
+            let _ = c.queue(Bytes::from(vec![tag; 1000]), 0);
         }
         assert!(c.out_cursor() > 0, "front still mid-write");
         assert_eq!(
@@ -2294,7 +2293,7 @@ mod tests {
     fn inflight_delta_tracks_queue_flush_and_drop_head() {
         let (server, mut client) = pair();
         let mut c = Connection::new(server, 100); // 100-byte cap → drop-head fires
-        let f = |n: u8, len: usize| -> Arc<[u8]> { Arc::from(vec![n; len].into_boxed_slice()) };
+        let f = |n: u8, len: usize| -> Bytes { Bytes::from(vec![n; len]) };
 
         // Running sum of all deltas taken; must always equal out_bytes().
         let mut running: i64 = 0;
@@ -2395,8 +2394,8 @@ mod tests {
     /// A small frame (10 bytes) tagged by its first byte so we can identify which
     /// frames the peer received. Small enough that every `flush` write succeeds
     /// outright (no partial writes), keeping the CoDel timeline deterministic.
-    fn small(tag: u8) -> Arc<[u8]> {
-        Arc::from(vec![tag; 10].into_boxed_slice())
+    fn small(tag: u8) -> Bytes {
+        Bytes::from(vec![tag; 10])
     }
 
     /// Drain the peer until exactly `expected` tags have been received in total

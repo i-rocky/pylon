@@ -166,12 +166,7 @@ impl Adapter for LocalAdapter {
             };
             let mut buf = bytes::BytesMut::new();
             crate::transport::frame::encode_text(&mut buf, json.as_bytes());
-            sink.broadcast(
-                Arc::from(app),
-                Arc::from(channel),
-                Arc::from(&buf[..]),
-                except,
-            );
+            sink.broadcast(Arc::from(app), Arc::from(channel), buf.freeze(), except);
         } else {
             // Legacy mailbox path (axum transport / tests): UNCHANGED.
             self.registry

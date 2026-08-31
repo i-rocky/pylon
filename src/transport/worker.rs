@@ -57,7 +57,7 @@ use crate::transport::frame::{self, OpCode};
 use crate::transport::handshake::{self, HeadResult};
 use crate::transport::timer::{Due, TimerWheel};
 use crate::ws::handler::ConnectionContext;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
@@ -1291,9 +1291,7 @@ fn queue_ping(
     let text = session.codec.encode(&ServerEvent::Ping);
     let mut out = BytesMut::new();
     frame::encode_text(&mut out, text.as_bytes());
-    let _ = entry
-        .conn
-        .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+    let _ = entry.conn.queue(out.freeze(), now_ns);
     Some(flush_and_arm(poll, entry, now_ns))
 }
 
@@ -1308,9 +1306,7 @@ fn queue_close_frame(entry: &mut Entry, code: u16, reason: &str, now_ns: u64) {
     frame_body.extend_from_slice(reason.as_bytes());
     let mut out = BytesMut::new();
     frame::encode(&mut out, true, OpCode::Close, &frame_body);
-    let _ = entry
-        .conn
-        .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+    let _ = entry.conn.queue(out.freeze(), now_ns);
 }
 
 /// Send a WebSocket Close frame with the given `code` and `reason` text —
@@ -1406,9 +1402,7 @@ fn queue_lifetime_error(conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) 
     };
     let mut out = BytesMut::new();
     frame::encode_text(&mut out, text.as_bytes());
-    let _ = entry
-        .conn
-        .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+    let _ = entry.conn.queue(out.freeze(), now_ns);
     // No explicit flush here: the caller queues the Close frame next via
     // `send_close_4202`, whose `flush_and_arm` flushes both frames together.
 }
@@ -1449,9 +1443,7 @@ fn queue_shutdown_error(conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) 
     };
     let mut out = BytesMut::new();
     frame::encode_text(&mut out, text.as_bytes());
-    let _ = entry
-        .conn
-        .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+    let _ = entry.conn.queue(out.freeze(), now_ns);
     // No explicit flush here: the caller queues the Close frame next, and
     // `send_close` calls `flush_and_arm` which flushes both frames together.
 }
@@ -1646,7 +1638,8 @@ fn handle_handshake(
         HeadResult::WsUpgrade { key: ws_key, path } => {
             let response = handshake::accept_response(&ws_key).into_boxed_slice();
             // Drop-head queue never rejects; the 101 response always enqueues.
-            let _ = entry.conn.queue(Arc::from(response), now_ns);
+            // (`Bytes::from(Box<[u8]>)` takes ownership — no copy.)
+            let _ = entry.conn.queue(Bytes::from(response), now_ns);
             // A browser never sends data frames before the 101, so any bytes
             // after the head would be a protocol error anyway; clearing is safe.
             entry.inbuf.clear();
@@ -1758,9 +1751,7 @@ fn handle_handshake(
                         let text = session.codec.encode(&established);
                         let mut out = BytesMut::new();
                         frame::encode_text(&mut out, text.as_bytes());
-                        let _ = entry
-                            .conn
-                            .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+                        let _ = entry.conn.queue(out.freeze(), now_ns);
                         entry.session = Some(session);
                         // Session established: the G3 handshake deadline has
                         // served its purpose — clear it so the absolute
@@ -1916,7 +1907,7 @@ fn finish_establish(
     // makes every connection pay 32*104 ≈ 3.3 KB up front even while idle (profiled as
     // the single largest per-conn allocation). Boxing shrinks that block ~6x; the heap
     // event is allocated only when a direct send actually happens (off the broadcast
-    // hot path, which uses the encode-once Arc<[u8]> sink).
+    // hot path, which uses the encode-once `Bytes` sink).
     let (tx, rx) = mpsc::channel::<Box<ServerEvent>>(env.mailbox_capacity.max(1));
     let ctx = ConnectionContext {
         app,
@@ -1978,9 +1969,7 @@ fn queue_reject(entry: &mut Entry, reject: &Reject, now_ns: u64) {
     };
     let mut out = BytesMut::new();
     frame::encode_text(&mut out, text.as_bytes());
-    let _ = entry
-        .conn
-        .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+    let _ = entry.conn.queue(out.freeze(), now_ns);
 
     // 2) the WS Close frame: code = the pusher error code, reason = its message.
     let reason = &reject.error.message;
@@ -1989,9 +1978,7 @@ fn queue_reject(entry: &mut Entry, reject: &Reject, now_ns: u64) {
     frame_body.extend_from_slice(reason.as_bytes());
     let mut close_out = BytesMut::new();
     frame::encode(&mut close_out, true, OpCode::Close, &frame_body);
-    let _ = entry
-        .conn
-        .queue(Arc::from(close_out.to_vec().into_boxed_slice()), now_ns);
+    let _ = entry.conn.queue(close_out.freeze(), now_ns);
 }
 
 /// Split a `/app/{key}` path (with an optional `?protocol=N&version=X&...`
@@ -2056,17 +2043,13 @@ fn echo_frames(poll: &Poll, entry: &mut Entry, frames: Vec<frame::Frame>, now_ns
             OpCode::Text | OpCode::Binary | OpCode::Continuation => {
                 let mut out = BytesMut::new();
                 frame::encode(&mut out, f.fin, f.opcode, &f.payload);
-                let _ = entry
-                    .conn
-                    .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+                let _ = entry.conn.queue(out.freeze(), now_ns);
                 wrote = true;
             }
             OpCode::Ping => {
                 let mut out = BytesMut::new();
                 frame::encode(&mut out, true, OpCode::Pong, &f.payload);
-                let _ = entry
-                    .conn
-                    .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+                let _ = entry.conn.queue(out.freeze(), now_ns);
                 wrote = true;
             }
             // A peer pong is unsolicited noise here; ignore it.
@@ -2205,9 +2188,7 @@ fn dispatch_frames(
             OpCode::Ping => {
                 let mut out = BytesMut::new();
                 frame::encode(&mut out, true, OpCode::Pong, &f.payload);
-                let _ = entry
-                    .conn
-                    .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+                let _ = entry.conn.queue(out.freeze(), now_ns);
                 // RFC 6455 §5.5.2: answer a Ping "as soon as is practical" —
                 // flush the Pong NOW. The end-of-batch drain below only
                 // flushes when mailbox events were written, so a lone Ping's
@@ -2368,9 +2349,7 @@ fn drain_session(poll: &Poll, entry: &mut Entry, now_ns: u64) -> DrainResult {
                 frame_body.extend_from_slice(&code.to_be_bytes());
                 frame_body.extend_from_slice(reason.as_bytes());
                 frame::encode(&mut out, true, OpCode::Close, &frame_body);
-                let _ = entry
-                    .conn
-                    .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+                let _ = entry.conn.queue(out.freeze(), now_ns);
                 wrote = true;
                 close_after = true;
                 break;
@@ -2390,9 +2369,7 @@ fn drain_session(poll: &Poll, entry: &mut Entry, now_ns: u64) -> DrainResult {
                 let text = session.codec.encode(&other);
                 let mut out = BytesMut::new();
                 frame::encode_text(&mut out, text.as_bytes());
-                let _ = entry
-                    .conn
-                    .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+                let _ = entry.conn.queue(out.freeze(), now_ns);
                 wrote = true;
             }
         }
@@ -2603,9 +2580,7 @@ fn drain_resolved(
                     let text = session.codec.encode(&established);
                     let mut out = BytesMut::new();
                     frame::encode_text(&mut out, text.as_bytes());
-                    let _ = entry
-                        .conn
-                        .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+                    let _ = entry.conn.queue(out.freeze(), now_ns);
                     entry.session = Some(session);
                     flush_and_arm(poll, entry, now_ns)
                 };
@@ -3129,7 +3104,8 @@ fn should_skip(band: ShedBand, out_bytes: usize, high_water: usize) -> bool {
 /// For each message: classify the current [`ShedBand`] from `inflight_bytes /
 /// effective_budget`; in `Saturated` (≥100%) the whole broadcast is dropped and
 /// the sink flagged; otherwise, for each subscriber (skipping `except`), the
-/// already-WS-framed `frame` is `queue`d (an `Arc` bump — never re-encoded)
+/// already-WS-framed `frame` is `queue`d (a `Bytes` refcount bump — never
+/// re-encoded)
 /// UNLESS the band says to skip a backed-up subscriber. `inflight_bytes` is kept
 /// live across the drain (each enqueue adds the net byte delta, accounting for
 /// any drop-head eviction) so the band tightens as the worker fills within a
