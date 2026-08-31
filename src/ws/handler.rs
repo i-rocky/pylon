@@ -49,6 +49,13 @@ pub struct ConnectionContext {
     /// `Mailbox`es that this connection hands out via `handle`.
     /// `None` in tests that build a `ConnectionContext` without a worker.
     pub mailbox_dropped: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// What THIS connection's negotiated protocol version supports (U1 /
+    /// Task 7.2). Snapshot of `Codec::capabilities()` taken once at session
+    /// establish (`finish_establish`) — the dispatch layer (subscribe /
+    /// signin / client-event gates) consults it, so a version lacking a
+    /// feature degrades gracefully instead of assuming v7. v7 = all on, so
+    /// v7 behavior is byte-identical to the pre-capability code.
+    pub capabilities: crate::protocol::codec::Capabilities,
 }
 
 impl ConnectionContext {

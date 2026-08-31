@@ -105,6 +105,22 @@ impl ConnectionContext {
         }
 
         let info = ChannelInfo::of(&channel);
+        // U1 / Task 7.2: cache channels are a version capability. A version
+        // without them rejects the subscribe with the SAME
+        // `pusher:subscription_error` AuthError/401 frame the auth failures
+        // below use. Gated BEFORE the adapter call on purpose: in cluster
+        // mode the cache replay/miss is performed by the BRIDGE inside
+        // `adapter.subscribe` (see `ClusterCmd::Subscribe`), which cannot see
+        // this connection's codec — refusing here is the one placement that
+        // keeps a cache-incapable version replay-free in BOTH modes.
+        if info.cache && !self.capabilities.cache_channels {
+            return self.send_subscription_error(
+                &channel,
+                "AuthError",
+                "Cache channels are not supported by this protocol version",
+                401,
+            );
+        }
         match info.auth {
             AuthKind::Public => {
                 let out = self
@@ -123,6 +139,20 @@ impl ConnectionContext {
             // Encrypted channels authenticate exactly like private channels
             // (HMAC over `socket_id:channel`, no channel_data) — pure relay.
             AuthKind::Private | AuthKind::PrivateEncrypted => {
+                // U1 / Task 7.2: encrypted channels are a version capability.
+                // A version without them rejects with the SAME
+                // `pusher:subscription_error` AuthError/401 frame the arm's
+                // auth failures use — graceful degradation, no new wire shape.
+                if matches!(info.auth, AuthKind::PrivateEncrypted)
+                    && !self.capabilities.encrypted_channels
+                {
+                    return self.send_subscription_error(
+                        &channel,
+                        "AuthError",
+                        "Encrypted channels are not supported by this protocol version",
+                        401,
+                    );
+                }
                 let token = match auth.as_deref() {
                     Some(t) => t,
                     None => {
@@ -158,6 +188,19 @@ impl ConnectionContext {
                 self.emit_occupied_if_edge(&channel, out.occupied);
             }
             AuthKind::Presence => {
+                // U1 / Task 7.2: presence is a version capability. A version
+                // without it rejects with the SAME `pusher:subscription_error`
+                // AuthError/401 frame every other presence-subscribe rejection
+                // (missing auth, bad signature, invalid channel_data) uses —
+                // graceful degradation, no new wire shape.
+                if !self.capabilities.presence {
+                    return self.send_subscription_error(
+                        &channel,
+                        "AuthError",
+                        "Presence channels are not supported by this protocol version",
+                        401,
+                    );
+                }
                 let token = match auth.as_deref() {
                     Some(t) => t,
                     None => {
@@ -319,6 +362,8 @@ impl ConnectionContext {
         // `cache_get` here would only see node-local events and spuriously miss an
         // event published on another node. So skip the whole block in cluster mode;
         // `subscription_succeeded` was already sent inline above, preserving ordering.
+        // (Cache-incapable versions never reach here: the cache_channels gate above
+        // refuses the subscribe before the adapter call, in both modes.)
         if !self.clustered && info.cache && self.subscribed.contains(&channel) {
             let event = match self.adapter.cache_get(&self.app.id, &channel).await {
                 Some(cached) => ServerEvent::ChannelEvent {
@@ -416,6 +461,17 @@ impl ConnectionContext {
         // with no code-specific branching for 43xx (Protocol.getCloseAction only maps
         // WebSocket CLOSE codes, and only during handshake/close), so any of these
         // frames is surfaced to app error handlers without disconnecting.
+        //
+        // U1 / Task 7.2: client events are a version capability. A version
+        // without them gets the SAME in-band 4301 `pusher:error` the
+        // app-disabled check below emits — same frame, same code, graceful.
+        if !self.capabilities.client_events {
+            self.send_self(ServerEvent::ClientEventError {
+                code: 4301,
+                message: "Client events are not supported by this protocol version.".into(),
+            });
+            return;
+        }
         if !self.app.client_messages_enabled {
             self.send_self(ServerEvent::ClientEventError {
                 code: 4301,

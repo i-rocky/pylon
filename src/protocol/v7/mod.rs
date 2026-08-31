@@ -18,10 +18,10 @@ impl Codec for V7Codec {
         7
     }
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            client_events: true,
-            presence: true,
-        }
+        // v7 supports the full feature set — see `Capabilities::v7` (U1 /
+        // Task 7.2): dispatch consults this, and v7 keeps every flag on so
+        // its wire behavior is exactly the pre-capability behavior.
+        Capabilities::v7()
     }
     fn decode(&self, text: &str) -> Result<ClientCommand, DecodeError> {
         frames::decode(text)

@@ -1,6 +1,7 @@
 use super::*;
 use crate::adapter::local::LocalAdapter;
 use crate::channel::registry::Registry;
+use crate::protocol::codec::Capabilities;
 use pylon_dispatcher_helpers::*;
 use tokio::sync::mpsc;
 
@@ -89,6 +90,7 @@ fn ctx(app: App) -> (ConnectionContext, mpsc::Receiver<Box<ServerEvent>>) {
         mailbox_notify: None,
         mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
+        capabilities: Capabilities::v7(),
     };
     (c, rx)
 }
@@ -413,6 +415,7 @@ async fn presence_unsubscribe_broadcasts_member_removed_to_others() {
             mailbox_notify: None,
             mailbox_dropped: None,
             client_event_rate: crate::ws::rate::RateWindow::new(0),
+            capabilities: Capabilities::v7(),
         };
         (c, rx)
     };
@@ -603,6 +606,7 @@ async fn client_event_on_encrypted_channel_is_dropped() {
             mailbox_notify: None,
             mailbox_dropped: None,
             client_event_rate: crate::ws::rate::RateWindow::new(0),
+            capabilities: Capabilities::v7(),
         };
         (c, rx)
     };
@@ -810,6 +814,7 @@ async fn presence_over_member_cap_errors() {
             mailbox_notify: None,
             mailbox_dropped: None,
             client_event_rate: crate::ws::rate::RateWindow::new(0),
+            capabilities: Capabilities::v7(),
         };
         (c, rx)
     };
@@ -978,6 +983,7 @@ async fn subscribe_emits_channel_occupied_then_close_emits_vacated() {
         mailbox_notify: None,
         mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
+        capabilities: Capabilities::v7(),
     };
 
     // Subscribe to a public channel → occupied.
@@ -1058,6 +1064,7 @@ async fn rapid_subscribe_unsubscribe_in_window_delivers_both() {
         mailbox_notify: None,
         mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
+        capabilities: Capabilities::v7(),
     };
 
     c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
@@ -1130,6 +1137,7 @@ async fn presence_first_and_last_emit_member_added_then_removed() {
         mailbox_notify: None,
         mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
+        capabilities: Capabilities::v7(),
     };
 
     c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
@@ -1213,6 +1221,7 @@ async fn client_event_on_presence_includes_user_id_webhook() {
         mailbox_notify: None,
         mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
+        capabilities: Capabilities::v7(),
     };
     c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
         channel: "presence-room".into(),
@@ -1274,6 +1283,7 @@ async fn client_event_on_private_omits_user_id_webhook() {
         mailbox_notify: None,
         mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
+        capabilities: Capabilities::v7(),
     };
     c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
         channel: "private-c".into(),
@@ -1333,6 +1343,7 @@ async fn client_event_webhook_gated_off_when_app_lacks_it() {
         mailbox_notify: None,
         mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
+        capabilities: Capabilities::v7(),
     };
     c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
         channel: "private-c".into(),
@@ -1390,6 +1401,7 @@ async fn cache_channel_miss_emits_cache_miss_webhook() {
         mailbox_notify: None,
         mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
+        capabilities: Capabilities::v7(),
     };
     // public cache channel: no auth, miss on first subscribe.
     c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
@@ -1741,6 +1753,7 @@ async fn relayed_client_event_frame(
             mailbox_notify: None,
             mailbox_dropped: None,
             client_event_rate: crate::ws::rate::RateWindow::new(0),
+            capabilities: Capabilities::v7(),
         };
         (c, rx)
     };
@@ -1823,6 +1836,7 @@ async fn client_event_oversize_name_returns_4301_and_does_not_broadcast() {
             mailbox_notify: None,
             mailbox_dropped: None,
             client_event_rate: crate::ws::rate::RateWindow::new(100), // generous budget
+            capabilities: Capabilities::v7(),
         };
         (c, rx)
     };
@@ -1915,6 +1929,7 @@ fn ctx_with_sub_cap(
         mailbox_notify: None,
         mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
+        capabilities: Capabilities::v7(),
     };
     (c, rx)
 }
@@ -2065,6 +2080,7 @@ async fn client_event_rate_limit_returns_4301_and_drops() {
         mailbox_notify: None,
         mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(3),
+        capabilities: Capabilities::v7(),
     };
 
     // Build receiver (unlimited, just needs to see broadcasts).
@@ -2084,6 +2100,7 @@ async fn client_event_rate_limit_returns_4301_and_drops() {
         mailbox_notify: None,
         mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
+        capabilities: Capabilities::v7(),
     };
 
     // Both subscribe to the same private channel.
@@ -2183,6 +2200,7 @@ fn ctx_saturated(
         mailbox_notify: None,
         mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
+        capabilities: Capabilities::v7(),
     };
     (c, rx, flag)
 }
@@ -2306,4 +2324,275 @@ async fn resub_already_held_channel_is_idempotent_under_saturation() {
         c.subscribed.contains("public-held"),
         "channel must still be in subscribed set after idempotent re-subscribe"
     );
+}
+
+/// ── U1 / Task 7.2: version feature-gating is REAL ─────────────────────────
+///
+/// A `#[cfg(test)]` stub codec whose `capabilities()` reports NOTHING
+/// supported — the shape a future protocol version lacking a feature takes.
+/// The dispatch layer must consult the negotiated codec's capabilities
+/// (snapshotted into `ConnectionContext` at establish, exactly like
+/// `finish_establish` does) and degrade GRACEFULLY: each feature-off path
+/// reuses the SAME error frame the analogous v7 path emits today (client
+/// events → `pusher:error` 4301 like the app-disabled path; presence /
+/// encrypted subscribe → `pusher:subscription_error` AuthError/401 like every
+/// other presence-subscribe rejection; signin → the exact `fail_signin`
+/// 4009 frames; cache replay → simply skipped, `subscription_succeeded`
+/// still arrives). No panics, no invented wire shapes.
+mod capability_gates {
+    use super::*;
+    use crate::adapter::Adapter;
+    use crate::protocol::codec::Codec;
+    use crate::protocol::v7::V7Codec;
+
+    /// Test-only codec: v7 on the WIRE (decode/encode delegate to `V7Codec`),
+    /// but `capabilities()` reports the all-false profile. Proves the gates
+    /// key off capabilities, not off the wire format or the version number.
+    #[derive(Debug)]
+    struct NoFeatureCodec(V7Codec);
+
+    impl Codec for NoFeatureCodec {
+        fn version(&self) -> u8 {
+            self.0.version()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default() // every feature off
+        }
+        fn decode(&self, text: &str) -> Result<ClientCommand, crate::protocol::codec::DecodeError> {
+            self.0.decode(text)
+        }
+        fn encode_into(&self, event: &ServerEvent, out: &mut String) {
+            self.0.encode_into(event, out)
+        }
+    }
+
+    /// Build a context whose `capabilities` come from `codec` — the test
+    /// twin of `finish_establish`'s `capabilities: codec.capabilities()`.
+    fn ctx_from_codec(codec: &dyn Codec) -> (ConnectionContext, mpsc::Receiver<Box<ServerEvent>>) {
+        let (tx, rx) = mpsc::channel(1024);
+        let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(
+            Arc::new(Registry::new()),
+            Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+        ));
+        let c = ConnectionContext {
+            // `app(false)` = subscription_count OFF: the capability tests
+            // assert the exact frame sequence after a join, so no
+            // `subscription_count` broadcast may interleave. Client
+            // messaging stays ON (that gate is tested separately).
+            app: Arc::new(app(false)),
+            socket_id: SocketId::generate(),
+            self_tx: tx,
+            adapter,
+            limits: crate::server::config::ServerConfig::default().limits(),
+            subscribed: HashSet::new(),
+            user: None,
+            webhooks: crate::webhook::WebhookHandle::null(),
+            presence_membership: std::collections::HashMap::new(),
+            saturated: None,
+            clustered: false,
+            mailbox_notify: None,
+            mailbox_dropped: None,
+            client_event_rate: crate::ws::rate::RateWindow::new(0),
+            capabilities: codec.capabilities(),
+        };
+        (c, rx)
+    }
+
+    fn no_feature_ctx() -> (ConnectionContext, mpsc::Receiver<Box<ServerEvent>>) {
+        ctx_from_codec(&NoFeatureCodec(V7Codec))
+    }
+
+    /// A subscribe command with a VALID v7 auth signature for `channel`
+    /// (presence channels get well-formed `channel_data` too) — so any
+    /// rejection observed in these tests is the capability gate, not auth.
+    fn valid_subscribe(c: &ConnectionContext, channel: &str) -> ClientCommand {
+        let sid = c.socket_id.as_str().to_string();
+        let channel_data = channel
+            .starts_with("presence-")
+            .then(|| serde_json::json!({"user_id":"u1","user_info":{"name":"U"}}).to_string());
+        let sig =
+            crate::auth::signature::channel_signature("s", &sid, channel, channel_data.as_deref());
+        ClientCommand::Subscribe {
+            channel: channel.into(),
+            auth: Some(format!("k:{sig}")),
+            channel_data,
+        }
+    }
+
+    /// A signin command with a VALID signature (so any rejection is the
+    /// capability gate, not the signature check).
+    fn valid_signin(c: &ConnectionContext, user_data: &str) -> ClientCommand {
+        let sig = crate::auth::signature::user_signature("s", c.socket_id.as_str(), user_data);
+        ClientCommand::Signin {
+            auth: format!("k:{sig}"),
+            user_data: user_data.to_string(),
+        }
+    }
+
+    /// Client events: the all-false codec must get the SAME `pusher:error`
+    /// 4301 frame the app-disabled v7 path emits — not a broadcast.
+    #[tokio::test]
+    async fn no_feature_codec_rejects_client_events() {
+        let (mut c, mut rx) = no_feature_ctx();
+        // Private channels are not capability-gated, so the join succeeds —
+        // the gate is specifically on TRIGGERING client events.
+        c.dispatch(valid_subscribe(&c, "private-x")).await;
+        assert!(matches!(
+            rx.try_recv().map(|b| *b),
+            Ok(ServerEvent::SubscriptionSucceeded { .. })
+        ));
+        c.dispatch(ClientCommand::ClientEvent {
+            event: "client-a".into(),
+            channel: "private-x".into(),
+            data: serde_json::json!({"a":1}),
+        })
+        .await;
+        match rx.try_recv().map(|b| *b) {
+            Ok(ServerEvent::ClientEventError { code, .. }) => assert_eq!(code, 4301),
+            other => panic!("expected ClientEventError 4301, got {other:?}"),
+        }
+    }
+
+    /// Presence subscribe: the all-false codec must get a
+    /// `pusher:subscription_error` with the SAME type/status every other
+    /// presence-subscribe rejection uses today (AuthError/401).
+    #[tokio::test]
+    async fn no_feature_codec_rejects_presence_subscribe() {
+        let (mut c, mut rx) = no_feature_ctx();
+        c.dispatch(valid_subscribe(&c, "presence-x")).await;
+        match rx.try_recv().map(|b| *b) {
+            Ok(ServerEvent::SubscriptionError {
+                error_type, status, ..
+            }) => {
+                assert_eq!(error_type, "AuthError");
+                assert_eq!(status, 401);
+            }
+            other => panic!("expected SubscriptionError AuthError/401, got {other:?}"),
+        }
+        // Graceful: the join did NOT happen and the connection stays usable.
+        assert!(!c.subscribed.contains("presence-x"));
+        c.dispatch(ClientCommand::Ping).await;
+        assert!(matches!(rx.try_recv().map(|b| *b), Ok(ServerEvent::Pong)));
+    }
+
+    /// Encrypted channels: same AuthError/401 `subscription_error` frame.
+    #[tokio::test]
+    async fn no_feature_codec_rejects_encrypted_subscribe() {
+        let (mut c, mut rx) = no_feature_ctx();
+        c.dispatch(valid_subscribe(&c, "private-encrypted-x")).await;
+        match rx.try_recv().map(|b| *b) {
+            Ok(ServerEvent::SubscriptionError {
+                error_type, status, ..
+            }) => {
+                assert_eq!(error_type, "AuthError");
+                assert_eq!(status, 401);
+            }
+            other => panic!("expected SubscriptionError AuthError/401, got {other:?}"),
+        }
+        assert!(!c.subscribed.contains("private-encrypted-x"));
+    }
+
+    /// Signin: the all-false codec must get the EXACT frames today's
+    /// rejected signin emits — `pusher:error` 4009 then Close 4009.
+    #[tokio::test]
+    async fn no_feature_codec_rejects_signin() {
+        let (mut c, mut rx) = no_feature_ctx();
+        c.dispatch(valid_signin(&c, r#"{"id":"7"}"#)).await;
+        assert!(
+            matches!(rx.try_recv().map(|b| *b), Ok(ServerEvent::Error(e)) if e.code == 4009),
+            "expected pusher:error 4009 (fail_signin parity)"
+        );
+        assert!(matches!(
+            rx.try_recv().map(|b| *b),
+            Ok(ServerEvent::Close { code: 4009, .. })
+        ));
+        assert!(c.user.is_none(), "no user may be registered");
+    }
+
+    /// Watchlist: with ONLY `watchlist` off (everything else v7), a valid
+    /// signin still succeeds (`signin_success`), but neither the initial
+    /// online snapshot nor the watch REGISTRATION happens.
+    #[tokio::test]
+    async fn no_watchlist_codec_signs_in_without_registering_watchers() {
+        let codec = WatchlistOffCodec(V7Codec);
+        let (mut c, mut rx) = ctx_from_codec(&codec);
+        c.dispatch(valid_signin(&c, r#"{"id":"C","watchlist":["B"]}"#))
+            .await;
+        assert!(
+            matches!(
+                rx.try_recv().map(|b| *b),
+                Ok(ServerEvent::SigninSuccess { .. })
+            ),
+            "signin itself must still succeed (user_auth is on)"
+        );
+        assert!(
+            rx.try_recv().map(|b| *b).is_err(),
+            "no WatchlistEvents snapshot may be sent"
+        );
+        assert!(
+            c.adapter.watchers_of("app", "B").await.is_empty(),
+            "the watch must NOT be registered"
+        );
+        assert!(c.user.is_some());
+    }
+
+    /// v7-except-watchlist codec: isolates the one flag.
+    #[derive(Debug)]
+    struct WatchlistOffCodec(V7Codec);
+
+    impl Codec for WatchlistOffCodec {
+        fn version(&self) -> u8 {
+            self.0.version()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                watchlist: false,
+                ..Capabilities::v7()
+            }
+        }
+        fn decode(&self, text: &str) -> Result<ClientCommand, crate::protocol::codec::DecodeError> {
+            self.0.decode(text)
+        }
+        fn encode_into(&self, event: &ServerEvent, out: &mut String) {
+            self.0.encode_into(event, out)
+        }
+    }
+
+    /// Cache channels: with the all-false codec a cache-channel subscribe is
+    /// REFUSED (AuthError/401, the same frame as the auth failures), so the
+    /// replay/`cache_miss` never fires. The refusal sits BEFORE the adapter
+    /// call, which keeps a cache-incapable version replay-free in cluster
+    /// mode too (the bridge replays inside `adapter.subscribe`).
+    #[tokio::test]
+    async fn no_feature_codec_rejects_cache_channel_subscribe() {
+        let (mut c, mut rx) = no_feature_ctx();
+        // Seed the cache so a v7 client WOULD get a replay.
+        c.adapter
+            .cache_set(
+                "app",
+                "private-cache-x",
+                crate::channel::cache::CachedEvent {
+                    event: "my-event".into(),
+                    data: "{\"hi\":1}".into(),
+                },
+                std::time::Duration::from_secs(60),
+            )
+            .await;
+        c.dispatch(valid_subscribe(&c, "private-cache-x")).await;
+        match rx.try_recv().map(|b| *b) {
+            Ok(ServerEvent::SubscriptionError {
+                error_type, status, ..
+            }) => {
+                assert_eq!(error_type, "AuthError");
+                assert_eq!(status, 401);
+            }
+            other => panic!("expected SubscriptionError AuthError/401, got {other:?}"),
+        }
+        // Graceful: nothing replayed, no cache_miss, the join did not
+        // happen, and the connection stays usable.
+        assert!(rx.try_recv().map(|b| *b).is_err());
+        assert!(!c.subscribed.contains("private-cache-x"));
+        c.dispatch(ClientCommand::Ping).await;
+        assert!(matches!(rx.try_recv().map(|b| *b), Ok(ServerEvent::Pong)));
+    }
 }

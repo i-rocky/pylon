@@ -1962,6 +1962,11 @@ fn finish_establish(
         // this connection hands out, so any full-mailbox drop is attributed to
         // this worker's `pylon_mailbox_dropped_total` metric.
         mailbox_dropped,
+        // U1 / Task 7.2: snapshot the negotiated codec's feature set into the
+        // dispatch context — the single place the codec's capabilities reach
+        // the handler layer. Every version-feature gate (client events,
+        // presence/encrypted/cache channels, signin, watchlist) reads this.
+        capabilities: codec.capabilities(),
     };
 
     // Register this live connection under its app so a cluster-wide `purge_app`
