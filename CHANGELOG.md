@@ -255,3 +255,25 @@ relay model; the `local: None` saturation-gate trap is called out in code (X2).
 
 #### Removed
 - Dead `ConnError::Backpressure` variant (audit X1).
+
+### Phase 8 — Security hardening (audit remediation)
+
+#### Security
+- **Optional bearer-token gate on `/metrics`** (audit S1): set
+  `PYLON_METRICS_TOKEN` and scraping requires `Authorization: Bearer <token>`
+  (case-insensitive scheme, constant-time compare). Wrong or missing token
+  returns **404 — not 401** — so the endpoint's existence is not disclosed;
+  `/health` and `/ready` stay open for load balancers. Unset = today's open
+  behavior.
+- **Webhook target SSRF guard** (audit S2): webhook URLs must be `http`/`https`,
+  and delivery is refused — fast, without burning the retry budget — when the
+  host resolves to (or is a literal) loopback, unspecified, link-local,
+  RFC1918-private, unique-local, CGNAT/shared (100.64.0.0/10), multicast, or
+  broadcast address, in v4 or v6 (including v4-mapped forms). Delivery is pinned
+  to the pre-flight-resolved addresses so a second DNS lookup cannot drift, and
+  the webhook client never follows redirects (a redirecting receiver gets the
+  non-2xx retry treatment). **Operators pointing webhooks at RFC1918/loopback
+  receivers must set `PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS=1`** — the guard is on
+  by default.
+- **`auth_key` verification is now constant-time** (audit S3), matching the
+  existing constant-time signature and body-MD5 comparisons.
