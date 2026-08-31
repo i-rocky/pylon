@@ -5,11 +5,12 @@
 //!
 //! * **Outbound.** A queue of pre-encoded frames ([`Arc<[u8]>`], so a broadcast
 //!   payload is encoded once and fanned out as cheap `Arc` clones). [`Connection::flush`]
-//!   drains the queue with *corked* writes — it coalesces as many queued frames
-//!   as the socket will accept in a single call, advancing a cursor across
-//!   partial writes, and reports backpressure via [`WriteStatus::WouldBlock`].
-//!   [`Connection::queue`] enforces a high-water mark so a slow consumer cannot make us
-//!   buffer unbounded memory.
+//!   drains the queue with *corked*, coalesced writes — whole queued frames are
+//!   gathered into `IoSlice` batches and handed to the socket in one
+//!   `writev(2)` per batch (bounded by an iovec count and a byte budget),
+//!   advancing a cursor across partial writes, and reporting backpressure via
+//!   [`WriteStatus::WouldBlock`]. [`Connection::queue`] enforces a high-water
+//!   mark so a slow consumer cannot make us buffer unbounded memory.
 //!
 //! * **Inbound.** [`Connection::read_frames`] reads whatever the socket has available into a
 //!   caller-supplied scratch [`BytesMut`] and parses every complete frame out of
@@ -23,7 +24,7 @@ use crate::transport::frame::{self, Frame, ParseError};
 use bytes::BytesMut;
 use rustls::server::ServerConnection as TlsConn;
 use std::collections::VecDeque;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, IoSlice, Read, Write};
 use std::sync::Arc;
 
 /// Lifecycle of a connection as seen by the transport.
@@ -137,6 +138,108 @@ struct CodelState {
     overloaded: bool,
 }
 
+/// The queued outbound element: a pre-encoded frame paired with its monotonic
+/// enqueue timestamp (for CoDel sojourn computation on dequeue).
+///
+/// F4/6.3 seam: everything in the flush path touches the frame only via
+/// `len()`/indexing (no `Arc`-specific API), so swapping `Arc<[u8]>` for
+/// `bytes::Bytes` later is a one-line change to this alias.
+type OutFrame = (Arc<[u8]>, u64);
+
+/// F4: coalescing limits for the flush path.
+///
+/// `WRITEV_MAX_SLICES` matches `IOV_MAX` (1024) on Linux and macOS — handing
+/// `writev(2)` more iovecs than that is undefined behaviour, so the gather
+/// stops there. `WRITEV_MAX_BYTES` caps one syscall's payload so a single
+/// huge burst cannot monopolise the socket's kernel send-buffer share and
+/// partial-write retries stay small.
+const WRITEV_MAX_SLICES: usize = 1024;
+/// Plain-TCP per-syscall byte budget (see [`WRITEV_MAX_SLICES`]).
+const WRITEV_MAX_BYTES: usize = 256 * 1024;
+/// TLS per-batch plaintext budget. Deliberately BELOW rustls's default 64 KiB
+/// sendable-buffer limit: after the pre-drain in [`TlsBatchSink`] empties the
+/// ciphertext buffer, a batch this size is always accepted whole by one
+/// `Writer::write`, so rustls packs it into as few full 16 KiB records as the
+/// record cap allows instead of one (nearly empty) record per frame.
+const TLS_BATCH_MAX_BYTES: usize = 60 * 1024;
+
+/// The write target of one coalesced batch (F4). Production uses
+/// [`mio::net::TcpStream`] — mio's `Write` impl forwards `write_vectored`
+/// straight to the std stream, i.e. a real `writev(2)` — and
+/// [`TlsBatchSink`] for the encrypted path. The unit tests drive the exact
+/// same flush loop with a call-counting mock, proving one batch is one
+/// syscall-shaped call.
+trait WriteSink {
+    /// Write as many of `bufs`' bytes as the sink accepts right now,
+    /// returning how many were consumed. `Ok(0)` on a non-empty batch means
+    /// the sink can accept nothing further (mapped to
+    /// [`WriteStatus::Closed`]).
+    fn write_batch(&mut self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize>;
+}
+
+impl WriteSink for mio::net::TcpStream {
+    fn write_batch(&mut self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        self.write_vectored(bufs)
+    }
+}
+
+/// The TLS flavour of [`WriteSink`] (F4): concatenates the batch into one
+/// contiguous plaintext buffer and hands it to rustls in a single
+/// `Writer::write`, so rustls encrypts fewer, fuller records.
+///
+/// Ciphertext is drained to the socket both before the write (emptying
+/// rustls's bounded send buffer so the plaintext is always accepted — a full
+/// one makes `Writer::write` short- or zero-write) and after it. A post-write
+/// drain that hits `WouldBlock` just leaves the ciphertext queued inside
+/// rustls for the next flush's Phase 1: the plaintext has already been
+/// consumed, so the app-side queue stays advanced and no byte is ever
+/// encrypted twice. (This also fixes the pre-F4 shape, which returned
+/// `WouldBlock` WITHOUT advancing the cursor over plaintext rustls had
+/// already consumed — on resume the same bytes were written again,
+/// duplicating them on the wire.)
+struct TlsBatchSink<'a> {
+    stream: &'a mut mio::net::TcpStream,
+    tls: &'a mut TlsConn,
+    /// Reusable contiguous plaintext buffer (owned by the `Connection`).
+    scratch: &'a mut Vec<u8>,
+}
+
+impl WriteSink for TlsBatchSink<'_> {
+    fn write_batch(&mut self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        // Pre-drain: make room under rustls's send-buffer limit.
+        while self.tls.wants_write() {
+            match self.tls.write_tls(self.stream) {
+                Ok(_) => {}
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                    // Socket full with ciphertext pending: no room for new
+                    // plaintext either — surface plain backpressure. Nothing
+                    // was consumed, so the caller's queue restore is exact.
+                    return Err(std::io::Error::from(e.kind()));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        self.scratch.clear();
+        for b in bufs {
+            self.scratch.extend_from_slice(b);
+        }
+        // (clippy::needless_borrow is wrong here: the explicit `&` keeps the
+        // disjoint-field borrows of `self.tls` (mutable, through `writer()`)
+        // and `self.scratch` (shared) syntactically obvious.)
+        #[allow(clippy::needless_borrow)]
+        let n = self.tls.writer().write(&self.scratch)?;
+        // Post-drain: push the freshly encrypted records out now.
+        while self.tls.wants_write() {
+            match self.tls.write_tls(self.stream) {
+                Ok(_) => {}
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(n)
+    }
+}
+
 /// The I/O backend for a connection: either a plain TCP stream or a rustls-
 /// encrypted stream backed by the same underlying socket.
 enum Io {
@@ -180,7 +283,7 @@ pub struct Connection {
     /// owning worker's epoch) used for CoDel sojourn computation on dequeue. The
     /// front element is the one currently being written, possibly partially (see
     /// `out_cursor`).
-    out: VecDeque<(Arc<[u8]>, u64)>,
+    out: VecDeque<OutFrame>,
     /// Byte offset into `out.front()` already written (partial-write resume
     /// point).
     out_cursor: usize,
@@ -205,6 +308,13 @@ pub struct Connection {
     /// worker-level total (→ `pylon_drophead_dropped_total`) via
     /// [`take_drophead_dropped`](Self::take_drophead_dropped).
     drophead_dropped: u64,
+    /// Reusable frame batch for the coalescing flush (F4): the frames popped
+    /// for the writev batch currently in flight. Kept on the connection so a
+    /// flush performs no allocation once warmed up.
+    writev_batch: Vec<OutFrame>,
+    /// Reusable contiguous plaintext batch for the TLS flush (F4): the current
+    /// frame batch, copied for one `rustls::Writer::write`.
+    tls_batch: Vec<u8>,
     /// Whether this connection's `mio` poll registration currently includes
     /// [`mio::Interest::WRITABLE`] — the tracked mirror of the actual registry
     /// interest, maintained by the worker at every re-registration site
@@ -243,6 +353,8 @@ impl Connection {
             codel_state: CodelState::default(),
             codel_dropped: 0,
             drophead_dropped: 0,
+            writev_batch: Vec::new(),
+            tls_batch: Vec::new(),
             writable_armed: false,
             inflight_delta: 0,
         }
@@ -263,6 +375,8 @@ impl Connection {
             codel_state: CodelState::default(),
             codel_dropped: 0,
             drophead_dropped: 0,
+            writev_batch: Vec::new(),
+            tls_batch: Vec::new(),
             writable_armed: false,
             inflight_delta: 0,
         }
@@ -492,10 +606,12 @@ impl Connection {
 
     /// Write as much of the queued data as the socket will accept, right now.
     ///
-    /// Frames are written back-to-back in a single call (corking) until the
-    /// socket returns `WouldBlock` or the queue empties. Partial writes are
-    /// handled by advancing `out_cursor`; a fully-written frame is popped and
-    /// the cursor reset. Returns:
+    /// Frames are coalesced into vectored write batches (F4): up to
+    /// [`WRITEV_MAX_SLICES`] frames and `WRITEV_MAX_BYTES`/`TLS_BATCH_MAX_BYTES`
+    /// bytes go out per write call until the socket returns `WouldBlock` or
+    /// the queue empties. Partial writes advance `out_cursor` across frame
+    /// boundaries; fully-written frames are popped and the cursor reset.
+    /// Returns:
     ///
     /// * [`WriteStatus::Drained`] — queue empty, clear writable interest.
     /// * [`WriteStatus::WouldBlock`] — send buffer full, data remains; re-arm
@@ -505,7 +621,7 @@ impl Connection {
     ///
     /// `now_ns` is the monotonic dequeue time (ns since the worker's epoch). With
     /// CoDel enabled (`target_ns != 0`), each frame's sojourn (`now_ns -
-    /// enqueue_ns`) is checked before it is written: see `codel_dequeue`.
+    /// enqueue_ns`) is checked as it reaches the batch head: see `codel_dequeue`.
     pub fn flush(&mut self, now_ns: u64) -> WriteStatus {
         match &self.io {
             Io::Plain(_) => self.flush_plain(now_ns),
@@ -513,71 +629,43 @@ impl Connection {
         }
     }
 
-    /// Plain-TCP flush: drain the out-queue directly to the socket.
-    ///
-    /// Behaviour-identical and allocation-/refcount-free vs the pre-TLS path: the
-    /// front frame's bytes are borrowed from `self.out` and the socket from
-    /// `self.io` SIMULTANEOUSLY — they are disjoint struct fields, which the borrow
-    /// checker permits when each is accessed directly (not through a `&mut self`
-    /// method). So there is NO per-frame `Arc::clone`; the hot path adds zero
-    /// overhead over the original single-field `self.stream.write(&front…)`.
+    /// Plain-TCP flush: drain the out-queue to the socket with coalesced
+    /// `writev(2)` batches — one syscall per batch instead of one per frame
+    /// (F4; a subscriber catching up on 50 queued frames paid 50 syscalls
+    /// before). Frames are MOVED into the reusable `writev_batch` vec (no
+    /// `Arc` clone, no per-flush allocation) and pushed back verbatim on any
+    /// non-writing exit, so the queue state is never lost; the batch iovecs
+    /// borrow that vec while the stream comes from `self.io` — disjoint
+    /// fields, borrowed simultaneously without cost.
     fn flush_plain(&mut self, now_ns: u64) -> WriteStatus {
-        loop {
-            // CoDel: before sending the front frame, drop any leading frame that
-            // is too stale to be worth sending (skips the mid-write front). When
-            // this returns, the front is either fresh-enough to send or the queue
-            // is empty. Takes `&mut self` but completes before the disjoint
-            // `self.out` / `self.io` split below, so no borrow conflict.
-            self.codel_dequeue(now_ns);
-            // Borrow the front frame from `self.out` and the socket from `self.io`
-            // at once: distinct fields, so this is a zero-cost disjoint split.
-            let Some((front, _ts)) = self.out.front() else {
-                break;
-            };
-            let front_len = front.len();
-            let buf = &front[self.out_cursor..];
-            let Io::Plain(stream) = &mut self.io else {
-                unreachable!("flush_plain only called for Io::Plain")
-            };
-            match stream.write(buf) {
-                Ok(0) => {
-                    // A zero-length write on a non-empty buffer means the peer
-                    // can no longer accept data.
-                    return WriteStatus::Closed;
-                }
-                Ok(n) => {
-                    self.out_cursor += n;
-                    if self.out_cursor == front_len {
-                        // Frame fully written: drop it, reset the cursor, and
-                        // continue coalescing into the next frame.
-                        let sent = front_len;
-                        self.out_bytes -= sent;
-                        // Sent bytes leave the queue: fold the negative delta in so
-                        // the worker's incremental inflight total drops by exactly
-                        // the bytes that went out (matching the `out_bytes` change).
-                        self.inflight_delta -= sent as i64;
-                        self.out.pop_front();
-                        self.out_cursor = 0;
-                    }
-                    // else: partial write; loop and try to write the remainder.
-                }
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                    return WriteStatus::WouldBlock;
-                }
-                Err(ref e) if e.kind() == ErrorKind::Interrupted => {
-                    // Retry the same write; nothing was consumed.
-                    continue;
-                }
-                Err(_) => return WriteStatus::Closed,
-            }
-        }
-        WriteStatus::Drained
+        let Io::Plain(stream) = &mut self.io else {
+            unreachable!("flush_plain only called for Io::Plain")
+        };
+        flush_coalesced(
+            &mut self.out,
+            &mut self.out_cursor,
+            &mut self.out_bytes,
+            &mut self.inflight_delta,
+            self.codel,
+            &mut self.codel_state,
+            &mut self.codel_dropped,
+            &mut self.writev_batch,
+            WRITEV_MAX_BYTES,
+            stream,
+            now_ns,
+        )
     }
 
-    /// TLS flush: encrypt app-data through rustls and drain ciphertext to the socket.
+    /// TLS flush: encrypt app-data through rustls and drain ciphertext to the
+    /// socket, one plaintext BATCH per `rustls::Writer::write` (F4): whole
+    /// queued frames are concatenated (≤ [`TLS_BATCH_MAX_BYTES`]) and handed
+    /// to rustls in a single write, so it packs fewer, fuller TLS records
+    /// instead of one nearly-empty record per frame.
     fn flush_tls(&mut self, now_ns: u64) -> WriteStatus {
         // Phase 1: drain any pending TLS ciphertext that rustls has already
-        // buffered (e.g. handshake records). Do this before touching the app queue.
+        // buffered (e.g. handshake records, or records a previous batch's
+        // post-write drain left behind a blocked socket). Do this before
+        // touching the app queue.
         {
             let Io::Tls(stream, tls) = &mut self.io else {
                 unreachable!()
@@ -593,52 +681,38 @@ impl Connection {
             }
         }
 
-        // Phase 2: encrypt and send each queued app-data frame. Like `flush_plain`,
-        // the front frame (`self.out`) and the TLS connection (`self.io`) are
-        // borrowed from disjoint fields at once — no per-frame `Arc::clone`.
-        loop {
-            self.codel_dequeue(now_ns);
-            let Some((front, _ts)) = self.out.front() else {
-                break;
-            };
-            let front_len = front.len();
-            let buf = &front[self.out_cursor..];
+        // Phase 2: encrypt and send the queued app-data frames in batches.
+        // The sink (stream + tls from `self.io`) and the queue state are
+        // disjoint fields of `self`, borrowed simultaneously without cost.
+        let status = {
             let Io::Tls(stream, tls) = &mut self.io else {
                 unreachable!("flush_tls only called for Io::Tls")
             };
-            let n = match tls.writer().write(buf) {
-                Ok(0) => return WriteStatus::Closed,
-                Ok(n) => {
-                    // Flush the freshly encrypted ciphertext to the socket.
-                    while tls.wants_write() {
-                        match tls.write_tls(stream) {
-                            Ok(_) => {}
-                            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                                return WriteStatus::WouldBlock;
-                            }
-                            Err(_) => return WriteStatus::Closed,
-                        }
-                    }
-                    n
-                }
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                    return WriteStatus::WouldBlock;
-                }
-                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(_) => return WriteStatus::Closed,
+            let mut sink = TlsBatchSink {
+                stream,
+                tls,
+                scratch: &mut self.tls_batch,
             };
-            self.out_cursor += n;
-            if self.out_cursor == front_len {
-                let sent = front_len;
-                self.out_bytes -= sent;
-                self.inflight_delta -= sent as i64;
-                self.out.pop_front();
-                self.out_cursor = 0;
-            }
+            flush_coalesced(
+                &mut self.out,
+                &mut self.out_cursor,
+                &mut self.out_bytes,
+                &mut self.inflight_delta,
+                self.codel,
+                &mut self.codel_state,
+                &mut self.codel_dropped,
+                &mut self.writev_batch,
+                TLS_BATCH_MAX_BYTES,
+                &mut sink,
+                now_ns,
+            )
+        };
+        if status != WriteStatus::Drained {
+            return status;
         }
 
-        // Final pass: flush any remaining TLS ciphertext rustls buffered during
-        // the app-data writes (e.g. finishing a record after the last write).
+        // Final pass: flush any remaining TLS ciphertext rustls buffered
+        // during the app-data writes.
         {
             let Io::Tls(stream, tls) = &mut self.io else {
                 unreachable!()
@@ -655,112 +729,6 @@ impl Connection {
         }
 
         WriteStatus::Drained
-    }
-
-    /// CoDel freshness check, run on **dequeue** before writing the front frame
-    /// (folly's controlled-delay algorithm).
-    ///
-    /// For each candidate front frame, computes its sojourn (`now_ns -
-    /// enqueue_ns`) and folds it into the running per-interval minimum. When an
-    /// interval (`interval_ns`) closes, the queue enters/leaves the "overloaded"
-    /// regime based on whether that interval's minimum sojourn exceeded `target`.
-    /// While overloaded, any front frame whose sojourn exceeds `2 * target` is
-    /// **dropped** (popped, `out_bytes` decremented, the codel-dropped counter
-    /// bumped) rather than written — so cores always send *fresh* data. Stops at
-    /// the first frame that is kept (or when the queue empties).
-    ///
-    /// Never drops the mid-write front (`out_cursor > 0`): those bytes are already
-    /// partly on the wire, and splicing them out would corrupt the peer's stream.
-    /// A `target_ns` of `0` disables the overlay entirely (pure drop-head).
-    fn codel_dequeue(&mut self, now_ns: u64) {
-        if !self.codel.enabled() {
-            return;
-        }
-        let two_target = self.codel.target_ns.saturating_mul(2);
-        loop {
-            let Some(&(_, enqueue_ns)) = self.out.front() else {
-                // Empty queue: no item is standing in line. Do NOT fold a sample
-                // (folly's algorithm samples real dequeues only), but let the
-                // overloaded flag age out if the interval has since closed with no
-                // sample — a backlog that fully drained is, by definition, fresh.
-                self.codel_age_empty(now_ns);
-                return;
-            };
-            let sojourn = now_ns.saturating_sub(enqueue_ns);
-            // Fold this real dequeue's sojourn into the interval minimum and (when
-            // the window closes) update the overloaded flag.
-            self.codel_note_interval(now_ns, sojourn);
-
-            // The mid-write front is locked: it is already partly on the wire and
-            // must be sent to completion, stale or not.
-            if self.out_cursor > 0 {
-                return;
-            }
-            // FRESHEST-WINS invariant: never CoDel-drop the LAST remaining frame.
-            // When a slow consumer's whole backlog is stale, CoDel skips straight
-            // past the old frames to the NEWEST one — maximally fresh — but the
-            // newest itself is always kept and sent. So even a fully-stale queue
-            // still delivers its freshest frame, exactly like drop-head's
-            // freshest-wins (drop-head evicts the oldest; CoDel here drops stale
-            // leading frames, but both always preserve the newest).
-            if self.codel_state.overloaded && sojourn > two_target && self.out.len() > 1 {
-                // Stale frame (and not the last one) in the overloaded regime:
-                // drop it and look at the next one (which may also be stale).
-                let (victim, _ts) = self.out.pop_front().expect("front checked");
-                self.out_bytes -= victim.len();
-                // CoDel staleness drop: this queued byte is discarded unsent, so
-                // fold the negative delta in for the worker's incremental total.
-                self.inflight_delta -= victim.len() as i64;
-                self.codel_dropped += 1;
-                continue;
-            }
-            // Fresh enough, not overloaded, or the last remaining (freshest) frame:
-            // keep it; flush writes it.
-            return;
-        }
-    }
-
-    /// Fold one real-dequeue sojourn sample into the current CoDel interval,
-    /// advancing the overloaded flag when the interval window closes. `sojourn`
-    /// is the candidate frame's time-in-queue.
-    fn codel_note_interval(&mut self, now_ns: u64, sojourn: u64) {
-        let interval = self.codel.interval_ns;
-        let target = self.codel.target_ns;
-        let st = &mut self.codel_state;
-        if st.interval_end == 0 {
-            // First sample ever: open the first interval window.
-            st.interval_end = now_ns.saturating_add(interval);
-        }
-        // Track the minimum sojourn seen this interval.
-        st.interval_min = Some(match st.interval_min {
-            Some(m) => m.min(sojourn),
-            None => sojourn,
-        });
-        // Window closed: decide overloaded from the interval minimum, then reset
-        // for the next window. Carry this very sample into the fresh interval so a
-        // window that closes never starts the next one empty.
-        if now_ns >= st.interval_end {
-            let min = st.interval_min.unwrap_or(sojourn);
-            st.overloaded = min > target;
-            st.interval_min = Some(sojourn);
-            st.interval_end = now_ns.saturating_add(interval);
-        }
-    }
-
-    /// Age the overloaded flag when the queue is empty. A queue that has fully
-    /// drained holds no stale frames, so once the current interval window has
-    /// elapsed with the queue empty, the overloaded regime is cleared. Does not
-    /// fold a (spuriously low) sojourn sample into a window that still has queued
-    /// frames being tracked.
-    fn codel_age_empty(&mut self, now_ns: u64) {
-        let st = &mut self.codel_state;
-        if st.interval_end != 0 && now_ns >= st.interval_end {
-            // The window elapsed and the queue is empty: nothing was backed up, so
-            // clear overload and re-arm the window.
-            st.overloaded = false;
-            st.interval_min = None;
-            st.interval_end = now_ns.saturating_add(self.codel.interval_ns);
-        }
     }
 
     /// Read whatever the socket has available and parse every complete frame.
@@ -981,6 +949,303 @@ impl Connection {
     }
 }
 
+impl CodelState {
+    /// Fold one real-dequeue sojourn sample into the current CoDel interval,
+    /// advancing the overloaded flag when the interval window closes. `sojourn`
+    /// is the candidate frame's time-in-queue.
+    fn note_interval(&mut self, codel: CodelParams, now_ns: u64, sojourn: u64) {
+        let interval = codel.interval_ns;
+        let target = codel.target_ns;
+        if self.interval_end == 0 {
+            // First sample ever: open the first interval window.
+            self.interval_end = now_ns.saturating_add(interval);
+        }
+        // Track the minimum sojourn seen this interval.
+        self.interval_min = Some(match self.interval_min {
+            Some(m) => m.min(sojourn),
+            None => sojourn,
+        });
+        // Window closed: decide overloaded from the interval minimum, then reset
+        // for the next window. Carry this very sample into the fresh interval so a
+        // window that closes never starts the next one empty.
+        if now_ns >= self.interval_end {
+            let min = self.interval_min.unwrap_or(sojourn);
+            self.overloaded = min > target;
+            self.interval_min = Some(sojourn);
+            self.interval_end = now_ns.saturating_add(interval);
+        }
+    }
+
+    /// Age the overloaded flag when the queue is empty. A queue that has fully
+    /// drained holds no stale frames, so once the current interval window has
+    /// elapsed with the queue empty, the overloaded regime is cleared. Does not
+    /// fold a (spuriously low) sojourn sample into a window that still has queued
+    /// frames being tracked.
+    fn age_empty(&mut self, codel: CodelParams, now_ns: u64) {
+        if self.interval_end != 0 && now_ns >= self.interval_end {
+            // The window elapsed and the queue is empty: nothing was backed up, so
+            // clear overload and re-arm the window.
+            self.overloaded = false;
+            self.interval_min = None;
+            self.interval_end = now_ns.saturating_add(codel.interval_ns);
+        }
+    }
+}
+
+/// CoDel freshness check, run on **dequeue** before a frame joins a write
+/// batch (folly's controlled-delay algorithm).
+///
+/// For each candidate front frame, computes its sojourn (`now_ns -
+/// enqueue_ns`) and folds it into the running per-interval minimum. When an
+/// interval (`interval_ns`) closes, the queue enters/leaves the "overloaded"
+/// regime based on whether that interval's minimum sojourn exceeded `target`.
+/// While overloaded, any front frame whose sojourn exceeds `2 * target` is
+/// **dropped** (popped, `out_bytes` decremented, the codel-dropped counter
+/// bumped) rather than written — so cores always send *fresh* data. Stops at
+/// the first frame that is kept (or when the queue empties).
+///
+/// Never drops the mid-write front (`out_cursor > 0`): those bytes are already
+/// partly on the wire, and splicing them out would corrupt the peer's stream.
+/// A `target_ns` of `0` disables the overlay entirely (pure drop-head).
+// 8 parameters: the same disjoint out-queue state bundle `flush_coalesced`
+// threads (see its allow note) — the Phase-3-reviewed accounting lives here.
+#[allow(clippy::too_many_arguments)]
+fn codel_dequeue(
+    out: &mut VecDeque<OutFrame>,
+    out_cursor: &usize,
+    out_bytes: &mut usize,
+    inflight_delta: &mut i64,
+    codel: CodelParams,
+    codel_state: &mut CodelState,
+    codel_dropped: &mut u64,
+    now_ns: u64,
+) {
+    if !codel.enabled() {
+        return;
+    }
+    let two_target = codel.target_ns.saturating_mul(2);
+    loop {
+        let Some(&(_, enqueue_ns)) = out.front() else {
+            // Empty queue: no item is standing in line. Do NOT fold a sample
+            // (folly's algorithm samples real dequeues only), but let the
+            // overloaded flag age out if the interval has since closed with no
+            // sample — a backlog that fully drained is, by definition, fresh.
+            codel_state.age_empty(codel, now_ns);
+            return;
+        };
+        let sojourn = now_ns.saturating_sub(enqueue_ns);
+        // Fold this real dequeue's sojourn into the interval minimum and (when
+        // the window closes) update the overloaded flag.
+        codel_state.note_interval(codel, now_ns, sojourn);
+
+        // The mid-write front is locked: it is already partly on the wire and
+        // must be sent to completion, stale or not.
+        if *out_cursor > 0 {
+            return;
+        }
+        // FRESHEST-WINS invariant: never CoDel-drop the LAST remaining frame.
+        // When a slow consumer's whole backlog is stale, CoDel skips straight
+        // past the old frames to the NEWEST one — maximally fresh — but the
+        // newest itself is always kept and sent. So even a fully-stale queue
+        // still delivers its freshest frame, exactly like drop-head's
+        // freshest-wins (drop-head evicts the oldest; CoDel here drops stale
+        // leading frames, but both always preserve the newest).
+        if codel_state.overloaded && sojourn > two_target && out.len() > 1 {
+            // Stale frame (and not the last one) in the overloaded regime:
+            // drop it and look at the next one (which may also be stale).
+            let (victim, _ts) = out.pop_front().expect("front checked");
+            *out_bytes -= victim.len();
+            // CoDel staleness drop: this queued byte is discarded unsent, so
+            // fold the negative delta in for the worker's incremental total.
+            *inflight_delta -= victim.len() as i64;
+            *codel_dropped += 1;
+            continue;
+        }
+        // Fresh enough, not overloaded, or the last remaining (freshest) frame:
+        // keep it; the flush batch takes it.
+        return;
+    }
+}
+
+/// The coalescing flush core (F4), shared by the plain and TLS paths: gather
+/// whole queued frames into one vectored batch, hand it to `sink` in a single
+/// call, and apply the result across frame boundaries. One syscall per batch
+/// instead of one per frame.
+///
+/// Per batch: up to [`WRITEV_MAX_SLICES`] frames and `max_bytes` bytes (the
+/// FIRST frame is always included, so every write makes progress). A partial
+/// `Ok(n)` advances `out_cursor` across the frames the batch covered —
+/// fully-written frames are popped, folding `out_bytes`/`inflight_delta` by
+/// their FULL lengths exactly like the one-frame-per-write loop did (a
+/// mid-write frame's earlier partial bytes were never folded; its completing
+/// write folds the whole frame) — and the mid-write remainder is pushed back
+/// to the front of the deque, keeping the `locked = out_cursor > 0` eviction
+/// guard meaningful. `WouldBlock`/`Interrupted`/`Closed` restore the
+/// untouched batch verbatim, so queue state is never lost.
+///
+/// CoDel runs per frame exactly as before: each frame is checked as it
+/// reaches the front, and the gather POPS the checked frame before checking
+/// the next, so the deque each check sees (and therefore every drop decision)
+/// is byte-identical to the one-write-per-frame loop's. One benign sampling
+/// difference: a frame the gather stops at (batch limit hit) or the tail of a
+/// partially-written batch is re-sampled on the next batch/flush attempt;
+/// CoDel folds interval MINIMA, so an extra early sample can only understate
+/// staleness, never fabricate it.
+// 11 parameters: the disjoint out-queue state the verified accounting
+// invariants live in. Bundling them into a struct would re-home Phase-3-
+// reviewed state for a perf change; the seam also lets the unit tests drive
+// this loop with a mock sink.
+#[allow(clippy::too_many_arguments)]
+fn flush_coalesced<W: WriteSink>(
+    out: &mut VecDeque<OutFrame>,
+    out_cursor: &mut usize,
+    out_bytes: &mut usize,
+    inflight_delta: &mut i64,
+    codel: CodelParams,
+    codel_state: &mut CodelState,
+    codel_dropped: &mut u64,
+    batch: &mut Vec<OutFrame>,
+    max_bytes: usize,
+    sink: &mut W,
+    now_ns: u64,
+) -> WriteStatus {
+    loop {
+        // CoDel: drop stale leading frames; on return the front (if any) is
+        // keepable. Completes before the batch borrows below.
+        codel_dequeue(
+            out,
+            out_cursor,
+            out_bytes,
+            inflight_delta,
+            codel,
+            codel_state,
+            codel_dropped,
+            now_ns,
+        );
+        if out.is_empty() {
+            // Release the last batch's frames promptly (they are only Arc
+            // handles, but fan-out data should not outlive its send).
+            batch.clear();
+            break;
+        }
+
+        // Gather one batch of whole frames from the (keepable) front. Frames
+        // are MOVED out of the deque, so CoDel's next check sees exactly the
+        // deque the one-write-per-frame loop would have at the same point.
+        let start_cursor = *out_cursor;
+        batch.clear();
+        let mut batch_bytes = 0usize;
+        // INVARIANT (loop entry): the front (if any) is keepable —
+        // codel_dequeue just ran, either at the top of the flush or after the
+        // previous pop.
+        while let Some((front, _ts)) = out.front() {
+            let take = front.len() - if batch.is_empty() { start_cursor } else { 0 };
+            // The first frame always joins (progress guarantee); later ones
+            // only while BOTH limits hold.
+            if !batch.is_empty()
+                && (batch.len() >= WRITEV_MAX_SLICES || batch_bytes + take > max_bytes)
+            {
+                break;
+            }
+            let frame = out.pop_front().expect("front checked");
+            batch_bytes += take;
+            batch.push(frame);
+            // Check the NEXT frame before it can join the batch, so CoDel's
+            // per-frame dequeue decision is made against the same shrunken
+            // deque the one-write-per-frame loop saw.
+            codel_dequeue(
+                out,
+                out_cursor,
+                out_bytes,
+                inflight_delta,
+                codel,
+                codel_state,
+                codel_dropped,
+                now_ns,
+            );
+        }
+
+        // One vectored write for the whole batch. The iovecs borrow `batch`
+        // (a local vec of owned frames), never `out`, so the deque stays
+        // freely mutable while the slices are live.
+        let slices: Vec<IoSlice<'_>> = batch
+            .iter()
+            .enumerate()
+            .map(|(i, (f, _))| IoSlice::new(if i == 0 { &f[start_cursor..] } else { &f[..] }))
+            .collect();
+        match sink.write_batch(&slices) {
+            Ok(0) => {
+                // A zero-length write on a non-empty batch: the peer can no
+                // longer accept data.
+                restore_batch(out, batch);
+                return WriteStatus::Closed;
+            }
+            Ok(mut n) => {
+                debug_assert!(n <= batch_bytes, "sink reported more than it was given");
+                // Consume fully-written frames. NOTE: the FULL frame length is
+                // folded for each, even one that was already partially written
+                // by an earlier batch — those earlier bytes were never folded,
+                // so the completing write folds the whole frame, exactly like
+                // the previous one-frame-per-write loop.
+                let mut idx = 0;
+                while idx < batch.len() {
+                    let rem = batch[idx].0.len() - if idx == 0 { start_cursor } else { 0 };
+                    if n < rem {
+                        break;
+                    }
+                    n -= rem;
+                    *out_bytes -= batch[idx].0.len();
+                    *inflight_delta -= batch[idx].0.len() as i64;
+                    idx += 1;
+                }
+                if idx == batch.len() {
+                    // Batch fully written: the queue front (if any) is now a
+                    // fresh, not-yet-written frame — reset the cursor so it
+                    // never points into a frame that has already gone out.
+                    *out_cursor = 0;
+                    // Drop the sent frames' Arc handles now, not at the next
+                    // flush.
+                    batch.clear();
+                    // Cork on with the next batch.
+                    continue;
+                }
+                // Partial write: push the unwritten tail back to the front and
+                // leave the cursor inside frame `idx`.
+                *out_cursor = if idx == 0 { start_cursor + n } else { n };
+                for frame in batch.drain(..).skip(idx).rev() {
+                    out.push_front(frame);
+                }
+                // Cork on: keep writing (the remainder plus whatever the
+                // limits now admit) until the socket blocks or the queue
+                // empties — a short write is not a block.
+            }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                restore_batch(out, batch);
+                return WriteStatus::WouldBlock;
+            }
+            Err(ref e) if e.kind() == ErrorKind::Interrupted => {
+                // Retry the same batch; nothing was consumed.
+                restore_batch(out, batch);
+            }
+            Err(_) => {
+                restore_batch(out, batch);
+                return WriteStatus::Closed;
+            }
+        }
+    }
+    WriteStatus::Drained
+}
+
+/// Push an unwritten batch back to the FRONT of the queue, restoring the
+/// exact pre-gather state (frame order; the cursor was never touched during
+/// the gather, so it still points where it did). Used on every non-writing
+/// outcome so no queued frame is ever lost.
+fn restore_batch(out: &mut VecDeque<OutFrame>, batch: &mut Vec<OutFrame>) {
+    for frame in batch.drain(..).rev() {
+        out.push_front(frame);
+    }
+}
+
 /// Shared TLS-handshake test support (G2): the raw materials for forcing a
 /// *blocked* handshake flight. A connected socket pair whose server end has a
 /// tiny `SO_SNDBUF` and whose peer end has a tiny `SO_RCVBUF`; a rustls server
@@ -1191,6 +1456,388 @@ mod tests {
         assert_eq!(got, expected);
     }
 
+    // ---- F4: writev coalescing ------------------------------------------------
+
+    /// A call-counting stand-in for the flush sink (the same [`WriteSink`]
+    /// interface the production `mio`/TLS sinks implement): records the bytes
+    /// each `write_batch` call actually ACCEPTED (the scripted prefix — a
+    /// short write's tail never left the queue) plus the offered slice count,
+    /// and can script short writes or errors per call — deterministic
+    /// partial-write driving that a real socket cannot force.
+    struct CountingSink {
+        /// The bytes each `write_batch` call accepted, in order.
+        calls: Vec<Vec<u8>>,
+        /// How many iovecs each call was offered.
+        slice_counts: Vec<usize>,
+        /// Total bytes each call was offered (a short write accepts less).
+        offered: Vec<usize>,
+        /// Scripted results, consumed one per call; missing entries mean
+        /// "accept the whole batch".
+        script: Vec<std::io::Result<usize>>,
+    }
+
+    impl CountingSink {
+        fn accepting() -> Self {
+            CountingSink {
+                calls: Vec::new(),
+                slice_counts: Vec::new(),
+                offered: Vec::new(),
+                script: Vec::new(),
+            }
+        }
+
+        fn scripted(script: Vec<std::io::Result<usize>>) -> Self {
+            CountingSink {
+                calls: Vec::new(),
+                slice_counts: Vec::new(),
+                offered: Vec::new(),
+                script,
+            }
+        }
+
+        /// All bytes ever accepted by the sink, in order.
+        fn received(&self) -> Vec<u8> {
+            self.calls.iter().flatten().copied().collect()
+        }
+    }
+
+    impl WriteSink for CountingSink {
+        fn write_batch(&mut self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
+            let total: usize = bufs.iter().map(|b| b.len()).sum();
+            let ret = match self.script.get(self.calls.len()) {
+                Some(Ok(n)) => Ok(*n),
+                Some(Err(e)) => Err(std::io::Error::from(e.kind())),
+                None => Ok(total),
+            };
+            // Record only the accepted prefix of the offered batch.
+            let accepted = match ret {
+                Ok(n) => n.min(total),
+                Err(_) => 0,
+            };
+            let mut got = Vec::with_capacity(accepted);
+            let mut need = accepted;
+            for b in bufs {
+                if need == 0 {
+                    break;
+                }
+                let take = need.min(b.len());
+                got.extend_from_slice(&b[..take]);
+                need -= take;
+            }
+            self.calls.push(got);
+            self.slice_counts.push(bufs.len());
+            self.offered.push(total);
+            ret
+        }
+    }
+
+    /// Standalone out-queue state (exactly the fields [`Connection`] keeps)
+    /// for driving [`flush_coalesced`] directly against a mock sink.
+    struct OutState {
+        out: VecDeque<OutFrame>,
+        out_cursor: usize,
+        out_bytes: usize,
+        inflight_delta: i64,
+        codel: CodelParams,
+        codel_state: CodelState,
+        codel_dropped: u64,
+        batch: Vec<OutFrame>,
+    }
+
+    impl OutState {
+        fn new() -> Self {
+            OutState {
+                out: VecDeque::new(),
+                out_cursor: 0,
+                out_bytes: 0,
+                inflight_delta: 0,
+                codel: CodelParams::DISABLED,
+                codel_state: CodelState::default(),
+                codel_dropped: 0,
+                batch: Vec::new(),
+            }
+        }
+
+        fn queue(&mut self, frame: Arc<[u8]>, now_ns: u64) {
+            self.out_bytes += frame.len();
+            self.inflight_delta += frame.len() as i64;
+            self.out.push_back((frame, now_ns));
+        }
+
+        fn flush_with<W: WriteSink>(&mut self, sink: &mut W, now_ns: u64) -> WriteStatus {
+            flush_coalesced(
+                &mut self.out,
+                &mut self.out_cursor,
+                &mut self.out_bytes,
+                &mut self.inflight_delta,
+                self.codel,
+                &mut self.codel_state,
+                &mut self.codel_dropped,
+                &mut self.batch,
+                WRITEV_MAX_BYTES,
+                sink,
+                now_ns,
+            )
+        }
+
+        /// Independent sum of the deque (cross-checks `out_bytes`).
+        fn true_bytes(&self) -> usize {
+            self.out.iter().map(|f| f.0.len()).sum()
+        }
+    }
+
+    /// (a) Three small frames that fit one batch go out as exactly ONE
+    /// vectored write carrying their concatenation, and the queue plus the
+    /// inflight accounting fully drain.
+    #[test]
+    fn writev_coalesces_three_frames_into_one_call() {
+        let mut st = OutState::new();
+        let mut expected = Vec::new();
+        for tag in 1..=3u8 {
+            let f = small(tag);
+            expected.extend_from_slice(&f[..]);
+            st.queue(f, 0);
+        }
+
+        let mut sink = CountingSink::accepting();
+        assert_eq!(st.flush_with(&mut sink, 0), WriteStatus::Drained);
+
+        assert_eq!(sink.calls.len(), 1, "3 fitting frames must be ONE writev");
+        assert_eq!(sink.slice_counts, vec![3], "one iovec per frame");
+        assert_eq!(sink.received(), expected);
+        assert!(st.out.is_empty());
+        assert_eq!(st.out_cursor, 0);
+        assert_eq!(st.out_bytes, 0);
+        assert_eq!(st.true_bytes(), 0);
+        assert_eq!(st.inflight_delta, 0, "+30 queued, then −30 sent");
+    }
+
+    /// (b) A short vectored write advances `out_cursor` across frame
+    /// boundaries correctly: fully-covered frames pop (folding their FULL
+    /// lengths into the accounting, like the one-frame-per-write loop), the
+    /// mid-write remainder stays at the front, and the byte stream is
+    /// identical to sequential per-frame writes. Sweeps cuts that land
+    /// mid-frame and exactly on frame boundaries.
+    #[test]
+    fn writev_partial_write_advances_cursor_across_frames() {
+        for short in [7usize, 10, 15, 20, 29] {
+            let mut st = OutState::new();
+            let mut expected = Vec::new();
+            for tag in 1..=3u8 {
+                let f = small(tag);
+                expected.extend_from_slice(&f[..]);
+                st.queue(f, 0);
+            }
+
+            // First call accepts only `short` of the 30 batch bytes; the
+            // corkscrew keeps flushing, and the (now accepting) sink drains
+            // the remainder.
+            let mut sink = CountingSink::scripted(vec![Ok(short)]);
+            assert_eq!(
+                st.flush_with(&mut sink, 0),
+                WriteStatus::Drained,
+                "short={short}: a short write is not a block"
+            );
+            assert_eq!(sink.received(), expected, "short={short}: byte stream");
+            assert_eq!(
+                sink.calls.first().map(|c| c.len()),
+                Some(short),
+                "short={short}: first call carried exactly the short count"
+            );
+            assert!(st.out.is_empty());
+            assert_eq!(st.out_cursor, 0);
+            assert_eq!(st.out_bytes, 0);
+            assert_eq!(st.inflight_delta, 0, "short={short}: +30 −30");
+        }
+    }
+
+    /// (b, cont.) A short write followed by a BLOCKED socket: the flush
+    /// surfaces `WouldBlock` with the partial state persisted — full frames
+    /// gone, cursor pointing into the mid-write frame — and a later flush
+    /// completes the stream with no duplication and no loss.
+    #[test]
+    fn writev_partial_then_blocked_persists_and_resumes() {
+        let mut st = OutState::new();
+        let mut expected = Vec::new();
+        for tag in 1..=3u8 {
+            let f = small(tag);
+            expected.extend_from_slice(&f[..]);
+            st.queue(f, 0);
+        }
+
+        // 15 bytes land: frame 1 fully (10), 5 into frame 2 — then the socket
+        // blocks.
+        let mut sink = CountingSink::scripted(vec![
+            Ok(15),
+            Err(std::io::Error::from(ErrorKind::WouldBlock)),
+        ]);
+        assert_eq!(st.flush_with(&mut sink, 0), WriteStatus::WouldBlock);
+
+        // Persistent partial state: frames 2 (mid-write) and 3 remain, cursor
+        // 5 into frame 2, accounting exact.
+        assert_eq!(st.out.len(), 2);
+        assert_eq!(st.out_cursor, 5);
+        assert_eq!(st.out.front().unwrap().0.len(), 10);
+        assert_eq!(st.out_bytes, 20, "counts FULL frames, cursor or not");
+        assert_eq!(st.true_bytes(), 20);
+        assert_eq!(st.inflight_delta, 20, "+30 queued, −10 sent so far");
+        // The mid-write pairing the drop-head guard keys on: the cursor is an
+        // offset into the CURRENT front.
+        assert!(st.out_cursor < st.out.front().unwrap().0.len());
+
+        // Resume: a fresh accepting flush drains the rest; total bytes are
+        // exactly the concatenation (no dup, no gap).
+        let mut sink2 = CountingSink::accepting();
+        assert_eq!(st.flush_with(&mut sink2, 0), WriteStatus::Drained);
+        let mut all = sink.received();
+        all.extend(sink2.received());
+        assert_eq!(all, expected);
+        assert_eq!(st.out_bytes, 0);
+        assert_eq!(st.inflight_delta, 0, "+30 −30 across both flushes");
+    }
+
+    /// `WouldBlock` before anything is written restores the queue verbatim:
+    /// nothing lost, nothing folded.
+    #[test]
+    fn writev_blocked_flush_restores_queue_verbatim() {
+        let mut st = OutState::new();
+        for tag in 1..=3u8 {
+            st.queue(small(tag), tag as u64);
+        }
+        let before: Vec<(u8, usize)> = st.out.iter().map(|f| (f.0[0], f.0.len())).collect();
+
+        let mut sink =
+            CountingSink::scripted(vec![Err(std::io::Error::from(ErrorKind::WouldBlock))]);
+        assert_eq!(st.flush_with(&mut sink, 0), WriteStatus::WouldBlock);
+        let after: Vec<(u8, usize)> = st.out.iter().map(|f| (f.0[0], f.0.len())).collect();
+        assert_eq!(before, after, "frame order and identity preserved");
+        assert_eq!(st.out_cursor, 0);
+        assert_eq!(st.out_bytes, 30);
+        // Net delta over the flush is zero (nothing sent, nothing dropped).
+        assert_eq!(st.inflight_delta, 30);
+
+        // And the queue is still flushable.
+        let mut sink2 = CountingSink::accepting();
+        assert_eq!(st.flush_with(&mut sink2, 0), WriteStatus::Drained);
+        assert_eq!(sink2.calls.len(), 1);
+    }
+
+    /// `Interrupted` is retried with the batch restored verbatim (nothing was
+    /// consumed), and a zero-length write on a non-empty batch means the peer
+    /// is gone (`Closed`, queue still intact for post-mortem).
+    #[test]
+    fn writev_interrupted_retries_and_zero_write_closes() {
+        let mut st = OutState::new();
+        for tag in 1..=3u8 {
+            st.queue(small(tag), 0);
+        }
+        let mut sink =
+            CountingSink::scripted(vec![Err(std::io::Error::from(ErrorKind::Interrupted))]);
+        assert_eq!(st.flush_with(&mut sink, 0), WriteStatus::Drained);
+        assert_eq!(sink.calls.len(), 2, "EINTR then the retry");
+        assert_eq!(sink.offered[0], sink.offered[1], "same batch both times");
+        assert!(sink.calls[0].is_empty(), "EINTR consumed nothing");
+        assert_eq!(sink.received().len(), 30);
+        assert_eq!(st.out_bytes, 0);
+
+        let mut st2 = OutState::new();
+        for tag in 1..=3u8 {
+            st2.queue(small(tag), 0);
+        }
+        let mut sink2 = CountingSink::scripted(vec![Ok(0)]);
+        assert_eq!(st2.flush_with(&mut sink2, 0), WriteStatus::Closed);
+        assert_eq!(st2.out.len(), 3, "closed with the queue untouched");
+        assert_eq!(st2.out_bytes, 30);
+        assert_eq!(st2.inflight_delta, 30);
+    }
+
+    /// The gather honours the IOV_MAX slice budget: 3000 tiny frames flush in
+    /// ceil(3000 / 1024) = 3 calls, the first two carrying exactly 1024
+    /// iovecs.
+    #[test]
+    fn writev_batch_respects_iov_max_slice_budget() {
+        let mut st = OutState::new();
+        for tag in 0..250u8 {
+            for _ in 0..12 {
+                st.queue(small(tag), 0);
+            }
+        }
+        assert_eq!(st.out.len(), 3000);
+
+        let mut sink = CountingSink::accepting();
+        assert_eq!(st.flush_with(&mut sink, 0), WriteStatus::Drained);
+        assert_eq!(
+            sink.calls.len(),
+            3,
+            "3000 frames / 1024 iovecs = 3 syscalls"
+        );
+        assert_eq!(sink.slice_counts[0], 1024);
+        assert_eq!(sink.slice_counts[1], 1024);
+        assert_eq!(sink.slice_counts[2], 3000 - 2 * 1024);
+        assert_eq!(st.out_bytes, 0);
+    }
+
+    /// The per-syscall byte budget splits oversized backlogs: three 100 KiB
+    /// frames (300 KiB total > 256 KiB budget) flush as [2 frames, 1 frame],
+    /// and the stream is still byte-exact.
+    #[test]
+    fn writev_batch_respects_byte_budget() {
+        let mut st = OutState::new();
+        let mut expected = Vec::new();
+        for tag in 1..=3u8 {
+            let f: Arc<[u8]> = Arc::from(vec![tag; 100 * 1024].into_boxed_slice());
+            expected.extend_from_slice(&f[..]);
+            st.queue(f, 0);
+        }
+
+        let mut sink = CountingSink::accepting();
+        assert_eq!(st.flush_with(&mut sink, 0), WriteStatus::Drained);
+        assert_eq!(
+            sink.slice_counts,
+            vec![2, 1],
+            "200 KiB then the leftover 100 KiB"
+        );
+        assert_eq!(sink.received(), expected);
+        assert_eq!(st.out_bytes, 0);
+    }
+
+    /// CoDel's per-frame dequeue decisions survive batching: once overloaded,
+    /// a flush of stale frames drops every stale leading frame on dequeue and
+    /// only the freshest reaches the sink — one writev, one frame's bytes.
+    #[test]
+    fn writev_batching_preserves_codel_staleness_drops() {
+        let mut st = OutState::new();
+        st.codel = CodelParams {
+            target_ns: TARGET_NS,
+            interval_ns: INTERVAL_NS,
+        };
+
+        // Drive one interval at 6 ms sojourn (> target, < 2×target: sent) to
+        // flip into the overloaded regime — one frame per flush, like the
+        // timeline tests.
+        for k in 0..=20u8 {
+            let now = (k as u64 + 1) * 6_000_000;
+            st.queue(small(k), now - 6_000_000);
+            let mut sink = CountingSink::accepting();
+            assert_eq!(st.flush_with(&mut sink, now), WriteStatus::Drained);
+        }
+        assert!(st.codel_state.overloaded);
+
+        // A batched flush of four stale frames (sojourn 13 ms > 2×target):
+        // the first three drop on dequeue, the freshest is sent alone.
+        let now = 200_000_000u64;
+        for tag in 90..=93u8 {
+            st.queue(small(tag), now - 13_000_000);
+        }
+        let mut sink = CountingSink::accepting();
+        assert_eq!(st.flush_with(&mut sink, now), WriteStatus::Drained);
+        assert_eq!(st.codel_dropped, 3, "three stale frames dropped");
+        assert_eq!(sink.calls.len(), 1);
+        assert_eq!(sink.received(), vec![93u8; 10], "only the freshest sent");
+        assert_eq!(st.out_bytes, 0);
+        assert_eq!(st.inflight_delta, 0, "+40 queued, −30 dropped, −10 sent");
+    }
+
     // ---- partial write / WouldBlock ------------------------------------------
     #[test]
     fn partial_write_advances_cursor_across_flushes() {
@@ -1325,6 +1972,221 @@ mod tests {
                                               // turn the partial write into a Closed status.
         let _ = peer.peer_addr();
         drop(peer);
+    }
+
+    /// (a, real socket) Many queued frames flushed once arrive at the peer as
+    /// their exact concatenation — the writev path on a REAL `mio` stream.
+    #[test]
+    fn flush_many_frames_matches_sequential_writes() {
+        let (server, mut client) = pair();
+        let mut conn = Connection::new(server, 1 << 20);
+
+        let mut expected = Vec::new();
+        for k in 0..200u8 {
+            let f = text_frame(&[k; 16]);
+            expected.extend_from_slice(&f);
+            assert_eq!(conn.queue(f, 0), 0);
+        }
+
+        assert_eq!(conn.flush(0), WriteStatus::Drained);
+        assert!(!conn.has_pending_writes());
+        assert_eq!(conn.out_bytes, 0);
+        assert_eq!(read_exact_n(&mut client, expected.len()), expected);
+    }
+
+    /// (c, real socket) A front left MID-WRITE by a batched flush is never
+    /// evicted by drop-head, and once the backlog pressure clears, the peer
+    /// receives the surviving frames' bytes in order — the stream is never
+    /// spliced mid-frame. This drives the eviction guard against the REAL
+    /// partial-write states the writev path now produces.
+    #[test]
+    fn partial_writev_front_survives_drop_head_eviction() {
+        let (server, peer) = pair_tiny_sndbuf();
+        let mut peer = peer;
+        peer.set_nonblocking(true).unwrap();
+
+        // ~4.1 MB cap with a ~4.1 MB enqueue of 1000-byte frames (1000 chosen
+        // deliberately: the kernel accepts exactly the free send-buffer space
+        // per flush — with SO_SNDBUF 8 KiB that is 8192 bytes, which 1000
+        // does NOT divide, so partial writes reliably land MID-frame; 1024
+        // would align perfectly and never produce a mid-write front here).
+        let mut c = Connection::new(server, 4_100_000);
+        for i in 0..4096u32 {
+            let tag = (i % 251) as u8 + 1;
+            let _ = c.queue(std::sync::Arc::from(vec![tag; 1000].into_boxed_slice()), 0);
+        }
+        assert!(c.out_bytes() > 3_000_000, "a real backlog must remain");
+
+        // Flush until a batch stops MID-FRAME. A partial write can land
+        // exactly on a frame boundary (cursor 0, front not mid-write — a
+        // legal state where eviction is allowed); drain the peer and flush
+        // again until the stop is genuinely mid-frame.
+        let mut chunk = vec![0u8; 64 * 1024];
+        let mut received = Vec::new();
+        let mut rounds = 0usize;
+        loop {
+            rounds += 1;
+            assert!(rounds < 500, "flush never stopped mid-frame");
+            let status = c.flush(0);
+            loop {
+                match peer.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => received.extend_from_slice(&chunk[..n]),
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("peer read failed: {e}"),
+                }
+            }
+            match status {
+                WriteStatus::WouldBlock if c.out_cursor() > 0 => break,
+                WriteStatus::WouldBlock => continue, // boundary-aligned stop; retry
+                WriteStatus::Drained => panic!("the multi-MB backlog cannot fully fit"),
+                WriteStatus::Closed => panic!("unexpected Closed"),
+            }
+        }
+
+        // The mid-write front: cursor points INTO the front frame.
+        let front_byte = c.peek_front_byte();
+        let front_len = c.out.front().unwrap().0.len();
+        assert!(c.out_cursor() > 0 && c.out_cursor() < front_len);
+
+        // Pressure the cap with more queues → drop-head evictions take the
+        // oldest droppable slot; the MID-WRITE front must survive untouched.
+        for i in 0..500u32 {
+            let tag = (i % 251) as u8 + 1;
+            let _ = c.queue(std::sync::Arc::from(vec![tag; 1000].into_boxed_slice()), 0);
+        }
+        assert!(c.out_cursor() > 0, "front still mid-write");
+        assert_eq!(
+            c.peek_front_byte(),
+            front_byte,
+            "mid-write front never evicted"
+        );
+        assert_eq!(c.out.front().unwrap().0.len(), front_len);
+        assert!(c.drophead_dropped() > 0, "evictions actually fired");
+
+        // Snapshot the survivors (same module: private field access) and drive
+        // the drain to completion, interleaving peer reads like the classic
+        // partial-write test. Bytes of the mid-write front already on the wire
+        // (`cursor_at_snapshot`) were received earlier; everything still owed
+        // is expected[cursor_at_snapshot..].
+        let expected: Vec<u8> = c.out.iter().flat_map(|f| f.0.iter().copied()).collect();
+        let already = received.len();
+        let cursor_at_snapshot = c.out_cursor();
+        loop {
+            loop {
+                match peer.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => received.extend_from_slice(&chunk[..n]),
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("peer read failed: {e}"),
+                }
+            }
+            if c.flush(0) == WriteStatus::Drained {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        // Pull the tail the final flush pushed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let owed = expected.len() - cursor_at_snapshot;
+        while received.len() - already < owed {
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => received.extend_from_slice(&chunk[..n]),
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < deadline, "tail drain stalled");
+                    std::thread::sleep(std::time::Duration::from_micros(50));
+                }
+                Err(e) => panic!("peer tail read failed: {e}"),
+            }
+        }
+        // Everything still owed after the snapshot arrived, in order, with no
+        // duplication and no gap.
+        assert_eq!(&received[already..], &expected[cursor_at_snapshot..]);
+        assert_eq!(c.out_bytes, 0);
+        assert!(!c.has_pending_writes());
+    }
+
+    /// (TLS, real rustls pair) The batched `flush_tls` path delivers every
+    /// queued frame through rustls byte-exact: 30 frames queued, flushed in
+    /// batches, the raw client decrypts exactly their concatenation. Drives
+    /// the TlsBatchSink pre/post ciphertext drains and the plaintext-batch
+    /// apply logic end to end.
+    #[test]
+    fn flush_tls_batches_frames_and_delivers_concatenation() {
+        use crate::transport::conn::tls_test_support as tlsup;
+
+        let (server_stream, mut client_sock) = tlsup::pair_tiny_tls();
+        let (server_cfg, cert_der) = tlsup::bloated_server_config();
+        let tls = rustls::server::ServerConnection::new(server_cfg).unwrap();
+        let mut conn = Connection::new_tls(server_stream, Box::new(tls), 1 << 20);
+        let mut client = tlsup::tls_client(&cert_der);
+
+        // Client sends its ClientHello.
+        while client.wants_write() {
+            client.write_tls(&mut client_sock).unwrap();
+        }
+
+        // Drive the handshake to completion (both sides), like the G2 test.
+        let mut buf = BytesMut::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while client.is_handshaking() {
+            assert!(std::time::Instant::now() < deadline, "handshake stalled");
+            match conn.drain_head_bytes(&mut buf) {
+                DrainStatus::Ok | DrainStatus::NeedsWrite => {}
+                DrainStatus::Closed => panic!("unexpected Closed mid-handshake"),
+            }
+            tlsup::pump_client(&mut client, &mut client_sock);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        // Queue 30 tagged frames and flush them in batches (tiny socket
+        // buffers force WouldBlock + resume through Phase 1 redrains).
+        let mut expected = Vec::new();
+        for tag in 0..30u8 {
+            let f = small(tag);
+            expected.extend_from_slice(&f[..]);
+            assert_eq!(conn.queue(f, 0), 0);
+        }
+
+        let mut plaintext = Vec::with_capacity(expected.len());
+        let mut chunk = [0u8; 4096];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "app-data drain stalled"
+            );
+            tlsup::pump_client(&mut client, &mut client_sock);
+            loop {
+                match client.reader().read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => plaintext.extend_from_slice(&chunk[..n]),
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(e) => panic!("client plaintext read failed: {e}"),
+                }
+            }
+            if plaintext.len() >= expected.len() {
+                break;
+            }
+            // Let the server ingest any client ciphertext (handshake tail),
+            // then push another batch.
+            match conn.drain_head_bytes(&mut buf) {
+                DrainStatus::Ok | DrainStatus::NeedsWrite => {}
+                DrainStatus::Closed => panic!("unexpected Closed ingesting client data"),
+            }
+            match conn.flush(0) {
+                WriteStatus::Drained => {}
+                WriteStatus::WouldBlock => {}
+                WriteStatus::Closed => panic!("unexpected Closed flushing app data"),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        assert_eq!(plaintext, expected, "decrypted stream == concatenation");
+        assert!(!conn.has_pending_writes());
+        assert_eq!(conn.out_bytes, 0);
     }
 
     // ---- incremental inflight-delta accounting --------------------------------
