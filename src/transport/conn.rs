@@ -1004,15 +1004,22 @@ impl CodelState {
 /// bumped) rather than written — so cores always send *fresh* data. Stops at
 /// the first frame that is kept (or when the queue empties).
 ///
-/// Never drops the mid-write front (`out_cursor > 0`): those bytes are already
-/// partly on the wire, and splicing them out would corrupt the peer's stream.
-/// A `target_ns` of `0` disables the overlay entirely (pure drop-head).
+/// Never drops the mid-write front: those bytes are already partly on the
+/// wire, and splicing them out would corrupt the peer's stream. The caller
+/// passes `front_locked` — true only while the mid-write frame is STILL the
+/// deque's front (not yet popped into the flush batch); once the gather has
+/// taken it, vetting resumes for the frames behind it (R19: the raw cursor
+/// stays `> 0` until the resuming write completes, so keying off the cursor
+/// inside the gather wrongly exempted every frame behind a mid-write front —
+/// up to `WRITEV_MAX_SLICES` frames / `WRITEV_MAX_BYTES` bytes per resume —
+/// from freshness vetting). A `target_ns` of `0` disables the overlay entirely
+/// (pure drop-head).
 // 8 parameters: the same disjoint out-queue state bundle `flush_coalesced`
 // threads (see its allow note) — the Phase-3-reviewed accounting lives here.
 #[allow(clippy::too_many_arguments)]
 fn codel_dequeue(
     out: &mut VecDeque<OutFrame>,
-    out_cursor: &usize,
+    front_locked: bool,
     out_bytes: &mut usize,
     inflight_delta: &mut i64,
     codel: CodelParams,
@@ -1040,7 +1047,7 @@ fn codel_dequeue(
 
         // The mid-write front is locked: it is already partly on the wire and
         // must be sent to completion, stale or not.
-        if *out_cursor > 0 {
+        if front_locked {
             return;
         }
         // FRESHEST-WINS invariant: never CoDel-drop the LAST remaining frame.
@@ -1086,11 +1093,15 @@ fn codel_dequeue(
 /// CoDel runs per frame exactly as before: each frame is checked as it
 /// reaches the front, and the gather POPS the checked frame before checking
 /// the next, so the deque each check sees (and therefore every drop decision)
-/// is byte-identical to the one-write-per-frame loop's. One benign sampling
-/// difference: a frame the gather stops at (batch limit hit) or the tail of a
-/// partially-written batch is re-sampled on the next batch/flush attempt;
-/// CoDel folds interval MINIMA, so an extra early sample can only understate
-/// staleness, never fabricate it.
+/// is byte-identical to the one-write-per-frame loop's. The mid-write lock is
+/// GATHER-AWARE (R19): a frame counts as locked only while it is still the
+/// deque's front — once the gather has popped it into the batch, the frames
+/// behind it are vetted normally, so staleness dropping resumes right behind a
+/// mid-write front instead of being suspended for the whole batch. One benign
+/// sampling difference: a frame the gather stops at (batch limit hit) or the
+/// tail of a partially-written batch is re-sampled on the next batch/flush
+/// attempt; CoDel folds interval MINIMA, so an extra early sample can only
+/// understate staleness, never fabricate it.
 // 11 parameters: the disjoint out-queue state the verified accounting
 // invariants live in. Bundling them into a struct would re-home Phase-3-
 // reviewed state for a perf change; the seam also lets the unit tests drive
@@ -1111,10 +1122,13 @@ fn flush_coalesced<W: WriteSink>(
 ) -> WriteStatus {
     loop {
         // CoDel: drop stale leading frames; on return the front (if any) is
-        // keepable. Completes before the batch borrows below.
+        // keepable. Completes before the batch borrows below. The front is
+        // locked only while the mid-write frame is still the deque's front —
+        // at this point the batch is always empty (every exit/continue path
+        // drains it), so the locked frame, if any, has not been gathered yet.
         codel_dequeue(
             out,
-            out_cursor,
+            *out_cursor > 0 && batch.is_empty(),
             out_bytes,
             inflight_delta,
             codel,
@@ -1152,10 +1166,13 @@ fn flush_coalesced<W: WriteSink>(
             batch.push(frame);
             // Check the NEXT frame before it can join the batch, so CoDel's
             // per-frame dequeue decision is made against the same shrunken
-            // deque the one-write-per-frame loop saw.
+            // deque the one-write-per-frame loop saw. The batch is non-empty
+            // here, so a mid-write front gathered above no longer locks the
+            // frame now at the deque front: vetting has resumed for the
+            // frames behind it (R19).
             codel_dequeue(
                 out,
-                out_cursor,
+                *out_cursor > 0 && batch.is_empty(),
                 out_bytes,
                 inflight_delta,
                 codel,
@@ -1836,6 +1853,84 @@ mod tests {
         assert_eq!(sink.received(), vec![93u8; 10], "only the freshest sent");
         assert_eq!(st.out_bytes, 0);
         assert_eq!(st.inflight_delta, 0, "+40 queued, −30 dropped, −10 sent");
+    }
+
+    /// R19 (Task 6.2 review carry-in): a flush that resumes with a mid-write
+    /// front must still CoDel-vet the frames gathered BEHIND that front. The
+    /// buggy shape threaded the raw `out_cursor` (still `> 0` until the
+    /// resuming write completes) into the in-gather `codel_dequeue`, which read
+    /// it as "the front is mid-write and locked" — but the front under check
+    /// had already been popped into the batch, so stale frames queued behind a
+    /// mid-write front escaped freshness vetting entirely (up to
+    /// [`WRITEV_MAX_SLICES`] frames / [`WRITEV_MAX_BYTES`] bytes per resume).
+    ///
+    /// Overload-style timeline: drive the queue into the overloaded regime,
+    /// lock a partially-written front (short write + block), queue stale frames
+    /// behind it (sojourn 13 ms > 2×target 10 ms), then RESUME the flush — the
+    /// stale leading frames must drop and only the freshest may follow the
+    /// locked front out.
+    #[test]
+    fn codel_vetting_resumes_behind_mid_write_front() {
+        let mut st = OutState::new();
+        st.codel = CodelParams {
+            target_ns: TARGET_NS,
+            interval_ns: INTERVAL_NS,
+        };
+
+        // Drive one interval at 6 ms sojourn (> target, < 2×target) to flip
+        // into the overloaded regime.
+        for k in 0..=20u8 {
+            let now = (k as u64 + 1) * 6_000_000;
+            st.queue(small(k), now - 6_000_000);
+            let mut sink = CountingSink::accepting();
+            assert_eq!(st.flush_with(&mut sink, now), WriteStatus::Drained);
+        }
+        assert!(st.codel_state.overloaded);
+
+        // A fresh front frame, partially written then blocked: the flush
+        // accepts 5 of its 10 bytes and the socket fills — the front stays
+        // mid-write (out_cursor 5). It must survive (locked, and fresh
+        // regardless).
+        let now = 200_000_000u64;
+        st.queue(small(50), now - 1_000_000); // sojourn 1 ms — fresh
+        let mut sink = CountingSink::scripted(vec![
+            Ok(5),
+            Err(std::io::Error::from(ErrorKind::WouldBlock)),
+        ]);
+        assert_eq!(st.flush_with(&mut sink, now), WriteStatus::WouldBlock);
+        assert_eq!(st.out_cursor, 5, "front is mid-write");
+        assert_eq!(st.out.len(), 1);
+
+        // Three STALE frames queue behind the locked front (sojourn 13 ms >
+        // 2×target 10 ms while overloaded).
+        for tag in [60u8, 61, 62] {
+            st.queue(small(tag), now - 13_000_000);
+        }
+
+        // RESUME the flush (same timestamp, so the staleness verdicts are
+        // unchanged): the locked front completes; vetting must have resumed
+        // behind it — tags 60 and 61 drop as stale, the freshest (62) follows
+        // the front out.
+        let mut sink2 = CountingSink::accepting();
+        assert_eq!(st.flush_with(&mut sink2, now), WriteStatus::Drained);
+        assert_eq!(
+            st.codel_dropped, 2,
+            "stale frames behind the mid-write front must drop on the resume"
+        );
+        let mut expected = vec![50u8; 5]; // the locked front's unwritten tail
+        expected.extend_from_slice(&[62u8; 10]); // then the freshest frame
+        assert_eq!(
+            sink2.received(),
+            expected,
+            "no stale byte may reach the wire"
+        );
+        assert!(st.out.is_empty());
+        assert_eq!(st.out_bytes, 0);
+        assert_eq!(st.true_bytes(), 0);
+        assert_eq!(
+            st.inflight_delta, 0,
+            "+40 queued, −10 front sent, −20 dropped, −10 freshest sent"
+        );
     }
 
     // ---- partial write / WouldBlock ------------------------------------------
