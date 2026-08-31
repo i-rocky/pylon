@@ -8,7 +8,7 @@
 //!
 //! [`frame`] is the RFC 6455 codec; [`conn`] is the per-connection state +
 //! non-blocking read/write that the worker event loop drives. The event loop
-//! itself is built in later SP9 tasks.
+//! itself is [`worker`] (driven by [`run_percore`]).
 
 pub mod conn;
 pub mod fanout;

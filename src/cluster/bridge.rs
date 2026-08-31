@@ -79,9 +79,12 @@ const ADMIT_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_milli
 /// [`PresenceLeave`](ClusterCmd::PresenceLeave): the presence membership edges (the
 /// cluster-wide roster in `subscription_succeeded` + the single cluster-wide
 /// `member_added` / `member_removed`, plus the presence channel's
-/// `channel_occupied` / `channel_vacated`). Later SP11 tasks GROW this enum (Signin /
-/// Watch …) as those paths move onto the bridge; each variant is added with its full
-/// drain-loop handling, never a stub.
+/// `channel_occupied` / `channel_vacated`). The user edges
+/// ([`Signin`](ClusterCmd::Signin) / [`Signout`](ClusterCmd::Signout),
+/// [`Watch`](ClusterCmd::Watch) / [`Unwatch`](ClusterCmd::Unwatch)) and the
+/// app-capacity edges ([`AdmitApp`](ClusterCmd::AdmitApp) /
+/// [`ReleaseApp`](ClusterCmd::ReleaseApp)) have since moved onto the bridge;
+/// every variant ships with its full drain-loop handling, never a stub.
 pub enum ClusterCmd {
     /// Fan a pre-encoded v7 broadcast `frame` out to the rest of the cluster on
     /// `(app, channel)`, excluding `except`. Maps to [`RedisAdapter::cluster_publish_broadcast`].

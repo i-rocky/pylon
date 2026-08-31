@@ -1055,7 +1055,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
             // `drain_broadcasts` empties the bounded hand-off inbox (its
             // `while rx.try_recv()` loop runs to `Empty`), so the channel now has
             // headroom: clear the sink's saturation flag. The publish-admission
-            // path (Phase 2) thereby resumes accepting once delivery catches up.
+            // path thereby resumes accepting once delivery catches up.
             if let Some(sat) = &saturated {
                 sat.store(false, Ordering::Relaxed);
             }

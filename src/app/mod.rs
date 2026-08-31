@@ -1,4 +1,4 @@
-//! App (tenant) definitions and the AppManager seam (static file now; DB in SP6).
+//! App (tenant) definitions and the AppManager seam (static file, SQL, or Mongo).
 
 pub mod cache;
 pub mod invalidation;

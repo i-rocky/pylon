@@ -30,8 +30,8 @@ pub struct AppState {
     /// redis+percore) pass `Some(local.saturation_flag())`; `None` appears only
     /// in tests. Do not wire a production `AppState` without the flag.
     pub saturated: Option<Arc<AtomicBool>>,
-    /// C2b graceful-shutdown draining flag. Set to `true` when a shutdown signal
-    /// fires (C2a, a later task). The `/ready` handler returns 503 while draining
+    /// C2b graceful-shutdown draining flag. Set to `true` by the C2a two-phase
+    /// shutdown sequence in `main.rs`. The `/ready` handler returns 503 while draining
     /// so load balancers stop routing new connections before we close existing ones.
     /// Always `false` at startup; the flag is only toggled by the shutdown sequence.
     pub draining: Arc<AtomicBool>,

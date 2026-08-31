@@ -30,7 +30,7 @@ use std::sync::Arc;
 /// Default capacity of a worker's bounded broadcast hand-off channel (frames).
 /// The publish→workers hand-off is bounded so a publish flood cannot grow it
 /// unbounded (the SP9 hang). On `Full` the broadcast is dropped (at-most-once)
-/// and the sink is flagged saturated. Overridable via config in Phase 2.
+/// and the sink is flagged saturated. Overridable via `PYLON_BROADCAST_HANDOFF_CAP`.
 pub const DEFAULT_BROADCAST_HANDOFF_CAP: usize = 1024;
 
 /// One sharded broadcast hand-off: the per-version WS-framed bytes plus the
@@ -163,7 +163,7 @@ impl BroadcastSink {
     }
 
     /// Whether the broadcast pipeline is currently saturated (a hand-off channel
-    /// was found full). Read cheaply by the publish-admission path (Phase 2's 503
+    /// was found full). Read cheaply by the publish-admission path (the REST 503
     /// gate). Cleared by a worker after it fully drains its broadcast inbox.
     pub fn is_saturated(&self) -> bool {
         self.saturated.load(Ordering::Relaxed)

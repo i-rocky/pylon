@@ -1,7 +1,7 @@
 //! pylon-load — Pusher-protocol load-test harness library.
-// Several protocol helpers and scenario entry points are not yet wired into the
-// default fanout path; they are exercised by tests and later SP8 tasks, so allow
-// the not-yet-used public API.
+// Several protocol helpers and scenario entry points are exercised only by the
+// load-test binaries (`src/main.rs`, `src/bin/ceiling.rs`) and the tests under
+// `tests/`, so allow the not-yet-used public API.
 #![allow(dead_code)]
 #![deny(unsafe_code)]
 
