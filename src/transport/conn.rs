@@ -71,15 +71,6 @@ pub enum DrainStatus {
 /// Error surfaced by the queue/read paths.
 #[derive(Debug, PartialEq)]
 pub enum ConnError {
-    /// The outbound queue is over its high-water mark; the caller must close the
-    /// connection (a slow consumer we refuse to buffer for unbounded).
-    ///
-    /// SP10: the per-connection out-queue is now byte-bounded **drop-head**
-    /// ([`Connection::queue`] drops the oldest frame(s) to fit rather than
-    /// rejecting), so this variant is no longer produced by the queue path. It is
-    /// retained for the read paths' API shape and possible future use.
-    #[allow(dead_code)]
-    Backpressure,
     /// The peer closed (EOF with nothing buffered) or the socket errored.
     Closed,
     /// A fatal WebSocket protocol violation; close with status 1002.

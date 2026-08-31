@@ -2068,7 +2068,6 @@ fn handle_frames(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig, now_ns: u64
             Ok(frames) => frames,
             // EOF or a fatal protocol violation: close.
             Err(ConnError::Closed) | Err(ConnError::Protocol(_)) => return Action::Close,
-            Err(ConnError::Backpressure) => return Action::Close,
         }
     };
 
