@@ -3065,7 +3065,18 @@ fn reconcile_membership(
     let sid = &session.ctx.socket_id;
 
     // Added channels: present in ctx.subscribed, absent from the recorded set.
-    for channel in session.ctx.subscribed.difference(&session.subs) {
+    // The `difference` iterator borrows `session.subs`, so the added names are
+    // collected first and then folded into the baseline one by one — the
+    // baseline converges in O(diff), without cloning the whole live set (the
+    // diff is almost always one channel; the live set is every channel the
+    // connection is in).
+    let added: Vec<String> = session
+        .ctx
+        .subscribed
+        .difference(&session.subs)
+        .cloned()
+        .collect();
+    for channel in &added {
         let inserted = local_subs
             .entry((Arc::clone(&app), Arc::<str>::from(channel.as_str())))
             .or_default()
@@ -3075,8 +3086,17 @@ fn reconcile_membership(
             LOCAL_SUBS_SLOTS.fetch_add(1, Ordering::Relaxed);
         }
     }
-    // Removed channels: were recorded, no longer subscribed.
-    for channel in session.subs.difference(&session.ctx.subscribed) {
+    for channel in added {
+        session.subs.insert(channel);
+    }
+    // Removed channels: were recorded, no longer subscribed. `retain` walks the
+    // recorded baseline once, deindexing and dropping exactly the channels the
+    // live set lacks — the removal half of the in-place diff.
+    let live = &session.ctx.subscribed;
+    session.subs.retain(|channel| {
+        if live.contains(channel) {
+            return true;
+        }
         let k = (Arc::clone(&app), Arc::<str>::from(channel.as_str()));
         if let Some(set) = local_subs.get_mut(&k) {
             if set.remove(sid) {
@@ -3087,11 +3107,10 @@ fn reconcile_membership(
                 local_subs.remove(&k);
             }
         }
-    }
+        false
+    });
     // Keep the reverse map current (stamp on first subscribe; harmless re-stamp).
     sid_to_token.insert(*sid, token);
-    // Record the new set as the reconcile baseline.
-    session.subs = session.ctx.subscribed.clone();
 }
 
 /// SP10 graduated-shed band, derived from this worker's `inflight_bytes` as a
