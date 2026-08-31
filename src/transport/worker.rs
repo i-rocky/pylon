@@ -1288,7 +1288,10 @@ fn queue_ping(
     if entry.conn.state != ConnState::Open {
         return None;
     }
-    let text = session.codec.encode(&ServerEvent::Ping);
+    // F6/6.4: encode through the append seam — no per-frame String clone for
+    // pre-encoded (`Raw`) payloads; the text then feeds the WS frame build.
+    let mut text = String::new();
+    session.codec.encode_into(&ServerEvent::Ping, &mut text);
     let mut out = BytesMut::new();
     frame::encode_text(&mut out, text.as_bytes());
     let _ = entry.conn.queue(out.freeze(), now_ns);
@@ -1390,16 +1393,23 @@ fn queue_lifetime_error(conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) 
     let error = crate::protocol::error::PusherError::max_lifetime();
     // A lifetime close only ever fires on an ESTABLISHED session, but fall back
     // to the raw-JSON form (as `queue_shutdown_error` does) for a conn whose
-    // session vanished between arming and firing.
-    let text = if let Some(session) = entry.session.as_ref() {
-        session.codec.encode(&ServerEvent::Error(error))
-    } else {
-        serde_json::json!({
-            "event": "pusher:error",
-            "data": { "code": error.code, "message": error.message }
-        })
-        .to_string()
-    };
+    // session vanished between arming and firing. F6/6.4: the session arm uses
+    // the append seam (`encode_into`) — no per-frame String clone.
+    let mut text = String::new();
+    match entry.session.as_ref() {
+        Some(session) => session
+            .codec
+            .encode_into(&ServerEvent::Error(error), &mut text),
+        None => {
+            text.push_str(
+                &serde_json::json!({
+                    "event": "pusher:error",
+                    "data": { "code": error.code, "message": error.message }
+                })
+                .to_string(),
+            );
+        }
+    }
     let mut out = BytesMut::new();
     frame::encode_text(&mut out, text.as_bytes());
     let _ = entry.conn.queue(out.freeze(), now_ns);
@@ -1424,23 +1434,29 @@ fn queue_shutdown_error(conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) 
     // present (so encoding is consistent with every other server event),
     // fall back to the same raw-JSON form used by `queue_reject` when no
     // codec has been negotiated yet (connection still handshaking).
-    let text = if let Some(session) = entry.session.as_ref() {
-        session.codec.encode(&ServerEvent::Error(
-            crate::protocol::error::PusherError::new(
+    // F6/6.4: the session arm uses the append seam (`encode_into`).
+    let mut text = String::new();
+    match entry.session.as_ref() {
+        Some(session) => session.codec.encode_into(
+            &ServerEvent::Error(crate::protocol::error::PusherError::new(
                 4200,
                 "Server is shutting down; please reconnect",
-            ),
-        ))
-    } else {
-        // No codec yet (connection in handshaking state): hand-build the
-        // raw JSON that the v7 codec would have produced. The data field is
-        // a plain JSON object (not double-encoded) — matching `queue_reject`.
-        serde_json::json!({
-            "event": "pusher:error",
-            "data": { "code": 4200_u16, "message": "Server is shutting down; please reconnect" }
-        })
-        .to_string()
-    };
+            )),
+            &mut text,
+        ),
+        None => {
+            // No codec yet (connection in handshaking state): hand-build the
+            // raw JSON that the v7 codec would have produced. The data field is
+            // a plain JSON object (not double-encoded) — matching `queue_reject`.
+            text.push_str(
+                &serde_json::json!({
+                    "event": "pusher:error",
+                    "data": { "code": 4200_u16, "message": "Server is shutting down; please reconnect" }
+                })
+                .to_string(),
+            );
+        }
+    }
     let mut out = BytesMut::new();
     frame::encode_text(&mut out, text.as_bytes());
     let _ = entry.conn.queue(out.freeze(), now_ns);
@@ -1748,7 +1764,10 @@ fn handle_handshake(
                             socket_id: session.ctx.socket_id,
                             activity_timeout: env.activity_timeout,
                         };
-                        let text = session.codec.encode(&established);
+                        // F6/6.4: append-seam encode (single frame; the local
+                        // String moves straight into the WS frame build).
+                        let mut text = String::new();
+                        session.codec.encode_into(&established, &mut text);
                         let mut out = BytesMut::new();
                         frame::encode_text(&mut out, text.as_bytes());
                         let _ = entry.conn.queue(out.freeze(), now_ns);
@@ -1958,15 +1977,22 @@ fn finish_establish(
 /// JSON fallback), then a WebSocket Close frame carrying the error `code` +
 /// `message`. The caller flushes and closes.
 fn queue_reject(entry: &mut Entry, reject: &Reject, now_ns: u64) {
-    // 1) the pusher:error Text frame.
-    let text = match &reject.codec {
-        Some(c) => c.encode(&ServerEvent::Error(reject.error.clone())),
-        None => serde_json::json!({
-            "event": "pusher:error",
-            "data": { "code": reject.error.code, "message": reject.error.message }
-        })
-        .to_string(),
-    };
+    // 1) the pusher:error Text frame. F6/6.4: the codec arm uses the append
+    //    seam (`encode_into`); the no-codec fallback appends its raw JSON into
+    //    the same buffer.
+    let mut text = String::new();
+    match &reject.codec {
+        Some(c) => c.encode_into(&ServerEvent::Error(reject.error.clone()), &mut text),
+        None => {
+            text.push_str(
+                &serde_json::json!({
+                    "event": "pusher:error",
+                    "data": { "code": reject.error.code, "message": reject.error.message }
+                })
+                .to_string(),
+            );
+        }
+    }
     let mut out = BytesMut::new();
     frame::encode_text(&mut out, text.as_bytes());
     let _ = entry.conn.queue(out.freeze(), now_ns);
@@ -2341,6 +2367,20 @@ fn drain_session(poll: &Poll, entry: &mut Entry, now_ns: u64) -> DrainResult {
     let mut close_after = false;
     let mut wrote = false;
     let mut subs_changed = false;
+    // F6 / Task 6.4: ONE encode scratch for the whole drain, reused across
+    // every queued event (`clear()` keeps the capacity). `encode_into` has
+    // append semantics, so per event this costs exactly one payload copy —
+    // into the WS frame buffer below — instead of `encode()`'s fresh String
+    // allocation plus its copy. For `Raw` events (relayed redis frames, the
+    // legacy registry fan-out path) the codec appends the `Arc`-shared payload
+    // BY REFERENCE (`&**s`, no `to_string()` clone per subscriber); the single
+    // remaining memcpy is the frame build itself, which is inherent: each
+    // connection's out-queue owns its `Bytes`, so per-connection WS framing
+    // must produce its own buffer. (Where text feeds `Bytes` directly, the
+    // move is zero-copy: bytes 1.x `From<String>` — that is the percore SINK
+    // path, where `local.broadcast` encodes + frames ONCE and every worker
+    // enqueues refcount clones of one shared `Bytes`.)
+    let mut text = String::with_capacity(256);
     while let Ok(ev) = session.rx.try_recv() {
         match *ev {
             ServerEvent::Close { code, reason } => {
@@ -2366,7 +2406,8 @@ fn drain_session(poll: &Poll, entry: &mut Entry, now_ns: u64) -> DrainResult {
                     }
                     session.ctx.presence_membership.remove(channel);
                 }
-                let text = session.codec.encode(&other);
+                text.clear();
+                session.codec.encode_into(&other, &mut text);
                 let mut out = BytesMut::new();
                 frame::encode_text(&mut out, text.as_bytes());
                 let _ = entry.conn.queue(out.freeze(), now_ns);
@@ -2577,7 +2618,9 @@ fn drain_resolved(
                         socket_id: session.ctx.socket_id,
                         activity_timeout: env.activity_timeout,
                     };
-                    let text = session.codec.encode(&established);
+                    // F6/6.4: append-seam encode (single frame).
+                    let mut text = String::new();
+                    session.codec.encode_into(&established, &mut text);
                     let mut out = BytesMut::new();
                     frame::encode_text(&mut out, text.as_bytes());
                     let _ = entry.conn.queue(out.freeze(), now_ns);
