@@ -229,6 +229,19 @@ impl ClusterHandle {
         &self.node_id
     }
 
+    /// Test seam: build a [`ClusterHandle`] over a caller-supplied command channel
+    /// so in-crate tests can drive a
+    /// [`ClusterAdapter`](crate::cluster::adapter::ClusterAdapter) without a live
+    /// bridge + Redis (the test drains the [`ClusterCmd`]s itself).
+    #[cfg(test)]
+    pub(crate) fn test_handle(tx: mpsc::Sender<ClusterCmd>) -> ClusterHandle {
+        ClusterHandle {
+            tx,
+            node_id: Arc::from("test-node"),
+            metrics: Arc::new(ClusterMetrics::new()),
+        }
+    }
+
     /// Fire a cross-node broadcast at the bridge. NON-BLOCKING: a `try_send` that drops the
     /// command if the channel is full or closed — the worker must NEVER block on the bridge.
     /// A full channel means the bridge is momentarily behind; a dropped publish is

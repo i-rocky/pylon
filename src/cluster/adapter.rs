@@ -141,18 +141,26 @@ impl Adapter for ClusterAdapter {
         event: ServerEvent,
         except: Option<SocketId>,
     ) {
-        // Local delivery on THIS worker (typed event, honouring `except`).
-        self.local
-            .broadcast(app, channel, event.clone(), except)
-            .await;
-        // Pre-encode the v7 frame ONCE and fire it at the bridge, which does ONLY the
-        // Redis publish (no double local delivery; self-dedup on the origin node).
-        let frame = match &event {
-            ServerEvent::Raw(f) => f.to_string(),
-            other => crate::protocol::v7::frames::encode(other),
+        // F17: encode the v7 frame ONCE (reusing the payload verbatim when the
+        // caller already encoded it as `Raw`) and feed the SAME bytes to BOTH
+        // halves: the local delivery runs as a `Raw` frame — so neither the
+        // percore sink nor the legacy registry path re-encodes — and the bridge
+        // publish relays the identical string to the cluster. Previously the
+        // typed event was encoded once inside the local half and AGAIN here for
+        // the publish payload.
+        let frame: Arc<str> = match &event {
+            ServerEvent::Raw(f) => f.clone(),
+            other => Arc::from(crate::protocol::v7::frames::encode(other).as_str()),
         };
-        self.handle
-            .publish(Arc::from(app), Arc::from(channel), frame, except);
+        self.local
+            .broadcast(app, channel, ServerEvent::Raw(frame.clone()), except)
+            .await;
+        self.handle.publish(
+            Arc::from(app),
+            Arc::from(channel),
+            frame.to_string(),
+            except,
+        );
     }
 
     async fn channels(&self, app: &str, prefix: Option<&str>) -> Vec<ChannelSummary> {
@@ -283,5 +291,122 @@ impl Adapter for ClusterAdapter {
         // the bridge does the local-watcher notify (the cluster-wide watch edge is published
         // by `watch`/`unwatch` above); reached only on the non-cluster path.
         self.local.watchers_of(app, user_id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::app_registry::AppRegistry;
+    use crate::channel::registry::Registry;
+    use crate::cluster::bridge::ClusterCmd;
+    use tokio::sync::mpsc;
+
+    /// F17 pinning test: `ClusterAdapter::broadcast` must feed the SAME encoded
+    /// bytes to BOTH halves — the local delivery (a `Raw` frame, byte-identical
+    /// to a fresh encode of the event) and the bridge's `Publish` command — so
+    /// the encode-once construction can never let the two halves diverge.
+    #[tokio::test]
+    async fn broadcast_feeds_identical_bytes_to_local_and_publish_halves() {
+        let local = Arc::new(LocalAdapter::new(
+            Arc::new(Registry::new()),
+            Arc::new(AppRegistry::new()),
+        ));
+        let (tx, mut rx) = mpsc::channel::<ClusterCmd>(16);
+        let adapter = ClusterAdapter::new(
+            local.clone(),
+            crate::cluster::bridge::ClusterHandle::test_handle(tx),
+        );
+
+        // A local subscriber captures the LOCAL half's delivered frame.
+        let (mtx, mut mrx) = mpsc::channel(1024);
+        local
+            .subscribe(
+                "app",
+                "c",
+                ConnectionHandle {
+                    socket_id: SocketId::generate(),
+                    mailbox: crate::connection::handle::Mailbox::new(mtx, None, None),
+                },
+                None,
+            )
+            .await;
+
+        let event = ServerEvent::ChannelEvent {
+            channel: "c".into(),
+            event: "client-hello".into(),
+            data: serde_json::json!({"hello":"world"}),
+            user_id: None,
+        };
+        let expected = crate::protocol::v7::frames::encode(&event);
+        adapter.broadcast("app", "c", event, None).await;
+
+        // LOCAL half: the subscriber receives exactly the expected wire bytes.
+        match mrx.try_recv().map(|b| *b) {
+            Ok(ServerEvent::Raw(f)) => assert_eq!(&*f, &expected),
+            other => panic!("expected Raw frame on the local half, got {other:?}"),
+        }
+        // REDIS half: the publish command carries the SAME frame string.
+        match rx.try_recv() {
+            Ok(ClusterCmd::Publish {
+                app,
+                channel,
+                frame,
+                except,
+            }) => {
+                assert_eq!(&*app, "app");
+                assert_eq!(&*channel, "c");
+                assert_eq!(except, None);
+                assert_eq!(
+                    frame, expected,
+                    "publish frame must be byte-identical to the local half's frame"
+                );
+            }
+            Ok(_) => panic!("expected a Publish command"),
+            Err(e) => panic!("no command arrived at the bridge: {e:?}"),
+        }
+    }
+
+    /// Same contract for a caller-supplied pre-encoded `Raw` event: the payload
+    /// must reach both halves VERBATIM (no re-encode, no mutation).
+    #[tokio::test]
+    async fn broadcast_relays_raw_payload_verbatim_to_both_halves() {
+        let local = Arc::new(LocalAdapter::new(
+            Arc::new(Registry::new()),
+            Arc::new(AppRegistry::new()),
+        ));
+        let (tx, mut rx) = mpsc::channel::<ClusterCmd>(16);
+        let adapter = ClusterAdapter::new(
+            local.clone(),
+            crate::cluster::bridge::ClusterHandle::test_handle(tx),
+        );
+
+        let (mtx, mut mrx) = mpsc::channel(1024);
+        local
+            .subscribe(
+                "app",
+                "c",
+                ConnectionHandle {
+                    socket_id: SocketId::generate(),
+                    mailbox: crate::connection::handle::Mailbox::new(mtx, None, None),
+                },
+                None,
+            )
+            .await;
+
+        let raw: Arc<str> = Arc::from(r#"{"event":"x","channel":"c","data":"{}"}"#);
+        adapter
+            .broadcast("app", "c", ServerEvent::Raw(raw.clone()), None)
+            .await;
+
+        match mrx.try_recv().map(|b| *b) {
+            Ok(ServerEvent::Raw(f)) => assert_eq!(&*f, &*raw),
+            other => panic!("expected the verbatim Raw frame locally, got {other:?}"),
+        }
+        match rx.try_recv() {
+            Ok(ClusterCmd::Publish { frame, .. }) => assert_eq!(frame, &*raw),
+            Ok(_) => panic!("expected a Publish command"),
+            Err(e) => panic!("no command arrived at the bridge: {e:?}"),
+        }
     }
 }
