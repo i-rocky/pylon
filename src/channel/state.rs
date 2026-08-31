@@ -181,9 +181,10 @@ impl ChannelState {
     /// send-under-guard loop did — a member removed after the snapshot may or
     /// may not still receive the frame (at-most-once per mailbox, as ever).
     pub fn fanout<'a>(&self, event: &ServerEvent, except: Option<&'a SocketId>) -> Fanout<'a> {
-        // One frame is shared by every subscriber of the channel, so today it
-        // encodes at the sole active version — 7.3 replaces this with
-        // per-version frames built on the `wire` seam.
+        // One frame is shared by every subscriber of the channel, so it encodes
+        // at `ACTIVE_VERSIONS[0]` — this is the LEGACY mailbox path (axum
+        // transport / tests); per-version fan-out lives in the percore sink
+        // (7.3).
         let frame: Arc<str> = match event {
             ServerEvent::Raw(f) => f.clone(),
             other => Arc::from(

@@ -542,9 +542,13 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     // dispatch; consulted when a `BroadcastMsg` arrives to fan the frame out to
     // exactly this worker's local subscribers.
     let mut local_subs: HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>> = HashMap::new();
-    // Reverse lookup: a subscriber's `socket_id` → its slab token, so a broadcast
-    // delivery can find the connection in O(1) without scanning the slab.
-    let mut sid_to_token: HashMap<SocketId, usize> = HashMap::new();
+    // Reverse lookup: a subscriber's `socket_id` → (slab token, negotiated
+    // protocol version), so a broadcast delivery can find the connection in O(1)
+    // without scanning the slab — and, U3, pick the frame for that subscriber's
+    // version out of the broadcast's per-version `frames` with NO second
+    // lookup (the version rides the same probe; stamped at reconcile from the
+    // session's negotiated codec).
+    let mut sid_to_token: HashMap<SocketId, (usize, u8)> = HashMap::new();
 
     // SP11 §4: per-worker liveness timer wheel. Idle-pings a silent connection
     // after `activity_timeout` and closes it `4201` if a pong doesn't follow
@@ -2468,7 +2472,7 @@ fn drain_dirty_sessions(
     dirty_rx: &std::sync::mpsc::Receiver<usize>,
     dirty_set: &mut HashSet<usize>,
     local_subs: &mut HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
-    sid_to_token: &mut HashMap<SocketId, usize>,
+    sid_to_token: &mut HashMap<SocketId, (usize, u8)>,
     wheel: &mut TimerWheel,
     inflight_bytes: &mut u64,
     codel_total: &mut u64,
@@ -2568,7 +2572,7 @@ fn drain_resolved(
     resolved_rx: &std::sync::mpsc::Receiver<ResolvedApp>,
     env: &Arc<DispatchEnv>,
     local_subs: &mut HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
-    sid_to_token: &mut HashMap<SocketId, usize>,
+    sid_to_token: &mut HashMap<SocketId, (usize, u8)>,
     wheel: &mut TimerWheel,
     inflight_bytes: &mut u64,
     codel_total: &mut u64,
@@ -2954,7 +2958,7 @@ fn remove(
     conns: &mut slab::Slab<Entry>,
     key: usize,
     local_subs: &mut HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
-    sid_to_token: &mut HashMap<SocketId, usize>,
+    sid_to_token: &mut HashMap<SocketId, (usize, u8)>,
     wheel: &mut TimerWheel,
     inflight_bytes: &mut u64,
     conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
@@ -3032,7 +3036,7 @@ fn remove(
 fn deindex_connection(
     session: &Session,
     local_subs: &mut HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
-    sid_to_token: &mut HashMap<SocketId, usize>,
+    sid_to_token: &mut HashMap<SocketId, (usize, u8)>,
 ) {
     let app: Arc<str> = Arc::from(session.ctx.app.id.as_str());
     let sid = &session.ctx.socket_id;
@@ -3061,15 +3065,15 @@ fn deindex_connection(
 /// Reconcile a connection's worker-local subscription index against the protocol
 /// state after a dispatch. Diffs the session's previously-recorded channel set
 /// (`session.subs`) against `ctx.subscribed`: channels newly joined are inserted
-/// into `local_subs` (and the `socket_id → token` reverse map is (re)stamped),
-/// channels left are removed. Cheap when nothing changed (two set diffs over the
-/// usually-tiny per-connection channel set). `token` is this connection's slab
-/// key. No-op for a connection in no channels with no change.
+/// into `local_subs` (and the `socket_id → (token, version)` reverse map is
+/// (re)stamped), channels left are removed. Cheap when nothing changed (two set
+/// diffs over the usually-tiny per-connection channel set). `token` is this
+/// connection's slab key. No-op for a connection in no channels with no change.
 fn reconcile_membership(
     session: &mut Session,
     token: usize,
     local_subs: &mut HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
-    sid_to_token: &mut HashMap<SocketId, usize>,
+    sid_to_token: &mut HashMap<SocketId, (usize, u8)>,
 ) {
     if session.subs == session.ctx.subscribed {
         return;
@@ -3122,8 +3126,12 @@ fn reconcile_membership(
         }
         false
     });
-    // Keep the reverse map current (stamp on first subscribe; harmless re-stamp).
-    sid_to_token.insert(*sid, token);
+    // Keep the reverse map current (stamp on first subscribe; harmless
+    // re-stamp). The value carries the connection's negotiated protocol
+    // version (U3), read from the session's codec at the same stamp, so the
+    // broadcast drain can select the subscriber's frame out of the
+    // per-version `frames` with no second lookup.
+    sid_to_token.insert(*sid, (token, session.codec.version()));
 }
 
 /// SP10 graduated-shed band, derived from this worker's `inflight_bytes` as a
@@ -3211,14 +3219,15 @@ impl ConnIndex for slab::Slab<Entry> {
 /// For each message: classify the current [`ShedBand`] from `inflight_bytes /
 /// effective_budget`; in `Saturated` (≥100%) the whole broadcast is dropped and
 /// the sink flagged; otherwise, for each subscriber (skipping `except`), the
-/// already-WS-framed `frame` is `queue`d (a `Bytes` refcount bump — never
-/// re-encoded) UNLESS the band says to skip a backed-up subscriber.
-/// `inflight_bytes` is kept live across the drain (each enqueue adds the net
-/// byte delta, accounting for any drop-head eviction) so the band tightens as
-/// the worker fills within a single drain. `touched` collects every connection
-/// queued onto (the caller's flush loop) and `to_close` the connections the
-/// caller already marked for teardown (backpressure-closed in a previous
-/// phase of this drain).
+/// already-WS-framed frame for THAT subscriber's negotiated protocol version
+/// (U3: the message carries one frame per active version) is `queue`d (a
+/// `Bytes` refcount bump — never re-encoded) UNLESS the band says to skip a
+/// backed-up subscriber. `inflight_bytes` is kept live across the drain (each
+/// enqueue adds the net byte delta, accounting for any drop-head eviction) so
+/// the band tightens as the worker fills within a single drain. `touched`
+/// collects every connection queued onto (the caller's flush loop) and
+/// `to_close` the connections the caller already marked for teardown
+/// (backpressure-closed in a previous phase of this drain).
 ///
 /// This is the fan-out half of [`drain_broadcasts`], factored out verbatim
 /// (same statement order, same skip conditions) so `benches/fanout_sink.rs`
@@ -3230,7 +3239,7 @@ impl ConnIndex for slab::Slab<Entry> {
 pub fn drain_broadcast_inbox<C: ConnIndex>(
     rx: &std::sync::mpsc::Receiver<crate::transport::fanout::BroadcastMsg>,
     local_subs: &HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
-    sid_to_token: &HashMap<SocketId, usize>,
+    sid_to_token: &HashMap<SocketId, (usize, u8)>,
     conns: &mut C,
     effective_budget: u64,
     inflight_bytes: &mut u64,
@@ -3243,18 +3252,32 @@ pub fn drain_broadcast_inbox<C: ConnIndex>(
     while let Ok(msg) = rx.try_recv() {
         // Destructure the message so the drain owns its Arcs: the lookup key
         // MOVES `app`/`channel` (no refcount bumps — the old code cloned both
-        // per message while `msg` kept the originals alive too), and `frame`
+        // per message while `msg` kept the originals alive too), and `frames`
         // stays owned by the drain while each enqueue takes a `Bytes` refcount
         // bump as before.
         let crate::transport::fanout::BroadcastMsg {
             app,
             channel,
-            frame,
+            frames,
             except,
         } = msg;
         let Some(subs) = local_subs.get(&(app, channel)) else {
             continue; // no local subscribers for this channel on this worker
         };
+        // U3: per-version fan-out. `frames` carries one finished WS frame per
+        // active protocol version, keyed by version byte. Version→slot
+        // mapping, and why it is cheap today: the SINGLE-version fast path is
+        // resolved ONCE PER MESSAGE here — `frames` is always built by
+        // looping `wire::ACTIVE_VERSIONS` (a 1-element slice today), so
+        // `fast` is `Some(&frames[0].1)` and the per-subscriber loop below
+        // costs exactly what the 6.3 single-frame shape cost: one nullable-
+        // pointer `Option` check (perfectly predicted, no scan, no allocation)
+        // — the subscriber's version byte rides the reverse-map probe that
+        // already happens. Only when a second protocol version goes active
+        // does the multi-version arm below start scanning (a first-match walk
+        // of the ≤2-element vec, falling back to the first frame so an
+        // unknown version byte never DROPS a broadcast).
+        let fast: Option<&Bytes> = (frames.len() == 1).then(|| &frames[0].1);
         for sid in subs.iter() {
             // Reclassify PER SUBSCRIBER: the band tightens as `inflight_bytes`
             // grows within this drain, so once the worker crosses 100% mid-fan-out
@@ -3272,7 +3295,10 @@ pub fn drain_broadcast_inbox<C: ConnIndex>(
             if except.as_ref() == Some(sid) {
                 continue; // sender exclusion
             }
-            let Some(&token) = sid_to_token.get(sid) else {
+            // One probe yields BOTH the slab token and the subscriber's
+            // negotiated version (the map value was widened for U3 — no
+            // second lookup was added).
+            let Some(&(token, version)) = sid_to_token.get(sid) else {
                 continue; // stale index entry; connection gone
             };
             if to_close.contains(&token) {
@@ -3286,6 +3312,17 @@ pub fn drain_broadcast_inbox<C: ConnIndex>(
             if should_skip(band, conn.out_bytes(), conn.high_water()) {
                 continue;
             }
+            // The frame for THIS subscriber's negotiated version: the hoisted
+            // fast frame when one version is active (see `fast` above), else
+            // the first-match slot for the version byte.
+            let frame: &Bytes = match fast {
+                Some(f) => f,
+                None => frames
+                    .iter()
+                    .find(|(v, _)| *v == version)
+                    .map(|(_, b)| b)
+                    .unwrap_or(&frames[0].1),
+            };
             // SP10: the per-connection queue is byte-bounded drop-head — it never
             // rejects. A slow consumer simply loses its OLDEST queued frame(s)
             // (freshest-wins, at-most-once), keeping memory bounded without
@@ -3330,7 +3367,7 @@ fn drain_broadcasts(
     conns: &mut slab::Slab<Entry>,
     rx: &std::sync::mpsc::Receiver<crate::transport::fanout::BroadcastMsg>,
     local_subs: &mut HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
-    sid_to_token: &mut HashMap<SocketId, usize>,
+    sid_to_token: &mut HashMap<SocketId, (usize, u8)>,
     wheel: &mut TimerWheel,
     effective_budget: u64,
     inflight_bytes: &mut u64,
@@ -3832,5 +3869,150 @@ mod tests {
             !conns[key].conn.writable_armed(),
             "WRITABLE interest cleared once the flight + 101 drained"
         );
+    }
+
+    // ---- U3 / Task 7.3: per-version sink frames (two-version fixture) ---------
+
+    /// The fixture's connection table: the same `ConnIndex` shape the
+    /// fan-out bench drives (a slab of `Open` connections — the seam the
+    /// production `slab::Slab<Entry>` impl resolves with its session check).
+    struct FixtureConns {
+        slab: slab::Slab<Connection>,
+    }
+
+    impl ConnIndex for FixtureConns {
+        fn open_conn(&mut self, token: usize) -> Option<&mut Connection> {
+            let conn = self.slab.get_mut(token)?;
+            (conn.state == ConnState::Open).then_some(conn)
+        }
+    }
+
+    /// One accepted loopback socket wrapped as a `Connection` (the bench's
+    /// setup shape, minus the port-pool concerns of 100k scales): connect,
+    /// accept, nonblocking, mio. Returns (connection, client half) so the
+    /// test can read the bytes the drain actually flushed to the subscriber.
+    fn fixture_conn(listener: &std::net::TcpListener) -> (Connection, std::net::TcpStream) {
+        use std::os::fd::OwnedFd;
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        accepted.set_nonblocking(true).unwrap();
+        let mut conn = Connection::new(mio::net::TcpStream::from(OwnedFd::from(accepted)), 1 << 20);
+        conn.state = ConnState::Open; // model an established session
+        (conn, client)
+    }
+
+    /// The finished WS frame for `event` at `version` — exactly what
+    /// `fanout::frames_for` builds per slot (encode through the wire seam,
+    /// wrap with the shared framing helper), reconstructed here so the
+    /// assertion is over EXPECTED bytes, not the builder's own output.
+    fn expected_frame(version: u8, event: &ServerEvent) -> Bytes {
+        let json = crate::protocol::wire::encode(version, event);
+        let mut buf = BytesMut::new();
+        frame::encode_text(&mut buf, json.as_bytes());
+        buf.freeze()
+    }
+
+    /// U3 / Task 7.3 fixture: TWO subscribers with DIFFERENT negotiated
+    /// protocol versions on the SAME broadcast each receive THEIR version's
+    /// frame bytes.
+    ///
+    /// The two-version world is built the test-safe way: the sink's frame
+    /// builder is parameterized by the version list, so the fixture passes a
+    /// LOCAL `&[7, 8]` slice (production passes `wire::ACTIVE_VERSIONS`) —
+    /// no global `ACTIVE_VERSIONS` override, no state to leak across tests.
+    /// Version 8 is a `#[cfg(test)]` wire arm whose bytes differ
+    /// deterministically from v7's (`[8,<v7 json>]`), so a wrong-slot
+    /// delivery cannot pass by aliasing.
+    ///
+    /// Delivery is asserted END TO END: after the drain, each connection is
+    /// flushed and the exact bytes on each subscriber's socket must equal
+    /// that subscriber's version's frame — and the two must differ.
+    #[test]
+    fn drain_delivers_each_subscriber_its_negotiated_versions_frame() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (conn7, client7) = fixture_conn(&listener);
+        let (conn8, client8) = fixture_conn(&listener);
+
+        let mut conns = FixtureConns {
+            slab: slab::Slab::new(),
+        };
+        let token7 = conns.slab.insert(conn7);
+        let token8 = conns.slab.insert(conn8);
+
+        // The worker's reverse map: socket_id → (slab token, negotiated
+        // version). One subscriber negotiated v7, the other the test v8.
+        let sid7 = SocketId::generate();
+        let sid8 = SocketId::generate();
+        let mut sid_to_token: HashMap<SocketId, (usize, u8)> = HashMap::new();
+        sid_to_token.insert(sid7, (token7, 7));
+        sid_to_token.insert(sid8, (token8, 8));
+
+        let app: Arc<str> = Arc::from("app");
+        let channel: Arc<str> = Arc::from("presence-room-42");
+        let mut local_subs: HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>> = HashMap::new();
+        let mut subs = HashSet::new();
+        subs.insert(sid7);
+        subs.insert(sid8);
+        local_subs.insert((app.clone(), channel.clone()), subs);
+
+        let event = ServerEvent::ChannelEvent {
+            channel: "presence-room-42".to_string(),
+            event: "client-message".to_string(),
+            data: serde_json::json!({"msg": "per-version fan-out"}),
+            user_id: None,
+        };
+
+        // The production builder over a TWO-version list (test-only; the
+        // production call site passes `wire::ACTIVE_VERSIONS`).
+        let frames = crate::transport::fanout::frames_for(&[7, 8], &event);
+        // Fixture precondition: the two versions' frames are distinct bytes
+        // (otherwise the delivery assertion could pass on the wrong slot).
+        assert_ne!(frames[0].1, frames[1].1);
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        tx.send(crate::transport::fanout::BroadcastMsg {
+            app,
+            channel,
+            frames,
+            except: None,
+        })
+        .unwrap();
+        drop(tx);
+
+        let mut touched: HashSet<usize> = HashSet::new();
+        let mut inflight: u64 = 0;
+        let mut drophead: u64 = 0;
+        drain_broadcast_inbox(
+            &rx,
+            &local_subs,
+            &sid_to_token,
+            &mut conns,
+            64 << 20, // Normal band: every subscriber delivered
+            &mut inflight,
+            &mut drophead,
+            None,
+            1,
+            &mut touched,
+            &HashSet::new(),
+        );
+        assert_eq!(touched.len(), 2, "both subscribers queued onto");
+
+        // Flush + read each subscriber's socket: the EXACT frame bytes of
+        // that subscriber's negotiated version, and nothing else.
+        let expect7 = expected_frame(7, &event);
+        let expect8 = expected_frame(8, &event);
+        for (token, mut client, expect) in
+            [(token7, client7, &expect7), (token8, client8, &expect8)]
+        {
+            let conn = conns.slab.get_mut(token).unwrap();
+            assert_eq!(conn.flush(1), WriteStatus::Drained, "loopback flush");
+            let mut got = vec![0u8; expect.len()];
+            use std::io::Read as _;
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            client.read_exact(&mut got).expect("read flushed frame");
+            assert_eq!(&got[..], &expect[..], "subscriber's own version frame");
+        }
     }
 }

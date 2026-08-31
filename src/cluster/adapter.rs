@@ -149,9 +149,10 @@ impl Adapter for ClusterAdapter {
         // typed event was encoded once inside the local half and AGAIN here for
         // the publish payload.
         //
-        // One frame is shared cluster-wide, so today it encodes at the sole
-        // active version — 7.3 replaces this with per-version frames built on
-        // the `wire` seam.
+        // One frame is shared cluster-wide, so it encodes at `ACTIVE_VERSIONS[0]`
+        // — the redis relay carries one string per broadcast. (7.3 made the
+        // percore SINK fan-out per-version via the `wire` seam; this cluster
+        // relay stays single-version until a v8 cluster envelope exists.)
         let frame: Arc<str> = match &event {
             ServerEvent::Raw(f) => f.clone(),
             other => Arc::from(

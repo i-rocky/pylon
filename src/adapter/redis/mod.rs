@@ -1241,9 +1241,11 @@ impl Adapter for RedisAdapter {
         // relays the identical string. Previously the typed event was encoded
         // once inside the local half and AGAIN here for the publish.
         //
-        // One frame is shared cluster-wide, so today it encodes at the sole
-        // active version — 7.3 replaces this with per-version frames built on
-        // the `wire` seam.
+        // One frame is shared cluster-wide, so it encodes at
+        // `ACTIVE_VERSIONS[0]` — the redis relay carries one string per
+        // broadcast. (7.3 made the percore SINK fan-out per-version via the
+        // `wire` seam; this cluster relay stays single-version until a v8
+        // cluster envelope exists.)
         let frame: Arc<str> = match &event {
             ServerEvent::Raw(f) => f.clone(),
             other => Arc::from(
@@ -1471,9 +1473,10 @@ impl Adapter for RedisAdapter {
     async fn send_to_user(&self, app: &str, user_id: &str, event: ServerEvent) {
         // Deliver to this node's local connections of the user, then fan the
         // pre-encoded frame out to every other node holding a connection of the
-        // user. The published frame is shared cluster-wide, so today it encodes
-        // at the sole active version (7.3 makes this per-version via the `wire`
-        // seam).
+        // user. The published frame is shared cluster-wide, so it encodes at
+        // `ACTIVE_VERSIONS[0]` (the sink's per-version fan-out is a local
+        // delivery concern; the user-message relay stays single-version until
+        // a v8 cluster envelope exists).
         self.local.send_to_user(app, user_id, event.clone()).await;
         let frame =
             crate::protocol::wire::encode(crate::protocol::wire::ACTIVE_VERSIONS[0], &event);

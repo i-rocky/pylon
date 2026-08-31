@@ -159,23 +159,18 @@ impl Adapter for LocalAdapter {
         except: Option<SocketId>,
     ) {
         if let Some(sink) = self.broadcast_sink() {
-            // Per-core active: encode the frame once, WS-frame it once, and
-            // route the shared frame to every worker. Each worker fans it out to
-            // its own local subscribers by direct slab-enqueue.
-            //
-            // One frame is shared by every local subscriber, so today it encodes
-            // at the sole active version — 7.3 replaces this with per-version
-            // frames built on the `wire` seam.
-            let json: Arc<str> = match &event {
-                ServerEvent::Raw(f) => f.clone(),
-                other => Arc::from(
-                    crate::protocol::wire::encode(crate::protocol::wire::ACTIVE_VERSIONS[0], other)
-                        .as_str(),
-                ),
-            };
-            let mut buf = bytes::BytesMut::new();
-            crate::transport::frame::encode_text(&mut buf, json.as_bytes());
-            sink.broadcast(Arc::from(app), Arc::from(channel), buf.freeze(), except);
+            // Per-core active: encode + WS-frame ONCE per active protocol
+            // version (U3 / 7.3: the sink message carries a `(version, frame)`
+            // pair per `wire::ACTIVE_VERSIONS` entry — a 1-element vec today,
+            // byte-identical to the previous single-frame build) and route the
+            // frames to every worker. Each worker delivers each subscriber the
+            // frame for ITS negotiated version; `Raw` events keep the
+            // no-re-encode property (one shared buffer across slots).
+            let frames = crate::transport::fanout::frames_for(
+                crate::protocol::wire::ACTIVE_VERSIONS,
+                &event,
+            );
+            sink.broadcast(Arc::from(app), Arc::from(channel), frames, except);
         } else {
             // Legacy mailbox path (axum transport / tests): UNCHANGED.
             self.registry
@@ -249,8 +244,9 @@ impl Adapter for LocalAdapter {
         // the same buffer by reference instead of re-serializing per socket.
         // `Raw` is wire-identical to encoding the structured event (pinned by
         // the golden wire-bytes tests), so the bytes per recipient are unchanged.
-        // The shared frame encodes at the sole active version today; 7.3 makes
-        // this per-version via the `wire` seam.
+        // The shared frame encodes at `ACTIVE_VERSIONS[0]` (the per-connection
+        // MAILBOX path re-encodes nothing by design; per-version fan-out lives
+        // in the percore sink — 7.3).
         let frame: Arc<str> = match &event {
             ServerEvent::Raw(f) => f.clone(),
             other => Arc::from(

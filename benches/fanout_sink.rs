@@ -6,16 +6,18 @@
 //! What is measured, per scenario, is exactly the production sequence:
 //!
 //! 1. **publish half** — the same statements `LocalAdapter::broadcast` runs
-//!    when the sink is installed: encode the v7 JSON once (`Raw` events skip
-//!    this — one `Arc<str>` clone), WS-frame it once (`frame::encode_text` +
-//!    `freeze`), hand the shared `Bytes` to every worker via
+//!    when the sink is installed: build the per-version frames once via
+//!    `fanout::frames_for` over `wire::ACTIVE_VERSIONS` (one `wire::encode` +
+//!    one `frame::encode_text` per active version — ONE today; `Raw` events
+//!    share a single buffer across slots), and hand them to every worker via
 //!    `BroadcastSink::broadcast` (one bounded `try_send` per worker slot);
 //! 2. **drain half** — `drain_broadcasts`' real inbox pump (factored into
 //!    `pylon::transport::worker::drain_broadcast_inbox` for exactly this
 //!    bench): the `(app, channel) → local_subs` lookup, then per subscriber
-//!    the shed-band reclassify, sender exclusion, `sid_to_token` resolve, the
-//!    graduated skip, and the `Connection::queue(frame.clone(), ..)`
-//!    refcount-bump enqueue with live inflight/drop-head accounting.
+//!    the shed-band reclassify, sender exclusion, `sid_to_token` resolve
+//!    (token + negotiated version in ONE probe), the graduated skip, and the
+//!    `Connection::queue(frame.clone(), ..)` refcount-bump enqueue with live
+//!    inflight/drop-head accounting.
 //!
 //! No drain logic is reimplemented here: the bench calls the production
 //! function through the production `ConnIndex` shape (its impl adds the same
@@ -68,11 +70,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::BytesMut;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use mio::net::TcpStream as MioTcpStream;
-use slab::Slab;
-
 use pylon::channel::registry::Registry;
 use pylon::connection::handle::{ConnectionHandle, Mailbox};
 use pylon::protocol::event::ServerEvent;
@@ -80,10 +79,10 @@ use pylon::protocol::socket_id::SocketId;
 use pylon::protocol::wire;
 use pylon::transport::conn::{ConnState, Connection};
 use pylon::transport::fanout::{
-    BroadcastMsg, BroadcastSink, WorkerSlot, DEFAULT_BROADCAST_HANDOFF_CAP,
+    frames_for, BroadcastMsg, BroadcastSink, WorkerSlot, DEFAULT_BROADCAST_HANDOFF_CAP,
 };
-use pylon::transport::frame;
 use pylon::transport::worker::{drain_broadcast_inbox, ConnIndex};
+use slab::Slab;
 
 /// Subscriber scales mandated by the plan.
 const SCALES: [usize; 3] = [1_000, 10_000, 100_000];
@@ -115,7 +114,8 @@ impl ConnIndex for BenchConns {
 /// One worker's world: the sink (one slot), its inbox receiver, and the
 /// worker-local indexes the drain walks — `local_subs` in the exact
 /// single-map `(app, channel) → {SocketId}` shape the worker keeps, plus the
-/// `socket_id → slab token` reverse map.
+/// `socket_id → (slab token, negotiated version)` reverse map (the bench's
+/// connections all negotiate v7, the sole active version).
 struct SinkWorld {
     conns: BenchConns,
     /// The rotation spare (see `reset_queues`): one extra never-subscribed
@@ -126,7 +126,7 @@ struct SinkWorld {
     rx: std::sync::mpsc::Receiver<BroadcastMsg>,
     sink: BroadcastSink,
     local_subs: HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
-    sid_to_token: HashMap<SocketId, usize>,
+    sid_to_token: HashMap<SocketId, (usize, u8)>,
     app: Arc<str>,
     channel: Arc<str>,
 }
@@ -158,7 +158,7 @@ fn build_world(n: usize) -> SinkWorld {
     // Setup ends with one spare socket (its subscriber never joins local_subs)
     // so the reset below has a spare to rotate through.
     let mut slab: Slab<Connection> = Slab::with_capacity(n);
-    let mut sid_to_token: HashMap<SocketId, usize> = HashMap::with_capacity(n);
+    let mut sid_to_token: HashMap<SocketId, (usize, u8)> = HashMap::with_capacity(n);
     let mut subs: HashSet<SocketId> = HashSet::with_capacity(n);
 
     for _ in 0..n {
@@ -166,7 +166,10 @@ fn build_world(n: usize) -> SinkWorld {
         conn.state = ConnState::Open; // bench conns model established sessions
         let token = slab.insert(conn);
         let sid = SocketId::generate();
-        sid_to_token.insert(sid, token);
+        // The production value shape: (slab token, negotiated protocol
+        // version) — the bench's connections all negotiated the sole active
+        // version, so the drain's fast single-frame path is exercised.
+        sid_to_token.insert(sid, (token, wire::ACTIVE_VERSIONS[0]));
         subs.insert(sid);
     }
     let spare_sock = accepted_stream(&listener);
@@ -241,15 +244,10 @@ fn reset_queues(world: &mut SinkWorld) {
 /// production publish half (`LocalAdapter::broadcast` with the sink installed)
 /// followed by the production inbox pump.
 fn broadcast_and_drain(world: &mut SinkWorld, event: &ServerEvent, now_ns: u64) {
-    let json: Arc<str> = match event {
-        ServerEvent::Raw(f) => f.clone(),
-        other => Arc::from(wire::encode(wire::ACTIVE_VERSIONS[0], other).as_str()),
-    };
-    let mut buf = BytesMut::new();
-    frame::encode_text(&mut buf, json.as_bytes());
+    let frames = frames_for(wire::ACTIVE_VERSIONS, event);
     world
         .sink
-        .broadcast(world.app.clone(), world.channel.clone(), buf.freeze(), None);
+        .broadcast(world.app.clone(), world.channel.clone(), frames, None);
 
     let mut touched = HashSet::new();
     let mut inflight: u64 = 0;
