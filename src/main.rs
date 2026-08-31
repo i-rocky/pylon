@@ -67,8 +67,78 @@ fn spawn_webhooks(
     )?)
 }
 
+// ── CLI flags (D5): the docs promise `pylon --version` / `pylon --help`. The
+// server is configured entirely via PYLON_* environment variables, so the CLI
+// surface is just these two informational flags. Checked FIRST in `main`: a
+// recognized flag prints and exits; NO ARGS falls through and the server boots
+// as before. Any other argument is rejected with a hint — the server takes no
+// positional args, and silently ignoring a typo'd flag would boot a server the
+// operator believed they had configured.
+
+/// `--version` / `-V` output.
+fn version_text() -> String {
+    format!("pylon {}\n", env!("CARGO_PKG_VERSION"))
+}
+
+/// `--help` / `-h` output: the flags, the PYLON_* env-var pointer, the docs URL.
+fn help_text() -> String {
+    format!(
+        concat!(
+            "pylon {} — Pusher-compatible WebSocket server\n",
+            "\n",
+            "Usage: pylon [OPTIONS]\n",
+            "\n",
+            "Options:\n",
+            "  -V, --version  Print version information and exit\n",
+            "  -h, --help     Print this help message and exit\n",
+            "\n",
+            "All server configuration is read from PYLON_* environment variables\n",
+            "(PYLON_ADAPTER, PYLON_APPS_PATH, PYLON_REDIS_URL, ...).\n",
+            "Documentation: https://i-rocky.github.io/pylon/\n"
+        ),
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// The `stderr` text for an unrecognized argument: name it and hint at `--help`.
+fn unknown_arg_text(arg: &str) -> String {
+    format!("pylon: unexpected argument '{arg}'\nTry 'pylon --help' for more information.\n")
+}
+
+/// Handle the first CLI argument, if any. Returns `Some(exit_code)` when a flag
+/// was handled (its output is already printed — the caller should exit with the
+/// code), or `None` when there were no arguments and the server should run.
+fn handle_cli_args<I>(args: I) -> Option<i32>
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
+    let first = args.into_iter().next()?;
+    match first.as_ref() {
+        "--version" | "-V" => {
+            print!("{}", version_text());
+            Some(0)
+        }
+        "--help" | "-h" => {
+            print!("{}", help_text());
+            Some(0)
+        }
+        other => {
+            eprint!("{}", unknown_arg_text(other));
+            Some(1)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // CLI flags first (D5): `--version`/`--help` (or an unknown-argument error)
+    // print and exit before any tracing/config/adapter work. No args → server.
+    if let Some(code) = handle_cli_args(std::env::args().skip(1)) {
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        std::process::exit(code);
+    }
     // Heap profiler guard: lives for the whole process; its Drop (after the worker
     // joins on shutdown) writes dhat-heap.json. The gmax snapshot inside captures the
     // heap at peak — i.e. while the connections were held.
@@ -265,7 +335,8 @@ async fn main() -> anyhow::Result<()> {
     // C2a two-phase graceful shutdown:
     //   1. Set draining=true  → /ready returns 503; LBs stop sending new traffic.
     //   2. Sleep predrain_ms  → allow LBs to observe the 503.
-    //   3. Set shutdown=true  → workers deregister listeners, queue Close(1001),
+    //   3. Set shutdown=true  → workers deregister listeners, queue a
+    //      `pusher:error` 4200 + Close(4200),
     //      flush in-flight bytes, run on_close cleanup, then exit.
     //   4. Join the worker.
     shutdown_signal().await;
@@ -476,4 +547,49 @@ async fn run_redis_percore(
     worker.await??;
     drop(bridge);
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn no_args_returns_none_so_the_server_runs() {
+        assert_eq!(handle_cli_args(Vec::<&str>::new()), None);
+    }
+
+    #[test]
+    fn version_flags_print_the_version_and_exit_zero() {
+        assert_eq!(handle_cli_args(vec!["--version"]), Some(0));
+        assert_eq!(handle_cli_args(vec!["-V"]), Some(0));
+        assert_eq!(
+            version_text(),
+            format!("pylon {}\n", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn help_flags_print_usage_and_exit_zero() {
+        assert_eq!(handle_cli_args(vec!["--help"]), Some(0));
+        assert_eq!(handle_cli_args(vec!["-h"]), Some(0));
+        let help = help_text();
+        assert!(help.contains("Usage: pylon"), "usage line missing: {help}");
+        assert!(help.contains("-V, --version"), "--version missing: {help}");
+        assert!(help.contains("-h, --help"), "--help missing: {help}");
+        assert!(help.contains("PYLON_"), "env-var pointer missing: {help}");
+        assert!(
+            help.contains("https://i-rocky.github.io/pylon/"),
+            "docs URL missing: {help}"
+        );
+    }
+
+    #[test]
+    fn unknown_argument_exits_one_with_a_hint() {
+        assert_eq!(handle_cli_args(vec!["--bogus"]), Some(1));
+        // The server takes no positional args either — reject them the same way.
+        assert_eq!(handle_cli_args(vec!["positional"]), Some(1));
+        let msg = unknown_arg_text("--bogus");
+        assert!(msg.contains("'--bogus'"), "must name the argument: {msg}");
+        assert!(msg.contains("--help"), "must hint at --help: {msg}");
+    }
 }

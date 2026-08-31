@@ -25,10 +25,14 @@ cargo run --release
 cargo test               # unit + integration suite
 ```
 
-Some clustering and Redis-backed tests require a local Redis and are gated on an environment
-variable (e.g. `PYLON_TEST_REDIS_URL`); see the individual test files under `tests/` for what each
-needs. Tests use random key prefixes for isolation — never run them against a Redis that holds data
-you care about, and never `FLUSHALL`/`FLUSHDB` a shared instance.
+Cluster and Redis-backed tests (e.g. `cluster_bridge`, `redis_cluster`, `percore_cluster`) require a
+local Redis and **fail loudly without one** — they default to `redis://127.0.0.1:6390` (port 6390,
+not the 6379 production default, so a stray run never clobbers a real instance) and refuse to
+silently pass. Export `PYLON_TEST_REDIS_URL` to point them elsewhere. The one exception is
+`redis_failover`, which is opt-in via `PYLON_TEST_REDIS_FAILOVER=1` because it bounces the Redis
+container and would disrupt parallel suites (CI runs it against a dedicated container). Tests use
+random key prefixes for isolation — never run them against a Redis that holds data you care about,
+and never `FLUSHALL`/`FLUSHDB` a shared instance.
 
 ## Before you open a pull request
 

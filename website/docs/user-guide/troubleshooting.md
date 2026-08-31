@@ -12,20 +12,29 @@ their meanings, and the recommended client action.
 |---|---|---|
 | `4001` | App key not found | Do not reconnect; check `key` in your Pusher client config |
 | `4004` | App connection limit reached (per-app `capacity`) | Do not reconnect; contact the server operator |
+| `4005` | Connection path malformed (not `/app/{key}`, or empty key) | Do not reconnect; fix the WebSocket URL |
 | `4006` | Invalid protocol version string format | Do not reconnect; fix client configuration |
 | `4007` | Unsupported protocol version | Do not reconnect; upgrade client library |
 | `4008` | No protocol version supplied | Do not reconnect; upgrade client library |
-| `4009` | Connection not authorised (auth failure) | Do not reconnect; fix authentication |
+| `4009` | Connection not authorised — sign-in verification failed, the user's connections were terminated, or the app was removed/disabled mid-connection | Do not reconnect; fix authentication or check the app's status |
+| `4100` | Server is over capacity (node connection ceiling reached, or the broadcast pipeline is saturated) | Reconnect with exponential back-off |
+| `4103` | Application store temporarily unavailable | Reconnect with exponential back-off |
 | `4200` | Server restarting | Reconnect immediately; pylon is doing a graceful restart |
 | `4201` | Activity / pong timeout | Reconnect; connection went silent too long |
-| `4301` | Client event rate limited (in-band error, connection stays open) | Slow down client event sends |
+| `4202` | Maximum connection lifetime reached (default 24 h) | Reconnect immediately; this is a normal scheduled recycle |
+| `4301` | Client event rejected — messaging disabled, name/payload too large, or rate limit (in-band error, connection stays open) | Fix the event or slow down client event sends |
 | `4302` | Watchlist too large (in-band error, connection stays open) | Reduce the number of channels in the watchlist |
 
 Codes `4001`–`4009` are terminal and should not trigger automatic reconnection.
+Codes `4100` and `4103` are transient — reconnect with exponential back-off.
 Code `4201` warrants an exponential back-off before reconnecting.
-Code `4200` warrants an immediate reconnect (the new process will be ready).
+Codes `4200` and `4202` warrant an immediate reconnect (the new process will be
+ready / the lifetime recycle is routine).
 Codes `4301` and `4302` are delivered as `pusher:error` events on an otherwise
-open connection — they do not close the socket.
+open connection — they do not close the socket. A `pusher:subscription_error`
+frame is likewise non-fatal: `data.status` `4009` means the channel name was
+invalid and `401` means the subscription auth failed — the connection stays
+open in both cases.
 
 ---
 
@@ -68,7 +77,7 @@ method, path, query string, and body MD5. A `401` can mean:
 |---|---|
 | **Clock skew** between client and server | Ensure both clocks are synchronised (NTP/chronyc). Adjust `PYLON_REST_AUTH_WINDOW_SECS` (default: 600 s) to widen the window if necessary. |
 | **Wrong secret** | Verify the `secret` in your pylon app config matches the secret used to initialise your SDK client. See [Applications & Authentication](applications.md). |
-| **Incorrect body MD5** | Some HTTP clients (or proxies) silently re-encode the body. Confirm the `Content-MD5` header matches the MD5 of the exact bytes sent. |
+| **Incorrect body MD5** | Some HTTP clients (or proxies) silently re-encode the body. The MD5 of the exact bytes sent must be sent as the `body_md5` **query parameter** (not a header) — confirm it matches the MD5 of the bytes actually transmitted. |
 
 ---
 
@@ -111,7 +120,8 @@ To use encrypted channels:
 3. Configure your client library with the `channelAuthorization` endpoint.
 
 See the [Pusher encrypted channels documentation](https://pusher.com/docs/channels/using_channels/encrypted-channels/)
-for the full protocol. Pylon's auth endpoint is configured via [Applications & Authentication](applications.md).
+for the full protocol. Your app's auth endpoint is the one you implement in
+step 2 — pylon itself has no auth endpoint to configure.
 
 ---
 

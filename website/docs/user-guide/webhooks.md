@@ -50,7 +50,7 @@ Pylon fires seven event types:
 | Event type | Fired when |
 |---|---|
 | `channel_occupied` | The first subscriber joins a channel (channel transitions from empty to occupied). |
-| `channel_vacated` | The last subscriber leaves a channel (channel becomes empty). A configurable grace period (`PYLON_WEBHOOK_VACATED_GRACE_MS`, default 3 000 ms) delays this event to absorb brief reconnects. |
+| `channel_vacated` | The last subscriber leaves a channel (channel becomes empty). On the **clustered** (Redis) deployment a configurable grace period (`PYLON_WEBHOOK_VACATED_GRACE_MS`, default 3 000 ms) delays this event to absorb brief reconnects; on a **single-node** deployment it fires immediately — see the note below. |
 | `member_added` | A client joins a presence channel (`presence-*`). |
 | `member_removed` | A client leaves a presence channel (`presence-*`). |
 | `client_event` | A client publishes a `client-` prefixed event (only fired when `client_messages_enabled` is `true` for the app). |
@@ -185,7 +185,22 @@ that delay). See [Configuration](configuration.md) for the full set of tuning va
 | `PYLON_WEBHOOK_BACKOFF_CAP_MS` | `60000` | Upper bound for each retry delay |
 | `PYLON_WEBHOOK_RETRY_BUDGET_MS` | `300000` | Total time a delivery may keep retrying |
 | `PYLON_WEBHOOK_TIMEOUT_MS` | `5000` | Per-attempt HTTP request timeout |
-| `PYLON_WEBHOOK_VACATED_GRACE_MS` | `3000` | Grace period before firing `channel_vacated` |
+| `PYLON_WEBHOOK_VACATED_GRACE_MS` | `3000` | Grace period before firing `channel_vacated` (**clustered deployments only** — see below) |
+
+### `channel_vacated` timing: single node vs cluster
+
+The vacated grace window exists to absorb the cluster's eventual-consistency
+window. On the Redis path, the "channel is now empty" edge arrives via the
+cluster occupancy state, so a reconnecting client's re-subscribe may race the
+webhook; the grace period plus a re-check of the cluster subscription count
+suppresses the vacated event if the channel re-occupied in time.
+
+On a **single-node** deployment (`PYLON_ADAPTER=local`) there is no such
+window — the node's own subscription count is the truth at the moment the last
+client leaves, so `channel_vacated` fires immediately with **no grace period
+and no debounce**, regardless of `PYLON_WEBHOOK_VACATED_GRACE_MS`. A client
+that reconnects still produces the normal `channel_occupied` event; only the
+suppression window differs.
 
 ### Retries
 

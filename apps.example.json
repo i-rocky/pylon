@@ -4,11 +4,10 @@
     "id": "<your-app-id>",
     "key": "<your-app-key>",
     "secret": "<your-app-secret>",
-    "host": "",
-    "path": "",
+    "enabled": true,
     "client_messages_enabled": true,
+    "subscription_count_enabled": false,
     "capacity": 10000,
-    "statistics_enabled": false,
     "webhooks": [
       {
         "url": "https://example.test/pusher/webhooks",

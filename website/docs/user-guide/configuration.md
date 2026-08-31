@@ -137,6 +137,9 @@ a specific workload.
 |---|---|---|
 | `PYLON_MEMORY_BUDGET_BYTES` | `0` | Total memory budget in bytes for the transport layer. `0` = auto (derived from cgroup/host memory using the `max(1.5 GiB, 7%)` reserve formula). |
 | `PYLON_MEMORY_BUDGET_FRACTION` | `0.0` | Memory budget as a fraction of effective host memory (0.0–1.0). Applied when `PYLON_MEMORY_BUDGET_BYTES` is `0`. `0.0` = use the built-in reserve formula. |
+| `PYLON_MAX_CONNECTIONS` | `0` | Node-wide ceiling on simultaneous connections across all apps. Connections beyond it are closed with WebSocket code `4100`. `0` = auto-derive from the memory budget (`budget / PYLON_EXPECTED_PER_CONN_BYTES`). |
+| `PYLON_EXPECTED_PER_CONN_BYTES` | `8192` | Expected per-connection memory footprint (bytes), used to auto-derive `PYLON_MAX_CONNECTIONS` when it is `0`. |
+| `PYLON_MAILBOX_CAPACITY` | `256` | Capacity (frames) of each connection's inbound mailbox — the bounded channel used for direct sends (presence rosters, `member_added`/`member_removed`, user-targeted events, watchlist notifications, cluster deliveries). When full, a frame is silently dropped and `pylon_mailbox_dropped_total` increments. Must be `> 0`. |
 | `PYLON_EXPECTED_CONNS_PER_WORKER` | `50000` | Expected concurrent connections per worker thread, used to derive the per-connection out-queue cap. |
 | `PYLON_PERCONN_QUEUE_MIN_BYTES` | `262144` | Lower clamp for the per-connection outbound queue cap (bytes). Default 256 KiB. |
 | `PYLON_PERCONN_QUEUE_MAX_BYTES` | `8388608` | Upper clamp for the per-connection outbound queue cap (bytes). Default 8 MiB. |
@@ -152,6 +155,36 @@ a specific workload.
 |---|---|---|
 | `PYLON_SHUTDOWN_PREDRAIN_MS` | `2000` | Milliseconds to hold `/ready` at 503 before workers begin draining. Gives load balancers time to stop sending new traffic. |
 | `PYLON_SHUTDOWN_GRACE_MS` | `10000` | Milliseconds each worker waits for in-flight connections to drain before force-closing. |
+
+---
+
+## Deliberate restrictions vs hosted Pusher
+
+Pylon is a drop-in replacement for the common path, and a few tighter limits are
+deliberate hardening rather than gaps. They are all operator-tunable where that
+makes sense:
+
+- **REST request body cap.** POST bodies are capped at
+  `max_batch_events × max_event_payload_bytes + 64 KiB` of JSON-framing headroom
+  — **164 KiB at the defaults** (10 × 10 KiB + 64 KiB), where hosted Pusher
+  accepts up to a 10 MB envelope. Every legitimate request (a full batch of
+  max-size events) fits; the smaller cap simply bounds how much memory one
+  unauthenticated request can make the server allocate. Raising
+  `PYLON_MAX_BATCH_EVENTS` / `PYLON_MAX_EVENT_PAYLOAD_BYTES` raises the cap with
+  them.
+- **Per-connection subscription cap.** `PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION`
+  (default `200`, `0` = unlimited). Hosted Pusher documents no per-connection
+  subscription limit; this is a pylon-specific memory guard (each subscription
+  holds server-side state). Excess subscribes fail non-fatally with
+  `pusher:subscription_error` (`LimitReached`, `4004`).
+- **Protocol v7 only.** Pylon speaks Pusher Channels protocol **v7** and
+  nothing else: connections negotiating an unsupported `protocol`/`version` are
+  rejected with `4007`. There is no v5/v6 compatibility surface.
+- **Encrypted channels are a pure relay.** Like current hosted Pusher, the
+  encryption happens in the client libraries (and your app server for
+  server-triggered payloads) — pylon transports `private-encrypted-*` frames as
+  opaque ciphertext and never decrypts or inspects them. There is no
+  server-side `encryption_master_key` facility to configure.
 
 ---
 

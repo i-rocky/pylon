@@ -147,12 +147,24 @@ See [`deploy/README.md`](deploy/README.md) for details.
 
 ## Performance
 
-Pylon uses a shared-nothing, per-core event-loop architecture (one worker thread per core,
-`SO_REUSEPORT` accept sharding) with an encode-once, sharded fan-out path and adaptive overload
-control. At roughly a few KB per idle connection it scales to millions of concurrent connections per
-node within its memory budget, and sustained several million message deliveries per second on a
-single multi-core workstation in internal benchmarks. These are indicative single-node figures —
-benchmark on your own hardware and workload.
+Pylon uses a shared-nothing, per-core event-loop architecture (one pinned worker
+thread per core running its own `mio` loop, `SO_REUSEPORT` accept sharding) with
+an encode-once, sharded fan-out path and adaptive overload control. At roughly a
+few KB per idle connection it is designed to hold millions of concurrent
+connections per node within its memory budget.
+
+Rather than quoting benchmark numbers from someone else's machine, measure on
+yours:
+
+- **Micro-benchmarks** — criterion benches in [`benches/`](benches/)
+  (`fanout`, `mailbox`, `app_lookup`): `cargo bench`.
+- **Scenario harness** — [`load/`](load/) drives a running server through the
+  four load shapes (connection density, hot-channel fan-out, many-channels, and
+  cross-node cluster latency): `cargo run -p pylon-load -- --help`.
+- **Capacity finder** — `pylon-ceiling` (in `load/`) spawns a pinned pylon
+  child, sweeps connections and publish rate to their ceilings under defined
+  stop criteria (RSS, connect failures, p99 latency, CPU), and prints a sizing
+  report for your hardware: `cargo run -p pylon-load --bin pylon-ceiling -- --help`.
 
 ## Building from source
 

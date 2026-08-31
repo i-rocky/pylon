@@ -28,7 +28,7 @@ Shutdown timeline:
 SIGTERM
   └─ /ready → 503 immediately
   └─ sleep PYLON_SHUTDOWN_PREDRAIN_MS (default 2 s)   ← LB drains here
-  └─ send WS Close (1001) to all connections
+  └─ send `pusher:error` 4200 + WS Close (4200) to all connections
   └─ flush up to PYLON_SHUTDOWN_GRACE_MS (default 10 s)
   └─ exit
 ```

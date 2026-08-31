@@ -153,3 +153,25 @@ pre-1.0 and versions track `Cargo.toml`.
   counts (with retry), bridge fail-open on unavailability, and heartbeat re-seeding
   of a node's counts after a long Redis outage (self-heal). Docs describe the real
   semantics including the ~55s worst-case reclaim timing.
+
+### Phase 5 — Documentation reconciliation (audit remediation)
+
+#### Fixed
+Every false/stale doc claim from the audit is resolved: dead `enable_client_messages`
+fields in deploy examples (D3); shutdown documented as 4200 everywhere (D4, incl.
+stale code comments); TOML apps block (D6), `systemctl reload` (D7), nonexistent
+env vars in pylon.env.example (D8) and the budget-factor "drops toward 0" myth with
+its dead Grafana alert (D9); close-code tables complete (4100/4103/4005/4202) with
+the 4009 fatal-vs-status split (D10); Redis Cluster recommendation replaced with the
+CROSSSLOT truth (D11); "Tokio worker per core" (D12); "Content-MD5 header" (D13);
+Helm "0 = no limit" (D14); sysctl "10 GB" (D15); CONTRIBUTING gating description
+(D16); root apps.example.json dead fields (D17); load/README.md created (D18);
+undocumented vars + metrics rows (D19); `#server-to-user-*` documented (D20);
+garbled heading/sentence (D21/D22); README performance claims grounded in the
+repo's own benches/harness (D23); "zero-dropped-message restarts" replaced with the
+truthful bounded-drain statement (D24); a "Deliberate restrictions vs hosted Pusher"
+section records the body cap, subscription cap, v7-only scope, and encrypted-channel
+relay model; the `local: None` saturation-gate trap is called out in code (X2).
+
+#### Added
+- `pylon --version` / `--help` (unit-tested; unknown flags exit 1 with a hint).

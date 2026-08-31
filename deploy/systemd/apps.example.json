@@ -5,7 +5,7 @@
     "key": "app-key",
     "secret": "CHANGE_ME",
     "capacity": 1000000,
-    "enable_client_messages": false,
+    "client_messages_enabled": false,
     "enabled": true,
     "webhooks": []
   }

@@ -182,16 +182,35 @@ events on an otherwise open connection (the socket is **not** closed).
 
 | Code | Cause |
 |---|---|
-| `4001` | App key not found |
-| `4004` | App connection limit reached |
+| `4001` | App key not found (well-formed `/app/{key}` path, unknown key) |
+| `4004` | App connection limit reached (per-app `capacity`) |
+| `4005` | Connection path malformed — not the `/app/{key}` shape, or an empty key (distinct from `4001`) |
 | `4006` | Invalid protocol version string format |
 | `4007` | Unsupported protocol version |
 | `4008` | No protocol version supplied (strict mode) |
-| `4009` | Channel name invalid or connection not authorised |
+| `4009` | Connection not authorised — **fatal close**: `pusher:signin` verification failure, user termination (`terminate_connections`), or the app being removed/disabled mid-connection (admin purge or sweep) |
+| `4100` | Server is over capacity — the node's connection ceiling (`PYLON_MAX_CONNECTIONS`) is reached, or the broadcast pipeline is saturated at connection admission |
+| `4103` | Application store temporarily unavailable (transient backend error) |
 | `4200` | Server shutting down — reconnect immediately |
 | `4201` | Pong timeout (connection went silent) |
-| `4301` | Client event rate-limited (non-fatal, connection stays open) |
+| `4202` | Maximum connection lifetime reached (`PYLON_MAX_CONN_LIFETIME_SECS`, default 24 h; absolute from establishment, not reset by activity) |
+| `4301` | Client event rejected (non-fatal, connection stays open) — see below |
 | `4302` | Watchlist too large (non-fatal, connection stays open) |
+
+### Non-fatal in-band errors
+
+**`pusher:subscription_error`** is a channel-scoped, non-fatal frame: the socket
+stays open and only that subscription failed. Its `data` object carries a
+`status` field — `4009` for an invalid channel name, `401` for an
+authentication failure (bad/missing auth on private/presence/encrypted
+channels, or a reserved `#` channel the connection may not join). These
+statuses share numeric values with the close-code namespace but never close
+the connection.
+
+**`4301`** covers all four client-event rejection classes: client messaging
+disabled for the app, event name too long, payload too large, and the
+per-connection rate limit (10 events/sec). The rate-limit message is hosted
+Pusher's error-table text verbatim: `Client event rejected due to rate limit`.
 
 For operator guidance on these codes see
 [Troubleshooting & FAQ](../user-guide/troubleshooting.md#close-codes).

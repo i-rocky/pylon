@@ -108,7 +108,9 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
 
     1. Flips `/ready` to 503 immediately (LB stops sending new connections).
     2. Waits `PYLON_SHUTDOWN_PREDRAIN_MS` (default 2 s).
-    3. Sends WebSocket Close (1001) to all connections.
+    3. Sends a `pusher:error` 4200 frame followed by a WebSocket Close (4200) to all
+       connections — Pusher's reconnect-immediately code, so clients reconnect to a
+       surviving node without backoff.
     4. Flushes up to `PYLON_SHUTDOWN_GRACE_MS` (default 10 s).
     5. Exits.
 

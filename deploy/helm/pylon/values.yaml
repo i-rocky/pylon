@@ -27,7 +27,8 @@ config:
   # 0 = auto (one worker per logical CPU).
   workers: 0
 
-  # Memory cap in bytes. 0 = no limit.
+  # Memory cap in bytes. 0 = auto-derived from total RAM
+  # (budget = RAM − reserve, where reserve = max(1.5 GiB, 7% of RAM)).
   memoryBudgetBytes: 0
 
   # Graceful shutdown timing (must sum to less than terminationGracePeriodSeconds).
@@ -47,7 +48,7 @@ apps:
     key: app-key
     secret: "CHANGE_ME"
     capacity: 1000000
-    enable_client_messages: false
+    client_messages_enabled: false
     enabled: true
     webhooks: []
 

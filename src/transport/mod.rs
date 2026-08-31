@@ -211,8 +211,15 @@ pub fn run_percore(
     // The CONCRETE local adapter (the same instance wrapped in `adapter` above)
     // when the per-core sharded fan-out applies. `Some` ⇒ install the broadcast
     // sink and give each worker a broadcast inbox so channel deliveries shard
-    // across workers; `None` (e.g. the deferred redis+percore combo) ⇒ no sink,
-    // broadcasts fall back to the legacy registry mailbox path.
+    // across workers.
+    //
+    // X2 — latent trap: `None` does more than skip the sink (broadcasts then
+    // fall back to the legacy registry mailbox path): the shared saturation
+    // flag below is DERIVED from `local`, so `None` also disables the SP10
+    // admission gates — the WS client-event ingress drop never fires and the
+    // REST `AppState` gets no flag (its 503 gate becomes a no-op). Both
+    // production paths in `main.rs` (standalone local AND clustered
+    // redis+percore) pass `Some(local)`; `None` is a tests-only wiring.
     local: Option<Arc<LocalAdapter>>,
     // SP11 §3.6: clustering toggle for this node. `true` ⇒ a clustered percore
     // node whose workers defer the single-emit cluster edges to the bridge (the
@@ -244,8 +251,9 @@ pub fn run_percore(
 
     // SP10: the shared saturation flag the WS client-event ingress drop reads. It
     // lives on the `LocalAdapter` (so the REST `AppState` and the sink share the
-    // SAME bit); `None` when there's no concrete local adapter (redis+percore
-    // fallback), so the WS drop never fires there.
+    // SAME bit); `None` only when `local` is `None` — a tests-only wiring (both
+    // production paths pass a concrete `LocalAdapter`), in which case the WS
+    // ingress drop never fires.
     let saturated_flag = local.as_ref().map(|l| l.saturation_flag());
 
     // SP10 self-sizing: worker count (explicit or `available_parallelism`), the

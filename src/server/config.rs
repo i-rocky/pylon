@@ -141,8 +141,9 @@ pub struct ServerConfig {
     /// shrunk. `PYLON_PSI_THRESHOLD` (default 15.0).
     pub psi_threshold: f64,
     /// C2a: how long (ms) each percore worker waits for in-flight connections to
-    /// drain before force-closing. After `shutdown` is set workers queue a WS
-    /// Close(1001) on every open connection, then keep flushing until
+    /// drain before force-closing. After `shutdown` is set workers queue a
+    /// `pusher:error` 4200 text frame plus a WS Close(4200) on every open
+    /// connection, then keep flushing until
     /// `inflight_bytes == 0` OR this deadline passes, then clean up and exit.
     /// `PYLON_SHUTDOWN_GRACE_MS` (default `10000`).
     pub shutdown_grace_ms: u64,
