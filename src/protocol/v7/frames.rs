@@ -37,9 +37,12 @@ impl std::io::Write for StrWriter<'_> {
 /// exact bytes `Value::to_string` always produced (`to_string` IS `to_writer`
 /// into a `Vec<u8>`), so the golden equivalence with the old encoder holds
 /// byte-for-byte. Infallible in practice: the only error source is the
-/// adapter's UTF-8 check, which serde_json output can never trip.
+/// adapter's UTF-8 check, which serde_json output can never trip — the
+/// `debug_assert` keeps that contract observable in tests instead of the
+/// result being silently discarded.
 fn write_frame(out: &mut String, frame: Value) {
-    let _ = serde_json::to_writer(StrWriter(out), &frame);
+    let res = serde_json::to_writer(StrWriter(out), &frame);
+    debug_assert!(res.is_ok(), "serde_json emitted invalid UTF-8: {res:?}");
 }
 
 /// Append the wire form of `event` to `out` WITHOUT clearing it (append
@@ -286,112 +289,180 @@ mod tests {
         assert_eq!(encode(&ev), "{\"event\":\"x\"}");
     }
 
-    /// Golden (F6 / Task 6.4): EVERY `ServerEvent` variant must produce
-    /// byte-identical output through BOTH `encode` and `encode_into`, and
-    /// `encode_into` must APPEND — a pre-filled sentinel prefix survives at
-    /// the front and the golden bytes land at the offset. This is the proof
-    /// that the reused-buffer call sites (worker drain scratch, 7.1's wire
-    /// module) see exactly the bytes `encode` always produced.
+    /// Golden drift-proof (F6 / Task 6.4, fix round): every `ServerEvent`
+    /// variant, built with FIXED inputs, must append EXACTLY the literal wire
+    /// bytes pinned below. The literals were derived from the pre-change
+    /// encoder's output and eyeballed against the Pusher v7 wire shapes:
+    /// double-encoded `data` STRINGS on connection_established /
+    /// subscription_succeeded / subscription_count / member_added /
+    /// member_removed; object `data` on pusher:error / subscription_error /
+    /// signin_success; `user_id` present only on the presence client-event;
+    /// cache_miss with no `data` key; `Close` empty (intercepted upstream);
+    /// `Raw` verbatim.
+    ///
+    /// Unlike an encode-vs-encode_into comparison — tautological now that
+    /// `encode` delegates to `encode_into` — these literals pin the WIRE FORMAT
+    /// itself: any edit to a `json!` arm or to `write_frame` that changes a
+    /// single byte fails here until the change is consciously re-pinned.
+    /// (Field order is insertion order via the workspace-unified serde_json
+    /// `preserve_order` feature; if that feature set ever changes, this test
+    /// flags the byte-order drift too.)
+    ///
+    /// Also proves APPEND semantics per variant: each frame encoded at an
+    /// offset behind a sentinel prefix must yield `"<sentinel>" + literal`.
     #[test]
-    fn encode_into_matches_encode_for_every_variant_and_appends() {
+    fn every_variant_appends_its_pinned_wire_literal() {
         use crate::protocol::event::{PresencePayload, WatchlistChange};
         use std::sync::Arc;
 
         let mut presence_hash = serde_json::Map::new();
         presence_hash.insert("u1".into(), serde_json::json!({"name":"Ann"}));
 
-        let variants: Vec<ServerEvent> = vec![
-            ServerEvent::ConnectionEstablished {
-                socket_id: SocketId::generate(),
-                activity_timeout: 120,
-            },
-            ServerEvent::Ping,
-            ServerEvent::Pong,
-            ServerEvent::SubscriptionSucceeded {
-                channel: "c".into(),
-                presence: None,
-            },
-            ServerEvent::SubscriptionSucceeded {
-                channel: "presence-x".into(),
-                presence: Some(PresencePayload {
-                    ids: vec!["u1".into()],
-                    hash: presence_hash,
-                    count: 1,
-                }),
-            },
-            ServerEvent::SubscriptionCount {
-                channel: "c".into(),
-                count: 2,
-            },
-            ServerEvent::Error(PusherError::app_not_found()),
-            ServerEvent::ChannelEvent {
-                channel: "c".into(),
-                event: "client-x".into(),
-                data: serde_json::json!({"a":1}),
-                user_id: None,
-            },
-            ServerEvent::ChannelEvent {
-                channel: "presence-x".into(),
-                event: "client-x".into(),
-                data: serde_json::json!({"a":1}),
-                user_id: Some("u1".into()),
-            },
-            ServerEvent::SubscriptionError {
-                channel: "private-x".into(),
-                error_type: "AuthError".into(),
-                error: "Invalid signature".into(),
-                status: 401,
-            },
-            ServerEvent::MemberAdded {
-                channel: "presence-x".into(),
-                user_id: "u1".into(),
-                user_info: serde_json::json!({"name":"Ann"}),
-            },
-            ServerEvent::MemberRemoved {
-                channel: "presence-x".into(),
-                user_id: "u1".into(),
-            },
-            ServerEvent::CacheMiss {
-                channel: "cache-x".into(),
-            },
-            ServerEvent::SigninSuccess {
-                user_data: r#"{"id":"7"}"#.into(),
-            },
-            ServerEvent::WatchlistEvents {
-                events: vec![WatchlistChange {
-                    name: "online".into(),
-                    user_ids: vec!["7".into()],
-                }],
-            },
-            ServerEvent::ClientEventError {
-                code: 4301,
-                message: "rejected".into(),
-            },
-            ServerEvent::Close {
-                code: 4009,
-                reason: "x".into(),
-            },
-            ServerEvent::Raw(Arc::from(r#"{"event":"relayed","channel":"c"}"#)),
+        let cases: Vec<(ServerEvent, &str)> = vec![
+            (
+                ServerEvent::ConnectionEstablished {
+                    socket_id: SocketId::from_raw("123.456"),
+                    activity_timeout: 120,
+                },
+                r#"{"event":"pusher:connection_established","data":"{\"socket_id\":\"123.456\",\"activity_timeout\":120}"}"#,
+            ),
+            (ServerEvent::Ping, r#"{"event":"pusher:ping","data":{}}"#),
+            (ServerEvent::Pong, r#"{"event":"pusher:pong","data":{}}"#),
+            (
+                ServerEvent::SubscriptionSucceeded {
+                    channel: "test-channel".into(),
+                    presence: None,
+                },
+                r#"{"event":"pusher_internal:subscription_succeeded","channel":"test-channel","data":""}"#,
+            ),
+            (
+                ServerEvent::SubscriptionSucceeded {
+                    channel: "presence-test".into(),
+                    presence: Some(PresencePayload {
+                        ids: vec!["u1".into()],
+                        hash: presence_hash,
+                        count: 1,
+                    }),
+                },
+                r#"{"event":"pusher_internal:subscription_succeeded","channel":"presence-test","data":"{\"presence\":{\"ids\":[\"u1\"],\"hash\":{\"u1\":{\"name\":\"Ann\"}},\"count\":1}}"}"#,
+            ),
+            (
+                ServerEvent::SubscriptionCount {
+                    channel: "test-channel".into(),
+                    count: 2,
+                },
+                r#"{"event":"pusher_internal:subscription_count","channel":"test-channel","data":"{\"subscription_count\":2}"}"#,
+            ),
+            (
+                ServerEvent::Error(PusherError::app_not_found()),
+                r#"{"event":"pusher:error","data":{"code":4001,"message":"Could not find app by key"}}"#,
+            ),
+            (
+                ServerEvent::ChannelEvent {
+                    channel: "test-channel".into(),
+                    event: "client-test".into(),
+                    data: serde_json::json!({"msg":"hello"}),
+                    user_id: None,
+                },
+                r#"{"event":"client-test","channel":"test-channel","data":{"msg":"hello"}}"#,
+            ),
+            (
+                ServerEvent::ChannelEvent {
+                    channel: "presence-test".into(),
+                    event: "client-test".into(),
+                    data: serde_json::json!({"msg":"hello"}),
+                    user_id: Some("u1".into()),
+                },
+                r#"{"event":"client-test","channel":"presence-test","data":{"msg":"hello"},"user_id":"u1"}"#,
+            ),
+            (
+                ServerEvent::SubscriptionError {
+                    channel: "private-test".into(),
+                    error_type: "AuthError".into(),
+                    error: "Invalid signature".into(),
+                    status: 401,
+                },
+                r#"{"event":"pusher:subscription_error","channel":"private-test","data":{"type":"AuthError","error":"Invalid signature","status":401}}"#,
+            ),
+            (
+                ServerEvent::MemberAdded {
+                    channel: "presence-test".into(),
+                    user_id: "u1".into(),
+                    user_info: serde_json::json!({"name":"Ann"}),
+                },
+                r#"{"event":"pusher_internal:member_added","channel":"presence-test","data":"{\"user_id\":\"u1\",\"user_info\":{\"name\":\"Ann\"}}"}"#,
+            ),
+            (
+                ServerEvent::MemberRemoved {
+                    channel: "presence-test".into(),
+                    user_id: "u1".into(),
+                },
+                r#"{"event":"pusher_internal:member_removed","channel":"presence-test","data":"{\"user_id\":\"u1\"}"}"#,
+            ),
+            (
+                ServerEvent::CacheMiss {
+                    channel: "cache-test".into(),
+                },
+                r#"{"event":"pusher:cache_miss","channel":"cache-test"}"#,
+            ),
+            (
+                ServerEvent::SigninSuccess {
+                    user_data: r#"{"id":"7"}"#.into(),
+                },
+                r#"{"event":"pusher:signin_success","data":{"user_data":"{\"id\":\"7\"}"}}"#,
+            ),
+            (
+                ServerEvent::WatchlistEvents {
+                    events: vec![WatchlistChange {
+                        name: "online".into(),
+                        user_ids: vec!["7".into()],
+                    }],
+                },
+                r#"{"event":"pusher_internal:watchlist_events","data":{"events":[{"name":"online","user_ids":["7"]}]}}"#,
+            ),
+            (
+                ServerEvent::ClientEventError {
+                    code: 4301,
+                    message: "Client event rejected due to rate limit".into(),
+                },
+                r#"{"event":"pusher:error","data":{"code":4301,"message":"Client event rejected due to rate limit"}}"#,
+            ),
+            // Intercepted by the connection task before encoding; the encoder
+            // is an exhaustive no-op.
+            (
+                ServerEvent::Close {
+                    code: 4009,
+                    reason: "x".into(),
+                },
+                "",
+            ),
+            // A relayed frame is appended VERBATIM (keys here deliberately in
+            // non-insertion order to show it is passthrough, not re-serialized).
+            (
+                ServerEvent::Raw(Arc::from(
+                    r#"{"channel":"test-channel","data":"{\"msg\":\"relayed\"}","event":"client-relayed"}"#,
+                )),
+                r#"{"channel":"test-channel","data":"{\"msg\":\"relayed\"}","event":"client-relayed"}"#,
+            ),
         ];
 
-        for ev in &variants {
-            let golden = encode(ev);
-            // (1) into an EMPTY buffer: byte-identical to encode().
+        for (ev, literal) in &cases {
+            // (1) append into an EMPTY buffer == the pinned literal.
             let mut fresh = String::new();
             encode_into(ev, &mut fresh);
-            assert_eq!(
-                fresh, golden,
-                "encode_into(empty) must be byte-identical to encode() for {ev:?}"
-            );
-            // (2) APPEND semantics: the sentinel prefix survives and the golden
-            //     bytes land AT THE OFFSET — never overwrite the front.
+            assert_eq!(&fresh, literal, "wire bytes drifted for {ev:?}");
+            // (2) APPEND semantics: the sentinel prefix survives and the
+            //     literal lands AT THE OFFSET — never overwrites the front.
             let mut at_offset = String::from("<sentinel>");
             encode_into(ev, &mut at_offset);
             assert_eq!(
                 at_offset,
-                format!("<sentinel>{golden}"),
+                format!("<sentinel>{literal}"),
                 "encode_into must append at the offset for {ev:?}"
             );
+            // (3) the delegating convenience must agree with the literal too —
+            //     a REAL cross-check now that the expected value is external.
+            assert_eq!(encode(ev), *literal, "encode() drifted for {ev:?}");
         }
     }
 

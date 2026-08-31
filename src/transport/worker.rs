@@ -2368,18 +2368,20 @@ fn drain_session(poll: &Poll, entry: &mut Entry, now_ns: u64) -> DrainResult {
     let mut wrote = false;
     let mut subs_changed = false;
     // F6 / Task 6.4: ONE encode scratch for the whole drain, reused across
-    // every queued event (`clear()` keeps the capacity). `encode_into` has
-    // append semantics, so per event this costs exactly one payload copy —
-    // into the WS frame buffer below — instead of `encode()`'s fresh String
-    // allocation plus its copy. For `Raw` events (relayed redis frames, the
-    // legacy registry fan-out path) the codec appends the `Arc`-shared payload
-    // BY REFERENCE (`&**s`, no `to_string()` clone per subscriber); the single
-    // remaining memcpy is the frame build itself, which is inherent: each
-    // connection's out-queue owns its `Bytes`, so per-connection WS framing
-    // must produce its own buffer. (Where text feeds `Bytes` directly, the
-    // move is zero-copy: bytes 1.x `From<String>` — that is the percore SINK
-    // path, where `local.broadcast` encodes + frames ONCE and every worker
-    // enqueues refcount clones of one shared `Bytes`.)
+    // every queued event (`clear()` keeps the capacity). Net effect vs a
+    // per-event `encode()`: one heap allocation REMOVED via scratch reuse;
+    // the memcpy count is UNCHANGED (the payload was already serialized once
+    // and copied once more into the WS frame buffer below). The no-copy win
+    // sits inside the codec for `Raw` events (relayed redis frames on the
+    // legacy registry fan-out path): `encode_into` appends the `Arc`-shared
+    // payload BY REFERENCE instead of `to_string()`-cloning it per
+    // subscriber, so the codec no longer re-materializes the relayed frame
+    // per connection. The one copy into the WS frame buffer is inherent —
+    // each connection's out-queue owns its `Bytes`, so per-connection WS
+    // framing must produce its own buffer. (Where text feeds `Bytes`
+    // directly the move is zero-copy: bytes 1.x `From<String>` — the percore
+    // SINK path, where `local.broadcast` encodes + frames ONCE and every
+    // worker enqueues refcount clones of one shared `Bytes`.)
     let mut text = String::with_capacity(256);
     while let Ok(ev) = session.rx.try_recv() {
         match *ev {
