@@ -42,6 +42,11 @@ pub struct ChannelState {
     users: HashMap<String, PresenceUser>, // user_id -> info + live connection count
     /// Membership snapshot for fan-out, rebuilt lazily: `add`/`remove` reset it,
     /// the next `fanout` rebuilds it under the caller's registry shard guard.
+    /// Retention bound: every membership change resets it, so a channel that
+    /// keeps ≥1 member holds at most ONE stale generation here — freed by the
+    /// next rebuild, or with the whole state when a vacate prunes the channel
+    /// (in-flight `Fanout`s keep one clone alive only until their `send`
+    /// completes).
     snapshot: OnceLock<SharedSnapshot>,
 }
 
@@ -433,6 +438,45 @@ mod tests {
             rx2.try_recv().map(|b| *b),
             Ok(ServerEvent::Raw(_))
         ));
+    }
+
+    #[test]
+    fn fanout_snapshot_excludes_subscriber_added_after_snapshot() {
+        // Mirror of the remove-side contract above (add half): a subscriber
+        // ADDED between snapshot and send is not in the guard-time set, so it
+        // must NOT receive the pre-add frame — and the add resets the cached
+        // snapshot, so the NEXT fan-out is rebuilt with the new member in.
+        let mut s = ChannelState::default();
+        let (h1, mut rx1) = handle_with_rx();
+        s.add(h1, None);
+
+        let plan = s.fanout(&ServerEvent::Pong, None);
+        let (h2, mut rx2) = handle_with_rx();
+        s.add(h2, None); // join lands between snapshot and send
+        plan.send();
+
+        // Guard-time set = {h1}: the pre-add frame went to h1 only.
+        match rx1.try_recv().map(|b| *b) {
+            Ok(ServerEvent::Raw(f)) => {
+                assert_eq!(&*f, crate::protocol::v7::frames::encode(&ServerEvent::Pong))
+            }
+            other => panic!("expected Raw(Pong), got {other:?}"),
+        }
+        assert!(
+            rx2.try_recv().is_err(),
+            "subscriber added after the snapshot must not receive the pre-add frame"
+        );
+
+        // Next fan-out rebuilds under the NEW membership: both receive.
+        s.fanout(&ServerEvent::Ping, None).send();
+        for rx in [&mut rx1, &mut rx2] {
+            match rx.try_recv().map(|b| *b) {
+                Ok(ServerEvent::Raw(f)) => {
+                    assert_eq!(&*f, crate::protocol::v7::frames::encode(&ServerEvent::Ping))
+                }
+                other => panic!("expected Raw(Ping), got {other:?}"),
+            }
+        }
     }
 
     #[test]
