@@ -1233,17 +1233,28 @@ impl Adapter for RedisAdapter {
         event: ServerEvent,
         except: Option<SocketId>,
     ) {
-        // 1. Local delivery on THIS node — typed event, honouring `except`.
+        // F17 encode-once (the same shape `ClusterAdapter::broadcast` proved):
+        // encode the v7 frame ONCE (reusing the payload verbatim when the
+        // caller already encoded it as `Raw`) and feed the SAME bytes to BOTH
+        // halves — the local delivery runs as a `Raw` frame (so neither the
+        // percore sink nor the legacy registry path re-encodes) and the cluster
+        // publish relays the identical string. Previously the typed event was
+        // encoded once inside the local half and AGAIN here for the publish.
+        let frame: Arc<str> = match &event {
+            ServerEvent::Raw(f) => f.clone(),
+            other => Arc::from(crate::protocol::v7::frames::encode(other).as_str()),
+        };
+
+        // 1. Local delivery on THIS node — the shared frame, honouring `except`.
         self.local
-            .broadcast(app, channel, event.clone(), except)
+            .broadcast(app, channel, ServerEvent::Raw(frame.clone()), except)
             .await;
 
         // 2. Fan out to the rest of the cluster. Publish the *pre-encoded* v7 frame
         //    so remote nodes deliver it verbatim (no re-encoding). Always publish —
         //    even with no local subscribers — because a REST trigger may land on a
         //    node where the channel is only subscribed elsewhere.
-        let frame = crate::protocol::v7::frames::encode(&event);
-        self.cluster_publish_broadcast(app, channel, frame, except.as_ref())
+        self.cluster_publish_broadcast(app, channel, frame.to_string(), except.as_ref())
             .await;
     }
 
