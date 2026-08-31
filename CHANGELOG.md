@@ -277,3 +277,12 @@ relay model; the `local: None` saturation-gate trap is called out in code (X2).
   by default.
 - **`auth_key` verification is now constant-time** (audit S3), matching the
   existing constant-time signature and body-MD5 comparisons.
+
+### Phase 9 — Release & hygiene
+
+#### Fixed
+- **Disabled apps close the WebSocket with 4003 "Application disabled"**
+  (re-audit P13): the Pusher protocol doc's close-code table gives disabled its
+  own code; WS previously collapsed it into 4001 (unknown key). 4001 stays
+  reserved for unknown keys; REST keeps 403. Supersedes the Phase 2 WS-collapse
+  decision.

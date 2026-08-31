@@ -116,8 +116,9 @@ unbounded app catalogue:
 - **Negative cache:** a separate, smaller, short-TTL cache holds "no such app" so a flood of bad
   keys can never evict real apps and never reaches the database.
 
-A backend outage is distinguished from a genuinely-missing app: a missing/disabled app is
-rejected fatally (WS `4001`), while a transient DB/Redis error is rejected *retryably* (WS
+A backend outage is distinguished from a genuinely-unusable app: a missing app is rejected
+fatally (WS `4001`), a disabled app with its own fatal code (WS `4003`), while a transient
+DB/Redis error is rejected *retryably* (WS
 `4103`) and never negatively cached, so clients reconnect and succeed when the backend recovers.
 See [Configuration → Application store](configuration.md#application-store) for the cache tuning
 variables.

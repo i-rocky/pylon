@@ -22,7 +22,7 @@ const APPS: &str = r#"[
      "client_messages_enabled":true,"subscription_count_enabled":true}
 ]"#;
 /// Same as [`APPS`] plus a DISABLED app (`"enabled": false`) — the R1 fixture:
-/// a disabled app exists but must not authenticate (REST 403 / WS 4001).
+/// a disabled app exists but must not authenticate (REST 403 / WS 4003).
 const APPS_WITH_DISABLED: &str = r#"[
     {"name":"Test","id":"app1","key":"app-key","secret":"app-secret",
      "client_messages_enabled":true,"subscription_count_enabled":false},
@@ -1626,28 +1626,47 @@ async fn rest_enabled_app_still_200() {
     assert_eq!(resp.status(), 200);
 }
 
-/// R1 (WS side): connecting with a DISABLED app's KEY keeps the single WS
-/// answer for an unusable key — 4001 "Could not find app by key" (the audit's
-/// chosen behavior; REST carries the 403 distinction, WS does not).
+/// P13 (WS side): connecting with a DISABLED app's KEY closes with the doc's
+/// dedicated close code — 4003 "Application disabled" (the Pusher protocol
+/// doc's close-code table assigns 4003 to exactly this trigger; 4001 "Could
+/// not find app by key" stays reserved for an unknown key). REST keeps 403.
 #[tokio::test]
-async fn ws_disabled_app_key_close_frame_carries_4001() {
+async fn ws_disabled_app_key_close_frame_carries_4003() {
     let addr = spawn_with_apps(APPS_WITH_DISABLED).await;
     let (mut ws, _) =
         tokio_tungstenite::connect_async(format!("ws://{addr}/app/off-key?protocol=7"))
             .await
             .unwrap();
 
+    // The in-band pusher:error frame precedes the Close (queue_reject shape)
+    // and carries the same code + the doc's message text.
+    let mut error_frame: Option<Value> = None;
     let mut close_code: Option<u16> = None;
     while let Some(Ok(msg)) = ws.next().await {
-        if let Message::Close(frame) = msg {
-            close_code = frame.map(|f| u16::from(f.code));
-            break;
+        match msg {
+            Message::Text(t) => {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                if v["event"] == "pusher:error" {
+                    error_frame = Some(v);
+                }
+            }
+            Message::Close(frame) => {
+                close_code = frame.map(|f| u16::from(f.code));
+                break;
+            }
+            _ => {}
         }
     }
+    let error_frame = error_frame.expect("pusher:error frame before Close");
+    assert_eq!(error_frame["data"]["code"], 4003, "frame: {error_frame}");
+    assert_eq!(
+        error_frame["data"]["message"], "Application disabled",
+        "message text must match the Pusher doc's 4003 row, frame: {error_frame}"
+    );
     assert_eq!(
         close_code,
-        Some(4001),
-        "disabled-app-key reject must close with code 4001 (R1), got: {close_code:?}"
+        Some(4003),
+        "disabled-app-key reject must close with code 4003 (P13), got: {close_code:?}"
     );
 }
 

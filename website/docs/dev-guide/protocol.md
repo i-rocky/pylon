@@ -30,7 +30,9 @@ ping interval in seconds (default 120; configurable via `PYLON_ACTIVITY_TIMEOUT`
 
 If the app key is not found, pylon sends a `pusher:error` frame with code
 `4001` followed by a WebSocket Close frame with the same code, then tears down
-the connection.
+the connection. A key that resolves to a **disabled** app (`enabled: false`) is
+answered with the doc's dedicated code instead: `4003` "Application disabled"
+(same pusher:error + Close pair).
 
 ---
 
@@ -183,6 +185,7 @@ events on an otherwise open connection (the socket is **not** closed).
 | Code | Cause |
 |---|---|
 | `4001` | App key not found (well-formed `/app/{key}` path, unknown key) |
+| `4003` | Application disabled (the key resolves to an app with `enabled: false` — the Pusher doc's dedicated close code; REST answers the same state with 403) |
 | `4004` | App connection limit reached (per-app `capacity`) |
 | `4005` | Connection path malformed — not the `/app/{key}` shape, or an empty key (distinct from `4001`) |
 | `4006` | Invalid protocol version string format |

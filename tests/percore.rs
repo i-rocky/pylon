@@ -724,14 +724,14 @@ async fn unknown_app_key_still_errors_4001() {
     assert_rejected_with(&mut ws, 4001, "Could not find app by key").await;
 }
 
-/// R1: a DISABLED app's key keeps the single WS answer for an unusable key —
-/// 4001 "Could not find app by key" (the audit's chosen behavior; the REST
-/// side distinguishes disabled via 403, the WS side does not).
+/// P13: a DISABLED app's key gets its dedicated WS answer — 4003 "Application
+/// disabled" per the Pusher protocol doc's close-code table (4001 stays
+/// reserved for an unknown key; the REST side distinguishes disabled via 403).
 #[tokio::test]
-async fn disabled_app_key_still_errors_4001() {
+async fn disabled_app_key_errors_4003() {
     let h = spawn_with_apps(ServerConfig::default(), APPS_WITH_DISABLED).await;
     let mut ws = connect_path(h.port, "/app/off-key?protocol=7").await;
-    assert_rejected_with(&mut ws, 4001, "Could not find app by key").await;
+    assert_rejected_with(&mut ws, 4003, "Application disabled").await;
 }
 
 // ── Scenario 8: max-connection-lifetime close 4202 ──────────────────────────

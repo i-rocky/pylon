@@ -341,11 +341,11 @@ async fn parked_disconnect_leaks_no_counter_and_discards_late_resolution() {
 // ── R1: disabled key on the PARKED (offloaded) path ──────────────────────────
 
 /// A DISABLED app's key resolved through the offload path (park →
-/// `drain_resolved`) keeps the single WS answer for an unusable key: reject
-/// `pusher:error` 4001 "Could not find app by key" + Close 4001. REST carries
-/// the 403 distinction; WS deliberately does not.
+/// `drain_resolved`) gets the dedicated disabled answer (P13): reject
+/// `pusher:error` 4003 "Application disabled" + Close 4003 — the Pusher
+/// protocol doc's close-code table. REST carries the 403 distinction.
 #[tokio::test]
-async fn parked_disabled_key_rejects_4001() {
+async fn parked_disabled_key_rejects_4003() {
     let h = spawn_slow(Duration::from_millis(20)).await;
     let url = format!("ws://127.0.0.1:{}/app/{}?protocol=7", h.port, DISABLED_KEY);
     let (mut ws, _) = tokio::time::timeout(
@@ -369,8 +369,8 @@ async fn parked_disabled_key_rejects_4001() {
     .await
     .expect("frame within 5s");
     assert_eq!(frame["event"], "pusher:error", "frame: {frame}");
-    assert_eq!(frame["data"]["code"], 4001, "frame: {frame}");
-    assert_eq!(frame["data"]["message"], "Could not find app by key");
+    assert_eq!(frame["data"]["code"], 4003, "frame: {frame}");
+    assert_eq!(frame["data"]["message"], "Application disabled");
 
     let mut close_code: Option<u16> = None;
     while let Some(Ok(msg)) = ws.next().await {
@@ -381,7 +381,7 @@ async fn parked_disabled_key_rejects_4001() {
     }
     assert_eq!(
         close_code,
-        Some(4001),
-        "disabled-key reject (parked path) must close 4001, got: {close_code:?}"
+        Some(4003),
+        "disabled-key reject (parked path) must close 4003, got: {close_code:?}"
     );
 }

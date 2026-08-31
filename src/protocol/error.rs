@@ -18,6 +18,12 @@ impl PusherError {
     pub fn app_not_found() -> Self {
         Self::new(4001, "Could not find app by key")
     }
+    /// Found-but-disabled app. The Pusher protocol doc's close-code table
+    /// assigns 4003 to exactly this trigger; the text is the doc's row label.
+    /// https://pusher.com/docs/channels/library_auth_reference/pusher-websockets-protocol/
+    pub fn app_disabled() -> Self {
+        Self::new(4003, "Application disabled")
+    }
     pub fn over_capacity() -> Self {
         Self::new(4004, "App connection limit reached")
     }
@@ -56,6 +62,15 @@ impl PusherError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P13: the doc's close-code table gives 4003 its own row — "Application
+    /// disabled" — distinct from 4001 (unknown key).
+    #[test]
+    fn app_disabled_carries_4003_and_pusher_wording() {
+        let e = PusherError::app_disabled();
+        assert_eq!(e.code, 4003);
+        assert_eq!(e.message, "Application disabled");
+    }
 
     #[test]
     fn constructors_carry_spec_codes() {
