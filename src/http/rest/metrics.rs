@@ -233,12 +233,17 @@ pub fn encode(snapshot: &MetricsSnapshot) -> String {
 /// Extract the bearer token from `Authorization: Bearer <token>`.
 /// Returns `""` when the header is absent, malformed, or not a Bearer scheme —
 /// the caller compares it against the configured token, so a missing token is
-/// simply "wrong" (and gets the same 404 as a wrong token).
+/// simply "wrong" (and gets the same 404 as a wrong token). The scheme match
+/// is case-insensitive per RFC 7235 (`bearer`/`BEARER`/… all accepted); the
+/// TOKEN itself is compared byte-exactly (it is a secret, not a scheme).
 fn bearer_token(headers: &axum::http::HeaderMap) -> &str {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
+        .and_then(|v| {
+            let (scheme, token) = v.split_once(' ')?;
+            scheme.eq_ignore_ascii_case("Bearer").then_some(token)
+        })
         .unwrap_or("")
 }
 
@@ -863,6 +868,43 @@ mod tests {
         h.insert(
             axum::http::header::AUTHORIZATION,
             "Basic c2Vrcml0OnNla3JpdA==".parse().unwrap(),
+        );
+        let resp = get_metrics(State(gate_state(Some("sekrit"))), h)
+            .await
+            .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// Fix-round 1: RFC 7235 auth schemes are case-INSENSITIVE — a scraper
+    /// sending `bearer <token>` (lowercase) must be accepted exactly like
+    /// `Bearer <token>`.
+    #[tokio::test]
+    async fn token_set_lowercase_and_uppercase_bearer_scheme_accepted() {
+        for scheme in ["bearer", "BEARER", "BeArEr"] {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("{scheme} sekrit").parse().unwrap(),
+            );
+            let resp = get_metrics(State(gate_state(Some("sekrit"))), h)
+                .await
+                .into_response();
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::OK,
+                "scheme {scheme:?} must be accepted (RFC 7235 case-insensitive)"
+            );
+        }
+    }
+
+    /// Case-insensitive scheme + WRONG token is still 404 (the scheme fix
+    /// must not loosen the token check).
+    #[tokio::test]
+    async fn token_set_lowercase_bearer_wrong_token_is_404() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "bearer wrong".parse().unwrap(),
         );
         let resp = get_metrics(State(gate_state(Some("sekrit"))), h)
             .await
