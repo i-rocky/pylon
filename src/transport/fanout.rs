@@ -227,7 +227,10 @@ mod tests {
 
     /// U3 Raw guard: a pre-encoded frame is WS-framed ONCE and SHARED by every
     /// version slot (refcount clones — the F17 no-copy property survives
-    /// per-version fan-out; the vec holds N slots but only one buffer).
+    /// per-version fan-out; the vec holds N slots but only one buffer). The
+    /// pointer-identity assertion pins the ONE-buffer property itself: content
+    /// equality alone would still pass under a frame-per-slot regression
+    /// (identical bytes, N allocations).
     #[test]
     fn frames_for_raw_shares_one_buffer_across_versions() {
         let ev = ServerEvent::Raw(Arc::from("{\"event\":\"e\"}"));
@@ -236,5 +239,11 @@ mod tests {
         assert_eq!(frames[0].0, 7);
         assert_eq!(frames[1].0, 8);
         assert_eq!(frames[0].1, frames[1].1);
+        // Non-empty first, so the pointer check cannot pass vacuously (empty
+        // `Bytes` all share the static dangling pointer).
+        assert!(!frames[0].1.is_empty());
+        // The two slots alias the SAME allocation (clones of one frozen
+        // buffer), not merely equal copies.
+        assert!(std::ptr::eq(frames[0].1.as_ptr(), frames[1].1.as_ptr()));
     }
 }
