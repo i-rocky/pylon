@@ -159,12 +159,19 @@ impl Adapter for LocalAdapter {
         except: Option<SocketId>,
     ) {
         if let Some(sink) = self.broadcast_sink() {
-            // Per-core active: encode the v7 JSON once, WS-frame it once, and
+            // Per-core active: encode the frame once, WS-frame it once, and
             // route the shared frame to every worker. Each worker fans it out to
             // its own local subscribers by direct slab-enqueue.
+            //
+            // One frame is shared by every local subscriber, so today it encodes
+            // at the sole active version — 7.3 replaces this with per-version
+            // frames built on the `wire` seam.
             let json: Arc<str> = match &event {
                 ServerEvent::Raw(f) => f.clone(),
-                other => Arc::from(crate::protocol::v7::frames::encode(other).as_str()),
+                other => Arc::from(
+                    crate::protocol::wire::encode(crate::protocol::wire::ACTIVE_VERSIONS[0], other)
+                        .as_str(),
+                ),
             };
             let mut buf = bytes::BytesMut::new();
             crate::transport::frame::encode_text(&mut buf, json.as_bytes());
@@ -237,14 +244,19 @@ impl Adapter for LocalAdapter {
             return;
         }
         // F10: a user event fans out to every socket signed in as `user_id`.
-        // Encode the v7 JSON ONCE (or reuse the payload when the caller already
+        // Encode the frame ONCE (or reuse the payload when the caller already
         // encoded it) and deliver `Raw` clones — each recipient's flush appends
         // the same buffer by reference instead of re-serializing per socket.
         // `Raw` is wire-identical to encoding the structured event (pinned by
         // the golden wire-bytes tests), so the bytes per recipient are unchanged.
+        // The shared frame encodes at the sole active version today; 7.3 makes
+        // this per-version via the `wire` seam.
         let frame: Arc<str> = match &event {
             ServerEvent::Raw(f) => f.clone(),
-            other => Arc::from(crate::protocol::v7::frames::encode(other).as_str()),
+            other => Arc::from(
+                crate::protocol::wire::encode(crate::protocol::wire::ACTIVE_VERSIONS[0], other)
+                    .as_str(),
+            ),
         };
         for h in handles {
             let _ = h.mailbox.send(ServerEvent::Raw(frame.clone()));
@@ -312,7 +324,7 @@ mod tests {
         // bytes match a freshly-encoded `Pong` rather than the structured variant.
         match rx.try_recv().map(|b| *b) {
             Ok(ServerEvent::Raw(f)) => {
-                assert_eq!(&*f, crate::protocol::v7::frames::encode(&ServerEvent::Pong))
+                assert_eq!(&*f, crate::protocol::wire::encode(7, &ServerEvent::Pong))
             }
             other => panic!("expected Raw(Pong), got {other:?}"),
         }
@@ -466,7 +478,7 @@ mod tests {
         for rx in [&mut rx1, &mut rx2] {
             match rx.try_recv().map(|b| *b) {
                 Ok(ServerEvent::Raw(f)) => {
-                    assert_eq!(&*f, crate::protocol::v7::frames::encode(&ServerEvent::Pong))
+                    assert_eq!(&*f, crate::protocol::wire::encode(7, &ServerEvent::Pong))
                 }
                 other => panic!("expected Raw(Pong), got {other:?}"),
             }
@@ -508,11 +520,11 @@ mod tests {
         };
         adapter.send_to_user("app", "u", sent.clone()).await;
 
-        let expected = crate::protocol::v7::frames::encode(&sent);
+        let expected = crate::protocol::wire::encode(7, &sent);
         let mut encoded: Vec<String> = rxs
             .iter_mut()
             .map(|rx| match rx.try_recv() {
-                Ok(b) => crate::protocol::v7::frames::encode(&b),
+                Ok(b) => crate::protocol::wire::encode(7, &b),
                 other => panic!("recipient mailbox empty: {other:?}"),
             })
             .collect();

@@ -1234,15 +1234,22 @@ impl Adapter for RedisAdapter {
         except: Option<SocketId>,
     ) {
         // F17 encode-once (the same shape `ClusterAdapter::broadcast` proved):
-        // encode the v7 frame ONCE (reusing the payload verbatim when the
-        // caller already encoded it as `Raw`) and feed the SAME bytes to BOTH
-        // halves — the local delivery runs as a `Raw` frame (so neither the
-        // percore sink nor the legacy registry path re-encodes) and the cluster
-        // publish relays the identical string. Previously the typed event was
-        // encoded once inside the local half and AGAIN here for the publish.
+        // encode the frame ONCE (reusing the payload verbatim when the caller
+        // already encoded it as `Raw`) and feed the SAME bytes to BOTH halves —
+        // the local delivery runs as a `Raw` frame (so neither the percore sink
+        // nor the legacy registry path re-encodes) and the cluster publish
+        // relays the identical string. Previously the typed event was encoded
+        // once inside the local half and AGAIN here for the publish.
+        //
+        // One frame is shared cluster-wide, so today it encodes at the sole
+        // active version — 7.3 replaces this with per-version frames built on
+        // the `wire` seam.
         let frame: Arc<str> = match &event {
             ServerEvent::Raw(f) => f.clone(),
-            other => Arc::from(crate::protocol::v7::frames::encode(other).as_str()),
+            other => Arc::from(
+                crate::protocol::wire::encode(crate::protocol::wire::ACTIVE_VERSIONS[0], other)
+                    .as_str(),
+            ),
         };
 
         // 1. Local delivery on THIS node — the shared frame, honouring `except`.
@@ -1463,9 +1470,13 @@ impl Adapter for RedisAdapter {
 
     async fn send_to_user(&self, app: &str, user_id: &str, event: ServerEvent) {
         // Deliver to this node's local connections of the user, then fan the
-        // pre-encoded frame out to every other node holding a connection of the user.
+        // pre-encoded frame out to every other node holding a connection of the
+        // user. The published frame is shared cluster-wide, so today it encodes
+        // at the sole active version (7.3 makes this per-version via the `wire`
+        // seam).
         self.local.send_to_user(app, user_id, event.clone()).await;
-        let frame = crate::protocol::v7::frames::encode(&event);
+        let frame =
+            crate::protocol::wire::encode(crate::protocol::wire::ACTIVE_VERSIONS[0], &event);
         user::publish(
             &self.clients.pool,
             &self.keys.usermsg(app, user_id),

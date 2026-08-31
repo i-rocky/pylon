@@ -5,14 +5,6 @@ use crate::protocol::command::ClientCommand;
 use crate::protocol::event::ServerEvent;
 use serde_json::{json, Value};
 
-/// Convenience wrapper: encode into a fresh `String`. Delegates to
-/// [`encode_into`], so both paths are byte-identical by construction.
-pub fn encode(event: &ServerEvent) -> String {
-    let mut out = String::new();
-    encode_into(event, &mut out);
-    out
-}
-
 /// `io::Write` adapter appending UTF-8 slices into a `String`, so
 /// `serde_json::to_writer` serializes straight into the append buffer with no
 /// intermediate `String` (which the delegating `encode`/`push_str` shape would
@@ -262,6 +254,15 @@ mod tests {
     use crate::protocol::event::ServerEvent;
     use crate::protocol::socket_id::SocketId;
     use serde_json::Value;
+
+    /// Test-local fresh-`String` wrapper: the production fresh-`String` encode
+    /// lives in `protocol::wire` only (U2); the frames module exposes just the
+    /// append seam, which this helper delegates to.
+    fn encode(event: &ServerEvent) -> String {
+        let mut out = String::new();
+        encode_into(event, &mut out);
+        out
+    }
 
     fn parse(s: &str) -> Value {
         serde_json::from_str(s).unwrap()

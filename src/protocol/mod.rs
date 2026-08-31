@@ -4,6 +4,7 @@ pub mod error;
 pub mod event;
 pub mod socket_id;
 pub mod v7;
+pub mod wire;
 
 use codec::Codec;
 use error::PusherError;

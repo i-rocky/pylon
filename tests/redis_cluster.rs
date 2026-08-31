@@ -1591,8 +1591,10 @@ async fn cluster_publish_broadcast_fans_out_only_remote() {
 
         // A publishes ONLY the cluster half — a pre-encoded v7 frame — with no local
         // delivery. B's subscriber receives it and re-delivers to B's local socket.
-        let frame =
-            pylon::protocol::v7::frames::encode(&ServerEvent::Raw(std::sync::Arc::from("ping")));
+        let frame = pylon::protocol::wire::encode(
+            pylon::protocol::wire::ACTIVE_VERSIONS[0],
+            &ServerEvent::Raw(std::sync::Arc::from("ping")),
+        );
         adapter_a
             .cluster_publish_broadcast(TEST_APP, "public-room", frame.clone(), None)
             .await;

@@ -120,7 +120,7 @@ fn raw_event_is(ev: &ServerEvent, name: &str) -> bool {
 /// `pusher:subscription_error`, which is its own event type that legitimately
 /// carries `channel` at top level).
 fn assert_frame_shape(ev: &ServerEvent, expected_event: &str, expected_keys: &[&str]) {
-    let wire = crate::protocol::v7::frames::encode(ev);
+    let wire = crate::protocol::wire::encode(7, ev);
     let j: serde_json::Value = serde_json::from_str(&wire).expect("wire frame must be valid JSON");
     assert_eq!(j["event"], expected_event, "wire frame: {wire}");
     let mut got: Vec<&str> = j

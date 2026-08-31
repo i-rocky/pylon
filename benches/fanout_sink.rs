@@ -77,7 +77,7 @@ use pylon::channel::registry::Registry;
 use pylon::connection::handle::{ConnectionHandle, Mailbox};
 use pylon::protocol::event::ServerEvent;
 use pylon::protocol::socket_id::SocketId;
-use pylon::protocol::v7::frames;
+use pylon::protocol::wire;
 use pylon::transport::conn::{ConnState, Connection};
 use pylon::transport::fanout::{
     BroadcastMsg, BroadcastSink, WorkerSlot, DEFAULT_BROADCAST_HANDOFF_CAP,
@@ -243,7 +243,7 @@ fn reset_queues(world: &mut SinkWorld) {
 fn broadcast_and_drain(world: &mut SinkWorld, event: &ServerEvent, now_ns: u64) {
     let json: Arc<str> = match event {
         ServerEvent::Raw(f) => f.clone(),
-        other => Arc::from(frames::encode(other).as_str()),
+        other => Arc::from(wire::encode(wire::ACTIVE_VERSIONS[0], other).as_str()),
     };
     let mut buf = BytesMut::new();
     frame::encode_text(&mut buf, json.as_bytes());
@@ -327,7 +327,9 @@ fn bench_sink(c: &mut Criterion) {
 /// what a redis-relayed broadcast re-frames, so this case measures the Raw
 /// no-copy path (no JSON encode; one shared `Arc<str>` → one shared `Bytes`).
 fn raw_event() -> ServerEvent {
-    ServerEvent::Raw(Arc::from(frames::encode(&fat_event()).as_str()))
+    ServerEvent::Raw(Arc::from(
+        wire::encode(wire::ACTIVE_VERSIONS[0], &fat_event()).as_str(),
+    ))
 }
 
 /// Monotonic ns since the bench epoch, the same stamp the worker's loop

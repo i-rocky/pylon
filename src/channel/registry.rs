@@ -181,7 +181,7 @@ mod tests {
         // verbatim wire frame for `Pong`.
         match rx2.try_recv().map(|b| *b) {
             Ok(ServerEvent::Raw(f)) => {
-                assert_eq!(&*f, crate::protocol::v7::frames::encode(&ServerEvent::Pong))
+                assert_eq!(&*f, crate::protocol::wire::encode(7, &ServerEvent::Pong))
             }
             other => panic!("expected Raw(Pong), got {other:?}"),
         }
