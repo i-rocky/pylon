@@ -86,6 +86,13 @@ pub struct ServerConfig {
     /// (single attempt). `PYLON_WEBHOOK_RETRY_BUDGET_MS` (default 300000).
     pub webhook_retry_budget_ms: u64,
     pub webhook_max_concurrency: usize,
+    /// S2: allow webhook delivery to private/loopback/link-local targets
+    /// (SSRF guard escape hatch). `false` (default, secure): a delivery whose
+    /// target resolves to (or literally is) a private address is refused
+    /// before any HTTP is sent. `PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS`
+    /// (`1`/`true` to enable) — for operators whose webhook receivers live on
+    /// internal networks.
+    pub webhook_allow_private_targets: bool,
     pub max_channel_name_length: usize,
     pub max_event_name_length: usize,
     pub max_client_events_per_second: u32,
@@ -204,6 +211,13 @@ pub struct ServerConfig {
     /// Bearer token required for the admin endpoints (`POST /admin/apps/{id}/invalidate`).
     /// When `None` (default, `PYLON_ADMIN_TOKEN` not set), the admin API is disabled (404).
     pub app_admin_token: Option<String>,
+    /// S1: optional bearer token for `GET /metrics`. When `None` (default,
+    /// `PYLON_METRICS_TOKEN` not set) metrics stay open (back-compat). When set,
+    /// a scrape must carry `Authorization: Bearer <token>`; anything else gets
+    /// **404** (not 401 — an unauthenticated prober must not learn that the
+    /// endpoint exists). `/health` and `/ready` are never gated (LB probes).
+    /// An empty value is treated as unset. `PYLON_METRICS_TOKEN`.
+    pub metrics_token: Option<String>,
     /// Interval (seconds) for the app-purge sweep backstop. `0` disables it
     /// (default). `PYLON_APP_SWEEP_INTERVAL`. The sweep enumerates distinct
     /// connected apps and purges any the authoritative (uncached) driver reports
@@ -236,6 +250,7 @@ impl Default for ServerConfig {
             webhook_backoff_cap_ms: 60000,
             webhook_retry_budget_ms: 300000,
             webhook_max_concurrency: 100,
+            webhook_allow_private_targets: false,
             max_channel_name_length: 164,
             max_event_name_length: 200,
             max_client_events_per_second: 10,
@@ -280,6 +295,7 @@ impl Default for ServerConfig {
             app_cache_neg_ttl: 30,
             app_cache_redis_url: None,
             app_admin_token: None,
+            metrics_token: None,
             app_sweep_interval_secs: 0,
         }
     }
@@ -354,6 +370,14 @@ impl ServerConfig {
         }
         c.app_cache_redis_url = std::env::var("PYLON_APP_CACHE_REDIS_URL").ok();
         c.app_admin_token = std::env::var("PYLON_ADMIN_TOKEN").ok();
+        // S1: empty string is treated as "not set" (same convention as the TLS
+        // paths) so `PYLON_METRICS_TOKEN=` can never arm a gate whose token is
+        // the empty string.
+        if let Ok(v) = std::env::var("PYLON_METRICS_TOKEN") {
+            if !v.is_empty() {
+                c.metrics_token = Some(v);
+            }
+        }
         if let Ok(v) = std::env::var("PYLON_APP_SWEEP_INTERVAL") {
             if let Ok(n) = v.parse() {
                 c.app_sweep_interval_secs = n;
@@ -444,6 +468,9 @@ impl ServerConfig {
             if let Ok(p) = v.parse() {
                 c.webhook_max_concurrency = p;
             }
+        }
+        if let Ok(v) = std::env::var("PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS") {
+            c.webhook_allow_private_targets = v == "1" || v.eq_ignore_ascii_case("true");
         }
         if let Ok(v) = std::env::var("PYLON_MAX_CHANNEL_NAME_LENGTH") {
             if let Ok(p) = v.parse() {
@@ -721,6 +748,8 @@ mod tests {
         assert_eq!(c.webhook_backoff_cap_ms, 60000);
         assert_eq!(c.webhook_retry_budget_ms, 300000);
         assert_eq!(c.webhook_max_concurrency, 100);
+        // S2 SSRF guard: private webhook targets refused by default.
+        assert!(!c.webhook_allow_private_targets);
         // adapter + redis tunables
         assert_eq!(c.adapter, "local");
         assert_eq!(c.redis_url, "redis://127.0.0.1:6379");
@@ -988,6 +1017,25 @@ mod tests {
     }
 
     #[test]
+    fn metrics_token_defaults_none() {
+        // Secure-by-default in the back-compat sense: unset token = open metrics.
+        assert!(ServerConfig::default().metrics_token.is_none());
+    }
+
+    #[test]
+    fn metrics_token_env_overrides_apply() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("PYLON_METRICS_TOKEN", "opensesame");
+        let c = ServerConfig::from_env();
+        assert_eq!(c.metrics_token.as_deref(), Some("opensesame"));
+        // An empty value is treated as unset (a locked-down-by-"" footgun).
+        std::env::set_var("PYLON_METRICS_TOKEN", "");
+        let c = ServerConfig::from_env();
+        assert!(c.metrics_token.is_none(), "empty token must be None");
+        std::env::remove_var("PYLON_METRICS_TOKEN");
+    }
+
+    #[test]
     fn tls_env_overrides_apply() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("PYLON_TLS_CERT", "/path/to/cert.pem");
@@ -1037,6 +1085,7 @@ mod tests {
         std::env::set_var("PYLON_WEBHOOK_BACKOFF_CAP_MS", "20");
         std::env::set_var("PYLON_WEBHOOK_RETRY_BUDGET_MS", "30");
         std::env::set_var("PYLON_WEBHOOK_MAX_CONCURRENCY", "5");
+        std::env::set_var("PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS", "1");
         let c = ServerConfig::from_env();
         assert_eq!(c.webhook_batch_ms, 25);
         assert_eq!(c.webhook_timeout_ms, 1234);
@@ -1044,12 +1093,19 @@ mod tests {
         assert_eq!(c.webhook_backoff_cap_ms, 20);
         assert_eq!(c.webhook_retry_budget_ms, 30);
         assert_eq!(c.webhook_max_concurrency, 5);
+        assert!(c.webhook_allow_private_targets, "the SSRF escape hatch");
+        // "true" also enables; anything else leaves it off.
+        std::env::set_var("PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS", "true");
+        assert!(ServerConfig::from_env().webhook_allow_private_targets);
+        std::env::set_var("PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS", "0");
+        assert!(!ServerConfig::from_env().webhook_allow_private_targets);
         std::env::remove_var("PYLON_WEBHOOK_BATCH_MS");
         std::env::remove_var("PYLON_WEBHOOK_TIMEOUT_MS");
         std::env::remove_var("PYLON_WEBHOOK_BACKOFF_BASE_MS");
         std::env::remove_var("PYLON_WEBHOOK_BACKOFF_CAP_MS");
         std::env::remove_var("PYLON_WEBHOOK_RETRY_BUDGET_MS");
         std::env::remove_var("PYLON_WEBHOOK_MAX_CONCURRENCY");
+        std::env::remove_var("PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS");
     }
 
     /// Install a thread-local `tracing` subscriber that records every event's

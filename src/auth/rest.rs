@@ -85,7 +85,11 @@ pub fn verify(
     if get("auth_version") != Some("1.0") {
         return Err(RestAuthError::BadVersion);
     }
-    if get("auth_key") != Some(app_key) {
+    // S3: constant-time key compare, mirroring the signature compare below —
+    // a missing key is the empty string (the length-mismatch path of the same
+    // constant-time fold), so absence and wrongness are indistinguishable in
+    // both result AND timing.
+    if !constant_time_eq(get("auth_key").unwrap_or(""), app_key) {
         return Err(RestAuthError::KeyMismatch);
     }
     let ts: u64 = get("auth_timestamp")
@@ -281,6 +285,67 @@ mod tests {
         assert_eq!(
             verify(
                 "other-key",
+                "secret",
+                "GET",
+                "/apps/1/channels",
+                &p,
+                b"",
+                1000,
+                600
+            ),
+            Err(RestAuthError::KeyMismatch)
+        );
+    }
+
+    /// S3: same-length wrong keys are rejected identically — the case the
+    /// constant-time compare exists for. The key check reuses the signature
+    /// compare's `constant_time_eq`, so a probing attacker learns nothing from
+    /// how fast a key is rejected either. (A timing property itself is not
+    /// runtime-assertable; these cases pin that every divergence shape —
+    /// first byte, last byte, length — maps to the same generic mismatch.)
+    #[test]
+    fn rejects_wrong_key_same_length() {
+        let p = signed_params("secret", "GET", "/apps/1/channels", 1000, b"");
+        // Differs in the LAST byte only.
+        assert_eq!(
+            verify(
+                "app-kez",
+                "secret",
+                "GET",
+                "/apps/1/channels",
+                &p,
+                b"",
+                1000,
+                600
+            ),
+            Err(RestAuthError::KeyMismatch)
+        );
+        // Differs in the FIRST byte only (where a short-circuit compare would
+        // return fastest — the constant-time fold must not care).
+        assert_eq!(
+            verify(
+                "bpp-key",
+                "secret",
+                "GET",
+                "/apps/1/channels",
+                &p,
+                b"",
+                1000,
+                600
+            ),
+            Err(RestAuthError::KeyMismatch)
+        );
+    }
+
+    /// S3: a MISSING auth_key is the same generic mismatch (empty string vs
+    /// the configured key — the constant-time compare's length-mismatch path).
+    #[test]
+    fn rejects_missing_key_as_mismatch() {
+        let mut p = signed_params("secret", "GET", "/apps/1/channels", 1000, b"");
+        p.remove("auth_key");
+        assert_eq!(
+            verify(
+                "app-key",
                 "secret",
                 "GET",
                 "/apps/1/channels",

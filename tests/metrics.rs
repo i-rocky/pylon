@@ -22,6 +22,12 @@ type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn spawn() -> SocketAddr {
+    spawn_with_metrics_token(None).await
+}
+
+/// Spawn a server whose `ServerConfig.metrics_token` is optionally set (S1):
+/// `None` keeps today's open /metrics; `Some(t)` arms the bearer gate.
+async fn spawn_with_metrics_token(token: Option<&str>) -> SocketAddr {
     use std::sync::atomic::AtomicBool;
 
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
@@ -41,6 +47,7 @@ async fn spawn() -> SocketAddr {
         bind: "127.0.0.1".into(),
         port,
         workers: 1,
+        metrics_token: token.map(|t| t.to_string()),
         ..ServerConfig::default()
     };
 
@@ -306,4 +313,86 @@ async fn metrics_drophead_dropped_total_present_at_zero_when_quiescent() {
         body.contains(r#"pylon_codel_dropped_total{worker="0"} 0"#),
         "pylon_codel_dropped_total must also be present at 0 (convention anchor):\n{body}"
     );
+}
+
+// ── S1: optional PYLON_METRICS_TOKEN bearer gate ─────────────────────────────
+
+const GATE_TOKEN: &str = "metrics-bearer-token";
+
+/// Token unset → /metrics is open (back-compat pin: the gate must be inert).
+#[tokio::test]
+async fn token_unset_metrics_open_backcompat() {
+    let addr = spawn().await;
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "unset token must keep /metrics open");
+}
+
+/// Token set → no Authorization header → 404 (NOT 401 — an unauthenticated
+/// prober must not learn that the endpoint exists at all).
+#[tokio::test]
+async fn token_set_no_authorization_is_404() {
+    let addr = spawn_with_metrics_token(Some(GATE_TOKEN)).await;
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "missing bearer must be 404");
+}
+
+/// Token set → wrong token → 404 (same reason as above).
+#[tokio::test]
+async fn token_set_wrong_token_is_404() {
+    let addr = spawn_with_metrics_token(Some(GATE_TOKEN)).await;
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .header(
+            "Authorization",
+            format!("Bearer {}", "x".repeat(GATE_TOKEN.len())),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "wrong bearer must be 404");
+}
+
+/// Token set → correct token → 200 with the full metrics body.
+#[tokio::test]
+async fn token_set_correct_token_returns_metrics_body() {
+    let addr = spawn_with_metrics_token(Some(GATE_TOKEN)).await;
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .header("Authorization", format!("Bearer {GATE_TOKEN}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("pylon_up 1"),
+        "authed scrape must see the metrics body:\n{body}"
+    );
+}
+
+/// `/health` and `/ready` stay OPEN when the metrics token is set — load
+/// balancers and kubelet probes must not need the token.
+#[tokio::test]
+async fn token_set_health_and_ready_stay_open() {
+    let addr = spawn_with_metrics_token(Some(GATE_TOKEN)).await;
+    for path in ["/health", "/ready", "/healthz", "/readyz"] {
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "{path} must stay open (no token required)"
+        );
+    }
 }

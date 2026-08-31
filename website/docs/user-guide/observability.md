@@ -7,11 +7,20 @@ same HTTP port as the REST API (`PYLON_PORT`, default 7000).
 
 ## `GET /metrics` — Prometheus Exposition
 
-Returns a Prometheus text-format (v0.0.4) snapshot. The endpoint is
-unauthenticated by design — restrict access at the network layer if needed.
+Returns a Prometheus text-format (v0.0.4) snapshot.
+
+By default the endpoint is unauthenticated (back-compat). Set
+`PYLON_METRICS_TOKEN` to require `Authorization: Bearer <token>` on every
+scrape; a request without the correct token then gets **404** (not 401, so an
+unauthenticated prober cannot learn that the endpoint exists). `/health` and
+`/ready` are never gated — load-balancer probes keep working without the
+token. See [Deployment: Protecting /metrics](deployment.md#protecting-metrics).
 
 ```bash
 curl http://localhost:7000/metrics
+
+# With the token gate armed:
+curl -H "Authorization: Bearer $PYLON_METRICS_TOKEN" http://localhost:7000/metrics
 ```
 
 ### Metrics Reference
@@ -78,7 +87,11 @@ scrape_configs:
       - targets:
           - "pylon-host-1:7000"
           - "pylon-host-2:7000"
-    # No auth needed; restrict at network layer instead.
+    # No auth needed unless PYLON_METRICS_TOKEN is set; restrict at the
+    # network layer regardless.
+    # authorization:
+    #   type: Bearer
+    #   credentials: ${PYLON_METRICS_TOKEN}
 ```
 
 For Kubernetes, use a `ServiceMonitor` (Prometheus Operator) pointing at port

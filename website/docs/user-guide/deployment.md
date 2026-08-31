@@ -302,3 +302,43 @@ before its existing connections are closed.
     settings) and kernel TCP buffer tuning are covered in Production Tuning. Set
     `PYLON_MEMORY_BUDGET_BYTES` to cap memory consumption — see
     [Configuration](configuration.md) for the full variable reference.
+
+---
+
+## Protecting /metrics
+
+`GET /metrics` is open by default (back-compat). Because metrics expose app IDs,
+connection counts, and infrastructure detail, bind pylon to a private interface
+in any shared network. When network-level restriction is not enough — or as
+defense in depth — arm the optional bearer gate:
+
+```bash
+PYLON_METRICS_TOKEN="$(openssl rand -hex 32)"
+```
+
+With the token set:
+
+- Every scrape must carry `Authorization: Bearer <token>`.
+- A missing or wrong token returns **404** — deliberately not 401, so an
+  unauthenticated prober cannot distinguish "metrics exist but are protected"
+  from "no such route".
+- The token is compared in constant time (no timing oracle on its value).
+- `/health` and `/ready` (and `/healthz` / `/readyz`) stay **open** — load
+  balancers and kubelet probes never need the token.
+- An empty `PYLON_METRICS_TOKEN` is treated as unset (metrics stay open).
+
+Prometheus scrape config with the token:
+
+```yaml
+scrape_configs:
+  - job_name: pylon
+    static_configs:
+      - targets: ["pylon-host-1:7000"]
+    authorization:
+      type: Bearer
+      credentials: ${PYLON_METRICS_TOKEN}
+```
+
+In Kubernetes, put the token in a Secret and mount it into both pylon and the
+Prometheus configuration rather than embedding it in a ConfigMap. See
+[Observability](observability.md) for the full metrics reference.
