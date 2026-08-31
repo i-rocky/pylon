@@ -246,7 +246,7 @@ async fn public_subscribe_succeeds_and_emits_count() {
     let succ = next_json(&mut ws).await;
     assert_eq!(succ["event"], "pusher_internal:subscription_succeeded");
     assert_eq!(succ["channel"], "my-channel");
-    assert_eq!(succ["data"], ""); // empty-string data for non-presence
+    assert_eq!(succ["data"], "{}"); // "{}" string for non-presence (P12)
 
     // subscription_count_enabled = true → a count frame follows.
     let count = next_json(&mut ws).await;

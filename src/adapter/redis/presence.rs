@@ -175,10 +175,16 @@ pub(super) async fn reap_member(
             .split_once(':')
             .map(|(n, _)| n.to_string())
             .unwrap_or_default();
-        let frame = crate::protocol::v7::frames::encode(&ServerEvent::MemberRemoved {
-            channel: channel.to_string(),
-            user_id: user_id.clone(),
-        });
+        // The sweeper's compensating `member_removed` is one frame shared
+        // cluster-wide; it encodes at `ACTIVE_VERSIONS[0]` (the cluster
+        // envelope stays single-version until a v8 relay format exists).
+        let frame = crate::protocol::wire::encode(
+            crate::protocol::wire::ACTIVE_VERSIONS[0],
+            &ServerEvent::MemberRemoved {
+                channel: channel.to_string(),
+                user_id: user_id.clone(),
+            },
+        );
         let env = Envelope {
             node_id: dead_node,
             app: app.to_string(),

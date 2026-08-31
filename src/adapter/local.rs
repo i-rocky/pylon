@@ -159,16 +159,18 @@ impl Adapter for LocalAdapter {
         except: Option<SocketId>,
     ) {
         if let Some(sink) = self.broadcast_sink() {
-            // Per-core active: encode the v7 JSON once, WS-frame it once, and
-            // route the shared frame to every worker. Each worker fans it out to
-            // its own local subscribers by direct slab-enqueue.
-            let json: Arc<str> = match &event {
-                ServerEvent::Raw(f) => f.clone(),
-                other => Arc::from(crate::protocol::v7::frames::encode(other).as_str()),
-            };
-            let mut buf = bytes::BytesMut::new();
-            crate::transport::frame::encode_text(&mut buf, json.as_bytes());
-            sink.broadcast(Arc::from(app), Arc::from(channel), buf.freeze(), except);
+            // Per-core active: encode + WS-frame ONCE per active protocol
+            // version (U3 / 7.3: the sink message carries a `(version, frame)`
+            // pair per `wire::ACTIVE_VERSIONS` entry — a 1-element vec today,
+            // byte-identical to the previous single-frame build) and route the
+            // frames to every worker. Each worker delivers each subscriber the
+            // frame for ITS negotiated version; `Raw` events keep the
+            // no-re-encode property (one shared buffer across slots).
+            let frames = crate::transport::fanout::frames_for(
+                crate::protocol::wire::ACTIVE_VERSIONS,
+                &event,
+            );
+            sink.broadcast(Arc::from(app), Arc::from(channel), frames, except);
         } else {
             // Legacy mailbox path (axum transport / tests): UNCHANGED.
             self.registry
@@ -224,19 +226,33 @@ impl Adapter for LocalAdapter {
     }
 
     async fn send_to_user(&self, app: &str, user_id: &str, event: ServerEvent) {
+        // F10 CONTRACT — do not pass `ServerEvent::Close` or `SubscriptionError`
+        // here: this path encodes once and flattens every non-`Raw` event to a
+        // shared `Raw` frame, which would strip the protocol semantics the
+        // worker's mailbox drain matches on for those variants (a real WS close
+        // frame + connection deindex for `Close`; the object-`data` shape for
+        // `SubscriptionError`). User events are data frames only — terminate a
+        // user's connections via `terminate_user` (which drives the proper
+        // error+close sequence through `close_handles_4009`).
         let handles = self.users.handles(app, user_id);
         if handles.is_empty() {
             return;
         }
         // F10: a user event fans out to every socket signed in as `user_id`.
-        // Encode the v7 JSON ONCE (or reuse the payload when the caller already
+        // Encode the frame ONCE (or reuse the payload when the caller already
         // encoded it) and deliver `Raw` clones — each recipient's flush appends
         // the same buffer by reference instead of re-serializing per socket.
         // `Raw` is wire-identical to encoding the structured event (pinned by
         // the golden wire-bytes tests), so the bytes per recipient are unchanged.
+        // The shared frame encodes at `ACTIVE_VERSIONS[0]` (the per-connection
+        // MAILBOX path re-encodes nothing by design; per-version fan-out lives
+        // in the percore sink — 7.3).
         let frame: Arc<str> = match &event {
             ServerEvent::Raw(f) => f.clone(),
-            other => Arc::from(crate::protocol::v7::frames::encode(other).as_str()),
+            other => Arc::from(
+                crate::protocol::wire::encode(crate::protocol::wire::ACTIVE_VERSIONS[0], other)
+                    .as_str(),
+            ),
         };
         for h in handles {
             let _ = h.mailbox.send(ServerEvent::Raw(frame.clone()));
@@ -304,7 +320,7 @@ mod tests {
         // bytes match a freshly-encoded `Pong` rather than the structured variant.
         match rx.try_recv().map(|b| *b) {
             Ok(ServerEvent::Raw(f)) => {
-                assert_eq!(&*f, crate::protocol::v7::frames::encode(&ServerEvent::Pong))
+                assert_eq!(&*f, crate::protocol::wire::encode(7, &ServerEvent::Pong))
             }
             other => panic!("expected Raw(Pong), got {other:?}"),
         }
@@ -458,7 +474,7 @@ mod tests {
         for rx in [&mut rx1, &mut rx2] {
             match rx.try_recv().map(|b| *b) {
                 Ok(ServerEvent::Raw(f)) => {
-                    assert_eq!(&*f, crate::protocol::v7::frames::encode(&ServerEvent::Pong))
+                    assert_eq!(&*f, crate::protocol::wire::encode(7, &ServerEvent::Pong))
                 }
                 other => panic!("expected Raw(Pong), got {other:?}"),
             }
@@ -500,11 +516,11 @@ mod tests {
         };
         adapter.send_to_user("app", "u", sent.clone()).await;
 
-        let expected = crate::protocol::v7::frames::encode(&sent);
+        let expected = crate::protocol::wire::encode(7, &sent);
         let mut encoded: Vec<String> = rxs
             .iter_mut()
             .map(|rx| match rx.try_recv() {
-                Ok(b) => crate::protocol::v7::frames::encode(&b),
+                Ok(b) => crate::protocol::wire::encode(7, &b),
                 other => panic!("recipient mailbox empty: {other:?}"),
             })
             .collect();

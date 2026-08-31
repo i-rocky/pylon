@@ -1233,17 +1233,37 @@ impl Adapter for RedisAdapter {
         event: ServerEvent,
         except: Option<SocketId>,
     ) {
-        // 1. Local delivery on THIS node — typed event, honouring `except`.
+        // F17 encode-once (the same shape `ClusterAdapter::broadcast` proved):
+        // encode the frame ONCE (reusing the payload verbatim when the caller
+        // already encoded it as `Raw`) and feed the SAME bytes to BOTH halves —
+        // the local delivery runs as a `Raw` frame (so neither the percore sink
+        // nor the legacy registry path re-encodes) and the cluster publish
+        // relays the identical string. Previously the typed event was encoded
+        // once inside the local half and AGAIN here for the publish.
+        //
+        // One frame is shared cluster-wide, so it encodes at
+        // `ACTIVE_VERSIONS[0]` — the redis relay carries one string per
+        // broadcast. (7.3 made the percore SINK fan-out per-version via the
+        // `wire` seam; this cluster relay stays single-version until a v8
+        // cluster envelope exists.)
+        let frame: Arc<str> = match &event {
+            ServerEvent::Raw(f) => f.clone(),
+            other => Arc::from(
+                crate::protocol::wire::encode(crate::protocol::wire::ACTIVE_VERSIONS[0], other)
+                    .as_str(),
+            ),
+        };
+
+        // 1. Local delivery on THIS node — the shared frame, honouring `except`.
         self.local
-            .broadcast(app, channel, event.clone(), except)
+            .broadcast(app, channel, ServerEvent::Raw(frame.clone()), except)
             .await;
 
         // 2. Fan out to the rest of the cluster. Publish the *pre-encoded* v7 frame
         //    so remote nodes deliver it verbatim (no re-encoding). Always publish —
         //    even with no local subscribers — because a REST trigger may land on a
         //    node where the channel is only subscribed elsewhere.
-        let frame = crate::protocol::v7::frames::encode(&event);
-        self.cluster_publish_broadcast(app, channel, frame, except.as_ref())
+        self.cluster_publish_broadcast(app, channel, frame.to_string(), except.as_ref())
             .await;
     }
 
@@ -1452,9 +1472,14 @@ impl Adapter for RedisAdapter {
 
     async fn send_to_user(&self, app: &str, user_id: &str, event: ServerEvent) {
         // Deliver to this node's local connections of the user, then fan the
-        // pre-encoded frame out to every other node holding a connection of the user.
+        // pre-encoded frame out to every other node holding a connection of the
+        // user. The published frame is shared cluster-wide, so it encodes at
+        // `ACTIVE_VERSIONS[0]` (the sink's per-version fan-out is a local
+        // delivery concern; the user-message relay stays single-version until
+        // a v8 cluster envelope exists).
         self.local.send_to_user(app, user_id, event.clone()).await;
-        let frame = crate::protocol::v7::frames::encode(&event);
+        let frame =
+            crate::protocol::wire::encode(crate::protocol::wire::ACTIVE_VERSIONS[0], &event);
         user::publish(
             &self.clients.pool,
             &self.keys.usermsg(app, user_id),

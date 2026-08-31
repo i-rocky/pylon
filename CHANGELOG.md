@@ -218,3 +218,40 @@ relay model; the `local: None` saturation-gate trap is called out in code (X2).
   BroadcastSink→drain path (typed and `Raw` events at 1k/10k/100k subscribers,
   plus a registry-churn-under-broadcast-storm case); `benches/fanout.rs` now
   documents that it covers the legacy registry path.
+
+### Phase 7 — Protocol-version seam (audit remediation)
+
+#### Fixed
+- **`pusher_internal:subscription_succeeded` now carries `"data":"{}"` on
+  non-presence channels** (audit P12): previously pylon emitted an empty
+  string. Verified against live hosted-Pusher captures (two connections, exact
+  frames recorded in-code); the official docs are ambiguous on this field for
+  non-presence channels. JSON-object key order differs from hosted frames
+  (`event,channel,data` vs hosted `event,data,channel`) — unobservable to any
+  conforming JSON parser and deliberately unchanged.
+
+#### Changed
+- All encode sites route through a single version-aware entry
+  (`protocol::wire`): `encode_into`/`encode` take the protocol version
+  explicitly and `ACTIVE_VERSIONS` is derived from the negotiation range; the
+  v7 frames module is no longer directly callable outside the protocol family
+  (compile-time fence). The REST adapter path also now encodes once per
+  broadcast (matching the cluster adapter).
+- `Capabilities` are real plumbing (audit U1): the dispatch layer consults the
+  negotiated codec's capabilities (client events, presence, user auth/signin,
+  cache channels, watchlist, encrypted channels) at a single snapshot point;
+  v7 behavior is unchanged (all capabilities true), and a future
+  version lacking a feature degrades gracefully through the same error frames
+  v7 uses for unauthorized paths (proven by all-false stub-codec tests).
+
+#### Added
+- Sink broadcasts carry per-version frames (`Vec<(version, Bytes)>` built once
+  per publish; each subscriber is delivered its negotiated version) — the
+  fan-out is v8-ready with zero cost while only v7 is active (pinned by a
+  two-version socket-level fixture).
+- "Supporting a new protocol version" dev-guide checklist
+  (`website/docs/dev-guide/protocol.md`), including the honest list of what is
+  not yet version-aware (cluster envelope, legacy mailbox path).
+
+#### Removed
+- Dead `ConnError::Backpressure` variant (audit X1).

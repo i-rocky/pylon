@@ -7,6 +7,14 @@ use crate::user::parse_user_data;
 
 impl ConnectionContext {
     pub(in crate::ws) async fn signin(&mut self, auth: String, user_data: String) {
+        // U1 / Task 7.2: user authentication is a version capability. A
+        // version without it gets the EXACT frames every other rejected
+        // signin gets today (`fail_signin`: `pusher:error` 4009 then Close
+        // 4009) — byte-identical reuse, no new wire shape. Gated before the
+        // re-signin check: an incapable version rejects signin outright.
+        if !self.capabilities.user_auth {
+            return self.fail_signin("Connection not authorized.");
+        }
         // Re-signin: same user_data is idempotent (re-ack); different is fatal.
         if let Some(existing) = &self.user {
             if existing.user_data_raw == user_data {
@@ -54,7 +62,15 @@ impl ConnectionContext {
         if !self.clustered && outcome.first_for_user {
             self.notify_watchers(&user.id, "online").await;
         }
-        let watched = self.capped_watchlist(&user.watchlist);
+        // U1 / Task 7.2: watchlists are a version capability. A version
+        // without them still signs in (`signin_success` above) but registers
+        // no watches and sends no initial online snapshot — a skip, not a
+        // rejection, so signin degrades gracefully.
+        let watched = if self.capabilities.watchlist {
+            self.capped_watchlist(&user.watchlist)
+        } else {
+            Vec::new()
+        };
         if !watched.is_empty() {
             // Always fire the watch (in cluster mode this fires the cluster Watch cmd, which
             // SUBSCRIBEs the per-user watch channels + sends the CLUSTER online snapshot via
@@ -205,6 +221,7 @@ mod tests {
             mailbox_notify: None,
             mailbox_dropped: None,
             client_event_rate: crate::ws::rate::RateWindow::new(0),
+            capabilities: crate::protocol::codec::Capabilities::v7(),
         };
         (c, rx)
     }

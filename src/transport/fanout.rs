@@ -21,8 +21,9 @@
 //! Safe Rust — the crate root sets `#![deny(unsafe_code)]`; this module adds no
 //! `unsafe`.
 
+use crate::protocol::event::ServerEvent;
 use crate::protocol::socket_id::SocketId;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -32,18 +33,58 @@ use std::sync::Arc;
 /// and the sink is flagged saturated. Overridable via config in Phase 2.
 pub const DEFAULT_BROADCAST_HANDOFF_CAP: usize = 1024;
 
-/// One sharded broadcast hand-off: the WS-framed bytes plus the routing keys
-/// every worker needs to find its local subscribers. `frame` is already a
-/// complete server→client WebSocket text frame (encoded once by the publisher,
-/// frozen zero-copy from the encoder's buffer), shared via `Bytes` so each
-/// worker's per-connection enqueue is a cheap refcount bump rather than a copy.
+/// One sharded broadcast hand-off: the per-version WS-framed bytes plus the
+/// routing keys every worker needs to find its local subscribers. `frames`
+/// carries ONE entry per active protocol version — a `(version, frame)` pair
+/// where `frame` is a complete server→client WebSocket text frame (encoded
+/// once per version by the publisher via [`frames_for`], frozen zero-copy
+/// from the encoder's buffer), shared via `Bytes` so each worker's
+/// per-connection enqueue is a cheap refcount bump rather than a copy. The
+/// worker's drain delivers each subscriber the frame for ITS negotiated
+/// version (U3); with one active version `frames` is a 1-element vec and
+/// every subscriber gets `frames[0].1` — the single-frame shape, zero
+/// per-subscriber cost.
 pub struct BroadcastMsg {
     pub app: Arc<str>,
     pub channel: Arc<str>,
-    pub frame: Bytes,
+    pub frames: Vec<(u8, Bytes)>,
     /// The originating connection's `socket_id`, excluded from delivery (sender
     /// exclusion for client events / count echoes). `None` ⇒ deliver to all.
     pub except: Option<SocketId>,
+}
+
+/// Build a broadcast's per-version frames: for every `version` in `versions`,
+/// encode `event` through the [`crate::protocol::wire`] seam and wrap the JSON
+/// in ONE finished server→client WebSocket text frame — the SAME
+/// [`crate::transport::frame::encode_text`] helper the direct-send paths use,
+/// so framing logic is not forked.
+///
+/// `ServerEvent::Raw` (a frame the caller — or a redis relay — already
+/// encoded) is version-agnostic: its bytes are WS-framed ONCE and the
+/// resulting `Bytes` SHARED by every version slot (refcount clones), so the
+/// Raw no-copy property (F17) survives per-version fan-out.
+///
+/// Production callers pass [`crate::protocol::wire::ACTIVE_VERSIONS`] — a
+/// 1-element slice today, hence a 1-element vec and zero behavioral change;
+/// the Task 7.3 fixture passes a two-version slice to prove the plumbing.
+pub fn frames_for(versions: &[u8], event: &ServerEvent) -> Vec<(u8, Bytes)> {
+    match event {
+        ServerEvent::Raw(f) => {
+            let mut buf = BytesMut::new();
+            crate::transport::frame::encode_text(&mut buf, f.as_bytes());
+            let frame = buf.freeze();
+            versions.iter().map(|&v| (v, frame.clone())).collect()
+        }
+        other => versions
+            .iter()
+            .map(|&v| {
+                let json = crate::protocol::wire::encode(v, other);
+                let mut buf = BytesMut::new();
+                crate::transport::frame::encode_text(&mut buf, json.as_bytes());
+                (v, buf.freeze())
+            })
+            .collect(),
+    }
 }
 
 /// One slot per worker. The `SyncSender` is created in `run_percore` (paired
@@ -80,25 +121,27 @@ pub struct BroadcastSink {
 }
 
 impl BroadcastSink {
-    /// Hand the (already WS-framed) `frame` to EVERY worker; each worker filters
-    /// to the subscribers it owns. The hand-off is BOUNDED: `try_send` on a full
-    /// channel means that worker is behind delivery, so the broadcast is dropped
-    /// (at-most-once delivery — dropping the freshest-loser is correct) and the
-    /// slot's `dropped` counter is bumped + the sink flagged saturated. A
-    /// `Disconnected` channel (a worker thread gone) and a failed `wake` are both
-    /// ignored — a vanished worker has no live connections to deliver to.
+    /// Hand the per-version (already WS-framed) `frames` to EVERY worker; each
+    /// worker filters to the subscribers it owns and delivers each one the
+    /// frame for ITS negotiated version. The hand-off is BOUNDED: `try_send` on
+    /// a full channel means that worker is behind delivery, so the broadcast
+    /// is dropped (at-most-once delivery — dropping the freshest-loser is
+    /// correct) and the slot's `dropped` counter is bumped + the sink flagged
+    /// saturated. A `Disconnected` channel (a worker thread gone) and a failed
+    /// `wake` are both ignored — a vanished worker has no live connections to
+    /// deliver to.
     pub fn broadcast(
         &self,
         app: Arc<str>,
         channel: Arc<str>,
-        frame: Bytes,
+        frames: Vec<(u8, Bytes)>,
         except: Option<SocketId>,
     ) {
         for slot in self.workers.iter() {
             match slot.tx.try_send(BroadcastMsg {
                 app: app.clone(),
                 channel: channel.clone(),
-                frame: frame.clone(),
+                frames: frames.clone(),
                 except,
             }) {
                 Ok(()) => {}
@@ -153,9 +196,54 @@ mod tests {
             saturated: Arc::new(AtomicBool::new(false)),
         };
         for _ in 0..5 {
-            sink.broadcast(arc("a"), arc("c"), bytes(b"x"), None);
+            sink.broadcast(arc("a"), arc("c"), vec![(7, bytes(b"x"))], None);
         }
         assert_eq!(sink.workers[0].dropped.load(Ordering::Relaxed), 3);
         assert!(sink.is_saturated());
+    }
+
+    /// U3 v7-only guard: over the production version list (`ACTIVE_VERSIONS`,
+    /// `[7]` today) the builder yields EXACTLY the 6.3 single-frame shape —
+    /// one slot, version 7, the same bytes encode+WS-frame would have
+    /// produced — so one active version means zero behavioral change.
+    #[test]
+    fn frames_for_over_active_versions_is_the_single_frame() {
+        let ev = ServerEvent::ChannelEvent {
+            channel: "c".to_string(),
+            event: "e".to_string(),
+            data: serde_json::json!({"m": 1}),
+            user_id: None,
+        };
+        let frames = frames_for(crate::protocol::wire::ACTIVE_VERSIONS, &ev);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, 7);
+        let mut want = BytesMut::new();
+        crate::transport::frame::encode_text(
+            &mut want,
+            crate::protocol::wire::encode(7, &ev).as_bytes(),
+        );
+        assert_eq!(frames[0].1, want.freeze());
+    }
+
+    /// U3 Raw guard: a pre-encoded frame is WS-framed ONCE and SHARED by every
+    /// version slot (refcount clones — the F17 no-copy property survives
+    /// per-version fan-out; the vec holds N slots but only one buffer). The
+    /// pointer-identity assertion pins the ONE-buffer property itself: content
+    /// equality alone would still pass under a frame-per-slot regression
+    /// (identical bytes, N allocations).
+    #[test]
+    fn frames_for_raw_shares_one_buffer_across_versions() {
+        let ev = ServerEvent::Raw(Arc::from("{\"event\":\"e\"}"));
+        let frames = frames_for(&[7, 8], &ev);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].0, 7);
+        assert_eq!(frames[1].0, 8);
+        assert_eq!(frames[0].1, frames[1].1);
+        // Non-empty first, so the pointer check cannot pass vacuously (empty
+        // `Bytes` all share the static dangling pointer).
+        assert!(!frames[0].1.is_empty());
+        // The two slots alias the SAME allocation (clones of one frozen
+        // buffer), not merely equal copies.
+        assert!(std::ptr::eq(frames[0].1.as_ptr(), frames[1].1.as_ptr()));
     }
 }

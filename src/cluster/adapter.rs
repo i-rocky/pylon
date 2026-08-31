@@ -141,16 +141,24 @@ impl Adapter for ClusterAdapter {
         event: ServerEvent,
         except: Option<SocketId>,
     ) {
-        // F17: encode the v7 frame ONCE (reusing the payload verbatim when the
+        // F17: encode the frame ONCE (reusing the payload verbatim when the
         // caller already encoded it as `Raw`) and feed the SAME bytes to BOTH
         // halves: the local delivery runs as a `Raw` frame — so neither the
         // percore sink nor the legacy registry path re-encodes — and the bridge
         // publish relays the identical string to the cluster. Previously the
         // typed event was encoded once inside the local half and AGAIN here for
         // the publish payload.
+        //
+        // One frame is shared cluster-wide, so it encodes at `ACTIVE_VERSIONS[0]`
+        // — the redis relay carries one string per broadcast. (7.3 made the
+        // percore SINK fan-out per-version via the `wire` seam; this cluster
+        // relay stays single-version until a v8 cluster envelope exists.)
         let frame: Arc<str> = match &event {
             ServerEvent::Raw(f) => f.clone(),
-            other => Arc::from(crate::protocol::v7::frames::encode(other).as_str()),
+            other => Arc::from(
+                crate::protocol::wire::encode(crate::protocol::wire::ACTIVE_VERSIONS[0], other)
+                    .as_str(),
+            ),
         };
         self.local
             .broadcast(app, channel, ServerEvent::Raw(frame.clone()), except)
@@ -338,7 +346,7 @@ mod tests {
             data: serde_json::json!({"hello":"world"}),
             user_id: None,
         };
-        let expected = crate::protocol::v7::frames::encode(&event);
+        let expected = crate::protocol::wire::encode(7, &event);
         adapter.broadcast("app", "c", event, None).await;
 
         // LOCAL half: the subscriber receives exactly the expected wire bytes.

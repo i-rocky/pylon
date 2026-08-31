@@ -5,14 +5,6 @@ use crate::protocol::command::ClientCommand;
 use crate::protocol::event::ServerEvent;
 use serde_json::{json, Value};
 
-/// Convenience wrapper: encode into a fresh `String`. Delegates to
-/// [`encode_into`], so both paths are byte-identical by construction.
-pub fn encode(event: &ServerEvent) -> String {
-    let mut out = String::new();
-    encode_into(event, &mut out);
-    out
-}
-
 /// `io::Write` adapter appending UTF-8 slices into a `String`, so
 /// `serde_json::to_writer` serializes straight into the append buffer with no
 /// intermediate `String` (which the delegating `encode`/`push_str` shape would
@@ -71,8 +63,12 @@ pub fn encode_into(event: &ServerEvent, out: &mut String) {
         ServerEvent::Ping => write_frame(out, json!({ "event": "pusher:ping", "data": {} })),
         ServerEvent::Pong => write_frame(out, json!({ "event": "pusher:pong", "data": {} })),
         ServerEvent::SubscriptionSucceeded { channel, presence } => {
+            // Non-presence `data` is the STRING "{}" — captured verbatim from
+            // hosted Pusher (ws-eu.pusher.com, protocol=7, 2026-08-30):
+            // {"event":"pusher_internal:subscription_succeeded","data":"{}","channel":"c"}
+            // (P12; the doc page only specifies the presence shape).
             let data = match presence {
-                None => String::new(),
+                None => "{}".to_string(),
                 Some(p) => {
                     json!({ "presence": { "ids": p.ids, "hash": p.hash, "count": p.count } })
                         .to_string()
@@ -259,6 +255,15 @@ mod tests {
     use crate::protocol::socket_id::SocketId;
     use serde_json::Value;
 
+    /// Test-local fresh-`String` wrapper: the production fresh-`String` encode
+    /// lives in `protocol::wire` only (U2); the frames module exposes just the
+    /// append seam, which this helper delegates to.
+    fn encode(event: &ServerEvent) -> String {
+        let mut out = String::new();
+        encode_into(event, &mut out);
+        out
+    }
+
     fn parse(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
     }
@@ -333,7 +338,7 @@ mod tests {
                     channel: "test-channel".into(),
                     presence: None,
                 },
-                r#"{"event":"pusher_internal:subscription_succeeded","channel":"test-channel","data":""}"#,
+                r#"{"event":"pusher_internal:subscription_succeeded","channel":"test-channel","data":"{}"}"#,
             ),
             (
                 ServerEvent::SubscriptionSucceeded {
@@ -494,14 +499,15 @@ mod tests {
     }
 
     #[test]
-    fn public_subscription_succeeded_has_empty_string_data() {
+    fn public_subscription_succeeded_data_is_empty_object_string() {
         let out = parse(&encode(&ServerEvent::SubscriptionSucceeded {
             channel: "c".into(),
             presence: None,
         }));
         assert_eq!(out["event"], "pusher_internal:subscription_succeeded");
         assert_eq!(out["channel"], "c");
-        assert_eq!(out["data"], ""); // empty string per spec
+        // "{}" as a string — captured from hosted Pusher (P12).
+        assert_eq!(out["data"], "{}");
     }
 
     #[test]

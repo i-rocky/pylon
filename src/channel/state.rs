@@ -181,9 +181,16 @@ impl ChannelState {
     /// send-under-guard loop did — a member removed after the snapshot may or
     /// may not still receive the frame (at-most-once per mailbox, as ever).
     pub fn fanout<'a>(&self, event: &ServerEvent, except: Option<&'a SocketId>) -> Fanout<'a> {
+        // One frame is shared by every subscriber of the channel, so it encodes
+        // at `ACTIVE_VERSIONS[0]` — this is the LEGACY mailbox path (axum
+        // transport / tests); per-version fan-out lives in the percore sink
+        // (7.3).
         let frame: Arc<str> = match event {
             ServerEvent::Raw(f) => f.clone(),
-            other => Arc::from(crate::protocol::v7::frames::encode(other).as_str()),
+            other => Arc::from(
+                crate::protocol::wire::encode(crate::protocol::wire::ACTIVE_VERSIONS[0], other)
+                    .as_str(),
+            ),
         };
         Fanout {
             frame,
@@ -346,7 +353,7 @@ mod tests {
             data: serde_json::json!({"x": 1}),
             user_id: None,
         };
-        let expected = crate::protocol::v7::frames::encode(&original);
+        let expected = crate::protocol::wire::encode(7, &original);
 
         s.fanout(&original, None).send();
 
@@ -386,7 +393,7 @@ mod tests {
             data: serde_json::json!({"k": "v"}),
             user_id: None,
         };
-        let expected = crate::protocol::v7::frames::encode(&original);
+        let expected = crate::protocol::wire::encode(7, &original);
 
         s.fanout(&original, Some(&except)).send();
 
@@ -433,7 +440,7 @@ mod tests {
         for rx in [&mut rx1, &mut rx2] {
             match rx.try_recv().map(|b| *b) {
                 Ok(ServerEvent::Raw(f)) => {
-                    assert_eq!(&*f, crate::protocol::v7::frames::encode(&ServerEvent::Pong))
+                    assert_eq!(&*f, crate::protocol::wire::encode(7, &ServerEvent::Pong))
                 }
                 other => panic!("expected Raw(Pong), got {other:?}"),
             }
@@ -466,7 +473,7 @@ mod tests {
         // Guard-time set = {h1}: the pre-add frame went to h1 only.
         match rx1.try_recv().map(|b| *b) {
             Ok(ServerEvent::Raw(f)) => {
-                assert_eq!(&*f, crate::protocol::v7::frames::encode(&ServerEvent::Pong))
+                assert_eq!(&*f, crate::protocol::wire::encode(7, &ServerEvent::Pong))
             }
             other => panic!("expected Raw(Pong), got {other:?}"),
         }
@@ -480,7 +487,7 @@ mod tests {
         for rx in [&mut rx1, &mut rx2] {
             match rx.try_recv().map(|b| *b) {
                 Ok(ServerEvent::Raw(f)) => {
-                    assert_eq!(&*f, crate::protocol::v7::frames::encode(&ServerEvent::Ping))
+                    assert_eq!(&*f, crate::protocol::wire::encode(7, &ServerEvent::Ping))
                 }
                 other => panic!("expected Raw(Ping), got {other:?}"),
             }
@@ -516,10 +523,13 @@ mod tests {
     fn golden_roster_bytes_across_joins_and_removals() {
         let ch = "presence-golden";
         let frame = |roster: PresencePayload| {
-            crate::protocol::v7::frames::encode(&ServerEvent::SubscriptionSucceeded {
-                channel: ch.into(),
-                presence: Some(roster),
-            })
+            crate::protocol::wire::encode(
+                7,
+                &ServerEvent::SubscriptionSucceeded {
+                    channel: ch.into(),
+                    presence: Some(roster),
+                },
+            )
         };
         let rich =
             serde_json::json!({"name":"A \"quoted\" \\ back","emoji":"🚀","arr":[1,2,null,true]});
@@ -587,10 +597,13 @@ mod tests {
     fn golden_roster_bytes_empty() {
         let s = ChannelState::default();
         assert_eq!(
-            crate::protocol::v7::frames::encode(&ServerEvent::SubscriptionSucceeded {
-                channel: "presence-golden".into(),
-                presence: Some(s.roster()),
-            }),
+            crate::protocol::wire::encode(
+                7,
+                &ServerEvent::SubscriptionSucceeded {
+                    channel: "presence-golden".into(),
+                    presence: Some(s.roster()),
+                }
+            ),
             r#"{"event":"pusher_internal:subscription_succeeded","channel":"presence-golden","data":"{\"presence\":{\"ids\":[],\"hash\":{},\"count\":0}}"}"#
         );
     }
