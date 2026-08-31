@@ -111,13 +111,14 @@ impl WebhookHandle {
 /// `queue_depth`, the transport owns `delivered_ok` / `delivered_failed`. A
 /// transport that doesn't count (e.g. `RecordingTransport`) simply ignores it.
 ///
-/// `vacated_grace_ms` + `occupancy` enable the cluster-aware `channel_vacated`
-/// grace window (Task D1): when a grace window is configured, a surviving
-/// `channel_vacated` is debounced by it and — if an occupancy source is also
-/// supplied — re-checked against the cluster subscription_count before firing,
-/// suppressed if the channel is occupied again anywhere in the cluster. Without
-/// an occupancy source the re-check is skipped and the event fires after the
-/// grace (logged as an error). With `0` (the local-adapter path) vacated fires
+/// `vacated_grace_ms` + `occupancy` enable the reconnect grace window (Task D1;
+/// extended to `member_removed` by re-audit R12b): when a grace window is
+/// configured, a surviving `channel_vacated` / `member_removed` is debounced by
+/// it and — if an occupancy source is also supplied — re-checked before firing
+/// (the cluster subscription_count for vacated, the user's presence for
+/// member_removed), suppressed if the channel re-occupied / the user re-joined
+/// within the window. Without an occupancy source the re-check is skipped and
+/// the event fires after the grace (logged as an error). With `0` both fire
 /// immediately, as before.
 ///
 /// The transport factory is fallible: a build failure (e.g. `HttpTransport`'s

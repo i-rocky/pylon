@@ -14,13 +14,15 @@ use common::{spawn, SpawnSpec, Ws};
 use futures_util::SinkExt;
 use futures_util::StreamExt;
 use pylon::adapter::local::LocalAdapter;
+use pylon::adapter::Adapter;
 use pylon::app::static_file::StaticFileAppManager;
 use pylon::app::AppManager;
-use pylon::auth::signature::hmac_sha256_hex;
+use pylon::auth::signature::{channel_signature, hmac_sha256_hex};
 use pylon::channel::registry::Registry;
 use pylon::server::config::ServerConfig;
 use pylon::webhook::dispatcher::SystemClock;
 use pylon::webhook::transport::{HttpTransport, WebhookTransport};
+use pylon::webhook::AdapterOccupancy;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -151,6 +153,43 @@ async fn spawn_pylon_apps(
     // Route through the transport-parameterized harness with the REAL webhook
     // dispatcher (not the null sink) and the concrete local adapter (so the
     // percore sharded sink installs on it).
+    spawn(SpawnSpec {
+        config,
+        apps,
+        local,
+        conn_counts: Arc::new(Default::default()),
+        webhooks,
+    })
+    .await
+}
+
+/// Like [`spawn_pylon_apps`] but with the R12b reconnect grace wired the way
+/// the production LOCAL path wires it: `reconnect_grace_ms` + the local
+/// adapter as its own occupancy/presence oracle (`AdapterOccupancy`).
+async fn spawn_pylon_apps_reconnect_grace(apps_json: &str, reconnect_grace_ms: u64) -> SocketAddr {
+    let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(apps_json).unwrap());
+    let local = Arc::new(LocalAdapter::new(
+        Arc::new(Registry::new()),
+        Arc::new(pylon::adapter::app_registry::AppRegistry::new()),
+    ));
+    let occupancy = Arc::new(AdapterOccupancy(local.clone() as Arc<dyn Adapter>));
+    let webhooks = pylon::webhook::spawn(
+        apps.clone(),
+        move |metrics| {
+            HttpTransport::new(1000, 60000, 5000, 5000, 100, true, metrics)
+                .map(|t| Arc::new(t) as Arc<dyn WebhookTransport>)
+        },
+        Arc::new(SystemClock),
+        30, // 30ms batch window
+        1024,
+        reconnect_grace_ms,
+        Some(occupancy),
+    )
+    .expect("webhook transport builds in tests");
+    let config = ServerConfig {
+        webhook_batch_ms: 30,
+        ..ServerConfig::default()
+    };
     spawn(SpawnSpec {
         config,
         apps,
@@ -634,6 +673,154 @@ impl Resolver for FixedResolver {
 
 fn ssrf_metrics() -> Arc<WebhookMetrics> {
     Arc::new(WebhookMetrics::new(64))
+}
+
+/// Re-audit R12b end-to-end (verified against
+/// https://pusher.com/docs/channels/server_api/webhooks/): the doc scopes BOTH
+/// the "up to three seconds" delay and the "if the client reconnects within
+/// this delay, no webhooks will be sent" suppression to `channel_vacated` AND
+/// `member_removed`, with no single-node/cluster distinction. This test wires
+/// the reconnect grace the way the production local path does (grace +
+/// `AdapterOccupancy` over the local adapter) and drives a real presence
+/// subscribe/unsubscribe/re-subscribe over a real WS connection:
+///
+/// 1. u1 joins  → `member_added` fires (inline, immediate).
+/// 2. u1 leaves → `member_removed` deferred behind the grace.
+/// 3. u1 rejoins inside the window → `member_added` fires again; the deferred
+///    `member_removed` is suppressed (user present at the re-check).
+/// 4. u1 leaves and stays gone → the deferred `member_removed` FIRES (once).
+#[tokio::test]
+async fn member_removed_debounced_suppressed_on_rejoin_fired_when_gone() {
+    let (receiver_addr, mut rx) = spawn_receiver().await;
+    let apps_json = format!(
+        r#"[
+            {{"name":"Test","id":"app","key":"{KEY}","secret":"{SECRET}",
+              "client_messages_enabled":true,
+              "webhooks":[{{"url":"http://{receiver_addr}/pusher/webhooks",
+                            "event_types":["member_added","member_removed"]}}]}}
+        ]"#
+    );
+    // Small grace (400ms) so the test stays inside the suite's timing budget
+    // while still proving delay + suppression; production default is 3000ms.
+    let grace_ms: u64 = 400;
+    let pylon_addr = spawn_pylon_apps_reconnect_grace(&apps_json, grace_ms).await;
+
+    let mut ws = connect(pylon_addr).await;
+    let est = next_json(&mut ws).await;
+    assert_eq!(est["event"], "pusher:connection_established");
+    let socket_id = est["data"]
+        .as_str()
+        .map(|d| serde_json::from_str::<Value>(d).unwrap())
+        .unwrap()["socket_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut captured: Vec<(String, String)> = Vec::new();
+    async fn collect(
+        rx: &mut mpsc::UnboundedReceiver<(String, String)>,
+        captured: &mut Vec<(String, String)>,
+    ) {
+        while let Ok(pair) = rx.try_recv() {
+            captured.push(pair);
+        }
+    }
+
+    // 1) join → member_added (inline).
+    subscribe_presence(&mut ws, &socket_id, "presence-room", "u1").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        collect(&mut rx, &mut captured).await;
+        if !events_named(&captured, "member_added").is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "member_added never fired"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // 2) leave → member_removed deferred behind the grace…
+    unsubscribe(&mut ws, "presence-room").await;
+    // 3) …and rejoin well inside the window → member_added fires again.
+    subscribe_presence(&mut ws, &socket_id, "presence-room", "u1").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        collect(&mut rx, &mut captured).await;
+        if events_named(&captured, "member_added").len() >= 2 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "rejoin member_added never fired"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The grace (plus batch + slack) elapses with the user back in the channel
+    // → the deferred member_removed is suppressed; exactly two member_added.
+    tokio::time::sleep(Duration::from_millis(grace_ms + 600)).await;
+    collect(&mut rx, &mut captured).await;
+    assert_eq!(
+        events_named(&captured, "member_added").len(),
+        2,
+        "member_added fires on join AND rejoin (suppression is removal-side only)"
+    );
+    assert_eq!(
+        events_named(&captured, "member_removed").len(),
+        0,
+        "member_removed suppressed when the user rejoins within the grace"
+    );
+
+    // 4) leave and STAY gone → the deferred member_removed fires, exactly once.
+    unsubscribe(&mut ws, "presence-room").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        collect(&mut rx, &mut captured).await;
+        if !events_named(&captured, "member_removed").is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "member_removed never fired after the user left for good"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        events_named(&captured, "member_removed").len(),
+        1,
+        "one member_removed when the user is genuinely gone"
+    );
+}
+
+/// Subscribe an established `ws` to a presence channel as `user_id` (signed
+/// `auth` + `channel_data`), consuming the roster success frame.
+async fn subscribe_presence(ws: &mut Ws, socket_id: &str, channel: &str, user_id: &str) {
+    let channel_data = json!({"user_id": user_id}).to_string();
+    let token = format!(
+        "app-key:{}",
+        channel_signature(SECRET, socket_id, channel, Some(&channel_data))
+    );
+    ws.send(Message::Text(
+        json!({"event":"pusher:subscribe","data":{
+            "channel": channel, "auth": token, "channel_data": channel_data
+        }})
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let frame = next_json(ws).await;
+    assert_eq!(frame["event"], "pusher_internal:subscription_succeeded");
+}
+
+/// Unsubscribe `ws` from `channel` (fire-and-forget: no server ack frame).
+async fn unsubscribe(ws: &mut Ws, channel: &str) {
+    ws.send(Message::Text(
+        json!({ "event": "pusher:unsubscribe", "data": { "channel": channel } }).to_string(),
+    ))
+    .await
+    .unwrap();
 }
 
 /// Poll (bounded, real time) until `f` is true.
