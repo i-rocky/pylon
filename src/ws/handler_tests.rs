@@ -2335,10 +2335,15 @@ async fn resub_already_held_channel_is_idempotent_under_saturation() {
 /// `finish_establish` does) and degrade GRACEFULLY: each feature-off path
 /// reuses the SAME error frame the analogous v7 path emits today (client
 /// events → `pusher:error` 4301 like the app-disabled path; presence /
-/// encrypted subscribe → `pusher:subscription_error` AuthError/401 like every
-/// other presence-subscribe rejection; signin → the exact `fail_signin`
-/// 4009 frames; cache replay → simply skipped, `subscription_succeeded`
-/// still arrives). No panics, no invented wire shapes.
+/// encrypted / cache subscribe → `pusher:subscription_error` AuthError/401
+/// like every other presence-subscribe rejection; signin → the exact
+/// `fail_signin` 4009 frames). A cache-incapable version is REFUSED at
+/// subscribe — the same AuthError/401 frame an unauthorized cache subscribe
+/// gets in v7 — because a silent subscribe-minus-replay would hand the
+/// client a channel whose cache contract is quietly violated, and the
+/// cluster bridge's replay path (inside `adapter.subscribe`) is codec-blind,
+/// so the handler is the only place the gate can live. No panics, no
+/// invented wire shapes.
 mod capability_gates {
     use super::*;
     use crate::adapter::Adapter;
