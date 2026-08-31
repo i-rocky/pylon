@@ -3200,12 +3200,24 @@ fn drain_broadcasts(
 ) -> bool {
     let mut touched: HashSet<usize> = HashSet::new();
     // Connections that backpressured during delivery; closed after the drain so
-    // we don't mutate the slab mid-lookup.
-    let mut to_close: Vec<usize> = Vec::new();
+    // we don't mutate the slab mid-lookup. A set: the per-subscriber and flush
+    // loops below both probe it, so membership must be O(1) — a drain of a
+    // backpressured channel checks it once per remaining subscriber.
+    let mut to_close: HashSet<usize> = HashSet::new();
 
     while let Ok(msg) = rx.try_recv() {
-        let key = (Arc::clone(&msg.app), Arc::clone(&msg.channel));
-        let Some(subs) = local_subs.get(&key) else {
+        // Destructure the message so the drain owns its Arcs: the lookup key
+        // MOVES `app`/`channel` (no refcount bumps — the old code cloned both
+        // per message while `msg` kept the originals alive too), and `frame`
+        // stays owned by the drain while each enqueue takes a `Bytes` refcount
+        // bump as before.
+        let crate::transport::fanout::BroadcastMsg {
+            app,
+            channel,
+            frame,
+            except,
+        } = msg;
+        let Some(subs) = local_subs.get(&(app, channel)) else {
             continue; // no local subscribers for this channel on this worker
         };
         for sid in subs.iter() {
@@ -3222,7 +3234,7 @@ fn drain_broadcasts(
                 }
                 continue;
             }
-            if msg.except.as_ref() == Some(sid) {
+            if except.as_ref() == Some(sid) {
                 continue; // sender exclusion
             }
             let Some(&token) = sid_to_token.get(sid) else {
@@ -3251,7 +3263,7 @@ fn drain_broadcasts(
             // counter via the `take_inflight_delta` choke point so the band stays
             // accurate within this drain — and so the post-drain flush's send delta
             // (taken below) composes correctly without double-counting.
-            let _dropped = entry.conn.queue(msg.frame.clone(), now_ns);
+            let _dropped = entry.conn.queue(frame.clone(), now_ns);
             *inflight_bytes = inflight_bytes.wrapping_add(entry.conn.take_inflight_delta() as u64);
             // G8: the enqueue may have evicted older frames (drop-head) — fold
             // the per-connection accumulator into the worker total NOW rather
@@ -3289,7 +3301,7 @@ fn drain_broadcasts(
                 *drophead_total = drophead_total.wrapping_add(dh);
             }
             if action == Action::Close {
-                to_close.push(token);
+                to_close.insert(token);
             }
         }
     }
