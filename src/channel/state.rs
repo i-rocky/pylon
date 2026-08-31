@@ -8,7 +8,7 @@ use crate::protocol::event::{PresencePayload, ServerEvent};
 use crate::protocol::socket_id::SocketId;
 use rayon::prelude::*;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, OnceLock};
 
 /// Above this subscriber count, `broadcast` fans the per-mailbox enqueue out
@@ -39,7 +39,14 @@ type SharedSnapshot = Arc<[(SocketId, Arc<Subscriber>)]>;
 #[derive(Default)]
 pub struct ChannelState {
     subscribers: HashMap<SocketId, Arc<Subscriber>>,
-    users: HashMap<String, PresenceUser>, // user_id -> info + live connection count
+    /// Distinct presence users (user_id -> info + live connection count) in a
+    /// `BTreeMap`: the map keeps the user ids in SORTED order incrementally on
+    /// every add/remove, so the roster walk below is already ordered — no
+    /// per-join `keys()` collect + re-sort, no unsorted scatter pass (F8). The
+    /// per-join allocation left is exactly the one owned `PresencePayload`
+    /// (`ids` Vec + `hash` Map with cloned user_info) that the join-outcome
+    /// API requires.
+    users: BTreeMap<String, PresenceUser>,
     /// Membership snapshot for fan-out, rebuilt lazily: `add`/`remove` reset it,
     /// the next `fanout` rebuilds it under the caller's registry shard guard.
     /// Retention bound: every membership change resets it, so a channel that
@@ -131,27 +138,28 @@ impl ChannelState {
     }
 
     /// Build the presence roster: sorted ids, id->user_info hash, distinct count.
+    /// One ordered walk of `users` — the BTreeMap maintains the id order
+    /// incrementally on add/remove, so `ids`, the `hash` keys and `count` agree
+    /// by construction and no per-join re-sort happens (F8).
     pub fn roster(&self) -> PresencePayload {
-        let mut ids: Vec<String> = self.users.keys().cloned().collect();
-        ids.sort();
-        let mut hash = serde_json::Map::new();
-        for id in &ids {
-            hash.insert(id.clone(), self.users[id].user_info.clone());
-        }
+        let hash: serde_json::Map<String, Value> = self
+            .users
+            .iter()
+            .map(|(id, u)| (id.clone(), u.user_info.clone()))
+            .collect();
         PresencePayload {
-            count: ids.len(),
-            ids,
+            count: self.users.len(),
+            ids: self.users.keys().cloned().collect(),
             hash,
         }
     }
 
     pub fn members(&self) -> Vec<PresenceMember> {
-        let mut ids: Vec<String> = self.users.keys().cloned().collect();
-        ids.sort();
-        ids.into_iter()
-            .map(|id| PresenceMember {
-                user_info: self.users[&id].user_info.clone(),
-                user_id: id,
+        self.users
+            .iter()
+            .map(|(id, u)| PresenceMember {
+                user_id: id.clone(),
+                user_info: u.user_info.clone(),
             })
             .collect()
     }
@@ -487,5 +495,103 @@ mod tests {
         let r = s.roster();
         assert_eq!(r.ids, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(r.count, 2);
+    }
+
+    /// Golden roster bytes (F8 / Task 6.6): the `subscription_succeeded`
+    /// presence payload must serialize to EXACTLY these bytes — ids in
+    /// byte-sorted order, `hash` keys in the SAME order (the roster walks
+    /// `users` in its incrementally-maintained sorted order and serde_json's
+    /// workspace `preserve_order` feature keeps that insertion order),
+    /// `count` = distinct users, `data` double-encoded as a string. Members
+    /// join deliberately OUT of sorted order with escaping-worthy content
+    /// (quotes, backslash, emoji, nested nulls/bools, a capital-letter id that
+    /// sorts before lowercase), plus a duplicate-user second connection whose
+    /// DIFFERENT `user_info` must NOT leak into the roster (the first
+    /// connection's info wins), a partial removal that must not change the
+    /// roster while the user still has a connection, and a MIDDLE full removal
+    /// that must restore the pre-join bytes. Literals captured from the
+    /// pre-refactor encoder: any byte drift (field order, id order, number
+    /// formatting, escaping) is a parity regression.
+    #[test]
+    fn golden_roster_bytes_across_joins_and_removals() {
+        let ch = "presence-golden";
+        let frame = |roster: PresencePayload| {
+            crate::protocol::v7::frames::encode(&ServerEvent::SubscriptionSucceeded {
+                channel: ch.into(),
+                presence: Some(roster),
+            })
+        };
+        let rich =
+            serde_json::json!({"name":"A \"quoted\" \\ back","emoji":"🚀","arr":[1,2,null,true]});
+        let nested = serde_json::json!({"twelve":12,"nested":{"x":[{"y":null}]}});
+        let weird = "we\"ird\\";
+        let m = |id: &str, info: Value| PresenceMember {
+            user_id: id.into(),
+            user_info: info,
+        };
+        let mut s = ChannelState::default();
+
+        // 1 member.
+        let j = s
+            .add(handle(), Some(m("zebra", serde_json::json!({"n":"z"}))))
+            .unwrap();
+        assert_eq!(
+            frame(j.roster),
+            r#"{"event":"pusher_internal:subscription_succeeded","channel":"presence-golden","data":"{\"presence\":{\"ids\":[\"zebra\"],\"hash\":{\"zebra\":{\"n\":\"z\"}},\"count\":1}}"}"#
+        );
+
+        // 2 members, joined out of order: ids come back sorted.
+        let j = s.add(handle(), Some(m("alpha", rich))).unwrap();
+        assert_eq!(
+            frame(j.roster),
+            r#"{"event":"pusher_internal:subscription_succeeded","channel":"presence-golden","data":"{\"presence\":{\"ids\":[\"alpha\",\"zebra\"],\"hash\":{\"alpha\":{\"name\":\"A \\\"quoted\\\" \\\\ back\",\"emoji\":\"🚀\",\"arr\":[1,2,null,true]},\"zebra\":{\"n\":\"z\"}},\"count\":2}}"}"#
+        );
+
+        // 3 members: capital "Mid" sorts before the lowercase ids (byte order).
+        let three = r#"{"event":"pusher_internal:subscription_succeeded","channel":"presence-golden","data":"{\"presence\":{\"ids\":[\"Mid\",\"alpha\",\"zebra\"],\"hash\":{\"Mid\":{\"twelve\":12,\"nested\":{\"x\":[{\"y\":null}]}},\"alpha\":{\"name\":\"A \\\"quoted\\\" \\\\ back\",\"emoji\":\"🚀\",\"arr\":[1,2,null,true]},\"zebra\":{\"n\":\"z\"}},\"count\":3}}"}"#;
+        let j = s.add(handle(), Some(m("Mid", nested))).unwrap();
+        assert_eq!(frame(j.roster), three);
+
+        // 4 members: an id that itself needs JSON escaping appears in `ids`
+        // AND as a `hash` key, escaped identically in both.
+        let hw = handle();
+        let sid_w = hw.socket_id;
+        let j = s
+            .add(hw, Some(m(weird, serde_json::json!({"w":1}))))
+            .unwrap();
+        let four = r#"{"event":"pusher_internal:subscription_succeeded","channel":"presence-golden","data":"{\"presence\":{\"ids\":[\"Mid\",\"alpha\",\"we\\\"ird\\\\\",\"zebra\"],\"hash\":{\"Mid\":{\"twelve\":12,\"nested\":{\"x\":[{\"y\":null}]}},\"alpha\":{\"name\":\"A \\\"quoted\\\" \\\\ back\",\"emoji\":\"🚀\",\"arr\":[1,2,null,true]},\"we\\\"ird\\\\\":{\"w\":1},\"zebra\":{\"n\":\"z\"}},\"count\":4}}"}"#;
+        assert_eq!(frame(j.roster), four);
+
+        // Second connection of an existing user: roster byte-identical (dedup;
+        // the new connection's different user_info must not leak).
+        let ha1 = handle();
+        let sid_a1 = ha1.socket_id;
+        let j = s
+            .add(ha1, Some(m("alpha", serde_json::json!({"ignored":true}))))
+            .unwrap();
+        assert_eq!(frame(j.roster), four);
+        assert_eq!(frame(s.roster()), four);
+
+        // Removing ONE of alpha's two connections: roster still byte-identical.
+        s.remove(&sid_a1);
+        assert_eq!(frame(s.roster()), four);
+
+        // Removing a MIDDLE id (`weird`, its user's last connection): the
+        // remaining order is exactly the 3-member bytes from before it joined.
+        s.remove(&sid_w);
+        assert_eq!(frame(s.roster()), three);
+    }
+
+    /// The empty roster shape: empty `ids` array, empty `hash` object, count 0.
+    #[test]
+    fn golden_roster_bytes_empty() {
+        let s = ChannelState::default();
+        assert_eq!(
+            crate::protocol::v7::frames::encode(&ServerEvent::SubscriptionSucceeded {
+                channel: "presence-golden".into(),
+                presence: Some(s.roster()),
+            }),
+            r#"{"event":"pusher_internal:subscription_succeeded","channel":"presence-golden","data":"{\"presence\":{\"ids\":[],\"hash\":{},\"count\":0}}"}"#
+        );
     }
 }
