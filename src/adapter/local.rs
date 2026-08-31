@@ -93,17 +93,19 @@ impl LocalAdapter {
         self.bcast_sink.get()
     }
 
-    /// Every local subscription as `(app, channel, socket_id)`. Exposed so the Redis
-    /// adapter's membership heartbeat can re-stamp each local member without reaching
-    /// into the private registry.
-    pub fn local_members(&self) -> Vec<(String, String, SocketId)> {
+    /// Every local subscription grouped per `(app, channel)`, with that channel's
+    /// subscriber socket ids. Exposed so the Redis adapter's membership heartbeat
+    /// can re-stamp each local member without reaching into the private registry;
+    /// the grouped shape lets it batch one multi-field HSET per channel hash.
+    pub fn local_members(&self) -> Vec<((String, String), Vec<SocketId>)> {
         self.registry.local_members()
     }
 
-    /// Every local user binding as `(app, user_id, socket_id)`. Exposed so the Redis
-    /// adapter's membership heartbeat can re-stamp each local user binding's `expireAt`
-    /// without reaching into the private user registry.
-    pub fn local_user_bindings(&self) -> Vec<(String, String, SocketId)> {
+    /// Every local user binding grouped per `(app, user_id)`, with that user's
+    /// signed-in socket ids. Exposed so the Redis adapter's membership heartbeat
+    /// can re-stamp each local user binding's `expireAt` without reaching into
+    /// the private user registry, batching one multi-field HSET per `usr` hash.
+    pub fn local_user_bindings(&self) -> Vec<((String, String), Vec<SocketId>)> {
         self.users.local_bindings()
     }
 
@@ -166,12 +168,7 @@ impl Adapter for LocalAdapter {
             };
             let mut buf = bytes::BytesMut::new();
             crate::transport::frame::encode_text(&mut buf, json.as_bytes());
-            sink.broadcast(
-                Arc::from(app),
-                Arc::from(channel),
-                Arc::from(&buf[..]),
-                except,
-            );
+            sink.broadcast(Arc::from(app), Arc::from(channel), buf.freeze(), except);
         } else {
             // Legacy mailbox path (axum transport / tests): UNCHANGED.
             self.registry
@@ -227,8 +224,22 @@ impl Adapter for LocalAdapter {
     }
 
     async fn send_to_user(&self, app: &str, user_id: &str, event: ServerEvent) {
-        for h in self.users.handles(app, user_id) {
-            let _ = h.mailbox.send(event.clone());
+        let handles = self.users.handles(app, user_id);
+        if handles.is_empty() {
+            return;
+        }
+        // F10: a user event fans out to every socket signed in as `user_id`.
+        // Encode the v7 JSON ONCE (or reuse the payload when the caller already
+        // encoded it) and deliver `Raw` clones — each recipient's flush appends
+        // the same buffer by reference instead of re-serializing per socket.
+        // `Raw` is wire-identical to encoding the structured event (pinned by
+        // the golden wire-bytes tests), so the bytes per recipient are unchanged.
+        let frame: Arc<str> = match &event {
+            ServerEvent::Raw(f) => f.clone(),
+            other => Arc::from(crate::protocol::v7::frames::encode(other).as_str()),
+        };
+        for h in handles {
+            let _ = h.mailbox.send(ServerEvent::Raw(frame.clone()));
         }
     }
 
@@ -442,8 +453,69 @@ mod tests {
             )
             .await;
         adapter.send_to_user("app", "u", ServerEvent::Pong).await;
-        assert!(matches!(rx1.try_recv().map(|b| *b), Ok(ServerEvent::Pong)));
-        assert!(matches!(rx2.try_recv().map(|b| *b), Ok(ServerEvent::Pong)));
+        // `send_to_user` encodes once and fans out `Raw` frames (F10); assert
+        // each recipient's wire bytes match a freshly-encoded `Pong`.
+        for rx in [&mut rx1, &mut rx2] {
+            match rx.try_recv().map(|b| *b) {
+                Ok(ServerEvent::Raw(f)) => {
+                    assert_eq!(&*f, crate::protocol::v7::frames::encode(&ServerEvent::Pong))
+                }
+                other => panic!("expected Raw(Pong), got {other:?}"),
+            }
+        }
+    }
+
+    /// F10 pinning test: every recipient of a user event must receive an event
+    /// whose wire encoding is IDENTICAL — byte-for-byte — to a fresh encode of
+    /// the sent event, and identical to every other recipient's. This pins the
+    /// observable contract that the encode-once/Raw-clone fan-out refactor must
+    /// preserve.
+    #[tokio::test]
+    async fn send_to_user_delivers_identical_bytes_to_every_recipient() {
+        let adapter = LocalAdapter::new(
+            Arc::new(Registry::new()),
+            Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+        );
+        const RECIPIENTS: usize = 3;
+        let mut rxs = Vec::with_capacity(RECIPIENTS);
+        for _ in 0..RECIPIENTS {
+            let (tx, rx) = mpsc::channel(1024);
+            rxs.push(rx);
+            adapter
+                .signin_user(
+                    "app",
+                    "u",
+                    ConnectionHandle {
+                        socket_id: SocketId::generate(),
+                        mailbox: crate::connection::handle::Mailbox::new(tx, None, None),
+                    },
+                )
+                .await;
+        }
+        let sent = ServerEvent::ChannelEvent {
+            channel: "private-u".into(),
+            event: "client-greeting".into(),
+            data: serde_json::json!({"hello": "user"}),
+            user_id: None,
+        };
+        adapter.send_to_user("app", "u", sent.clone()).await;
+
+        let expected = crate::protocol::v7::frames::encode(&sent);
+        let mut encoded: Vec<String> = rxs
+            .iter_mut()
+            .map(|rx| match rx.try_recv() {
+                Ok(b) => crate::protocol::v7::frames::encode(&b),
+                other => panic!("recipient mailbox empty: {other:?}"),
+            })
+            .collect();
+        // All recipients' encodings collapse to exactly the expected bytes.
+        encoded.sort();
+        encoded.dedup();
+        assert_eq!(
+            encoded,
+            vec![expected],
+            "every recipient must see identical wire bytes for the user event"
+        );
     }
 
     #[tokio::test]

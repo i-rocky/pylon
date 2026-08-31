@@ -140,17 +140,19 @@ impl UserRegistry {
             .unwrap_or_default()
     }
 
-    /// All local (app, user_id, socket_id) signed-in bindings — for the membership heartbeat.
-    pub fn local_bindings(&self) -> Vec<(String, String, SocketId)> {
+    /// All local signed-in bindings grouped per `(app, user_id)`: one entry per
+    /// user carrying that user's signed-in socket ids — for the membership
+    /// heartbeat's user-binding refresh, which batches ONE multi-field HSET per
+    /// `usr` hash per tick (the key Strings clone once per user, not per socket).
+    pub fn local_bindings(&self) -> Vec<((String, String), Vec<SocketId>)> {
         self.users
             .iter()
-            .flat_map(|e| {
-                let (app, user) = e.key().clone();
-                e.value()
-                    .keys()
-                    .cloned()
-                    .map(move |sid| (app.clone(), user.clone(), sid))
-                    .collect::<Vec<_>>()
+            .filter(|e| !e.value().is_empty())
+            .map(|e| {
+                (
+                    (e.key().0.clone(), e.key().1.clone()),
+                    e.value().keys().cloned().collect(),
+                )
             })
             .collect()
     }
@@ -238,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn local_bindings_enumerates_every_signed_in_connection() {
+    fn local_bindings_groups_per_user() {
         let r = UserRegistry::new();
         let (h1, _r1) = handle();
         let (h2, _r2) = handle();
@@ -251,17 +253,25 @@ mod tests {
         r.signin("app", "u", h2);
         r.signin("app", "v", h3);
 
+        // Grouped shape: exactly one (app, user) entry per user — no matter how
+        // many sockets signed in — carrying every signed-in socket id, so the
+        // Redis heartbeat batches one multi-field HSET per usr hash and the
+        // (app, user) Strings never clone per socket.
         let mut got = r.local_bindings();
         got.sort();
+        for (_, ids) in &mut got {
+            ids.sort();
+        }
+        let mut u_ids = vec![s1, s2];
+        u_ids.sort();
         let mut want = vec![
-            ("app".to_string(), "u".to_string(), s1),
-            ("app".to_string(), "u".to_string(), s2),
-            ("app".to_string(), "v".to_string(), s3),
+            (("app".to_string(), "u".to_string()), u_ids),
+            (("app".to_string(), "v".to_string()), vec![s3]),
         ];
         want.sort();
         assert_eq!(
             got, want,
-            "local_bindings must enumerate every (app, user, socket) signed-in tuple"
+            "local_bindings must group every signed-in socket under its (app, user)"
         );
     }
 

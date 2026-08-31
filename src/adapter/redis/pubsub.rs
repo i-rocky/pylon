@@ -84,34 +84,29 @@ pub async fn receive_loop(
                 // the target `user_id` rather than a channel name.
                 match env.kind {
                     EnvelopeKind::Broadcast => {
-                        // The envelope carries the finished v7 frame as a JSON string.
-                        let frame = match env.event.as_str() {
-                            Some(s) => s.to_string(),
+                        // The envelope carries the finished v7 frame — preferring
+                        // the additive `frame_b64` (F16; base64 of the raw frame
+                        // bytes, no JSON string escaping on either end) and
+                        // falling back to the legacy `event` JSON string, so
+                        // mixed-version clusters relay in both directions.
+                        let frame = match env.frame() {
+                            Some(f) => f,
                             None => continue,
                         };
                         // Honour `except` even on the relaying node (usually a no-op:
                         // the excepted socket lives on the originating node).
                         let except = env.except.as_deref().map(SocketId::from_raw);
                         local
-                            .broadcast(
-                                &env.app,
-                                &env.channel,
-                                ServerEvent::Raw(std::sync::Arc::from(frame)),
-                                except,
-                            )
+                            .broadcast(&env.app, &env.channel, ServerEvent::Raw(frame), except)
                             .await;
                     }
                     EnvelopeKind::UserSend => {
-                        let frame = match env.event.as_str() {
-                            Some(s) => s.to_string(),
+                        let frame = match env.frame() {
+                            Some(f) => f,
                             None => continue,
                         };
                         local
-                            .send_to_user(
-                                &env.app,
-                                &env.channel,
-                                ServerEvent::Raw(std::sync::Arc::from(frame)),
-                            )
+                            .send_to_user(&env.app, &env.channel, ServerEvent::Raw(frame))
                             .await;
                     }
                     EnvelopeKind::UserTerminate => {

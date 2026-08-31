@@ -309,6 +309,79 @@ async fn presence_member_added_and_removed() {
     assert_eq!(removed_data["user_id"], "ub");
 }
 
+/// Byte-stable roster ordering, end to end (F8 / Task 6.6): members joining in
+/// NON-sorted order must receive `subscription_succeeded` frames with EXACTLY
+/// the pinned bytes — ids byte-sorted, `hash` keys in the same order, `count`
+/// = distinct users, escaping intact (emoji, embedded quotes) through the
+/// double-encoded `data` string. The roster data carries no socket ids, so
+/// the frames are fully deterministic. Literals captured from the pre-refactor
+/// server; any byte drift is a parity regression. (Deeper ordering cases —
+/// 4 members, escaping-worthy user_ids, same-user dedup, partial removal —
+/// are pinned at unit level in `channel::state::tests::golden_*`.)
+#[tokio::test]
+async fn presence_roster_wire_bytes_pinned_across_join_order() {
+    let addr = spawn(ServerConfig::default()).await;
+
+    // First member: single-entry roster.
+    let mut z = connect(addr, "?protocol=7").await;
+    let sid_z = established_socket_id(&mut z).await;
+    let cd_z = r#"{"user_id":"z-user","user_info":{"n":"z"}}"#;
+    send_json(
+        &mut z,
+        json!({
+            "event": "pusher:subscribe",
+            "data": {
+                "channel": "presence-roster",
+                "auth": auth_token(&sid_z, "presence-roster", Some(cd_z)),
+                "channel_data": cd_z
+            }
+        }),
+    )
+    .await;
+    let raw = tokio::time::timeout(std::time::Duration::from_secs(5), z.next())
+        .await
+        .expect("frame within 5s")
+        .expect("stream open")
+        .expect("ws ok");
+    let Message::Text(t) = raw else {
+        panic!("expected a text frame")
+    };
+    assert_eq!(
+        t,
+        r#"{"event":"pusher_internal:subscription_succeeded","channel":"presence-roster","data":"{\"presence\":{\"ids\":[\"z-user\"],\"hash\":{\"z-user\":{\"n\":\"z\"}},\"count\":1}}"}"#
+    );
+
+    // Second member (joins after z, sorts before z): two-entry roster with
+    // escaping-worthy user_info.
+    let mut a = connect(addr, "?protocol=7").await;
+    let sid_a = established_socket_id(&mut a).await;
+    let cd_a = r#"{"user_id":"a-user","user_info":{"em":"🚀","q":"a\"b"}}"#;
+    send_json(
+        &mut a,
+        json!({
+            "event": "pusher:subscribe",
+            "data": {
+                "channel": "presence-roster",
+                "auth": auth_token(&sid_a, "presence-roster", Some(cd_a)),
+                "channel_data": cd_a
+            }
+        }),
+    )
+    .await;
+    let raw = tokio::time::timeout(std::time::Duration::from_secs(5), a.next())
+        .await
+        .expect("frame within 5s")
+        .expect("stream open")
+        .expect("ws ok");
+    let Message::Text(t) = raw else {
+        panic!("expected a text frame")
+    };
+    assert_eq!(
+        t,
+        r#"{"event":"pusher_internal:subscription_succeeded","channel":"presence-roster","data":"{\"presence\":{\"ids\":[\"a-user\",\"z-user\"],\"hash\":{\"a-user\":{\"em\":\"🚀\",\"q\":\"a\\\"b\"},\"z-user\":{\"n\":\"z\"}},\"count\":2}}"}"#
+    );
+}
+
 #[tokio::test]
 async fn client_event_broadcast_excludes_sender() {
     let addr = spawn(ServerConfig::default()).await;

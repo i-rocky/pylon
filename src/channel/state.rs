@@ -8,7 +8,8 @@ use crate::protocol::event::{PresencePayload, ServerEvent};
 use crate::protocol::socket_id::SocketId;
 use rayon::prelude::*;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, OnceLock};
 
 /// Above this subscriber count, `broadcast` fans the per-mailbox enqueue out
 /// across the rayon pool; at or below it the serial loop is cheaper than the
@@ -30,10 +31,30 @@ struct PresenceUser {
     conn_count: usize,
 }
 
+/// Shared membership snapshot for fan-out: every `(socket_id, subscriber)` pair
+/// of a channel, behind one `Arc` so a broadcast can detach from the registry
+/// shard lock with a single refcount bump (F7).
+type SharedSnapshot = Arc<[(SocketId, Arc<Subscriber>)]>;
+
 #[derive(Default)]
 pub struct ChannelState {
-    subscribers: HashMap<SocketId, Subscriber>,
-    users: HashMap<String, PresenceUser>, // user_id -> info + live connection count
+    subscribers: HashMap<SocketId, Arc<Subscriber>>,
+    /// Distinct presence users (user_id -> info + live connection count) in a
+    /// `BTreeMap`: the map keeps the user ids in SORTED order incrementally on
+    /// every add/remove, so the roster walk below is already ordered — no
+    /// per-join `keys()` collect + re-sort, no unsorted scatter pass (F8). The
+    /// per-join allocation left is exactly the one owned `PresencePayload`
+    /// (`ids` Vec + `hash` Map with cloned user_info) that the join-outcome
+    /// API requires.
+    users: BTreeMap<String, PresenceUser>,
+    /// Membership snapshot for fan-out, rebuilt lazily: `add`/`remove` reset it,
+    /// the next `fanout` rebuilds it under the caller's registry shard guard.
+    /// Retention bound: every membership change resets it, so a channel that
+    /// keeps ≥1 member holds at most ONE stale generation here — freed by the
+    /// next rebuild, or with the whole state when a vacate prunes the channel
+    /// (in-flight `Fanout`s keep one clone alive only until their `send`
+    /// completes).
+    snapshot: OnceLock<SharedSnapshot>,
 }
 
 impl ChannelState {
@@ -61,7 +82,8 @@ impl ChannelState {
             }
         });
         self.subscribers
-            .insert(socket_id, Subscriber { handle, member });
+            .insert(socket_id, Arc::new(Subscriber { handle, member }));
+        self.snapshot.take(); // membership changed: next fan-out rebuilds
         join.map(|mut j| {
             j.roster = self.roster();
             j
@@ -72,7 +94,8 @@ impl ChannelState {
     /// presence member (with `last_for_user` set when its last connection left).
     pub fn remove(&mut self, socket_id: &SocketId) -> Option<PresenceLeave> {
         let sub = self.subscribers.remove(socket_id)?;
-        let member = sub.member?;
+        self.snapshot.take(); // membership changed: next fan-out rebuilds
+        let member = sub.member.clone()?;
         let last_for_user = match self.users.get_mut(&member.user_id) {
             Some(u) => {
                 u.conn_count -= 1;
@@ -115,76 +138,126 @@ impl ChannelState {
     }
 
     /// Build the presence roster: sorted ids, id->user_info hash, distinct count.
+    /// One ordered walk of `users` — the BTreeMap maintains the id order
+    /// incrementally on add/remove, so `ids`, the `hash` keys and `count` agree
+    /// by construction and no per-join re-sort happens (F8).
     pub fn roster(&self) -> PresencePayload {
-        let mut ids: Vec<String> = self.users.keys().cloned().collect();
-        ids.sort();
-        let mut hash = serde_json::Map::new();
-        for id in &ids {
-            hash.insert(id.clone(), self.users[id].user_info.clone());
-        }
+        let hash: serde_json::Map<String, Value> = self
+            .users
+            .iter()
+            .map(|(id, u)| (id.clone(), u.user_info.clone()))
+            .collect();
         PresencePayload {
-            count: ids.len(),
-            ids,
+            count: self.users.len(),
+            ids: self.users.keys().cloned().collect(),
             hash,
         }
     }
 
     pub fn members(&self) -> Vec<PresenceMember> {
-        let mut ids: Vec<String> = self.users.keys().cloned().collect();
-        ids.sort();
-        ids.into_iter()
-            .map(|id| PresenceMember {
-                user_info: self.users[&id].user_info.clone(),
-                user_id: id,
+        self.users
+            .iter()
+            .map(|(id, u)| PresenceMember {
+                user_id: id.clone(),
+                user_info: u.user_info.clone(),
             })
             .collect()
     }
 
-    /// Deliver `event` to every subscriber's mailbox except `except`.
+    /// Capture this channel's half of a broadcast as an owned [`Fanout`]
+    /// snapshot: the wire frame encoded ONCE here (reusing a pre-encoded
+    /// `Raw` event's `Arc` rather than re-encoding) plus the channel's shared
+    /// membership snapshot (rebuilt here under the caller's guard iff
+    /// membership changed since the last fan-out; `except` is applied at send
+    /// time). Control events (`Close`) never reach this path.
     ///
-    /// Encode the wire frame ONCE here and fan out cheap `Arc<str>` clones rather
-    /// than re-encoding in every connection task (was N encodes + N deep clones for
-    /// N local subscribers). If the event is already pre-encoded (`Raw`, e.g. a
-    /// broadcast relayed verbatim from another node), reuse its `Arc`. Control
-    /// events (`Close`) never reach `broadcast`.
+    /// MUST be called while the caller holds the registry shard read guard;
+    /// the returned snapshot is then executed via [`Fanout::send`] AFTER that
+    /// guard is dropped, so the shard is never held across mailbox enqueues
+    /// (finding F7 — see `Registry::broadcast`).
     ///
-    /// For large channels the serial per-subscriber `mailbox.send` loop becomes
-    /// the publish-side bottleneck (at N=10k it caps fan-out below the worker
-    /// ceiling). Above `PARALLEL_THRESHOLD` we fan the enqueue out across the
-    /// rayon work-stealing pool. This is correctness-safe: subscribers are keyed
-    /// by `SocketId`, so each distinct mailbox appears in `targets` at most once
-    /// and is sent to exactly once per broadcast — no two threads ever push to the
-    /// same mailbox, and per-channel send ordering is preserved (a connection only
-    /// receives via its own mailbox). Small broadcasts stay on the serial path so
-    /// presence/small channels pay zero pool overhead.
-    pub fn broadcast(&self, event: &ServerEvent, except: Option<&SocketId>) {
-        let frame: std::sync::Arc<str> = match event {
+    /// The snapshot is exactly the guard-time subscriber set: collect-then-send
+    /// races with concurrent subscribe/unsubscribe the same way the previous
+    /// send-under-guard loop did — a member removed after the snapshot may or
+    /// may not still receive the frame (at-most-once per mailbox, as ever).
+    pub fn fanout<'a>(&self, event: &ServerEvent, except: Option<&'a SocketId>) -> Fanout<'a> {
+        let frame: Arc<str> = match event {
             ServerEvent::Raw(f) => f.clone(),
-            other => std::sync::Arc::from(crate::protocol::v7::frames::encode(other).as_str()),
+            other => Arc::from(crate::protocol::v7::frames::encode(other).as_str()),
         };
-        if self.subscribers.len() <= PARALLEL_THRESHOLD {
-            for (sid, sub) in &self.subscribers {
+        Fanout {
+            frame,
+            except,
+            snapshot: self
+                .snapshot
+                .get_or_init(|| {
+                    let mut v = Vec::with_capacity(self.subscribers.len());
+                    for (sid, sub) in &self.subscribers {
+                        v.push((*sid, Arc::clone(sub)));
+                    }
+                    Arc::from(v.into_boxed_slice())
+                })
+                .clone(),
+            // Path choice stays keyed on the FULL subscriber count so the
+            // serial/parallel cutover is identical to the previous in-guard
+            // loop.
+            parallel: self.subscribers.len() > PARALLEL_THRESHOLD,
+        }
+    }
+}
+
+/// One broadcast's fan-out, detached from the registry shard lock (F7): the
+/// frame encoded once plus a shared membership snapshot (one refcount for the
+/// whole subscriber set, not one handle clone per subscriber per broadcast),
+/// with the send path (serial vs rayon) chosen at snapshot time.
+pub struct Fanout<'a> {
+    frame: Arc<str>,
+    snapshot: SharedSnapshot,
+    except: Option<&'a SocketId>,
+    parallel: bool,
+}
+
+impl Fanout<'_> {
+    /// Deliver the frame to every snapshotted mailbox — serially for small
+    /// snapshots, fanned out across the rayon work-stealing pool above
+    /// `PARALLEL_THRESHOLD`. Runs with NO registry shard guard held (that is
+    /// the point). For large channels the serial per-subscriber `mailbox.send`
+    /// loop is the publish-side bottleneck (at N=10k it caps fan-out below the
+    /// worker ceiling), hence the rayon path. This is correctness-safe:
+    /// subscribers are keyed by `SocketId`, so each distinct mailbox appears in
+    /// `snapshot` at most once and is sent to exactly once per broadcast — no
+    /// two threads ever push to the same mailbox, and per-channel send ordering
+    /// is preserved (a connection only receives via its own mailbox). Small
+    /// broadcasts stay on the serial path so presence/small channels pay zero
+    /// pool overhead.
+    pub fn send(self) {
+        let except = self.except;
+        if !self.parallel {
+            for (sid, sub) in &*self.snapshot {
                 if Some(sid) == except {
                     continue;
                 }
-                let _ = sub.handle.mailbox.send(ServerEvent::Raw(frame.clone()));
+                let _ = sub
+                    .handle
+                    .mailbox
+                    .send(ServerEvent::Raw(self.frame.clone()));
             }
             return;
         }
-        let targets: Vec<&crate::connection::handle::Mailbox> = self
-            .subscribers
-            .iter()
-            .filter(|(sid, _)| Some(*sid) != except)
-            .map(|(_, sub)| &sub.handle.mailbox)
-            .collect();
         // Chunk the fan-out so each rayon job does a meaningful batch of sends
         // (a single `Mailbox::send` is ~tens of ns; per-element rayon dispatch
-        // would otherwise dominate). The frame `Arc` is cloned once per batch
-        // closure entry and once per send. Each `send` also marks its target dirty
-        // + wakes that connection's worker (when the mailbox is wired).
-        targets.par_chunks(SEND_CHUNK).for_each(|chunk| {
-            for mb in chunk {
-                let _ = mb.send(ServerEvent::Raw(frame.clone()));
+        // would otherwise dominate). The frame `Arc` is cloned once per send.
+        // Each `send` also marks its target dirty + wakes that connection's
+        // worker (when the mailbox is wired).
+        self.snapshot.par_chunks(SEND_CHUNK).for_each(|chunk| {
+            for (sid, sub) in chunk {
+                if Some(sid) == except {
+                    continue;
+                }
+                let _ = sub
+                    .handle
+                    .mailbox
+                    .send(ServerEvent::Raw(self.frame.clone()));
             }
         });
     }
@@ -275,7 +348,7 @@ mod tests {
         };
         let expected = crate::protocol::v7::frames::encode(&original);
 
-        s.broadcast(&original, None);
+        s.fanout(&original, None).send();
 
         for rx in [&mut rx1, &mut rx2] {
             match rx
@@ -315,7 +388,7 @@ mod tests {
         };
         let expected = crate::protocol::v7::frames::encode(&original);
 
-        s.broadcast(&original, Some(&except));
+        s.fanout(&original, Some(&except)).send();
 
         let mut delivered = 0;
         for (i, rx) in &mut rxs {
@@ -337,6 +410,84 @@ mod tests {
     }
 
     #[test]
+    fn fanout_snapshot_is_the_guard_time_set_and_survives_later_mutation() {
+        // F7 contract: the snapshot is taken under the registry shard guard and
+        // the sends run after it is dropped — so a subscriber removed between
+        // snapshot and send STILL receives the frame (the race the old
+        // send-under-guard loop also allowed: removal could not complete before
+        // the sends finished, but delivery was never conditioned on the entry
+        // still being present). The NEXT fan-out must see the new membership:
+        // removal invalidates the cached snapshot, which is rebuilt under the
+        // next guard.
+        let mut s = ChannelState::default();
+        let (h1, mut rx1) = handle_with_rx();
+        let (h2, mut rx2) = handle_with_rx();
+        let s1 = h1.socket_id;
+        s.add(h1, None);
+        s.add(h2, None);
+
+        let plan = s.fanout(&ServerEvent::Pong, None);
+        s.remove(&s1); // unsubscribe lands between snapshot and send
+        plan.send();
+
+        for rx in [&mut rx1, &mut rx2] {
+            match rx.try_recv().map(|b| *b) {
+                Ok(ServerEvent::Raw(f)) => {
+                    assert_eq!(&*f, crate::protocol::v7::frames::encode(&ServerEvent::Pong))
+                }
+                other => panic!("expected Raw(Pong), got {other:?}"),
+            }
+        }
+
+        // Snapshot after the mutation: exactly the remaining subscriber.
+        s.fanout(&ServerEvent::Pong, None).send();
+        assert!(rx1.try_recv().is_err(), "removed member gets nothing");
+        assert!(matches!(
+            rx2.try_recv().map(|b| *b),
+            Ok(ServerEvent::Raw(_))
+        ));
+    }
+
+    #[test]
+    fn fanout_snapshot_excludes_subscriber_added_after_snapshot() {
+        // Mirror of the remove-side contract above (add half): a subscriber
+        // ADDED between snapshot and send is not in the guard-time set, so it
+        // must NOT receive the pre-add frame — and the add resets the cached
+        // snapshot, so the NEXT fan-out is rebuilt with the new member in.
+        let mut s = ChannelState::default();
+        let (h1, mut rx1) = handle_with_rx();
+        s.add(h1, None);
+
+        let plan = s.fanout(&ServerEvent::Pong, None);
+        let (h2, mut rx2) = handle_with_rx();
+        s.add(h2, None); // join lands between snapshot and send
+        plan.send();
+
+        // Guard-time set = {h1}: the pre-add frame went to h1 only.
+        match rx1.try_recv().map(|b| *b) {
+            Ok(ServerEvent::Raw(f)) => {
+                assert_eq!(&*f, crate::protocol::v7::frames::encode(&ServerEvent::Pong))
+            }
+            other => panic!("expected Raw(Pong), got {other:?}"),
+        }
+        assert!(
+            rx2.try_recv().is_err(),
+            "subscriber added after the snapshot must not receive the pre-add frame"
+        );
+
+        // Next fan-out rebuilds under the NEW membership: both receive.
+        s.fanout(&ServerEvent::Ping, None).send();
+        for rx in [&mut rx1, &mut rx2] {
+            match rx.try_recv().map(|b| *b) {
+                Ok(ServerEvent::Raw(f)) => {
+                    assert_eq!(&*f, crate::protocol::v7::frames::encode(&ServerEvent::Ping))
+                }
+                other => panic!("expected Raw(Ping), got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn roster_sorted_and_distinct() {
         let mut s = ChannelState::default();
         s.add(handle(), Some(member("b")));
@@ -344,5 +495,103 @@ mod tests {
         let r = s.roster();
         assert_eq!(r.ids, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(r.count, 2);
+    }
+
+    /// Golden roster bytes (F8 / Task 6.6): the `subscription_succeeded`
+    /// presence payload must serialize to EXACTLY these bytes — ids in
+    /// byte-sorted order, `hash` keys in the SAME order (the roster walks
+    /// `users` in its incrementally-maintained sorted order and serde_json's
+    /// workspace `preserve_order` feature keeps that insertion order),
+    /// `count` = distinct users, `data` double-encoded as a string. Members
+    /// join deliberately OUT of sorted order with escaping-worthy content
+    /// (quotes, backslash, emoji, nested nulls/bools, a capital-letter id that
+    /// sorts before lowercase), plus a duplicate-user second connection whose
+    /// DIFFERENT `user_info` must NOT leak into the roster (the first
+    /// connection's info wins), a partial removal that must not change the
+    /// roster while the user still has a connection, and a MIDDLE full removal
+    /// that must restore the pre-join bytes. Literals captured from the
+    /// pre-refactor encoder: any byte drift (field order, id order, number
+    /// formatting, escaping) is a parity regression.
+    #[test]
+    fn golden_roster_bytes_across_joins_and_removals() {
+        let ch = "presence-golden";
+        let frame = |roster: PresencePayload| {
+            crate::protocol::v7::frames::encode(&ServerEvent::SubscriptionSucceeded {
+                channel: ch.into(),
+                presence: Some(roster),
+            })
+        };
+        let rich =
+            serde_json::json!({"name":"A \"quoted\" \\ back","emoji":"🚀","arr":[1,2,null,true]});
+        let nested = serde_json::json!({"twelve":12,"nested":{"x":[{"y":null}]}});
+        let weird = "we\"ird\\";
+        let m = |id: &str, info: Value| PresenceMember {
+            user_id: id.into(),
+            user_info: info,
+        };
+        let mut s = ChannelState::default();
+
+        // 1 member.
+        let j = s
+            .add(handle(), Some(m("zebra", serde_json::json!({"n":"z"}))))
+            .unwrap();
+        assert_eq!(
+            frame(j.roster),
+            r#"{"event":"pusher_internal:subscription_succeeded","channel":"presence-golden","data":"{\"presence\":{\"ids\":[\"zebra\"],\"hash\":{\"zebra\":{\"n\":\"z\"}},\"count\":1}}"}"#
+        );
+
+        // 2 members, joined out of order: ids come back sorted.
+        let j = s.add(handle(), Some(m("alpha", rich))).unwrap();
+        assert_eq!(
+            frame(j.roster),
+            r#"{"event":"pusher_internal:subscription_succeeded","channel":"presence-golden","data":"{\"presence\":{\"ids\":[\"alpha\",\"zebra\"],\"hash\":{\"alpha\":{\"name\":\"A \\\"quoted\\\" \\\\ back\",\"emoji\":\"🚀\",\"arr\":[1,2,null,true]},\"zebra\":{\"n\":\"z\"}},\"count\":2}}"}"#
+        );
+
+        // 3 members: capital "Mid" sorts before the lowercase ids (byte order).
+        let three = r#"{"event":"pusher_internal:subscription_succeeded","channel":"presence-golden","data":"{\"presence\":{\"ids\":[\"Mid\",\"alpha\",\"zebra\"],\"hash\":{\"Mid\":{\"twelve\":12,\"nested\":{\"x\":[{\"y\":null}]}},\"alpha\":{\"name\":\"A \\\"quoted\\\" \\\\ back\",\"emoji\":\"🚀\",\"arr\":[1,2,null,true]},\"zebra\":{\"n\":\"z\"}},\"count\":3}}"}"#;
+        let j = s.add(handle(), Some(m("Mid", nested))).unwrap();
+        assert_eq!(frame(j.roster), three);
+
+        // 4 members: an id that itself needs JSON escaping appears in `ids`
+        // AND as a `hash` key, escaped identically in both.
+        let hw = handle();
+        let sid_w = hw.socket_id;
+        let j = s
+            .add(hw, Some(m(weird, serde_json::json!({"w":1}))))
+            .unwrap();
+        let four = r#"{"event":"pusher_internal:subscription_succeeded","channel":"presence-golden","data":"{\"presence\":{\"ids\":[\"Mid\",\"alpha\",\"we\\\"ird\\\\\",\"zebra\"],\"hash\":{\"Mid\":{\"twelve\":12,\"nested\":{\"x\":[{\"y\":null}]}},\"alpha\":{\"name\":\"A \\\"quoted\\\" \\\\ back\",\"emoji\":\"🚀\",\"arr\":[1,2,null,true]},\"we\\\"ird\\\\\":{\"w\":1},\"zebra\":{\"n\":\"z\"}},\"count\":4}}"}"#;
+        assert_eq!(frame(j.roster), four);
+
+        // Second connection of an existing user: roster byte-identical (dedup;
+        // the new connection's different user_info must not leak).
+        let ha1 = handle();
+        let sid_a1 = ha1.socket_id;
+        let j = s
+            .add(ha1, Some(m("alpha", serde_json::json!({"ignored":true}))))
+            .unwrap();
+        assert_eq!(frame(j.roster), four);
+        assert_eq!(frame(s.roster()), four);
+
+        // Removing ONE of alpha's two connections: roster still byte-identical.
+        s.remove(&sid_a1);
+        assert_eq!(frame(s.roster()), four);
+
+        // Removing a MIDDLE id (`weird`, its user's last connection): the
+        // remaining order is exactly the 3-member bytes from before it joined.
+        s.remove(&sid_w);
+        assert_eq!(frame(s.roster()), three);
+    }
+
+    /// The empty roster shape: empty `ids` array, empty `hash` object, count 0.
+    #[test]
+    fn golden_roster_bytes_empty() {
+        let s = ChannelState::default();
+        assert_eq!(
+            crate::protocol::v7::frames::encode(&ServerEvent::SubscriptionSucceeded {
+                channel: "presence-golden".into(),
+                presence: Some(s.roster()),
+            }),
+            r#"{"event":"pusher_internal:subscription_succeeded","channel":"presence-golden","data":"{\"presence\":{\"ids\":[],\"hash\":{},\"count\":0}}"}"#
+        );
     }
 }

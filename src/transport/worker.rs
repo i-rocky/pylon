@@ -57,7 +57,7 @@ use crate::transport::frame::{self, OpCode};
 use crate::transport::handshake::{self, HeadResult};
 use crate::transport::timer::{Due, TimerWheel};
 use crate::ws::handler::ConnectionContext;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
@@ -614,7 +614,15 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     let mut drain_deadline: Option<Instant> = None;
 
     loop {
-        if shutdown.load(Ordering::SeqCst) {
+        // Relaxed is sound: the flag carries no payload — the store side
+        // (main's shutdown sequence) publishes nothing this thread reads
+        // through this load, and everything after the run loop exits is
+        // synchronized by the supervisor's thread join, not by the flag's
+        // ordering. Liveness does not need ordering either: the poll timeout
+        // below is bounded at 50ms, so the loop re-reads the flag at least
+        // once per idle cycle and a Relaxed load cannot stall shutdown
+        // observation beyond that.
+        if shutdown.load(Ordering::Relaxed) {
             // C2a drain phase — runs only on the shutdown path, zero cost otherwise.
             let now_ns = worker_epoch.elapsed().as_nanos() as u64;
             if !drain_started {
@@ -1288,12 +1296,13 @@ fn queue_ping(
     if entry.conn.state != ConnState::Open {
         return None;
     }
-    let text = session.codec.encode(&ServerEvent::Ping);
+    // F6/6.4: encode through the append seam — no per-frame String clone for
+    // pre-encoded (`Raw`) payloads; the text then feeds the WS frame build.
+    let mut text = String::new();
+    session.codec.encode_into(&ServerEvent::Ping, &mut text);
     let mut out = BytesMut::new();
     frame::encode_text(&mut out, text.as_bytes());
-    let _ = entry
-        .conn
-        .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+    let _ = entry.conn.queue(out.freeze(), now_ns);
     Some(flush_and_arm(poll, entry, now_ns))
 }
 
@@ -1308,9 +1317,7 @@ fn queue_close_frame(entry: &mut Entry, code: u16, reason: &str, now_ns: u64) {
     frame_body.extend_from_slice(reason.as_bytes());
     let mut out = BytesMut::new();
     frame::encode(&mut out, true, OpCode::Close, &frame_body);
-    let _ = entry
-        .conn
-        .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+    let _ = entry.conn.queue(out.freeze(), now_ns);
 }
 
 /// Send a WebSocket Close frame with the given `code` and `reason` text —
@@ -1394,21 +1401,26 @@ fn queue_lifetime_error(conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) 
     let error = crate::protocol::error::PusherError::max_lifetime();
     // A lifetime close only ever fires on an ESTABLISHED session, but fall back
     // to the raw-JSON form (as `queue_shutdown_error` does) for a conn whose
-    // session vanished between arming and firing.
-    let text = if let Some(session) = entry.session.as_ref() {
-        session.codec.encode(&ServerEvent::Error(error))
-    } else {
-        serde_json::json!({
-            "event": "pusher:error",
-            "data": { "code": error.code, "message": error.message }
-        })
-        .to_string()
-    };
+    // session vanished between arming and firing. F6/6.4: the session arm uses
+    // the append seam (`encode_into`) — no per-frame String clone.
+    let mut text = String::new();
+    match entry.session.as_ref() {
+        Some(session) => session
+            .codec
+            .encode_into(&ServerEvent::Error(error), &mut text),
+        None => {
+            text.push_str(
+                &serde_json::json!({
+                    "event": "pusher:error",
+                    "data": { "code": error.code, "message": error.message }
+                })
+                .to_string(),
+            );
+        }
+    }
     let mut out = BytesMut::new();
     frame::encode_text(&mut out, text.as_bytes());
-    let _ = entry
-        .conn
-        .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+    let _ = entry.conn.queue(out.freeze(), now_ns);
     // No explicit flush here: the caller queues the Close frame next via
     // `send_close_4202`, whose `flush_and_arm` flushes both frames together.
 }
@@ -1430,28 +1442,32 @@ fn queue_shutdown_error(conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) 
     // present (so encoding is consistent with every other server event),
     // fall back to the same raw-JSON form used by `queue_reject` when no
     // codec has been negotiated yet (connection still handshaking).
-    let text = if let Some(session) = entry.session.as_ref() {
-        session.codec.encode(&ServerEvent::Error(
-            crate::protocol::error::PusherError::new(
+    // F6/6.4: the session arm uses the append seam (`encode_into`).
+    let mut text = String::new();
+    match entry.session.as_ref() {
+        Some(session) => session.codec.encode_into(
+            &ServerEvent::Error(crate::protocol::error::PusherError::new(
                 4200,
                 "Server is shutting down; please reconnect",
-            ),
-        ))
-    } else {
-        // No codec yet (connection in handshaking state): hand-build the
-        // raw JSON that the v7 codec would have produced. The data field is
-        // a plain JSON object (not double-encoded) — matching `queue_reject`.
-        serde_json::json!({
-            "event": "pusher:error",
-            "data": { "code": 4200_u16, "message": "Server is shutting down; please reconnect" }
-        })
-        .to_string()
-    };
+            )),
+            &mut text,
+        ),
+        None => {
+            // No codec yet (connection in handshaking state): hand-build the
+            // raw JSON that the v7 codec would have produced. The data field is
+            // a plain JSON object (not double-encoded) — matching `queue_reject`.
+            text.push_str(
+                &serde_json::json!({
+                    "event": "pusher:error",
+                    "data": { "code": 4200_u16, "message": "Server is shutting down; please reconnect" }
+                })
+                .to_string(),
+            );
+        }
+    }
     let mut out = BytesMut::new();
     frame::encode_text(&mut out, text.as_bytes());
-    let _ = entry
-        .conn
-        .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+    let _ = entry.conn.queue(out.freeze(), now_ns);
     // No explicit flush here: the caller queues the Close frame next, and
     // `send_close` calls `flush_and_arm` which flushes both frames together.
 }
@@ -1503,6 +1519,14 @@ fn accept_ready(
                     tracing::debug!(error = %e, "failed to register accepted socket");
                     continue;
                 }
+                // F3 (Nagle): disable Nagle on the accepted socket. Small
+                // latency-critical frames (pong, subscription_succeeded,
+                // member_added) queued right after a partial write would
+                // otherwise sit in the kernel's Nagle buffer waiting for the
+                // peer's delayed ACK — the classic 40ms stall. Best-effort: a
+                // failure to set a socket option must not break or spam the
+                // accept loop.
+                let _ = stream.set_nodelay(true);
                 let mut conn = if let Some(tls_cfg) = &cfg.tls {
                     match rustls::server::ServerConnection::new(tls_cfg.clone()) {
                         Ok(sc) => Connection::new_tls(stream, Box::new(sc), cfg.high_water),
@@ -1638,7 +1662,8 @@ fn handle_handshake(
         HeadResult::WsUpgrade { key: ws_key, path } => {
             let response = handshake::accept_response(&ws_key).into_boxed_slice();
             // Drop-head queue never rejects; the 101 response always enqueues.
-            let _ = entry.conn.queue(Arc::from(response), now_ns);
+            // (`Bytes::from(Box<[u8]>)` takes ownership — no copy.)
+            let _ = entry.conn.queue(Bytes::from(response), now_ns);
             // A browser never sends data frames before the 101, so any bytes
             // after the head would be a protocol error anyway; clearing is safe.
             entry.inbuf.clear();
@@ -1747,12 +1772,13 @@ fn handle_handshake(
                             socket_id: session.ctx.socket_id,
                             activity_timeout: env.activity_timeout,
                         };
-                        let text = session.codec.encode(&established);
+                        // F6/6.4: append-seam encode (single frame; the local
+                        // String moves straight into the WS frame build).
+                        let mut text = String::new();
+                        session.codec.encode_into(&established, &mut text);
                         let mut out = BytesMut::new();
                         frame::encode_text(&mut out, text.as_bytes());
-                        let _ = entry
-                            .conn
-                            .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+                        let _ = entry.conn.queue(out.freeze(), now_ns);
                         entry.session = Some(session);
                         // Session established: the G3 handshake deadline has
                         // served its purpose — clear it so the absolute
@@ -1908,7 +1934,7 @@ fn finish_establish(
     // makes every connection pay 32*104 ≈ 3.3 KB up front even while idle (profiled as
     // the single largest per-conn allocation). Boxing shrinks that block ~6x; the heap
     // event is allocated only when a direct send actually happens (off the broadcast
-    // hot path, which uses the encode-once Arc<[u8]> sink).
+    // hot path, which uses the encode-once `Bytes` sink).
     let (tx, rx) = mpsc::channel::<Box<ServerEvent>>(env.mailbox_capacity.max(1));
     let ctx = ConnectionContext {
         app,
@@ -1959,20 +1985,25 @@ fn finish_establish(
 /// JSON fallback), then a WebSocket Close frame carrying the error `code` +
 /// `message`. The caller flushes and closes.
 fn queue_reject(entry: &mut Entry, reject: &Reject, now_ns: u64) {
-    // 1) the pusher:error Text frame.
-    let text = match &reject.codec {
-        Some(c) => c.encode(&ServerEvent::Error(reject.error.clone())),
-        None => serde_json::json!({
-            "event": "pusher:error",
-            "data": { "code": reject.error.code, "message": reject.error.message }
-        })
-        .to_string(),
-    };
+    // 1) the pusher:error Text frame. F6/6.4: the codec arm uses the append
+    //    seam (`encode_into`); the no-codec fallback appends its raw JSON into
+    //    the same buffer.
+    let mut text = String::new();
+    match &reject.codec {
+        Some(c) => c.encode_into(&ServerEvent::Error(reject.error.clone()), &mut text),
+        None => {
+            text.push_str(
+                &serde_json::json!({
+                    "event": "pusher:error",
+                    "data": { "code": reject.error.code, "message": reject.error.message }
+                })
+                .to_string(),
+            );
+        }
+    }
     let mut out = BytesMut::new();
     frame::encode_text(&mut out, text.as_bytes());
-    let _ = entry
-        .conn
-        .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+    let _ = entry.conn.queue(out.freeze(), now_ns);
 
     // 2) the WS Close frame: code = the pusher error code, reason = its message.
     let reason = &reject.error.message;
@@ -1981,9 +2012,7 @@ fn queue_reject(entry: &mut Entry, reject: &Reject, now_ns: u64) {
     frame_body.extend_from_slice(reason.as_bytes());
     let mut close_out = BytesMut::new();
     frame::encode(&mut close_out, true, OpCode::Close, &frame_body);
-    let _ = entry
-        .conn
-        .queue(Arc::from(close_out.to_vec().into_boxed_slice()), now_ns);
+    let _ = entry.conn.queue(close_out.freeze(), now_ns);
 }
 
 /// Split a `/app/{key}` path (with an optional `?protocol=N&version=X&...`
@@ -2048,17 +2077,13 @@ fn echo_frames(poll: &Poll, entry: &mut Entry, frames: Vec<frame::Frame>, now_ns
             OpCode::Text | OpCode::Binary | OpCode::Continuation => {
                 let mut out = BytesMut::new();
                 frame::encode(&mut out, f.fin, f.opcode, &f.payload);
-                let _ = entry
-                    .conn
-                    .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+                let _ = entry.conn.queue(out.freeze(), now_ns);
                 wrote = true;
             }
             OpCode::Ping => {
                 let mut out = BytesMut::new();
                 frame::encode(&mut out, true, OpCode::Pong, &f.payload);
-                let _ = entry
-                    .conn
-                    .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+                let _ = entry.conn.queue(out.freeze(), now_ns);
                 wrote = true;
             }
             // A peer pong is unsolicited noise here; ignore it.
@@ -2197,9 +2222,7 @@ fn dispatch_frames(
             OpCode::Ping => {
                 let mut out = BytesMut::new();
                 frame::encode(&mut out, true, OpCode::Pong, &f.payload);
-                let _ = entry
-                    .conn
-                    .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+                let _ = entry.conn.queue(out.freeze(), now_ns);
                 // RFC 6455 §5.5.2: answer a Ping "as soon as is practical" —
                 // flush the Pong NOW. The end-of-batch drain below only
                 // flushes when mailbox events were written, so a lone Ping's
@@ -2352,6 +2375,22 @@ fn drain_session(poll: &Poll, entry: &mut Entry, now_ns: u64) -> DrainResult {
     let mut close_after = false;
     let mut wrote = false;
     let mut subs_changed = false;
+    // F6 / Task 6.4: ONE encode scratch for the whole drain, reused across
+    // every queued event (`clear()` keeps the capacity). Net effect vs a
+    // per-event `encode()`: one heap allocation REMOVED via scratch reuse;
+    // the memcpy count is UNCHANGED (the payload was already serialized once
+    // and copied once more into the WS frame buffer below). The no-copy win
+    // sits inside the codec for `Raw` events (relayed redis frames on the
+    // legacy registry fan-out path): `encode_into` appends the `Arc`-shared
+    // payload BY REFERENCE instead of `to_string()`-cloning it per
+    // subscriber, so the codec no longer re-materializes the relayed frame
+    // per connection. The one copy into the WS frame buffer is inherent —
+    // each connection's out-queue owns its `Bytes`, so per-connection WS
+    // framing must produce its own buffer. (Where text feeds `Bytes`
+    // directly the move is zero-copy: bytes 1.x `From<String>` — the percore
+    // SINK path, where `local.broadcast` encodes + frames ONCE and every
+    // worker enqueues refcount clones of one shared `Bytes`.)
+    let mut text = String::with_capacity(256);
     while let Ok(ev) = session.rx.try_recv() {
         match *ev {
             ServerEvent::Close { code, reason } => {
@@ -2360,9 +2399,7 @@ fn drain_session(poll: &Poll, entry: &mut Entry, now_ns: u64) -> DrainResult {
                 frame_body.extend_from_slice(&code.to_be_bytes());
                 frame_body.extend_from_slice(reason.as_bytes());
                 frame::encode(&mut out, true, OpCode::Close, &frame_body);
-                let _ = entry
-                    .conn
-                    .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+                let _ = entry.conn.queue(out.freeze(), now_ns);
                 wrote = true;
                 close_after = true;
                 break;
@@ -2379,12 +2416,11 @@ fn drain_session(poll: &Poll, entry: &mut Entry, now_ns: u64) -> DrainResult {
                     }
                     session.ctx.presence_membership.remove(channel);
                 }
-                let text = session.codec.encode(&other);
+                text.clear();
+                session.codec.encode_into(&other, &mut text);
                 let mut out = BytesMut::new();
                 frame::encode_text(&mut out, text.as_bytes());
-                let _ = entry
-                    .conn
-                    .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+                let _ = entry.conn.queue(out.freeze(), now_ns);
                 wrote = true;
             }
         }
@@ -2592,12 +2628,12 @@ fn drain_resolved(
                         socket_id: session.ctx.socket_id,
                         activity_timeout: env.activity_timeout,
                     };
-                    let text = session.codec.encode(&established);
+                    // F6/6.4: append-seam encode (single frame).
+                    let mut text = String::new();
+                    session.codec.encode_into(&established, &mut text);
                     let mut out = BytesMut::new();
                     frame::encode_text(&mut out, text.as_bytes());
-                    let _ = entry
-                        .conn
-                        .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+                    let _ = entry.conn.queue(out.freeze(), now_ns);
                     entry.session = Some(session);
                     flush_and_arm(poll, entry, now_ns)
                 };
@@ -3037,7 +3073,18 @@ fn reconcile_membership(
     let sid = &session.ctx.socket_id;
 
     // Added channels: present in ctx.subscribed, absent from the recorded set.
-    for channel in session.ctx.subscribed.difference(&session.subs) {
+    // The `difference` iterator borrows `session.subs`, so the added names are
+    // collected first and then folded into the baseline one by one — the
+    // baseline converges in O(diff), without cloning the whole live set (the
+    // diff is almost always one channel; the live set is every channel the
+    // connection is in).
+    let added: Vec<String> = session
+        .ctx
+        .subscribed
+        .difference(&session.subs)
+        .cloned()
+        .collect();
+    for channel in &added {
         let inserted = local_subs
             .entry((Arc::clone(&app), Arc::<str>::from(channel.as_str())))
             .or_default()
@@ -3047,8 +3094,17 @@ fn reconcile_membership(
             LOCAL_SUBS_SLOTS.fetch_add(1, Ordering::Relaxed);
         }
     }
-    // Removed channels: were recorded, no longer subscribed.
-    for channel in session.subs.difference(&session.ctx.subscribed) {
+    for channel in added {
+        session.subs.insert(channel);
+    }
+    // Removed channels: were recorded, no longer subscribed. `retain` walks the
+    // recorded baseline once, deindexing and dropping exactly the channels the
+    // live set lacks — the removal half of the in-place diff.
+    let live = &session.ctx.subscribed;
+    session.subs.retain(|channel| {
+        if live.contains(channel) {
+            return true;
+        }
         let k = (Arc::clone(&app), Arc::<str>::from(channel.as_str()));
         if let Some(set) = local_subs.get_mut(&k) {
             if set.remove(sid) {
@@ -3059,11 +3115,10 @@ fn reconcile_membership(
                 local_subs.remove(&k);
             }
         }
-    }
+        false
+    });
     // Keep the reverse map current (stamp on first subscribe; harmless re-stamp).
     sid_to_token.insert(*sid, token);
-    // Record the new set as the reconcile baseline.
-    session.subs = session.ctx.subscribed.clone();
 }
 
 /// SP10 graduated-shed band, derived from this worker's `inflight_bytes` as a
@@ -3115,18 +3170,151 @@ fn should_skip(band: ShedBand, out_bytes: usize, high_water: usize) -> bool {
     }
 }
 
-/// Deliver every queued [`crate::transport::fanout::BroadcastMsg`] to this worker's local subscribers,
-/// applying the SP10 graduated shed (§6) against this worker's byte budget.
+/// Minimal seam over the worker's connection table: resolve a subscriber's
+/// slab token to its OPEN dispatch connection. `None` covers everything the
+/// inline drain loop has always skipped — a missing slot, a session-less
+/// entry, or a non-`Open` connection. Factored out of `drain_broadcasts` so
+/// the inbox pump can run against any connection container; the impl below is
+/// the production one (`slab::Slab<Entry>`).
+///
+/// `#[doc(hidden)]`: an internal seam exposed ONLY so `benches/fanout_sink.rs`
+/// can drive the REAL inbox pump against a bench-built connection set (the
+/// same hidden-seam pattern as the redis adapter's bench accessors). Not part
+/// of the supported public API.
+#[doc(hidden)]
+pub trait ConnIndex {
+    /// The OPEN dispatch connection at `token`, if there is one to deliver to.
+    fn open_conn(&mut self, token: usize) -> Option<&mut Connection>;
+}
+
+impl ConnIndex for slab::Slab<Entry> {
+    fn open_conn(&mut self, token: usize) -> Option<&mut Connection> {
+        let entry = self.get_mut(token)?;
+        // Only deliver to Open dispatch connections.
+        if entry.session.is_none() || entry.conn.state != ConnState::Open {
+            return None;
+        }
+        Some(&mut entry.conn)
+    }
+}
+
+/// Pump this worker's broadcast inbox to empty: deliver every queued
+/// [`crate::transport::fanout::BroadcastMsg`] to this worker's local
+/// subscribers, applying the SP10 graduated shed (§6) against this worker's
+/// byte budget.
 ///
 /// For each message: classify the current [`ShedBand`] from `inflight_bytes /
 /// effective_budget`; in `Saturated` (≥100%) the whole broadcast is dropped and
 /// the sink flagged; otherwise, for each subscriber (skipping `except`), the
-/// already-WS-framed `frame` is `queue`d (an `Arc` bump — never re-encoded)
-/// UNLESS the band says to skip a backed-up subscriber. `inflight_bytes` is kept
-/// live across the drain (each enqueue adds the net byte delta, accounting for
-/// any drop-head eviction) so the band tightens as the worker fills within a
-/// single drain. Connections that backpressure-close are torn down. Returns
-/// `true` if any frame was queued.
+/// already-WS-framed `frame` is `queue`d (a `Bytes` refcount bump — never
+/// re-encoded) UNLESS the band says to skip a backed-up subscriber.
+/// `inflight_bytes` is kept live across the drain (each enqueue adds the net
+/// byte delta, accounting for any drop-head eviction) so the band tightens as
+/// the worker fills within a single drain. `touched` collects every connection
+/// queued onto (the caller's flush loop) and `to_close` the connections the
+/// caller already marked for teardown (backpressure-closed in a previous
+/// phase of this drain).
+///
+/// This is the fan-out half of [`drain_broadcasts`], factored out verbatim
+/// (same statement order, same skip conditions) so `benches/fanout_sink.rs`
+/// can benchmark the REAL production loop — encode/hand-off once on the
+/// publish side, one shared `Bytes` refcount bump per subscriber on the drain
+/// side. `#[doc(hidden)]` for the same reason as [`ConnIndex`].
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn drain_broadcast_inbox<C: ConnIndex>(
+    rx: &std::sync::mpsc::Receiver<crate::transport::fanout::BroadcastMsg>,
+    local_subs: &HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
+    sid_to_token: &HashMap<SocketId, usize>,
+    conns: &mut C,
+    effective_budget: u64,
+    inflight_bytes: &mut u64,
+    drophead_total: &mut u64,
+    saturated: Option<&Arc<AtomicBool>>,
+    now_ns: u64,
+    touched: &mut HashSet<usize>,
+    to_close: &HashSet<usize>,
+) {
+    while let Ok(msg) = rx.try_recv() {
+        // Destructure the message so the drain owns its Arcs: the lookup key
+        // MOVES `app`/`channel` (no refcount bumps — the old code cloned both
+        // per message while `msg` kept the originals alive too), and `frame`
+        // stays owned by the drain while each enqueue takes a `Bytes` refcount
+        // bump as before.
+        let crate::transport::fanout::BroadcastMsg {
+            app,
+            channel,
+            frame,
+            except,
+        } = msg;
+        let Some(subs) = local_subs.get(&(app, channel)) else {
+            continue; // no local subscribers for this channel on this worker
+        };
+        for sid in subs.iter() {
+            // Reclassify PER SUBSCRIBER: the band tightens as `inflight_bytes`
+            // grows within this drain, so once the worker crosses 100% mid-fan-out
+            // it stops enqueueing for the remaining subscribers of this very
+            // broadcast — the budget is never blown past by a single large channel.
+            let band = shed_band(*inflight_bytes, effective_budget);
+            if band == ShedBand::Saturated {
+                // ≥100%: never enqueue past the budget. Flag saturation so the
+                // publish-admission path 503s; skip enqueueing this subscriber.
+                if let Some(sat) = saturated {
+                    sat.store(true, Ordering::Relaxed);
+                }
+                continue;
+            }
+            if except.as_ref() == Some(sid) {
+                continue; // sender exclusion
+            }
+            let Some(&token) = sid_to_token.get(sid) else {
+                continue; // stale index entry; connection gone
+            };
+            if to_close.contains(&token) {
+                continue;
+            }
+            let Some(conn) = conns.open_conn(token) else {
+                continue;
+            };
+            // Graduated shed: under pressure, skip backed-up subscribers so the
+            // fast (caught-up) ones still get every frame — targeted drop.
+            if should_skip(band, conn.out_bytes(), conn.high_water()) {
+                continue;
+            }
+            // SP10: the per-connection queue is byte-bounded drop-head — it never
+            // rejects. A slow consumer simply loses its OLDEST queued frame(s)
+            // (freshest-wins, at-most-once), keeping memory bounded without
+            // closing the connection or stalling the fast path. Fold the net byte
+            // delta (enqueue minus any drop-head eviction) into the live inflight
+            // counter via the `take_inflight_delta` choke point so the band stays
+            // accurate within this drain — and so the post-drain flush's send delta
+            // (taken below) composes correctly without double-counting.
+            let _dropped = conn.queue(frame.clone(), now_ns);
+            *inflight_bytes = inflight_bytes.wrapping_add(conn.take_inflight_delta() as u64);
+            // G8: the enqueue may have evicted older frames (drop-head) — fold
+            // the per-connection accumulator into the worker total NOW rather
+            // than deferring to the post-drain flush fold, so the counter is
+            // current even if the flush below closes the connection.
+            let dh = conn.take_drophead_dropped();
+            if dh > 0 {
+                *drophead_total = drophead_total.wrapping_add(dh);
+            }
+            touched.insert(token);
+        }
+    }
+}
+
+/// Deliver every queued [`crate::transport::fanout::BroadcastMsg`] to this worker's local subscribers,
+/// applying the SP10 graduated shed (§6) against this worker's byte budget.
+///
+/// The per-message fan-out itself (band classification, sender exclusion, the
+/// graduated skip, the byte-bounded drop-head enqueue and its live
+/// `inflight_bytes`/drop-head accounting) is [`drain_broadcast_inbox`] —
+/// factored out verbatim so the real loop is benchmarkable. This wrapper adds
+/// the two worker-iteration phases the pump must not do mid-lookup: flushing
+/// every connection queued onto (a backpressuring flush arms writable
+/// interest, a failed flush closes), then tearing the closed connections down.
+/// Returns `true` if any frame was queued.
 ///
 /// `effective_budget` is the per-worker budget already scaled by the PSI factor
 /// (§8); `now_ns` is this iteration's monotonic timestamp, stamped onto every
@@ -3152,70 +3340,24 @@ fn drain_broadcasts(
 ) -> bool {
     let mut touched: HashSet<usize> = HashSet::new();
     // Connections that backpressured during delivery; closed after the drain so
-    // we don't mutate the slab mid-lookup.
-    let mut to_close: Vec<usize> = Vec::new();
+    // we don't mutate the slab mid-lookup. A set: the per-subscriber and flush
+    // loops below both probe it, so membership must be O(1) — a drain of a
+    // backpressured channel checks it once per remaining subscriber.
+    let mut to_close: HashSet<usize> = HashSet::new();
 
-    while let Ok(msg) = rx.try_recv() {
-        let key = (Arc::clone(&msg.app), Arc::clone(&msg.channel));
-        let Some(subs) = local_subs.get(&key) else {
-            continue; // no local subscribers for this channel on this worker
-        };
-        for sid in subs.iter() {
-            // Reclassify PER SUBSCRIBER: the band tightens as `inflight_bytes`
-            // grows within this drain, so once the worker crosses 100% mid-fan-out
-            // it stops enqueueing for the remaining subscribers of this very
-            // broadcast — the budget is never blown past by a single large channel.
-            let band = shed_band(*inflight_bytes, effective_budget);
-            if band == ShedBand::Saturated {
-                // ≥100%: never enqueue past the budget. Flag saturation so the
-                // publish-admission path 503s; skip enqueueing this subscriber.
-                if let Some(sat) = saturated {
-                    sat.store(true, Ordering::Relaxed);
-                }
-                continue;
-            }
-            if msg.except.as_ref() == Some(sid) {
-                continue; // sender exclusion
-            }
-            let Some(&token) = sid_to_token.get(sid) else {
-                continue; // stale index entry; connection gone
-            };
-            if to_close.contains(&token) {
-                continue;
-            }
-            let Some(entry) = conns.get_mut(token) else {
-                continue;
-            };
-            // Only deliver to Open dispatch connections.
-            if entry.session.is_none() || entry.conn.state != ConnState::Open {
-                continue;
-            }
-            // Graduated shed: under pressure, skip backed-up subscribers so the
-            // fast (caught-up) ones still get every frame — targeted drop.
-            if should_skip(band, entry.conn.out_bytes(), entry.conn.high_water()) {
-                continue;
-            }
-            // SP10: the per-connection queue is byte-bounded drop-head — it never
-            // rejects. A slow consumer simply loses its OLDEST queued frame(s)
-            // (freshest-wins, at-most-once), keeping memory bounded without
-            // closing the connection or stalling the fast path. Fold the net byte
-            // delta (enqueue minus any drop-head eviction) into the live inflight
-            // counter via the `take_inflight_delta` choke point so the band stays
-            // accurate within this drain — and so the post-drain flush's send delta
-            // (taken below) composes correctly without double-counting.
-            let _dropped = entry.conn.queue(msg.frame.clone(), now_ns);
-            *inflight_bytes = inflight_bytes.wrapping_add(entry.conn.take_inflight_delta() as u64);
-            // G8: the enqueue may have evicted older frames (drop-head) — fold
-            // the per-connection accumulator into the worker total NOW rather
-            // than deferring to the post-drain flush fold, so the counter is
-            // current even if the flush below closes the connection.
-            let dh = entry.conn.take_drophead_dropped();
-            if dh > 0 {
-                *drophead_total = drophead_total.wrapping_add(dh);
-            }
-            touched.insert(token);
-        }
-    }
+    drain_broadcast_inbox(
+        rx,
+        local_subs,
+        sid_to_token,
+        conns,
+        effective_budget,
+        inflight_bytes,
+        drophead_total,
+        saturated,
+        now_ns,
+        &mut touched,
+        &to_close,
+    );
 
     let wrote = !touched.is_empty();
     // Flush every connection we queued onto. A flush that backpressures arms
@@ -3241,7 +3383,7 @@ fn drain_broadcasts(
                 *drophead_total = drophead_total.wrapping_add(dh);
             }
             if action == Action::Close {
-                to_close.push(token);
+                to_close.insert(token);
             }
         }
     }
@@ -3280,40 +3422,85 @@ mod tests {
         l.local_addr().unwrap().port()
     }
 
+    /// A plain-TCP `Mode::Echo` worker config for tests.
+    fn echo_worker_config(addr: std::net::SocketAddr) -> WorkerConfig {
+        WorkerConfig {
+            addr,
+            max_payload: 1 << 20,
+            max_message_bytes: 1 << 20,
+            max_head_bytes: 16_384,
+            handshake_timeout_ms: 10_000,
+            high_water: 1 << 20,
+            mode: Mode::Echo,
+            rest_handoff: None,
+            worker_id: 0,
+            broadcast: None,
+            per_worker_budget: 0,
+            inflight_slot: None,
+            accepted_slot: None,
+            codel_dropped_slot: None,
+            drophead_dropped_slot: None,
+            mailbox_dropped_slot: None,
+            codel: crate::transport::conn::CodelParams::DISABLED,
+            budget_factor: None,
+            shutdown_grace_ms: 0,
+            tls: None,
+        }
+    }
+
     /// Spawn the worker on its own OS thread bound to `addr` in [`Mode::Echo`],
     /// returning the shutdown flag and the join handle.
     fn spawn_worker(addr: std::net::SocketAddr) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
         let shutdown = Arc::new(AtomicBool::new(false));
         let sd = shutdown.clone();
         let handle = std::thread::spawn(move || {
-            run(
-                WorkerConfig {
-                    addr,
-                    max_payload: 1 << 20,
-                    max_message_bytes: 1 << 20,
-                    max_head_bytes: 16_384,
-                    handshake_timeout_ms: 10_000,
-                    high_water: 1 << 20,
-                    mode: Mode::Echo,
-                    rest_handoff: None,
-                    worker_id: 0,
-                    broadcast: None,
-                    per_worker_budget: 0,
-                    inflight_slot: None,
-                    accepted_slot: None,
-                    codel_dropped_slot: None,
-                    drophead_dropped_slot: None,
-                    mailbox_dropped_slot: None,
-                    codel: crate::transport::conn::CodelParams::DISABLED,
-                    budget_factor: None,
-                    shutdown_grace_ms: 0,
-                    tls: None,
-                },
-                sd,
-            )
-            .expect("worker run failed");
+            run(echo_worker_config(addr), sd).expect("worker run failed");
         });
         (shutdown, handle)
+    }
+
+    /// F3 (Nagle): `accept_ready` must disable Nagle on every accepted
+    /// socket. The server-side socket isn't reachable through a client
+    /// connection (the client only sees its own half), and a loopback
+    /// ping/pong latency assertion is probabilistic — macOS loopback rarely
+    /// exhibits the Nagle+delayed-ACK stall the fix targets — so this asserts
+    /// the option observably on the accepted stream itself, driven through
+    /// the real accept path (no `run` loop needed: one pending connection,
+    /// then inspect the slab entry's stream).
+    #[test]
+    fn accept_ready_sets_nodelay_on_accepted_socket() {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // `mio::net::TcpListener::from_std` expects a listener already in
+        // nonblocking mode (as `reuseport_listener` arms it) — otherwise the
+        // drain loop's trailing `accept()` would block forever.
+        std_listener.set_nonblocking(true).unwrap();
+        let addr = std_listener.local_addr().unwrap();
+        let mut listener = TcpListener::from_std(std_listener);
+
+        // A pending client connection for accept_ready to drain.
+        let _client = std::net::TcpStream::connect(addr).unwrap();
+
+        let poll = Poll::new().unwrap();
+        let mut conns = slab::Slab::new();
+        let mut wheel = TimerWheel::new();
+        let cfg = echo_worker_config(addr);
+
+        let accepted = accept_ready(
+            &poll,
+            &mut listener,
+            &mut conns,
+            &cfg,
+            crate::transport::conn::CodelParams::DISABLED,
+            &mut wheel,
+            None,
+        );
+        assert_eq!(accepted, 1);
+        assert_eq!(conns.len(), 1);
+        let entry = conns.iter_mut().next().unwrap().1;
+        assert!(
+            entry.conn.stream_mut().nodelay().unwrap(),
+            "accepted socket must have TCP_NODELAY set (F3)"
+        );
     }
 
     /// THE GATE: a real `tokio-tungstenite` client completes the RFC 6455

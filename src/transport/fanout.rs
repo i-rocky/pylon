@@ -9,7 +9,7 @@
 //! This sink replaces that with a per-WORKER hand-off: a broadcast notifies each
 //! worker exactly ONCE (W messages, not N), and each worker then fans the
 //! (already WS-framed) bytes out to its OWN local subscribers by direct
-//! slab-enqueue (an `Arc` bump per subscriber, no per-connection mpsc, no
+//! slab-enqueue (a refcount bump per subscriber, no per-connection mpsc, no
 //! per-connection wake). The work to actually copy bytes onto each connection's
 //! send queue is thereby spread across all worker cores instead of running
 //! serially on the publisher.
@@ -22,6 +22,7 @@
 //! `unsafe`.
 
 use crate::protocol::socket_id::SocketId;
+use bytes::Bytes;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -33,13 +34,13 @@ pub const DEFAULT_BROADCAST_HANDOFF_CAP: usize = 1024;
 
 /// One sharded broadcast hand-off: the WS-framed bytes plus the routing keys
 /// every worker needs to find its local subscribers. `frame` is already a
-/// complete server→client WebSocket text frame (encoded once by the publisher),
-/// shared via `Arc` so each worker's per-connection enqueue is a cheap refcount
-/// bump rather than a copy.
+/// complete server→client WebSocket text frame (encoded once by the publisher,
+/// frozen zero-copy from the encoder's buffer), shared via `Bytes` so each
+/// worker's per-connection enqueue is a cheap refcount bump rather than a copy.
 pub struct BroadcastMsg {
     pub app: Arc<str>,
     pub channel: Arc<str>,
-    pub frame: Arc<[u8]>,
+    pub frame: Bytes,
     /// The originating connection's `socket_id`, excluded from delivery (sender
     /// exclusion for client events / count echoes). `None` ⇒ deliver to all.
     pub except: Option<SocketId>,
@@ -90,7 +91,7 @@ impl BroadcastSink {
         &self,
         app: Arc<str>,
         channel: Arc<str>,
-        frame: Arc<[u8]>,
+        frame: Bytes,
         except: Option<SocketId>,
     ) {
         for slot in self.workers.iter() {
@@ -133,8 +134,8 @@ mod tests {
     fn arc(s: &str) -> Arc<str> {
         Arc::from(s)
     }
-    fn bytes(b: &[u8]) -> Arc<[u8]> {
-        Arc::from(b.to_vec().into_boxed_slice())
+    fn bytes(b: &[u8]) -> Bytes {
+        Bytes::copy_from_slice(b)
     }
 
     /// A bounded hand-off with no draining receiver: capacity 2, send 5 → exactly

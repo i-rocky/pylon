@@ -20,7 +20,10 @@ impl Codec for V7Codec {
     fn decode(&self, text: &str) -> Result<ClientCommand, DecodeError> {
         frames::decode(text)
     }
-    fn encode(&self, event: &ServerEvent) -> String {
-        frames::encode(event)
+    /// The encoding seam (F6 / Task 6.4): append-only, `Raw` payloads shared
+    /// by reference. `encode` is inherited from the trait default, which
+    /// delegates here — both paths stay byte-identical by construction.
+    fn encode_into(&self, event: &ServerEvent, out: &mut String) {
+        frames::encode_into(event, out)
     }
 }
