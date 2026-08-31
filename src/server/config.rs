@@ -86,6 +86,13 @@ pub struct ServerConfig {
     /// (single attempt). `PYLON_WEBHOOK_RETRY_BUDGET_MS` (default 300000).
     pub webhook_retry_budget_ms: u64,
     pub webhook_max_concurrency: usize,
+    /// S2: allow webhook delivery to private/loopback/link-local targets
+    /// (SSRF guard escape hatch). `false` (default, secure): a delivery whose
+    /// target resolves to (or literally is) a private address is refused
+    /// before any HTTP is sent. `PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS`
+    /// (`1`/`true` to enable) — for operators whose webhook receivers live on
+    /// internal networks.
+    pub webhook_allow_private_targets: bool,
     pub max_channel_name_length: usize,
     pub max_event_name_length: usize,
     pub max_client_events_per_second: u32,
@@ -243,6 +250,7 @@ impl Default for ServerConfig {
             webhook_backoff_cap_ms: 60000,
             webhook_retry_budget_ms: 300000,
             webhook_max_concurrency: 100,
+            webhook_allow_private_targets: false,
             max_channel_name_length: 164,
             max_event_name_length: 200,
             max_client_events_per_second: 10,
@@ -460,6 +468,9 @@ impl ServerConfig {
             if let Ok(p) = v.parse() {
                 c.webhook_max_concurrency = p;
             }
+        }
+        if let Ok(v) = std::env::var("PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS") {
+            c.webhook_allow_private_targets = v == "1" || v.eq_ignore_ascii_case("true");
         }
         if let Ok(v) = std::env::var("PYLON_MAX_CHANNEL_NAME_LENGTH") {
             if let Ok(p) = v.parse() {
@@ -737,6 +748,8 @@ mod tests {
         assert_eq!(c.webhook_backoff_cap_ms, 60000);
         assert_eq!(c.webhook_retry_budget_ms, 300000);
         assert_eq!(c.webhook_max_concurrency, 100);
+        // S2 SSRF guard: private webhook targets refused by default.
+        assert!(!c.webhook_allow_private_targets);
         // adapter + redis tunables
         assert_eq!(c.adapter, "local");
         assert_eq!(c.redis_url, "redis://127.0.0.1:6379");
@@ -1072,6 +1085,7 @@ mod tests {
         std::env::set_var("PYLON_WEBHOOK_BACKOFF_CAP_MS", "20");
         std::env::set_var("PYLON_WEBHOOK_RETRY_BUDGET_MS", "30");
         std::env::set_var("PYLON_WEBHOOK_MAX_CONCURRENCY", "5");
+        std::env::set_var("PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS", "1");
         let c = ServerConfig::from_env();
         assert_eq!(c.webhook_batch_ms, 25);
         assert_eq!(c.webhook_timeout_ms, 1234);
@@ -1079,12 +1093,19 @@ mod tests {
         assert_eq!(c.webhook_backoff_cap_ms, 20);
         assert_eq!(c.webhook_retry_budget_ms, 30);
         assert_eq!(c.webhook_max_concurrency, 5);
+        assert!(c.webhook_allow_private_targets, "the SSRF escape hatch");
+        // "true" also enables; anything else leaves it off.
+        std::env::set_var("PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS", "true");
+        assert!(ServerConfig::from_env().webhook_allow_private_targets);
+        std::env::set_var("PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS", "0");
+        assert!(!ServerConfig::from_env().webhook_allow_private_targets);
         std::env::remove_var("PYLON_WEBHOOK_BATCH_MS");
         std::env::remove_var("PYLON_WEBHOOK_TIMEOUT_MS");
         std::env::remove_var("PYLON_WEBHOOK_BACKOFF_BASE_MS");
         std::env::remove_var("PYLON_WEBHOOK_BACKOFF_CAP_MS");
         std::env::remove_var("PYLON_WEBHOOK_RETRY_BUDGET_MS");
         std::env::remove_var("PYLON_WEBHOOK_MAX_CONCURRENCY");
+        std::env::remove_var("PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS");
     }
 
     /// Install a thread-local `tracing` subscriber that records every event's

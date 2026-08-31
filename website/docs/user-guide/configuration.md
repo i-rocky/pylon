@@ -122,6 +122,7 @@ TLS configuration is covered in detail on the [TLS / SSL](tls.md) page.
 | `PYLON_WEBHOOK_BACKOFF_CAP_MS` | `60000` | Upper bound (milliseconds) for each webhook retry delay. |
 | `PYLON_WEBHOOK_RETRY_BUDGET_MS` | `300000` | Total time (milliseconds, attempts included) a webhook delivery may keep retrying without a 2xx — Pusher parity ("exponential backoff, for 5 minutes"). `0` disables retries. |
 | `PYLON_WEBHOOK_TIMEOUT_MS` | `5000` | HTTP request timeout (milliseconds) for each webhook delivery attempt. |
+| `PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS` | `false` | SSRF guard escape hatch: set `1`/`true` to allow webhook delivery to private/loopback/link-local targets. Refused targets fail fast (no HTTP sent, no retries — a configuration error). See [Webhooks: Target restrictions](webhooks.md#target-restrictions-ssrf-guard). |
 | `PYLON_WEBHOOK_VACATED_GRACE_MS` | `3000` | Grace period (milliseconds) after the last member leaves a channel before a `channel_vacated` webhook fires. |
 
 Deprecated (honored or ignored with a startup warning, for one release): `PYLON_WEBHOOK_RETRY_BASE_MS` (alias of `PYLON_WEBHOOK_BACKOFF_BASE_MS`), `PYLON_WEBHOOK_MAX_RETRIES` (ignored — retries are budget-bounded, not count-bounded).

@@ -45,6 +45,7 @@ fn spawn_webhooks(
     let retry_budget_ms = config.webhook_retry_budget_ms;
     let timeout_ms = config.webhook_timeout_ms;
     let max_concurrency = config.webhook_max_concurrency;
+    let allow_private_targets = config.webhook_allow_private_targets;
     Ok(pylon::webhook::spawn(
         apps,
         move |metrics| {
@@ -54,6 +55,7 @@ fn spawn_webhooks(
                 retry_budget_ms,
                 timeout_ms,
                 max_concurrency,
+                allow_private_targets,
                 metrics,
             )
             .map(|t| Arc::new(t) as Arc<dyn WebhookTransport>)

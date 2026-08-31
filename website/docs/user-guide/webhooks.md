@@ -229,3 +229,52 @@ With the defaults and an unresponsive endpoint, attempts are made at roughly 0, 
 
 Deliveries that never receive a 2xx within the retry budget are counted as failures in the
 Prometheus metrics exposed at `/metrics`.
+
+---
+
+## Target restrictions (SSRF guard)
+
+Webhook URLs are configured per-app in `apps.json`, but pylon itself sends the
+POSTs — so a hostile app config could aim them at internal addresses (cloud
+metadata at `169.254.169.254`, loopback services, RFC1918 hosts). Before any
+HTTP is sent, every delivery runs a pre-flight check:
+
+1. **Scheme**: the URL must be `http://` or `https://`. Anything else
+   (`file://`, `ftp://`, …) is refused.
+2. **Address classification**: for a literal-IP URL the address itself is
+   classified; for a hostname, DNS is resolved first and the delivery is
+   refused if **any** resolved address is private. Refused classes:
+   - IPv4 loopback (`127.0.0.0/8`), unspecified (`0.0.0.0`),
+     link-local (`169.254.0.0/16` — includes the cloud metadata addresses),
+     and RFC1918 (`10/8`, `172.16/12`, `192.168/16`).
+   - IPv6 loopback (`::1`), unspecified (`::`), unique-local (`fc00::/7`),
+     and link-local (`fe80::/10`).
+   - IPv4-mapped (`::ffff:10.0.0.5`) and IPv4-compatible (`::10.0.0.5`) IPv6
+     forms are classified by their embedded IPv4 address.
+3. **Pinning**: for hostname URLs the delivery is pinned to the addresses the
+   pre-flight resolved (`ClientBuilder::resolve_to_addrs`), so the actual
+   connect cannot drift to a second, un-checked DNS lookup between the check
+   and the request.
+
+A refused delivery is a **configuration error**: it fails fast with a
+`webhook target refused by SSRF guard` warning log, is counted once in
+`pylon_webhook_delivered_total{status="failed"}`, sends no HTTP at all, and
+does **not** consume the retry budget (retrying a refused target for five
+minutes cannot succeed). A hostname that does not resolve at all is treated
+the same way.
+
+### Redirects are never followed
+
+The webhook client does not follow 3xx responses. A `302` is treated as an
+ordinary non-2xx outcome and retried per the schedule above. This closes a
+bypass where an attacker-controlled endpoint answers `302 →
+http://169.254.169.254/…` — following the redirect would sidestep the
+pre-flight check and pinning entirely.
+
+### Allowing internal targets
+
+If your webhook receivers genuinely live on internal networks, set:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS` | `false` | Set `1` (or `true`) to permit delivery to private/loopback/link-local addresses. The scheme check and the pinning still apply; only the address classification is relaxed. |

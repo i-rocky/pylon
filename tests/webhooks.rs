@@ -123,12 +123,16 @@ async fn spawn_pylon_apps(
     let webhooks = pylon::webhook::spawn(
         apps.clone(),
         move |metrics| {
+            // These delivery tests target the loopback mock receiver, so they
+            // opt into the SSRF guard's escape hatch; the guard itself is
+            // exercised end-to-end by the ssrf_* tests below.
             HttpTransport::new(
                 backoff_base_ms,
                 backoff_cap_ms,
                 retry_budget_ms,
                 5000,
                 100,
+                true,
                 metrics,
             )
             .map(|t| Arc::new(t) as Arc<dyn WebhookTransport>)
@@ -607,4 +611,291 @@ async fn subscription_count_webhook_absent_without_feature_toggle() {
         0,
         "no subscription_count webhook with subscription_count_enabled = false (doc: the App Settings feature toggle gates the event)"
     );
+}
+
+// ── S2: webhook target SSRF guard ─────────────────────────────────────────────
+
+use pylon::webhook::transport::Resolver;
+use pylon::webhook::WebhookMetrics;
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Mock resolver for the SSRF tests: every host resolves to the canned list.
+struct FixedResolver {
+    ips: Vec<IpAddr>,
+}
+
+#[async_trait::async_trait]
+impl Resolver for FixedResolver {
+    async fn resolve(&self, _host: &str) -> Vec<IpAddr> {
+        self.ips.clone()
+    }
+}
+
+fn ssrf_metrics() -> Arc<WebhookMetrics> {
+    Arc::new(WebhookMetrics::new(64))
+}
+
+/// Poll (bounded, real time) until `f` is true.
+async fn until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if f() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    f()
+}
+
+fn signed_delivery_to(url: &str) -> pylon::webhook::transport::WebhookDelivery {
+    pylon::webhook::transport::build_signed_delivery(
+        url,
+        KEY,
+        SECRET,
+        1,
+        &[json!({ "name": "channel_occupied", "channel": "ssrf-room" })],
+        &std::collections::BTreeMap::new(),
+    )
+}
+
+/// S2 case 1: the resolver returns a private address (10.0.0.5) → the delivery
+/// is REFUSED. Observable end-to-end: `delivered_failed` reaches 1 in well
+/// under the 60-second retry budget (a retrying delivery cannot have given up
+/// by then), and nothing was delivered.
+#[tokio::test]
+async fn ssrf_private_resolution_refuses_delivery() {
+    let metrics = ssrf_metrics();
+    let t = HttpTransport::with_resolver(
+        Arc::new(FixedResolver {
+            ips: vec!["10.0.0.5".parse().unwrap()],
+        }),
+        false, // guard armed
+        1000,
+        60_000,
+        60_000, // budget 60s: refusal must NOT wait for this
+        5_000,
+        10,
+        metrics.clone(),
+    )
+    .expect("client builds");
+    let started = std::time::Instant::now();
+    t.deliver(signed_delivery_to("https://internal.example.test/wh"))
+        .await;
+
+    let refused = until(Duration::from_secs(3), || {
+        metrics.delivered_failed.load(Ordering::Relaxed) >= 1
+    })
+    .await;
+    assert!(refused, "delivery must be refused quickly");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "refusal is fast-fail (config error), not budget-bounded; took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(metrics.delivered_ok.load(Ordering::Relaxed), 0);
+}
+
+/// S2 case 2: the resolver returns a PUBLIC address → the delivery is attempted
+/// (not refused). The pinned address (93.184.216.34) is unroutable from the
+/// test host, so the delivery cannot succeed — the observable distinction is
+/// WHEN it fails: an attempted delivery rides the retry loop and records its
+/// failure only once the small budget (400 ms) has elapsed, whereas a refusal
+/// is instant. The delivered-and-signed path over a public resolution is
+/// pinned by the transport unit tests (public → 2xx → delivered_ok).
+#[tokio::test]
+async fn ssrf_public_resolution_is_attempted_not_refused() {
+    let metrics = ssrf_metrics();
+    let t = HttpTransport::with_resolver(
+        Arc::new(FixedResolver {
+            ips: vec!["93.184.216.34".parse().unwrap()],
+        }),
+        false,
+        50,
+        100,
+        400, // small budget
+        300, // per-attempt timeout
+        10,
+        metrics.clone(),
+    )
+    .expect("client builds");
+    let started = std::time::Instant::now();
+    t.deliver(signed_delivery_to("https://public.example.test/wh"))
+        .await;
+
+    let failed = until(Duration::from_secs(5), || {
+        metrics.delivered_failed.load(Ordering::Relaxed) >= 1
+    })
+    .await;
+    assert!(failed, "unroutable public target exhausts the budget");
+    assert!(
+        started.elapsed() >= Duration::from_millis(400),
+        "failure must come from the retry budget (attempted), not refusal; took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(metrics.delivered_ok.load(Ordering::Relaxed), 0);
+}
+
+/// S2 case 3: allow-flag TRUE → a private (loopback) target IS delivered, and
+/// the POST arrives fully signed at the receiver behind the mocked hostname.
+#[tokio::test]
+async fn ssrf_allow_flag_lets_private_target_deliver() {
+    let (receiver_addr, mut rx) = spawn_receiver().await;
+    // The URL uses a HOSTNAME; the resolver pins it to the receiver's real
+    // loopback address — delivery must reach the receiver through the pin.
+    let metrics = ssrf_metrics();
+    let t = HttpTransport::with_resolver(
+        Arc::new(FixedResolver {
+            ips: vec![receiver_addr.ip()],
+        }),
+        true, // PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS=1 equivalent
+        1000,
+        60_000,
+        60_000,
+        5_000,
+        10,
+        metrics.clone(),
+    )
+    .expect("client builds");
+    t.deliver(signed_delivery_to(&format!(
+        "http://receiver.example.test:{port}/pusher/webhooks",
+        port = receiver_addr.port()
+    )))
+    .await;
+
+    let (body, signature) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("webhook POST arrived through the pin")
+        .expect("channel open");
+    assert_eq!(signature, hmac_sha256_hex(SECRET, &body));
+    let ok = until(Duration::from_secs(3), || {
+        metrics.delivered_ok.load(Ordering::Relaxed) >= 1
+    })
+    .await;
+    assert!(ok, "delivered_ok must be recorded");
+}
+
+/// S2 case 4: a `file://` URL is refused regardless of the allow flag (the
+/// allow flag only widens the ADDRESS policy, never the scheme policy).
+#[tokio::test]
+async fn ssrf_file_scheme_refused_even_with_allow_flag() {
+    let metrics = ssrf_metrics();
+    let t = HttpTransport::with_resolver(
+        Arc::new(FixedResolver {
+            ips: vec!["127.0.0.1".parse().unwrap()],
+        }),
+        true,
+        1000,
+        60_000,
+        60_000,
+        5_000,
+        10,
+        metrics.clone(),
+    )
+    .expect("client builds");
+    let started = std::time::Instant::now();
+    t.deliver(signed_delivery_to("file:///etc/passwd")).await;
+
+    let refused = until(Duration::from_secs(3), || {
+        metrics.delivered_failed.load(Ordering::Relaxed) >= 1
+    })
+    .await;
+    assert!(refused, "file:// must be refused fast");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(metrics.delivered_ok.load(Ordering::Relaxed), 0);
+}
+
+/// Redirect bypass closure: a public-looking webhook endpoint that answers
+/// **302 → http://127.0.0.1:PORT/honeypot** must NOT have its redirect
+/// followed — otherwise an attacker-controlled 302 to a metadata/loopback
+/// address would sidestep the pre-flight pinning entirely. The honeypot (a
+/// second local receiver) proves the negative: it must receive ZERO requests
+/// while the original endpoint is retried against (the 302 is just another
+/// non-2xx) until the budget gives up.
+#[tokio::test]
+async fn ssrf_redirect_to_private_target_is_not_followed() {
+    // Honeypot: any hit proves a redirect was followed.
+    let honeypot_hits = Arc::new(AtomicU64::new(0));
+    let hits = honeypot_hits.clone();
+    let honeypot = {
+        use axum::extract::State;
+        async fn handler(State(hits): State<Arc<AtomicU64>>) -> axum::http::StatusCode {
+            hits.fetch_add(1, Ordering::SeqCst);
+            axum::http::StatusCode::OK
+        }
+        let app = axum::Router::new()
+            .route("/honeypot", axum::routing::post(handler))
+            .with_state(hits);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    };
+
+    // The "public" endpoint: every POST answers 302 → the honeypot (a private
+    // address). Its hit counter proves the FIRST hop happened.
+    let first_hits = Arc::new(AtomicU64::new(0));
+    let redirect_app = {
+        use axum::extract::State;
+        // Hand-rolled responder so we can attach the Location header.
+        async fn handler(
+            State((first_hits, honeypot)): State<(Arc<AtomicU64>, SocketAddr)>,
+        ) -> axum::response::Response {
+            use axum::http::StatusCode;
+            first_hits.fetch_add(1, Ordering::SeqCst);
+            let loc = format!("http://{honeypot}/honeypot");
+            let mut resp = axum::response::Response::new(axum::body::Body::empty());
+            *resp.status_mut() = StatusCode::FOUND;
+            resp.headers_mut().insert("location", loc.parse().unwrap());
+            resp
+        }
+        let app = axum::Router::new()
+            .route("/pusher/webhooks", axum::routing::post(handler))
+            .with_state((first_hits.clone(), honeypot));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    };
+
+    let metrics = ssrf_metrics();
+    let t = HttpTransport::with_resolver(
+        Arc::new(FixedResolver {
+            ips: vec![first_hits_addr_ip(&redirect_app)],
+        }),
+        true, // allow private: the FIRST hop is loopback by test necessity
+        50,
+        100,
+        600, // small budget: retried 302s give up fast
+        5_000,
+        10,
+        metrics.clone(),
+    )
+    .expect("client builds");
+    t.deliver(signed_delivery_to(&format!(
+        "http://redirector.example.test:{port}/pusher/webhooks",
+        port = redirect_app.port()
+    )))
+    .await;
+
+    let failed = until(Duration::from_secs(5), || {
+        metrics.delivered_failed.load(Ordering::Relaxed) >= 1
+    })
+    .await;
+    assert!(failed, "the 302 (non-2xx) must exhaust the retry budget");
+    assert!(
+        first_hits.load(Ordering::SeqCst) >= 1,
+        "the first hop must have been attempted (and retried)"
+    );
+    assert_eq!(
+        honeypot_hits.load(Ordering::SeqCst),
+        0,
+        "the redirect target must NEVER be contacted (Policy::none)"
+    );
+    assert_eq!(metrics.delivered_ok.load(Ordering::Relaxed), 0);
+}
+
+/// Helper: the IP of the redirector endpoint (for the mock resolver's pin).
+fn first_hits_addr_ip(addr: &SocketAddr) -> IpAddr {
+    addr.ip()
 }

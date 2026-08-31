@@ -6,10 +6,169 @@ use crate::webhook::WebhookMetrics;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
+
+// ── S2: webhook target SSRF guard ─────────────────────────────────────────────
+
+/// Classify a resolved (or literal) webhook target address as "private" — i.e.
+/// a target the guard refuses unless `PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS=1`:
+///
+/// * IPv4: loopback (127/8), unspecified (`0.0.0.0`), link-local
+///   (169.254.0.0/16 — includes the cloud metadata addresses), RFC1918
+///   (10/8, 172.16/12, 192.168/16).
+/// * IPv6: loopback (`::1`), unspecified (`::`), unique-local (fc00::/7),
+///   link-local (fe80::/10).
+/// * IPv4-mapped (`::ffff:a.b.c.d`) and the deprecated IPv4-compatible
+///   (`::a.b.c.d`) IPv6 forms are classified by their embedded IPv4 address —
+///   a dual-stack socket interprets them as that v4 address.
+///
+/// Pure function over [`IpAddr`] so every class is unit-testable.
+pub fn is_private_target(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_unspecified() || v4.is_link_local() || v4.is_private()
+        }
+        IpAddr::V6(v6) => {
+            // The v6 special forms come FIRST: `to_ipv4` also converts the
+            // IPv4-compatible range ::/96, which would otherwise swallow ::1
+            // and :: into "0.0.0.1" / "0.0.0.0".
+            if v6.is_loopback() || v6.is_unspecified() {
+                return true;
+            }
+            // IPv4-mapped ::ffff:a.b.c.d — classify by the embedded v4.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_target(IpAddr::V4(v4));
+            }
+            // The (deprecated) IPv4-compatible form ::a.b.c.d — still
+            // interpreted as the v4 address by dual-stack sockets; classify
+            // it the same way (fail closed).
+            if let Some(v4) = v6.to_ipv4() {
+                return is_private_target(IpAddr::V4(v4));
+            }
+            (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+        }
+    }
+}
+
+/// DNS resolution seam for the SSRF pre-flight. Production uses
+/// [`SystemResolver`] (`tokio::net::lookup_host`); tests inject canned answers.
+#[async_trait]
+pub trait Resolver: Send + Sync {
+    /// Resolve a hostname to its addresses (empty = the name did not resolve).
+    async fn resolve(&self, host: &str) -> Vec<IpAddr>;
+}
+
+/// Production [`Resolver`]: `tokio::net::lookup_host`. `lookup_host` requires a
+/// `host:port` pair, so the (irrelevant) conventional ports are tried in turn;
+/// only the addresses are used — the URL's own port always wins in the pin.
+pub struct SystemResolver;
+
+#[async_trait]
+impl Resolver for SystemResolver {
+    async fn resolve(&self, host: &str) -> Vec<IpAddr> {
+        for port in [80u16, 443] {
+            if let Ok(addrs) = tokio::net::lookup_host((host, port)).await {
+                let mut ips: Vec<IpAddr> = Vec::new();
+                for sa in addrs {
+                    if !ips.contains(&sa.ip()) {
+                        ips.push(sa.ip());
+                    }
+                }
+                if !ips.is_empty() {
+                    return ips;
+                }
+            }
+        }
+        Vec::new()
+    }
+}
+
+/// A delivery's pinned target: the URL's hostname plus the exact addresses the
+/// pre-flight resolved. Passed to `ClientBuilder::resolve_to_addrs` so the
+/// actual request cannot drift to a second, un-checked lookup.
+#[derive(Debug)]
+pub(crate) struct DeliveryPin {
+    /// The hostname exactly as it appears in the URL (matches what reqwest
+    /// resolves — no brackets for IPv6, which never reaches here: literal IPs
+    /// are not pinned, they are classified directly).
+    pub(crate) host: String,
+    pub(crate) addrs: Vec<SocketAddr>,
+}
+
+/// The SSRF pre-flight: parse the delivery URL, refuse non-`http`/`https`
+/// schemes, classify every address the hostname resolves to (or the literal IP
+/// itself), and — for hostnames — pin the delivery to the resolved addresses.
+#[derive(Clone)]
+pub(crate) struct SsrfGuard {
+    pub(crate) resolver: Arc<dyn Resolver>,
+    pub(crate) allow_private: bool,
+}
+
+impl SsrfGuard {
+    /// `Ok(None)` — allowed, literal-IP URL: no lookup, so no pin needed (the
+    /// URL host IS the address). `Ok(Some(pin))` — allowed hostname URL, pinned
+    /// to its pre-flight addresses. `Err(reason)` — refuse the delivery.
+    pub(crate) async fn check(&self, url: &str) -> Result<Option<DeliveryPin>, String> {
+        let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+        let scheme = parsed.scheme().to_ascii_lowercase();
+        if scheme != "http" && scheme != "https" {
+            return Err(format!(
+                "unsupported scheme {scheme:?}: webhook targets must be http:// or https://"
+            ));
+        }
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| "URL has no host".to_string())?
+            .to_string();
+        let port = parsed
+            .port_or_known_default()
+            .ok_or_else(|| "unknown port for scheme".to_string())?;
+
+        // Literal IP hosts skip resolution but run the SAME classification.
+        // IPv6 hosts arrive bracketed ("[::1]"); a zone suffix fails the parse
+        // and falls through to the resolver, which cannot resolve it either —
+        // both paths fail closed.
+        let literal = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+            Some(v6) => v6.parse::<Ipv6Addr>().ok().map(IpAddr::V6),
+            None => host.parse::<IpAddr>().ok(),
+        };
+        match literal {
+            Some(ip) => {
+                if is_private_target(ip) && !self.allow_private {
+                    Err(format!(
+                        "target {ip} is a private/loopback/link-local address"
+                    ))
+                } else {
+                    Ok(None)
+                }
+            }
+            None => {
+                let ips = self.resolver.resolve(&host).await;
+                if ips.is_empty() {
+                    return Err(format!("host {host} did not resolve"));
+                }
+                let mut addrs = Vec::with_capacity(ips.len());
+                for ip in ips {
+                    if is_private_target(ip) && !self.allow_private {
+                        // ANY private address in the answer set refuses the
+                        // delivery (a round-robin DNS split across public and
+                        // private space must not leak requests inward).
+                        return Err(format!(
+                            "host {host} resolves to private/loopback/link-local address {ip}"
+                        ));
+                    }
+                    addrs.push(SocketAddr::new(ip, port));
+                }
+                Ok(Some(DeliveryPin { host, addrs }))
+            }
+        }
+    }
+}
 
 /// One fully-prepared POST: the raw signed body bytes plus the exact header set.
 #[derive(Debug, Clone, PartialEq)]
@@ -111,9 +270,39 @@ pub(crate) trait AttemptSender: Send + Sync {
 }
 
 /// Production [`AttemptSender`]: one reqwest POST with the per-attempt timeout
-/// baked into the client.
+/// baked into the client. Redirects are NEVER followed (`Policy::none`) — a
+/// 3xx is returned as-is and lands in the non-2xx retry path. Following a
+/// redirect would let an attacker-controlled 302 to e.g.
+/// `http://169.254.169.254/` bypass the SSRF pre-flight pinning entirely.
 struct ReqwestSender {
     client: reqwest::Client,
+}
+
+impl ReqwestSender {
+    /// Shared (unpinned) client: redirects off, per-attempt timeout on.
+    fn shared(timeout_ms: u64) -> Result<Self, reqwest::Error> {
+        Ok(Self {
+            client: reqwest_client_builder(timeout_ms).build()?,
+        })
+    }
+
+    /// Per-delivery client pinned to the pre-flight's resolved addresses, so
+    /// the connect cannot drift from the addresses the guard classified.
+    /// (The URL's own port always wins over the pin's port — reqwest contract.)
+    fn pinned(pin: &DeliveryPin, timeout_ms: u64) -> Result<Self, String> {
+        let client = reqwest_client_builder(timeout_ms)
+            .resolve_to_addrs(&pin.host, &pin.addrs)
+            .build()
+            .map_err(|e| e.to_string())?;
+        Ok(Self { client })
+    }
+}
+
+/// The common client recipe: per-attempt timeout + NO redirect following.
+fn reqwest_client_builder(timeout_ms: u64) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .redirect(reqwest::redirect::Policy::none())
 }
 
 #[async_trait]
@@ -148,16 +337,26 @@ pub struct HttpTransport {
     backoff_cap_ms: u64,
     retry_budget_ms: u64,
     semaphore: Arc<Semaphore>,
+    /// Per-attempt timeout (kept for building the per-delivery pinned client).
+    timeout_ms: u64,
+    /// S2 SSRF pre-flight. `None` on the pure retry-policy test seam
+    /// ([`HttpTransport::with_sender`]); `Some` on every production path.
+    guard: Option<SsrfGuard>,
     /// Shared pipeline counters. The spawned delivery task bumps `delivered_ok`
     /// (2xx) or `delivered_failed` (retry budget exhausted without a 2xx /
-    /// closed semaphore) exactly once when the attempt loop resolves.
+    /// closed semaphore / target refused by the SSRF guard) exactly once when
+    /// the attempt loop resolves.
     metrics: Arc<WebhookMetrics>,
 }
 
 impl HttpTransport {
     /// `timeout_ms` is the per-attempt request timeout; `max_concurrency` caps
-    /// simultaneous in-flight deliveries. `metrics` is the shared pipeline
-    /// counter set; the spawned delivery task records each resolved outcome.
+    /// simultaneous in-flight deliveries. `allow_private_targets` is the
+    /// `PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS` escape hatch (default `false`):
+    /// when `false`, deliveries whose target resolves to (or literally is) a
+    /// private/loopback/link-local address are refused before any HTTP is
+    /// sent — see [`SsrfGuard`]. `metrics` is the shared pipeline counter set;
+    /// the spawned delivery task records each resolved outcome.
     ///
     /// Returns `Err` when the underlying reqwest client cannot be built (e.g. a
     /// TLS-backend initialization failure). This runs at startup even when zero
@@ -170,13 +369,50 @@ impl HttpTransport {
         retry_budget_ms: u64,
         timeout_ms: u64,
         max_concurrency: usize,
+        allow_private_targets: bool,
         metrics: Arc<WebhookMetrics>,
     ) -> Result<Self, reqwest::Error> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(timeout_ms))
-            .build()?;
-        Ok(Self::with_sender(
-            Arc::new(ReqwestSender { client }),
+        let sender = Arc::new(ReqwestSender::shared(timeout_ms)?);
+        let guard = SsrfGuard {
+            resolver: Arc::new(SystemResolver),
+            allow_private: allow_private_targets,
+        };
+        Ok(Self::with_sender_and_guard(
+            sender,
+            Some(guard),
+            timeout_ms,
+            backoff_base_ms,
+            backoff_cap_ms,
+            retry_budget_ms,
+            max_concurrency,
+            metrics,
+        ))
+    }
+
+    /// Test seam: like [`HttpTransport::new`] but with an injectable DNS
+    /// [`Resolver`], so the SSRF pre-flight can be pinned to exact addresses
+    /// (and real HTTP still exercised) without touching the system resolver.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_resolver(
+        resolver: Arc<dyn Resolver>,
+        allow_private_targets: bool,
+        backoff_base_ms: u64,
+        backoff_cap_ms: u64,
+        retry_budget_ms: u64,
+        timeout_ms: u64,
+        max_concurrency: usize,
+        metrics: Arc<WebhookMetrics>,
+    ) -> Result<Self, reqwest::Error> {
+        let sender = Arc::new(ReqwestSender::shared(timeout_ms)?);
+        let guard = SsrfGuard {
+            resolver,
+            allow_private: allow_private_targets,
+        };
+        Ok(Self::with_sender_and_guard(
+            sender,
+            Some(guard),
+            timeout_ms,
             backoff_base_ms,
             backoff_cap_ms,
             retry_budget_ms,
@@ -187,8 +423,38 @@ impl HttpTransport {
 
     /// Test seam: build with an injectable [`AttemptSender`] so the retry
     /// policy runs under paused tokio time with deterministic canned attempts.
+    /// No SSRF guard runs on this seam (the retry policy is what is under
+    /// test); see [`HttpTransport::with_sender_and_guard`] for the guarded
+    /// variant. Only used by this module's tests (`cfg(test)`).
+    #[cfg(test)]
     pub(crate) fn with_sender(
         sender: Arc<dyn AttemptSender>,
+        backoff_base_ms: u64,
+        backoff_cap_ms: u64,
+        retry_budget_ms: u64,
+        max_concurrency: usize,
+        metrics: Arc<WebhookMetrics>,
+    ) -> Self {
+        Self::with_sender_and_guard(
+            sender,
+            None,
+            0,
+            backoff_base_ms,
+            backoff_cap_ms,
+            retry_budget_ms,
+            max_concurrency,
+            metrics,
+        )
+    }
+
+    /// Test seam: injectable [`AttemptSender`] AND [`SsrfGuard`] — the guarded
+    /// delivery path with a counting mock sender, so a refusal can be pinned
+    /// to "zero HTTP attempts".
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_sender_and_guard(
+        sender: Arc<dyn AttemptSender>,
+        guard: Option<SsrfGuard>,
+        timeout_ms: u64,
         backoff_base_ms: u64,
         backoff_cap_ms: u64,
         retry_budget_ms: u64,
@@ -203,6 +469,8 @@ impl HttpTransport {
             backoff_cap_ms: backoff_cap_ms.max(1),
             retry_budget_ms,
             semaphore: Arc::new(Semaphore::new(max_concurrency)),
+            timeout_ms,
+            guard,
             metrics,
         }
     }
@@ -221,6 +489,8 @@ impl WebhookTransport for HttpTransport {
     /// exhausted / closed semaphore) exactly once.
     async fn deliver(&self, delivery: WebhookDelivery) {
         let sender = self.sender.clone();
+        let guard = self.guard.clone();
+        let pin_timeout_ms = self.timeout_ms;
         let base = self.backoff_base_ms;
         let cap = self.backoff_cap_ms;
         let budget = self.retry_budget_ms;
@@ -228,6 +498,47 @@ impl WebhookTransport for HttpTransport {
         let metrics = self.metrics.clone();
 
         tokio::spawn(async move {
+            // S2 pre-flight (inside the spawn: deliver must never block the
+            // dispatcher, and a DNS lookup takes real time). A refusal is a
+            // CONFIGURATION error — retrying a refused target for the whole
+            // budget cannot succeed — so it fails the delivery attempt fast:
+            // one `delivered_failed` outcome, a warn log naming the reason,
+            // zero HTTP attempts, and no budget or semaphore permit consumed.
+            // (Empty DNS resolution is treated the same way: there is nothing
+            // to pin, so the delivery cannot be made responsibly.)
+            let sender: Arc<dyn AttemptSender> = match guard.as_ref() {
+                None => sender,
+                Some(g) => match g.check(&delivery.url).await {
+                    // Allowed literal-IP URL: the URL host IS the address —
+                    // no lookup can drift, the shared sender is safe.
+                    Ok(None) => sender,
+                    // Allowed hostname URL: pin this delivery to the
+                    // pre-flight addresses so the connect cannot resolve
+                    // again on its own.
+                    Ok(Some(pin)) => match ReqwestSender::pinned(&pin, pin_timeout_ms) {
+                        Ok(s) => Arc::new(s),
+                        Err(e) => {
+                            tracing::warn!(
+                                url = %delivery.url,
+                                error = %e,
+                                "webhook pinned client build failed; dropping"
+                            );
+                            metrics.delivered_failed.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                    },
+                    Err(reason) => {
+                        tracing::warn!(
+                            url = %delivery.url,
+                            reason = %reason,
+                            "webhook target refused by SSRF guard; dropping without retry"
+                        );
+                        metrics.delivered_failed.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                },
+            };
+
             // First permit before the clock starts: the budget bounds time
             // spent RETRYING, not time queued behind a saturated semaphore.
             // (semaphore closed = shutdown: the delivery never went out)
@@ -252,7 +563,11 @@ impl WebhookTransport for HttpTransport {
                         return;
                     }
                     Ok(status) => {
-                        // Any non-2xx is retried (Pusher parity).
+                        // Any non-2xx is retried (Pusher parity). That
+                        // includes 3xx: redirects are never followed
+                        // (`Policy::none`), so a 302 is just another non-2xx
+                        // outcome — following it would let an attacker's
+                        // redirect sidestep the SSRF pre-flight pin.
                         tracing::debug!(
                             url = %delivery.url,
                             status,
@@ -685,8 +1000,9 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let addr = spawn_mock(post(flaky_handler), calls.clone()).await;
         let metrics = Arc::new(WebhookMetrics::new(64));
-        // base 1ms / cap 10ms / budget 5s so the test is fast.
-        let t = HttpTransport::new(1, 10, 5_000, 5_000, 10, metrics.clone())
+        // base 1ms / cap 10ms / budget 5s so the test is fast. The receiver is
+        // loopback, so this live-HTTP test opts into the SSRF escape hatch.
+        let t = HttpTransport::new(1, 10, 5_000, 5_000, 10, true, metrics.clone())
             .expect("reqwest client builds in tests");
         let d = build_signed_delivery(
             &format!("http://{addr}/wh"),
@@ -715,7 +1031,8 @@ mod tests {
         let addr = spawn_mock(post(reject_handler), calls.clone()).await;
         let metrics = Arc::new(WebhookMetrics::new(64));
         // Small budget (100ms) so the retry loop resolves quickly in real time.
-        let t = HttpTransport::new(1, 10, 100, 5_000, 10, metrics.clone())
+        // Loopback receiver → SSRF escape hatch opted in.
+        let t = HttpTransport::new(1, 10, 100, 5_000, 10, true, metrics.clone())
             .expect("reqwest client builds in tests");
         let d = build_signed_delivery(
             &format!("http://{addr}/wh"),
@@ -781,7 +1098,7 @@ mod tests {
     #[test]
     fn new_returns_ok_when_the_client_builds() {
         let metrics = Arc::new(WebhookMetrics::new(64));
-        assert!(HttpTransport::new(1000, 60_000, 300_000, 5_000, 10, metrics).is_ok());
+        assert!(HttpTransport::new(1000, 60_000, 300_000, 5_000, 10, false, metrics).is_ok());
     }
 
     #[test]
@@ -841,5 +1158,338 @@ mod tests {
             d.headers["X-Pusher-Signature"],
             hmac_sha256_hex("real-secret", &d.body)
         );
+    }
+
+    // ── S2: SSRF guard — address classification (every class) ────────────────
+
+    /// A "private" (refused) target per the plan: v4 loopback / unspecified /
+    /// link-local / RFC1918; v6 loopback / unspecified / unique-local (fc00::/7) /
+    /// link-local (fe80::/10); plus v4-mapped and v4-compatible v6 forms
+    /// classified by their embedded v4 address.
+    fn private(s: &str) -> bool {
+        is_private_target(s.parse().expect("valid ip literal for the test"))
+    }
+
+    #[test]
+    fn classifier_blocks_v4_loopback_range() {
+        assert!(private("127.0.0.1"));
+        assert!(private("127.0.0.0"));
+        assert!(private("127.255.255.254"), "the whole 127/8 is loopback");
+    }
+
+    #[test]
+    fn classifier_blocks_v4_unspecified() {
+        assert!(private("0.0.0.0"));
+    }
+
+    #[test]
+    fn classifier_blocks_v4_link_local_169_254() {
+        assert!(private("169.254.0.1"));
+        assert!(private("169.254.169.254"), "the cloud metadata address");
+        assert!(private("169.254.255.255"));
+        assert!(!private("169.253.255.255"), "just below the /16");
+        assert!(!private("169.255.0.1"), "just above the /16");
+    }
+
+    #[test]
+    fn classifier_blocks_rfc1918() {
+        // 10.0.0.0/8
+        assert!(private("10.0.0.5"));
+        assert!(private("10.255.255.255"));
+        assert!(private("10.1.2.3"));
+        // 172.16.0.0/12 — the bounds matter (is_private must cover 172.16–172.31)
+        assert!(private("172.16.0.1"));
+        assert!(private("172.31.255.255"));
+        assert!(!private("172.15.255.255"), "just below the /12");
+        assert!(!private("172.32.0.1"), "just above the /12");
+        // 192.168.0.0/16
+        assert!(private("192.168.0.1"));
+        assert!(private("192.168.255.255"));
+        assert!(!private("192.169.0.1"), "just above the /16");
+    }
+
+    #[test]
+    fn classifier_allows_public_v4() {
+        assert!(!private("8.8.8.8"));
+        assert!(!private("1.1.1.1"));
+        assert!(!private("203.0.113.10"), "TEST-NET is not RFC1918-private");
+        assert!(!private("172.32.0.1"));
+    }
+
+    #[test]
+    fn classifier_blocks_v6_loopback_and_unspecified() {
+        assert!(private("::1"));
+        assert!(private("::"), "unspecified v6");
+    }
+
+    #[test]
+    fn classifier_blocks_v6_unique_local_fc00_slash_7() {
+        assert!(private("fc00::1"));
+        assert!(private("fd00::1"));
+        assert!(private("fd12:3456:789a::1"));
+        assert!(!private("fbff::1"), "just below fc00::/7");
+        assert!(!private("fe00::1"), "just above fc00::/7");
+    }
+
+    #[test]
+    fn classifier_blocks_v6_link_local_fe80_slash_10() {
+        assert!(private("fe80::1"));
+        assert!(private("fe80::ffff:ffff:ffff:ffff"));
+        assert!(private("febf::1"), "top of fe80::/10");
+        assert!(!private("fec0::1"), "just above fe80::/10 (old site-local)");
+    }
+
+    #[test]
+    fn classifier_blocks_v4_mapped_v6_by_embedded_v4() {
+        assert!(private("::ffff:10.0.0.5"), "mapped RFC1918");
+        assert!(private("::ffff:127.0.0.1"), "mapped loopback");
+        assert!(
+            private("::ffff:169.254.169.254"),
+            "mapped link-local/metadata"
+        );
+        assert!(private("::ffff:0.0.0.0"), "mapped unspecified");
+        assert!(!private("::ffff:8.8.8.8"), "mapped public is allowed");
+    }
+
+    #[test]
+    fn classifier_blocks_v4_compatible_v6_by_embedded_v4() {
+        // The deprecated ::a.b.c.d form is still interpreted as the v4 address
+        // by dual-stack sockets — classify it the same way (fail closed).
+        assert!(private("::127.0.0.1"));
+        assert!(private("::10.0.0.5"));
+        assert!(!private("::8.8.8.8"));
+    }
+
+    #[test]
+    fn classifier_allows_public_v6() {
+        assert!(!private("2001:4860:4860::8888"));
+        assert!(!private("2606:4700:4700::1111"));
+    }
+
+    // ── S2: SSRF guard — the pre-flight over a mock resolver ──────────────────
+
+    /// Mock [`Resolver`]: returns the same canned address list for every host.
+    struct MockResolver {
+        ips: Vec<IpAddr>,
+    }
+
+    #[async_trait]
+    impl Resolver for MockResolver {
+        async fn resolve(&self, _host: &str) -> Vec<IpAddr> {
+            self.ips.clone()
+        }
+    }
+
+    fn guard_with(ips: &[IpAddr], allow_private: bool) -> SsrfGuard {
+        SsrfGuard {
+            resolver: Arc::new(MockResolver { ips: ips.to_vec() }),
+            allow_private,
+        }
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn preflight_refuses_when_any_resolved_ip_is_private() {
+        let g = guard_with(&[ip("8.8.8.8"), ip("10.0.0.5")], false);
+        let err = g.check("https://e.test/wh").await.unwrap_err();
+        assert!(
+            err.contains("10.0.0.5"),
+            "the refusal must name the offending address: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_pins_public_resolution() {
+        let g = guard_with(&[ip("93.184.216.34"), ip("1.1.1.1")], false);
+        let pin = g.check("https://e.test/wh").await.unwrap().unwrap();
+        assert_eq!(pin.host, "e.test");
+        assert_eq!(
+            pin.addrs,
+            vec![
+                SocketAddr::new(ip("93.184.216.34"), 443),
+                SocketAddr::new(ip("1.1.1.1"), 443),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_uses_the_urls_explicit_port_in_the_pin() {
+        let g = guard_with(&[ip("93.184.216.34")], false);
+        let pin = g.check("http://e.test:9090/wh").await.unwrap().unwrap();
+        assert_eq!(pin.addrs, vec![SocketAddr::new(ip("93.184.216.34"), 9090)]);
+    }
+
+    #[tokio::test]
+    async fn preflight_pins_even_when_private_targets_are_allowed() {
+        let g = guard_with(&[ip("10.0.0.5")], true);
+        assert!(g.check("https://e.test/wh").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn preflight_refuses_when_resolution_is_empty() {
+        let g = guard_with(&[], false);
+        let err = g.check("https://nx.test/wh").await.unwrap_err();
+        assert!(
+            err.contains("nx.test") && err.to_lowercase().contains("resolve"),
+            "empty resolution must refuse with the host named: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_literal_ip_skips_resolution_but_classifies() {
+        // Private literal, guard on → refused without consulting the resolver
+        // (which would panic-fail the test if called for a literal… instead it
+        // simply must not matter: classification is on the literal itself).
+        let g = guard_with(&[ip("8.8.8.8")], false);
+        let err = g.check("http://10.0.0.5/wh").await.unwrap_err();
+        assert!(err.contains("10.0.0.5"), "{err}");
+        // Public literal → allowed, no pin needed (the URL host IS the address).
+        let out = g.check("http://93.184.216.34/wh").await.unwrap();
+        assert!(out.is_none(), "literal IP needs no DNS pin");
+        // v6 literal, private → refused.
+        let err = g.check("http://[::1]/wh").await.unwrap_err();
+        assert!(err.contains("::1"), "{err}");
+        // v6 literal, public → allowed.
+        assert!(g
+            .check("http://[2001:4860:4860::8888]/wh")
+            .await
+            .unwrap()
+            .is_none());
+        // v4-mapped v6 literal → classified by the embedded v4.
+        let err = g.check("http://[::ffff:10.0.0.5]/wh").await.unwrap_err();
+        assert!(err.contains("10.0.0.5"), "mapped form: {err}");
+    }
+
+    #[tokio::test]
+    async fn preflight_literal_private_allowed_when_flag_set() {
+        let g = guard_with(&[], true);
+        assert!(g.check("http://127.0.0.1:8080/wh").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn preflight_refuses_non_http_schemes() {
+        let g = guard_with(&[ip("8.8.8.8")], true);
+        for url in [
+            "file:///etc/passwd",
+            "ftp://e.test/wh",
+            "gopher://e.test/wh",
+            "unix:///var/run/sock",
+        ] {
+            let err = g.check(url).await.unwrap_err();
+            assert!(
+                err.to_lowercase().contains("scheme"),
+                "{url} must be refused as a scheme violation: {err}"
+            );
+        }
+    }
+
+    // ── S2: SSRF guard — full delivery through the transport (mock sender) ────
+
+    /// Build a transport with a counting mock sender AND a real guard over the
+    /// mock resolver, so refusal can be pinned to "zero HTTP attempts".
+    fn guarded_transport(
+        respond: impl Fn(u32, &WebhookDelivery) -> Result<u16, String> + Send + Sync + 'static,
+        ips: &[IpAddr],
+        allow_private: bool,
+        metrics: Arc<WebhookMetrics>,
+    ) -> (HttpTransport, Arc<AtomicUsize>) {
+        let m = mock(respond);
+        let guard = SsrfGuard {
+            resolver: Arc::new(MockResolver { ips: ips.to_vec() }),
+            allow_private,
+        };
+        let t = HttpTransport::with_sender_and_guard(
+            m.sender.clone(),
+            Some(guard),
+            0, // timeout placeholder: only used when a pin must build a client
+            100,
+            1_000,
+            10_000,
+            10,
+            metrics,
+        );
+        (t, m.calls.clone())
+    }
+
+    /// Private resolution + guard on → refused: ZERO HTTP attempts, exactly one
+    /// delivered_failed, resolved immediately (never consumes the retry budget).
+    #[tokio::test(start_paused = true)]
+    async fn private_target_refused_without_any_http_attempt() {
+        let metrics = Arc::new(WebhookMetrics::new(64));
+        let (t, calls) =
+            guarded_transport(|_, _| Ok(200u16), &[ip("10.0.0.5")], false, metrics.clone());
+        t.deliver(delivery_to("https://internal.test/wh")).await;
+        for _ in 0..1_000 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no HTTP attempt may happen"
+        );
+        assert_eq!(metrics.delivered_failed.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.delivered_ok.load(Ordering::Relaxed), 0);
+        // And the clock never moved: refusal is immediate, not budget-bounded.
+        assert_eq!(tokio::time::Instant::now().elapsed(), Duration::ZERO);
+    }
+
+    /// Public target + 2xx sender → delivered exactly once. Uses a LITERAL
+    /// public IP URL (pre-flight `Ok(None)` → the shared counting sender runs;
+    /// a hostname URL would pin a REAL reqwest client instead, which is what
+    /// the integration tests exercise).
+    #[tokio::test(start_paused = true)]
+    async fn public_target_delivered() {
+        let metrics = Arc::new(WebhookMetrics::new(64));
+        let (t, calls) = guarded_transport(
+            |_, _| Ok(200u16),
+            &[ip("93.184.216.34")],
+            false,
+            metrics.clone(),
+        );
+        t.deliver(delivery_to("http://93.184.216.34/wh")).await;
+        for _ in 0..1_000 {
+            if metrics.delivered_ok.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(metrics.delivered_ok.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.delivered_failed.load(Ordering::Relaxed), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Private LITERAL target + allow-flag → classification is bypassed and
+    /// the delivery proceeds through the shared sender (2xx → ok).
+    #[tokio::test(start_paused = true)]
+    async fn private_target_delivered_when_allow_flag_set() {
+        let metrics = Arc::new(WebhookMetrics::new(64));
+        let (t, calls) =
+            guarded_transport(|_, _| Ok(200u16), &[ip("10.0.0.5")], true, metrics.clone());
+        t.deliver(delivery_to("http://10.0.0.5/wh")).await;
+        for _ in 0..1_000 {
+            if metrics.delivered_ok.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(metrics.delivered_ok.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A refused scheme (file://) fails fast the same way — zero attempts.
+    #[tokio::test(start_paused = true)]
+    async fn file_scheme_refused_without_any_http_attempt() {
+        let metrics = Arc::new(WebhookMetrics::new(64));
+        let (t, calls) =
+            guarded_transport(|_, _| Ok(200u16), &[ip("8.8.8.8")], true, metrics.clone());
+        t.deliver(delivery_to("file:///etc/passwd")).await;
+        for _ in 0..1_000 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(metrics.delivered_failed.load(Ordering::Relaxed), 1);
     }
 }
