@@ -3170,49 +3170,71 @@ fn should_skip(band: ShedBand, out_bytes: usize, high_water: usize) -> bool {
     }
 }
 
-/// Deliver every queued [`crate::transport::fanout::BroadcastMsg`] to this worker's local subscribers,
-/// applying the SP10 graduated shed (§6) against this worker's byte budget.
+/// Minimal seam over the worker's connection table: resolve a subscriber's
+/// slab token to its OPEN dispatch connection. `None` covers everything the
+/// inline drain loop has always skipped — a missing slot, a session-less
+/// entry, or a non-`Open` connection. Factored out of `drain_broadcasts` so
+/// the inbox pump can run against any connection container; the impl below is
+/// the production one (`slab::Slab<Entry>`).
+///
+/// `#[doc(hidden)]`: an internal seam exposed ONLY so `benches/fanout_sink.rs`
+/// can drive the REAL inbox pump against a bench-built connection set (the
+/// same hidden-seam pattern as the redis adapter's bench accessors). Not part
+/// of the supported public API.
+#[doc(hidden)]
+pub trait ConnIndex {
+    /// The OPEN dispatch connection at `token`, if there is one to deliver to.
+    fn open_conn(&mut self, token: usize) -> Option<&mut Connection>;
+}
+
+impl ConnIndex for slab::Slab<Entry> {
+    fn open_conn(&mut self, token: usize) -> Option<&mut Connection> {
+        let entry = self.get_mut(token)?;
+        // Only deliver to Open dispatch connections.
+        if entry.session.is_none() || entry.conn.state != ConnState::Open {
+            return None;
+        }
+        Some(&mut entry.conn)
+    }
+}
+
+/// Pump this worker's broadcast inbox to empty: deliver every queued
+/// [`crate::transport::fanout::BroadcastMsg`] to this worker's local
+/// subscribers, applying the SP10 graduated shed (§6) against this worker's
+/// byte budget.
 ///
 /// For each message: classify the current [`ShedBand`] from `inflight_bytes /
 /// effective_budget`; in `Saturated` (≥100%) the whole broadcast is dropped and
 /// the sink flagged; otherwise, for each subscriber (skipping `except`), the
 /// already-WS-framed `frame` is `queue`d (a `Bytes` refcount bump — never
-/// re-encoded)
-/// UNLESS the band says to skip a backed-up subscriber. `inflight_bytes` is kept
-/// live across the drain (each enqueue adds the net byte delta, accounting for
-/// any drop-head eviction) so the band tightens as the worker fills within a
-/// single drain. Connections that backpressure-close are torn down. Returns
-/// `true` if any frame was queued.
+/// re-encoded) UNLESS the band says to skip a backed-up subscriber.
+/// `inflight_bytes` is kept live across the drain (each enqueue adds the net
+/// byte delta, accounting for any drop-head eviction) so the band tightens as
+/// the worker fills within a single drain. `touched` collects every connection
+/// queued onto (the caller's flush loop) and `to_close` the connections the
+/// caller already marked for teardown (backpressure-closed in a previous
+/// phase of this drain).
 ///
-/// `effective_budget` is the per-worker budget already scaled by the PSI factor
-/// (§8); `now_ns` is this iteration's monotonic timestamp, stamped onto every
-/// enqueued frame for the CoDel sojourn check (§7).
+/// This is the fan-out half of [`drain_broadcasts`], factored out verbatim
+/// (same statement order, same skip conditions) so `benches/fanout_sink.rs`
+/// can benchmark the REAL production loop — encode/hand-off once on the
+/// publish side, one shared `Bytes` refcount bump per subscriber on the drain
+/// side. `#[doc(hidden)]` for the same reason as [`ConnIndex`].
+#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
-fn drain_broadcasts(
-    poll: &Poll,
-    conns: &mut slab::Slab<Entry>,
+pub fn drain_broadcast_inbox<C: ConnIndex>(
     rx: &std::sync::mpsc::Receiver<crate::transport::fanout::BroadcastMsg>,
-    local_subs: &mut HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
-    sid_to_token: &mut HashMap<SocketId, usize>,
-    wheel: &mut TimerWheel,
+    local_subs: &HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
+    sid_to_token: &HashMap<SocketId, usize>,
+    conns: &mut C,
     effective_budget: u64,
     inflight_bytes: &mut u64,
-    codel_total: &mut u64,
     drophead_total: &mut u64,
     saturated: Option<&Arc<AtomicBool>>,
     now_ns: u64,
-    conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
-    app_registry: &Arc<AppRegistry>,
-    node_conns: &Arc<AtomicUsize>,
-    cluster: &Option<crate::cluster::bridge::ClusterHandle>,
-) -> bool {
-    let mut touched: HashSet<usize> = HashSet::new();
-    // Connections that backpressured during delivery; closed after the drain so
-    // we don't mutate the slab mid-lookup. A set: the per-subscriber and flush
-    // loops below both probe it, so membership must be O(1) — a drain of a
-    // backpressured channel checks it once per remaining subscriber.
-    let mut to_close: HashSet<usize> = HashSet::new();
-
+    touched: &mut HashSet<usize>,
+    to_close: &HashSet<usize>,
+) {
     while let Ok(msg) = rx.try_recv() {
         // Destructure the message so the drain owns its Arcs: the lookup key
         // MOVES `app`/`channel` (no refcount bumps — the old code cloned both
@@ -3251,16 +3273,12 @@ fn drain_broadcasts(
             if to_close.contains(&token) {
                 continue;
             }
-            let Some(entry) = conns.get_mut(token) else {
+            let Some(conn) = conns.open_conn(token) else {
                 continue;
             };
-            // Only deliver to Open dispatch connections.
-            if entry.session.is_none() || entry.conn.state != ConnState::Open {
-                continue;
-            }
             // Graduated shed: under pressure, skip backed-up subscribers so the
             // fast (caught-up) ones still get every frame — targeted drop.
-            if should_skip(band, entry.conn.out_bytes(), entry.conn.high_water()) {
+            if should_skip(band, conn.out_bytes(), conn.high_water()) {
                 continue;
             }
             // SP10: the per-connection queue is byte-bounded drop-head — it never
@@ -3271,19 +3289,75 @@ fn drain_broadcasts(
             // counter via the `take_inflight_delta` choke point so the band stays
             // accurate within this drain — and so the post-drain flush's send delta
             // (taken below) composes correctly without double-counting.
-            let _dropped = entry.conn.queue(frame.clone(), now_ns);
-            *inflight_bytes = inflight_bytes.wrapping_add(entry.conn.take_inflight_delta() as u64);
+            let _dropped = conn.queue(frame.clone(), now_ns);
+            *inflight_bytes = inflight_bytes.wrapping_add(conn.take_inflight_delta() as u64);
             // G8: the enqueue may have evicted older frames (drop-head) — fold
             // the per-connection accumulator into the worker total NOW rather
             // than deferring to the post-drain flush fold, so the counter is
             // current even if the flush below closes the connection.
-            let dh = entry.conn.take_drophead_dropped();
+            let dh = conn.take_drophead_dropped();
             if dh > 0 {
                 *drophead_total = drophead_total.wrapping_add(dh);
             }
             touched.insert(token);
         }
     }
+}
+
+/// Deliver every queued [`crate::transport::fanout::BroadcastMsg`] to this worker's local subscribers,
+/// applying the SP10 graduated shed (§6) against this worker's byte budget.
+///
+/// The per-message fan-out itself (band classification, sender exclusion, the
+/// graduated skip, the byte-bounded drop-head enqueue and its live
+/// `inflight_bytes`/drop-head accounting) is [`drain_broadcast_inbox`] —
+/// factored out verbatim so the real loop is benchmarkable. This wrapper adds
+/// the two worker-iteration phases the pump must not do mid-lookup: flushing
+/// every connection queued onto (a backpressuring flush arms writable
+/// interest, a failed flush closes), then tearing the closed connections down.
+/// Returns `true` if any frame was queued.
+///
+/// `effective_budget` is the per-worker budget already scaled by the PSI factor
+/// (§8); `now_ns` is this iteration's monotonic timestamp, stamped onto every
+/// enqueued frame for the CoDel sojourn check (§7).
+#[allow(clippy::too_many_arguments)]
+fn drain_broadcasts(
+    poll: &Poll,
+    conns: &mut slab::Slab<Entry>,
+    rx: &std::sync::mpsc::Receiver<crate::transport::fanout::BroadcastMsg>,
+    local_subs: &mut HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
+    sid_to_token: &mut HashMap<SocketId, usize>,
+    wheel: &mut TimerWheel,
+    effective_budget: u64,
+    inflight_bytes: &mut u64,
+    codel_total: &mut u64,
+    drophead_total: &mut u64,
+    saturated: Option<&Arc<AtomicBool>>,
+    now_ns: u64,
+    conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
+    app_registry: &Arc<AppRegistry>,
+    node_conns: &Arc<AtomicUsize>,
+    cluster: &Option<crate::cluster::bridge::ClusterHandle>,
+) -> bool {
+    let mut touched: HashSet<usize> = HashSet::new();
+    // Connections that backpressured during delivery; closed after the drain so
+    // we don't mutate the slab mid-lookup. A set: the per-subscriber and flush
+    // loops below both probe it, so membership must be O(1) — a drain of a
+    // backpressured channel checks it once per remaining subscriber.
+    let mut to_close: HashSet<usize> = HashSet::new();
+
+    drain_broadcast_inbox(
+        rx,
+        local_subs,
+        sid_to_token,
+        conns,
+        effective_budget,
+        inflight_bytes,
+        drophead_total,
+        saturated,
+        now_ns,
+        &mut touched,
+        &to_close,
+    );
 
     let wrote = !touched.is_empty();
     // Flush every connection we queued onto. A flush that backpressures arms

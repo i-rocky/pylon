@@ -111,6 +111,10 @@ name = "fanout"
 harness = false
 
 [[bench]]
+name = "fanout_sink"
+harness = false
+
+[[bench]]
 name = "mailbox"
 harness = false
 
