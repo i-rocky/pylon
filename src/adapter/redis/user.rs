@@ -203,6 +203,11 @@ pub(super) async fn publish(
         app: app.to_string(),
         kind,
         channel: user_id.to_string(),
+        // Additive (F16): when the envelope carries a frame (`UserSend`), emit
+        // its raw bytes as base64 alongside the legacy `event` JSON string so
+        // mixed old/new nodes relay either shape. Non-frame kinds (`Null`)
+        // omit the field.
+        frame_b64: frame.as_str().map(Envelope::encode_frame_b64),
         event: frame,
         except: None,
     };

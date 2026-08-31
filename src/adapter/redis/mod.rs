@@ -1085,8 +1085,11 @@ impl RedisAdapter {
             app: app.to_string(),
             kind: envelope::EnvelopeKind::Broadcast,
             channel: channel.to_string(),
-            event: serde_json::Value::String(frame),
+            event: serde_json::Value::String(frame.clone()),
             except: except.map(|s| s.as_str().to_string()),
+            // Additive (F16): the raw frame bytes as base64 alongside the legacy
+            // `event` JSON string, so mixed old/new nodes relay either shape.
+            frame_b64: Some(envelope::Envelope::encode_frame_b64(&frame)),
         };
         // Publish as a UTF-8 string (the envelope JSON is valid UTF-8); the receive
         // loop reads it back with `Value::into_string()` — a proven round-trip.

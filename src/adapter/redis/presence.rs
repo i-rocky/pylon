@@ -184,8 +184,11 @@ pub(super) async fn reap_member(
             app: app.to_string(),
             kind: EnvelopeKind::Broadcast,
             channel: channel.to_string(),
-            event: Value::String(frame),
+            event: Value::String(frame.clone()),
             except: None,
+            // Additive (F16): raw frame bytes as base64 alongside the legacy
+            // `event` JSON string (see `Envelope::frame_b64`).
+            frame_b64: Some(Envelope::encode_frame_b64(&frame)),
         };
         if let Ok(payload) = String::from_utf8(env.encode()) {
             if let Err(e) =
