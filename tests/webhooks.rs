@@ -805,16 +805,22 @@ async fn ssrf_file_scheme_refused_even_with_allow_flag() {
     assert_eq!(metrics.delivered_ok.load(Ordering::Relaxed), 0);
 }
 
-/// Redirect bypass closure: a public-looking webhook endpoint that answers
-/// **302 → http://127.0.0.1:PORT/honeypot** must NOT have its redirect
-/// followed — otherwise an attacker-controlled 302 to a metadata/loopback
-/// address would sidestep the pre-flight pinning entirely. The honeypot (a
-/// second local receiver) proves the negative: it must receive ZERO requests
-/// while the original endpoint is retried against (the 302 is just another
-/// non-2xx) until the budget gives up.
-#[tokio::test]
-async fn ssrf_redirect_to_private_target_is_not_followed() {
-    // Honeypot: any hit proves a redirect was followed.
+/// Redirect bypass closure — shared trial harness (fix-round 1): a
+/// webhook endpoint answering `status` with `Location: http://<honeypot>/…`
+/// must NOT have its redirect followed — otherwise an attacker-controlled
+/// redirect to a metadata/loopback address sidesteps the SSRF pre-flight
+/// pinning entirely.
+///
+/// The honeypot is registered with `routing::any` (fix-round 1, Important 1):
+/// a followed 302 is rewritten POST→GET, and a GET against a POST-only route
+/// answers 405 WITHOUT invoking the handler — so a POST-only honeypot would
+/// stay at 0 hits even with redirect-following enabled and prove nothing.
+/// `any` counts every method shape: GET (302/303 rewrite), POST (307/308
+/// method-and-body preservation).
+async fn redirect_honeypot_trial(
+    status: axum::http::StatusCode,
+) -> (Arc<AtomicU64>, Arc<AtomicU64>, Arc<WebhookMetrics>) {
+    // Honeypot: ANY hit proves a redirect was followed.
     let honeypot_hits = Arc::new(AtomicU64::new(0));
     let hits = honeypot_hits.clone();
     let honeypot = {
@@ -824,7 +830,7 @@ async fn ssrf_redirect_to_private_target_is_not_followed() {
             axum::http::StatusCode::OK
         }
         let app = axum::Router::new()
-            .route("/honeypot", axum::routing::post(handler))
+            .route("/honeypot", axum::routing::any(handler))
             .with_state(hits);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -832,26 +838,29 @@ async fn ssrf_redirect_to_private_target_is_not_followed() {
         addr
     };
 
-    // The "public" endpoint: every POST answers 302 → the honeypot (a private
-    // address). Its hit counter proves the FIRST hop happened.
+    // The "public" endpoint: every POST answers `status` → the honeypot (a
+    // private address). Its hit counter proves the FIRST hop happened.
     let first_hits = Arc::new(AtomicU64::new(0));
     let redirect_app = {
         use axum::extract::State;
         // Hand-rolled responder so we can attach the Location header.
         async fn handler(
-            State((first_hits, honeypot)): State<(Arc<AtomicU64>, SocketAddr)>,
+            State((first_hits, honeypot, status)): State<(
+                Arc<AtomicU64>,
+                SocketAddr,
+                axum::http::StatusCode,
+            )>,
         ) -> axum::response::Response {
-            use axum::http::StatusCode;
             first_hits.fetch_add(1, Ordering::SeqCst);
             let loc = format!("http://{honeypot}/honeypot");
             let mut resp = axum::response::Response::new(axum::body::Body::empty());
-            *resp.status_mut() = StatusCode::FOUND;
+            *resp.status_mut() = status;
             resp.headers_mut().insert("location", loc.parse().unwrap());
             resp
         }
         let app = axum::Router::new()
             .route("/pusher/webhooks", axum::routing::post(handler))
-            .with_state((first_hits.clone(), honeypot));
+            .with_state((first_hits.clone(), honeypot, status));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -861,12 +870,12 @@ async fn ssrf_redirect_to_private_target_is_not_followed() {
     let metrics = ssrf_metrics();
     let t = HttpTransport::with_resolver(
         Arc::new(FixedResolver {
-            ips: vec![first_hits_addr_ip(&redirect_app)],
+            ips: vec![redirect_app.ip()],
         }),
         true, // allow private: the FIRST hop is loopback by test necessity
         50,
         100,
-        600, // small budget: retried 302s give up fast
+        600, // small budget: retried redirects give up fast
         5_000,
         10,
         metrics.clone(),
@@ -882,20 +891,51 @@ async fn ssrf_redirect_to_private_target_is_not_followed() {
         metrics.delivered_failed.load(Ordering::Relaxed) >= 1
     })
     .await;
-    assert!(failed, "the 302 (non-2xx) must exhaust the retry budget");
+    assert!(
+        failed,
+        "the {status} (non-2xx) must exhaust the retry budget"
+    );
     assert!(
         first_hits.load(Ordering::SeqCst) >= 1,
         "the first hop must have been attempted (and retried)"
     );
+    (first_hits, honeypot_hits, metrics)
+}
+
+/// 302: the classic rewrite form — a followed 302 drops the method to GET,
+/// so a route+handler pair that counts GETs too (any-method honeypot) is what
+/// makes this assertion bite. The redirect target must NEVER be contacted.
+#[tokio::test]
+async fn ssrf_redirect_302_to_private_target_is_not_followed() {
+    let (first_hits, honeypot_hits, metrics) =
+        redirect_honeypot_trial(axum::http::StatusCode::FOUND).await;
     assert_eq!(
         honeypot_hits.load(Ordering::SeqCst),
         0,
-        "the redirect target must NEVER be contacted (Policy::none)"
+        "the 302 redirect target must NEVER be contacted (Policy::none)"
     );
     assert_eq!(metrics.delivered_ok.load(Ordering::Relaxed), 0);
+    assert!(first_hits.load(Ordering::SeqCst) >= 1);
 }
 
-/// Helper: the IP of the redirector endpoint (for the mock resolver's pin).
-fn first_hits_addr_ip(addr: &SocketAddr) -> IpAddr {
-    addr.ip()
+/// 307/308: the method-and-body-PRESERVING redirect — the more dangerous
+/// follow form, because the honeypot would receive the exact signed POST
+/// (body intact) if the client followed it. Both variants must be refused
+/// the same way: the 3xx is returned to the retry loop as-is.
+#[tokio::test]
+async fn ssrf_redirect_307_308_to_private_target_is_not_followed() {
+    for status in [
+        axum::http::StatusCode::TEMPORARY_REDIRECT,
+        axum::http::StatusCode::PERMANENT_REDIRECT,
+    ] {
+        let (first_hits, honeypot_hits, metrics) = redirect_honeypot_trial(status).await;
+        assert_eq!(
+            honeypot_hits.load(Ordering::SeqCst),
+            0,
+            "the {status} redirect target must NEVER be contacted — the signed \
+             POST must not be replayed to it (Policy::none)"
+        );
+        assert_eq!(metrics.delivered_ok.load(Ordering::Relaxed), 0);
+        assert!(first_hits.load(Ordering::SeqCst) >= 1);
+    }
 }
