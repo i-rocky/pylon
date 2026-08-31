@@ -614,7 +614,15 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     let mut drain_deadline: Option<Instant> = None;
 
     loop {
-        if shutdown.load(Ordering::SeqCst) {
+        // Relaxed is sound: the flag carries no payload — the store side
+        // (main's shutdown sequence) publishes nothing this thread reads
+        // through this load, and everything after the run loop exits is
+        // synchronized by the supervisor's thread join, not by the flag's
+        // ordering. Liveness does not need ordering either: the poll timeout
+        // below is bounded at 50ms, so the loop re-reads the flag at least
+        // once per idle cycle and a Relaxed load cannot stall shutdown
+        // observation beyond that.
+        if shutdown.load(Ordering::Relaxed) {
             // C2a drain phase — runs only on the shutdown path, zero cost otherwise.
             let now_ns = worker_epoch.elapsed().as_nanos() as u64;
             if !drain_started {
