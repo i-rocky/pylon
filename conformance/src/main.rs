@@ -46,6 +46,13 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// server-plane scenarios that witness pylon's HTTP and webhook planes.
 const SMOKE_IDS: [&str; 3] = ["C-ESTABLISH", "S-TRIGGER", "S-WEBHOOK-VERIFY"];
 
+/// Wall-clock bound on one `--sign` child. Signing is pure crypto (no server
+/// I/O), so a healthy runner finishes in well under a second; a hung one must
+/// not pin the auth endpoint forever. Cancelling the `wait_with_output` future
+/// drops the child, and `kill_on_drop` (set below) kills it — so the timeout
+/// cannot orphan the process.
+const SIGNER_TIMEOUT: Duration = Duration::from_secs(15);
+
 #[tokio::main]
 async fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -330,7 +337,8 @@ fn select_scenarios(
 
 /// Build the auth endpoint's [`SignerFn`]: spawn the official pusher-http-node
 /// runner in `--sign` mode per auth hit, request body on STDIN, and return
-/// its trimmed stdout as the auth response string.
+/// its trimmed stdout as the auth response string. The child is bounded by
+/// [`SIGNER_TIMEOUT`] — safe to cancel because `kill_on_drop` kills it.
 ///
 /// The outer closure must stay `Fn` (the endpoint may answer concurrently),
 /// so the captured paths are cloned into each invocation's future.
@@ -366,9 +374,11 @@ fn signer_fn(http_adapter_dir: &Path, env_path: &Path) -> SignerFn {
                 drop(stdin);
             }
 
-            let output = child
-                .wait_with_output()
+            // Bounded wait: on timeout the wait future (which owns the child)
+            // is dropped, and kill_on_drop above kills the process.
+            let output = tokio::time::timeout(SIGNER_TIMEOUT, child.wait_with_output())
                 .await
+                .context("signer runner timed out")?
                 .context("wait for signer runner")?;
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !output.status.success() {
