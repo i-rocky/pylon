@@ -172,6 +172,7 @@ mod tests {
         };
         let text = render_human(&r);
         assert!(text.contains("C-ESTABLISH | pusher-js | pass"));
+        assert!(text.find("Client plane").unwrap() < text.find("Server plane").unwrap());
         assert!(text.contains("1 passed, 1 failed, 1 skipped"));
         assert!(text.contains("pusher-js@8.4.0"));
         assert_eq!(exit_code(&r), 1);
@@ -221,6 +222,10 @@ mod tests {
         assert!(
             raw.contains("\n  \"run\""),
             "pretty-printed (indented top-level keys)"
+        );
+        assert!(
+            raw.find("\"run\"").unwrap() < raw.find("\"results\"").unwrap(),
+            "run metadata is serialized before the results array"
         );
         assert_eq!(serde_json::from_str::<Report>(&raw).unwrap(), r);
     }

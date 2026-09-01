@@ -294,6 +294,42 @@ mod tests {
     }
 
     #[test]
+    fn audit_flags_wrong_sdk_and_duplicate_bindings() {
+        let full: Vec<_> = CATALOG
+            .iter()
+            .map(|s| (s.sdk.to_string(), s.id.to_string()))
+            .collect();
+
+        // A scenario bound to the OTHER sdk: exactly one wrong-sdk problem.
+        let mut wrong = full.clone();
+        wrong.push(("pusher-http-node".into(), "C-PRES-SUB".into()));
+        let problems = audit(&wrong);
+        assert_eq!(
+            problems.len(),
+            1,
+            "only the wrong-sdk binding is a problem: {problems:?}"
+        );
+        assert_eq!(
+            problems[0],
+            "C-PRES-SUB is a pusher-js scenario but is implemented by pusher-http-node"
+        );
+
+        // The same (sdk, id) twice: exactly one duplicate problem.
+        let mut dup = full.clone();
+        dup.push(dup[0].clone());
+        let problems = audit(&dup);
+        assert_eq!(
+            problems.len(),
+            1,
+            "only the duplicate binding is a problem: {problems:?}"
+        );
+        assert_eq!(
+            problems[0],
+            "duplicate implementation C-ESTABLISH (pusher-js)"
+        );
+    }
+
+    #[test]
     fn find_returns_entry_by_id() {
         assert_eq!(find("C-PRES-SUB").unwrap().sdk, "pusher-js");
         assert!(find("C-NOPE").is_none());
