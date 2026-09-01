@@ -115,10 +115,14 @@ pub struct ServerConfig {
     /// `event` escaped-JSON string field and the additive `frame_b64` field.
     /// Receivers always prefer `frame_b64` and fall back to `event`, so the
     /// default keeps a 0.2.x↔0.3.x mixed fleet relaying in both directions
-    /// during rolling upgrades. Set `0`/`false` (`PYLON_CLUSTER_ENVELOPE_COMPAT`)
-    /// — ONLY once the WHOLE fleet is ≥0.3.0 — to omit the legacy `event`
-    /// member for frame kinds and halve the cluster-bus bandwidth; frame-less
-    /// control envelopes keep their shape either way.
+    /// during rolling upgrades. Set `0`/`false`/`off`
+    /// (`PYLON_CLUSTER_ENVELOPE_COMPAT`) — ONLY once EVERY node runs a build
+    /// that SHIPS this knob — to omit the legacy `event` member for frame
+    /// kinds and roughly halve the cluster-bus bandwidth. v0.3.0 alone does
+    /// NOT qualify: a 0.3.0 receiver still requires the `event` field and
+    /// SILENTLY DROPS compat-off envelopes (the missing-field decode
+    /// accommodation shipped with this knob). Frame-less control envelopes
+    /// keep their shape either way.
     pub cluster_envelope_compat: bool,
     /// Number of per-core worker threads for the percore transport. `0` means
     /// "auto" — one worker per available CPU. See [`ServerConfig::worker_count`].
@@ -555,10 +559,12 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("PYLON_REDIS_SHARDED_PUBSUB") {
             c.redis_sharded_pubsub = v == "1" || v.eq_ignore_ascii_case("true");
         }
-        // F-1: default-true knob (the app_cache parsing shape) — anything but an
-        // explicit `0`/`false` keeps the compat double-carry wire shape.
+        // F-1: default-true knob (the app_cache parsing shape, `off` included)
+        // — anything but an explicit `0`/`false`/`off` keeps the compat
+        // double-carry wire shape.
         if let Ok(v) = std::env::var("PYLON_CLUSTER_ENVELOPE_COMPAT") {
-            c.cluster_envelope_compat = v != "0" && v.to_lowercase() != "false";
+            c.cluster_envelope_compat =
+                v != "0" && v.to_lowercase() != "off" && v.to_lowercase() != "false";
         }
         if let Ok(v) = std::env::var("PYLON_WORKERS") {
             if let Ok(p) = v.parse() {
@@ -1250,12 +1256,17 @@ mod tests {
         std::env::remove_var("PYLON_CLUSTER_ENVELOPE_COMPAT");
         // Default (unset): compat double-carry ON.
         assert!(ServerConfig::from_env().cluster_envelope_compat);
-        // The explicit opt-outs for a homogeneous >=0.3.0 fleet.
+        // The explicit opt-outs for a fleet of knob-shipping builds.
         std::env::set_var("PYLON_CLUSTER_ENVELOPE_COMPAT", "0");
         assert!(!ServerConfig::from_env().cluster_envelope_compat);
         std::env::set_var("PYLON_CLUSTER_ENVELOPE_COMPAT", "false");
         assert!(!ServerConfig::from_env().cluster_envelope_compat);
         std::env::set_var("PYLON_CLUSTER_ENVELOPE_COMPAT", "FALSE");
+        assert!(!ServerConfig::from_env().cluster_envelope_compat);
+        // `off` also opts out (the PYLON_APP_CACHE sibling parsing shape).
+        std::env::set_var("PYLON_CLUSTER_ENVELOPE_COMPAT", "off");
+        assert!(!ServerConfig::from_env().cluster_envelope_compat);
+        std::env::set_var("PYLON_CLUSTER_ENVELOPE_COMPAT", "OFF");
         assert!(!ServerConfig::from_env().cluster_envelope_compat);
         // The explicit re-enables.
         std::env::set_var("PYLON_CLUSTER_ENVELOPE_COMPAT", "1");

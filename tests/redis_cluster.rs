@@ -1665,6 +1665,11 @@ async fn cluster_envelope_compat_knob_shapes_the_wire_and_relay_still_works() {
         );
 
         // ── Part 2: compat OFF via the exported env var. ───────────────────────
+        // The guard restores the var's PRIOR value on scope exit — even when a
+        // later assertion panics — so a leaked `=0` can never re-knob the rest
+        // of this test binary (the lib suite's ENV_LOCK discipline, scoped to
+        // the one variable this test owns).
+        let _env_guard = EnvCompatGuard::capture();
         std::env::set_var("PYLON_CLUSTER_ENVELOPE_COMPAT", "0");
         let prefix_off = random_prefix();
         // Boot the publisher from the ENVIRONMENT (the env knob's whole point) —
@@ -1760,16 +1765,38 @@ async fn cluster_envelope_compat_knob_shapes_the_wire_and_relay_still_works() {
             other => panic!("expected a Raw frame, got {other:?}"),
         }
 
-        // Cleanup: drop the memberships and the env override.
+        // Cleanup: drop the memberships. The env override is restored by
+        // `_env_guard`'s Drop (which also runs on a panic unwind).
         adapter_b
             .unsubscribe(TEST_APP, "compat-room", &sock_b)
             .await;
         adapter_b.signout_user(TEST_APP, "u1", &user_sock).await;
         let _ = probe.quit().await;
-        std::env::remove_var("PYLON_CLUSTER_ENVELOPE_COMPAT");
     })
     .await
     .expect("compat knob test must not hang (Redis up?)");
+}
+
+/// Restores `PYLON_CLUSTER_ENVELOPE_COMPAT` to its pre-test value when dropped
+/// (removed when it was unset) — panic-safe env hygiene for the knob test: a
+/// leaked `=0` would silently re-knob any later env-reading code in this
+/// binary. Mirrors the lib suite's `ENV_LOCK` discipline, scoped to the one
+/// variable that test owns (the binary's tests run `--test-threads=1`).
+struct EnvCompatGuard(Option<String>);
+
+impl EnvCompatGuard {
+    fn capture() -> Self {
+        Self(std::env::var("PYLON_CLUSTER_ENVELOPE_COMPAT").ok())
+    }
+}
+
+impl Drop for EnvCompatGuard {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(prior) => std::env::set_var("PYLON_CLUSTER_ENVELOPE_COMPAT", prior),
+            None => std::env::remove_var("PYLON_CLUSTER_ENVELOPE_COMPAT"),
+        }
+    }
 }
 
 /// Read the probe's next pub/sub message as JSON (fails loud on stall/close).

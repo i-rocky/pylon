@@ -10,10 +10,12 @@ pre-1.0 and versions track `Cargo.toml`.
 - `PYLON_CLUSTER_ENVELOPE_COMPAT` (default `true`) — retire the Redis cluster
   envelope's legacy `event` double-carry. The default keeps emitting both the
   `event` escaped-JSON string and the additive `frame_b64` field, preserving
-  0.2.x↔0.3.x mixed-fleet rolling upgrades. Set `0`/`false` — only once the
-  whole fleet is ≥0.3.0 — and frame-carrying envelopes omit the legacy field,
-  halving cluster-bus bandwidth (frame-less control envelopes unchanged;
-  receivers decode both shapes regardless).
+  0.2.x↔0.3.x mixed-fleet rolling upgrades. Set `0`/`false`/`off` — only once
+  every node runs a build that ships this knob (**v0.3.0 does NOT qualify**: a
+  0.3.0 receiver cannot decode a compat-off envelope and drops it silently) —
+  and frame-carrying envelopes omit the legacy field, roughly halving
+  cluster-bus bandwidth (frame-less control envelopes unchanged; receivers on
+  knob-shipping builds decode both shapes regardless).
 - `conformance/` — an SDK-conformance harness: boots a real pylon and drives the
   official `pusher-js` and `pusher-http-node` SDKs through every protocol
   feature they can exercise (26 scenarios), with a coverage audit (`--audit`)

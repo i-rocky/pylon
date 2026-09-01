@@ -284,7 +284,9 @@ pub struct RedisConfig {
     /// F-1 (`PYLON_CLUSTER_ENVELOPE_COMPAT`, default `true`): emit the compat
     /// double-carry envelope shape (`event` + `frame_b64`). When `false` the
     /// emitters omit the legacy `event` member for frame-carrying envelopes —
-    /// legal only on a homogeneous ≥0.3.0 fleet (see
+    /// legal only on a fleet whose EVERY node ships this knob (v0.3.0 alone
+    /// does NOT qualify: a 0.3.0 receiver requires `event` and drops
+    /// compat-off envelopes silently; see
     /// [`Envelope::encode_with`](envelope::Envelope::encode_with)).
     pub envelope_compat: bool,
 }
@@ -1102,9 +1104,9 @@ impl RedisAdapter {
             // `event` JSON string, so mixed old/new nodes relay either shape.
             frame_b64: Some(envelope::Envelope::encode_frame_b64(&frame)),
         };
-        // F-1: with the compat knob off (homogeneous ≥0.3.0 fleet) the envelope
-        // drops the legacy `event` member for this frame kind; receivers are
-        // unchanged (they prefer `frame_b64` either way). Publish as a UTF-8
+        // F-1: with the compat knob off (a fleet whose every node ships the
+        // knob) the envelope drops the legacy `event` member for this frame
+        // kind; receivers are unchanged (they prefer `frame_b64` either way). Publish as a UTF-8
         // string (the envelope JSON is valid UTF-8); the receive loop reads it
         // back with `Value::into_string()` — a proven round-trip.
         let payload = match String::from_utf8(env.encode_with(self.cfg.envelope_compat)) {

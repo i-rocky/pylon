@@ -116,7 +116,8 @@ pub(super) async fn user_count(
 /// (the token prefix) so every LIVE node — including this sweeper's — delivers it.
 /// `compat` is the cluster-wide `PYLON_CLUSTER_ENVELOPE_COMPAT` setting: with compat
 /// off the member_removed envelope omits the legacy `event` member (frame_b64 is the
-/// sole carrier — a homogeneous ≥0.3.0 fleet).
+/// sole carrier — legal only on a fleet whose every node ships the knob; v0.3.0
+/// alone does not qualify, its receivers drop compat-off envelopes silently).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn reap_member(
     pool: &Pool,

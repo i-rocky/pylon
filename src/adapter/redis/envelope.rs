@@ -27,8 +27,11 @@ pub struct Envelope {
     pub channel: String,
     // F-1: `event` is `#[serde(default)]` so a NEW-only envelope — emitted with
     // `PYLON_CLUSTER_ENVELOPE_COMPAT=0` (frame_b64, no `event` member) — decodes
-    // on every receiver (the field resolves to `Null`; `frame()` then takes
-    // `frame_b64`). Old-only envelopes (event, no frame_b64) decode as before.
+    // on every receiver that SHIPS this knob (the field resolves to `Null`;
+    // `frame()` then takes `frame_b64`). This accommodation post-dates v0.3.0 —
+    // a released-0.3.0 receiver has no default here and fails the decode (see
+    // `released_030_receiver_cannot_decode_compat_off_emissions`). Old-only
+    // envelopes (event, no frame_b64) decode as before.
     #[serde(default)]
     pub event: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -86,11 +89,18 @@ impl Envelope {
     /// `legacy_event = true` (the default; identical to [`Envelope::encode`])
     /// emits BOTH the legacy `event` JSON string and the additive `frame_b64` —
     /// the exact F16 double-carry that keeps a 0.2.x↔0.3.x mixed fleet relaying
-    /// in both directions. `legacy_event = false` — legal only on a homogeneous
-    /// ≥0.3.0 fleet — OMITS `event` for frame-carrying envelopes (halving the
+    /// in both directions. `legacy_event = false` — legal only on a fleet whose
+    /// EVERY node ships this knob (v0.3.0 alone does NOT qualify: a 0.3.0
+    /// receiver still requires `event` and silently drops compat-off envelopes)
+    /// — OMITS `event` for frame-carrying envelopes (roughly halving the
     /// cluster-bus bandwidth); frame-less control envelopes (the `Null` /
     /// watch / terminate kinds, which carry no `frame_b64`) keep their exact
     /// shape either way.
+    ///
+    /// The receive-side counterpart of this contract is `event`'s
+    /// `#[serde(default)]` — it shipped WITH this knob, which is exactly why
+    /// the fleet threshold is "ships the knob", not "≥0.3.0" (see
+    /// `released_030_receiver_cannot_decode_compat_off_emissions`).
     pub fn encode_with(&self, legacy_event: bool) -> Vec<u8> {
         if legacy_event || self.frame_b64.is_none() {
             return self.encode();
@@ -477,12 +487,71 @@ mod tests {
         assert_eq!(got.frame().as_deref(), Some(frame.as_str()));
         // And the compat=off emission is exactly the new-only shape: decoding it
         // through the OLD pre-F16 receiver struct must FAIL on the missing
-        // required `event` — the documented reason the knob demands a ≥0.3 fleet.
+        // required `event` — the documented reason the knob demands a fleet
+        // that ships it.
         let old: Result<OldEnvelopeShape, _> =
             serde_json::from_slice(&frame_envelope().encode_with(false));
         assert!(
             old.is_err(),
             "an old receiver cannot decode a compat=off frame envelope"
+        );
+    }
+
+    /// The RELEASED v0.3.0 envelope receiver shape, field-for-field: identical
+    /// to the current [`Envelope`] EXCEPT `event` carries no `#[serde(default)]`
+    /// — the missing-field accommodation shipped WITH the compat knob, i.e.
+    /// AFTER 0.3.0. Decoding the knob's emissions into this struct models what
+    /// a real 0.3.0 node does at `receive_loop`'s `Envelope::decode`.
+    #[derive(serde::Deserialize)]
+    struct Released030EnvelopeShape {
+        node_id: String,
+        app: String,
+        #[serde(default)]
+        kind: EnvelopeKind,
+        channel: String,
+        event: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        except: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        frame_b64: Option<String>,
+    }
+
+    #[test]
+    fn released_030_receiver_cannot_decode_compat_off_emissions() {
+        // The fleet-threshold regression guard: the knob is safe only once
+        // every node runs a build that SHIPS it. v0.3.0 is NOT such a build —
+        // a 0.3.0 receiver requires `event`, so a compat=off emission fails
+        // its decode and the receive loop drops the frame SILENTLY
+        // (`Err(_) => continue`). Pinned here so the threshold claim in the
+        // docs/config can never drift from the decode contract.
+        //
+        // compat=on (the default): a 0.3.0 receiver keeps decoding fine — the
+        // additive frame_b64 is an unknown member serde tolerates, and `event`
+        // is still present (field-for-field checks so the shape really is the
+        // current one, not merely "some decodable thing").
+        let on =
+            serde_json::from_slice::<Released030EnvelopeShape>(&frame_envelope().encode_with(true))
+                .expect(
+                    "a released-0.3.0 receiver must keep decoding the default double-carry shape",
+                );
+        assert_eq!(on.node_id, "n1");
+        assert_eq!(on.app, "a");
+        assert_eq!(on.kind, EnvelopeKind::Broadcast);
+        assert_eq!(on.channel, "c");
+        assert_eq!(on.event, serde_json::Value::String(frame_payload()));
+        assert_eq!(
+            on.frame_b64.as_deref(),
+            Some(Envelope::encode_frame_b64(&frame_payload()).as_str())
+        );
+        assert_eq!(on.except, None);
+        // compat=off: the `event` member is absent, 0.3.0's REQUIRED field
+        // fails, the whole decode errors, and the frame is silently dropped.
+        let off: Result<Released030EnvelopeShape, _> =
+            serde_json::from_slice(&frame_envelope().encode_with(false));
+        assert!(
+            off.is_err(),
+            "a released-0.3.0 receiver must FAIL on a compat=off emission (missing \
+             required `event`) — the knob demands a fleet where every node ships it"
         );
     }
 }
