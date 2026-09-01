@@ -1487,15 +1487,33 @@ impl Adapter for RedisAdapter {
     }
 
     async fn send_to_user(&self, app: &str, user_id: &str, event: ServerEvent) {
-        // Deliver to this node's local connections of the user, then fan the
-        // pre-encoded frame out to every other node holding a connection of the
-        // user. The published frame is shared cluster-wide, so it encodes at
-        // `ACTIVE_VERSIONS[0]` (the sink's per-version fan-out is a local
-        // delivery concern; the user-message relay stays single-version until
-        // a v8 cluster envelope exists).
-        self.local.send_to_user(app, user_id, event.clone()).await;
-        let frame =
-            crate::protocol::wire::encode(crate::protocol::wire::ACTIVE_VERSIONS[0], &event);
+        // Encode-once (the same shape `ClusterAdapter::broadcast` and the REST
+        // `broadcast` above proved): encode the frame ONCE (reusing the payload
+        // verbatim when the caller already encoded it as `Raw`) and feed the
+        // SAME bytes to BOTH halves — the local delivery runs as a `Raw` frame
+        // (its F10 flatten would have encoded the identical bytes at
+        // `ACTIVE_VERSIONS[0]` anyway) and the usermsg publish relays the
+        // identical string. Previously the typed event was encoded once inside
+        // the local half and AGAIN here for the publish.
+        //
+        // One frame is shared cluster-wide, so it encodes at
+        // `ACTIVE_VERSIONS[0]` (the user-message relay stays single-version
+        // until a v8 cluster envelope exists).
+        let frame: Arc<str> = match &event {
+            ServerEvent::Raw(f) => f.clone(),
+            other => Arc::from(
+                crate::protocol::wire::encode(crate::protocol::wire::ACTIVE_VERSIONS[0], other)
+                    .as_str(),
+            ),
+        };
+
+        // 1. Deliver to this node's local connections of the user — the shared frame.
+        self.local
+            .send_to_user(app, user_id, ServerEvent::Raw(frame.clone()))
+            .await;
+
+        // 2. Fan the pre-encoded frame out to every other node holding a
+        //    connection of the user.
         user::publish(
             &self.clients.pool,
             &self.keys.usermsg(app, user_id),
@@ -1503,7 +1521,7 @@ impl Adapter for RedisAdapter {
             app,
             user_id,
             envelope::EnvelopeKind::UserSend,
-            serde_json::Value::String(frame),
+            serde_json::Value::String(frame.to_string()),
             self.cfg.sharded_pubsub,
             self.cfg.envelope_compat,
         )

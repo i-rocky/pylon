@@ -6,6 +6,14 @@ pre-1.0 and versions track `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+- `RedisAdapter::send_to_user` now encodes the user event ONCE per send and
+  feeds the same frame to both halves (the node-local delivery runs as a `Raw`
+  frame; the `usermsg` publish reuses the identical string) — previously the
+  typed event was encoded once inside the local half and again for the Redis
+  publish. Wire bytes are unchanged (the same `wire::encode` at
+  `ACTIVE_VERSIONS[0]`; the encode-once shape already proven for broadcasts).
+
 ### Added
 - `PYLON_CLUSTER_ENVELOPE_COMPAT` (default `true`) — retire the Redis cluster
   envelope's legacy `event` double-carry. The default keeps emitting both the

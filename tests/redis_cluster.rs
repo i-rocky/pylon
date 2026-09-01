@@ -1213,6 +1213,96 @@ async fn send_to_user_reaches_connection_on_another_node() {
     }
 }
 
+/// F-2 encode-once pin: `RedisAdapter::send_to_user` must encode the frame ONCE
+/// and feed the SAME bytes to BOTH halves — the node-local delivery (a `Raw`
+/// frame, byte-identical to a fresh `wire::encode` of the event) and the
+/// usermsg publish's `event` string — so the encode-once construction can never
+/// let the two halves diverge (the same contract `ClusterAdapter::broadcast`'s
+/// F17 pin enforces). A caller-supplied pre-encoded `Raw` payload must reach
+/// both halves VERBATIM (no re-encode, no mutation).
+#[tokio::test]
+async fn send_to_user_feeds_the_same_encoded_bytes_to_local_and_publish_halves() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let adapter = connect_adapter_with_prefix(&prefix).await;
+
+        // A local connection of the user on THIS node (the local half's target).
+        let (_sid, handle, mut rx) = recording_handle();
+        adapter.signin_user(TEST_APP, "u-half", handle).await;
+
+        // A raw probe subscriber sniffs the published envelope bytes (fred's
+        // `subscribe` future resolves on the server's confirmation, so the
+        // sniffed publish cannot race the subscription).
+        let probe = fred::prelude::Builder::from_config(
+            fred::prelude::Config::from_url(test_redis_url().as_str()).unwrap(),
+        )
+        .build_subscriber_client()
+        .unwrap();
+        probe.init().await.expect("probe must connect");
+        let mut probe_rx = probe.message_rx();
+        let usermsg = keys.usermsg(TEST_APP, "u-half");
+        probe
+            .subscribe(usermsg.clone())
+            .await
+            .expect("probe SUBSCRIBE");
+
+        // Typed event → ONE encode shared by both halves.
+        let event = ServerEvent::ChannelEvent {
+            channel: "x".into(),
+            event: "e".into(),
+            data: serde_json::json!({"k":1}),
+            user_id: None,
+        };
+        adapter
+            .send_to_user(TEST_APP, "u-half", event.clone())
+            .await;
+
+        let expected =
+            pylon::protocol::wire::encode(pylon::protocol::wire::ACTIVE_VERSIONS[0], &event);
+        let local = with_timeout(async { rx.recv().await }).await.map(|b| *b);
+        match local {
+            Some(ServerEvent::Raw(f)) => assert_eq!(
+                &*f, &expected,
+                "local half must get the shared frame (byte-identical to a fresh encode)"
+            ),
+            other => panic!("expected Raw frame locally, got {other:?}"),
+        }
+        let wire = next_probe_json(&mut probe_rx).await;
+        assert_eq!(
+            wire["kind"], "UserSend",
+            "the probed envelope is the user send"
+        );
+        assert_eq!(
+            wire["event"].as_str(),
+            Some(expected.as_str()),
+            "publish half must relay the SAME bytes the local half delivered, got: {wire}"
+        );
+
+        // `Raw` passthrough: a caller-supplied pre-encoded payload reaches both
+        // halves VERBATIM.
+        let raw: Arc<str> = Arc::from("{\"event\":\"pre\"}");
+        adapter
+            .send_to_user(TEST_APP, "u-half", ServerEvent::Raw(raw.clone()))
+            .await;
+        let local = with_timeout(async { rx.recv().await }).await.map(|b| *b);
+        match local {
+            Some(ServerEvent::Raw(f)) => assert_eq!(&*f, &*raw, "Raw payload verbatim locally"),
+            other => panic!("expected the verbatim Raw frame locally, got {other:?}"),
+        }
+        let wire = next_probe_json(&mut probe_rx).await;
+        assert_eq!(
+            wire["event"].as_str(),
+            Some(&*raw),
+            "publish half must relay the Raw payload verbatim, got: {wire}"
+        );
+
+        let _ = probe.quit().await;
+    })
+    .await
+    .expect("send_to_user encode-once pin must not hang (Redis up?)");
+}
+
 /// B1: `terminate_user` from one node closes the user's connection on ANOTHER node
 /// (4009 error frame then a 4009 Close).
 #[tokio::test]
