@@ -29,27 +29,27 @@
 //       https://pusher.com/docs/channels/server_api/authenticating-users/) is
 //       parsed and merged into the userData signed here.
 //
-//   node runner.js --fire '<json>' --env <env.json>
+//   node runner.js --fire-stdin --env <env.json>   (spec JSON on STDIN)
 //       Publish one event server-side via the SDK: `client().trigger`. The
-//       JSON spec is {channel, name, data, encrypted?} — `data` may be any
-//       JSON value (strings pass verbatim, objects are JSON-serialized by the
-//       SDK). `encrypted: true` is accepted as an assertion that the channel
-//       is private-encrypted-*: the SDK encrypts automatically on those
-//       channels (this client carries encryptionMasterKeyBase64), so the flag
-//       only cross-checks the channel prefix. Exit 0 on a 2xx response,
-//       non-zero with a stderr message otherwise. Used by the client-plane
-//       (pusher-js) scenarios for their server-side publishes, keeping ALL
-//       server-side protocol work on the official server SDK.
+//       JSON spec arrives on STDIN — never argv, where a value token can be
+//       misparsed as an option by this runner's own argv scanner — as
+//       {channel, name, data, encrypted?} — `data` may be any JSON value
+//       (strings pass verbatim, objects are JSON-serialized by the SDK).
+//       `encrypted: true` is accepted as an assertion that the channel is
+//       private-encrypted-*: the SDK encrypts automatically on those channels
+//       (this client carries encryptionMasterKeyBase64), so the flag only
+//       cross-checks the channel prefix. Exit 0 on a 2xx response, non-zero
+//       with a stderr message otherwise. Used by the client-plane (pusher-js)
+//       scenarios for their server-side publishes, keeping ALL server-side
+//       protocol work on the official server SDK.
 //
 //   node runner.js --terminate <user-id> --env <env.json>
 //       Terminate every connection of a signed-in user server-side via the
 //       SDK's `terminateUserConnections` (POST
-//       /apps/{app}/users/{user}/terminate_connections). Exit 0 on a 2xx
-//       response. Used by the pusher-js U-TERMINATE scenario.
-
-//   node runner.js --verify-webhook <envelope.json> [--env <env.json>]
-//       Read {headers, body}, verify with the SDK's webhook checker, print
-//       {"valid": bool, "events": [...], "error"?: string}.
+//       /apps/{app}/users/{user}/terminate_connections). The id is
+//       shape-guarded (USER_ID_RE) BEFORE routing — a value starting with
+//       `-`/`--` must never reach a flag position. Exit 0 on a 2xx response.
+//       Used by the pusher-js U-TERMINATE scenario.
 //
 //   node runner.js --version    Print the SDK's package version.
 //   node runner.js --list       Print implemented scenario ids, one per line.
@@ -72,7 +72,7 @@ const arg = (n) => {
 const has = (n) => argv.includes(n);
 const log = (...a) => console.error('[runner]', ...a);
 
-// Read all of STDIN (the --sign auth-request body).
+// Read all of STDIN (the --sign auth-request body, the --fire-stdin spec).
 const readStdin = () =>
   new Promise((resolve, reject) => {
     let data = '';
@@ -81,6 +81,12 @@ const readStdin = () =>
     process.stdin.on('end', () => resolve(data));
     process.stdin.on('error', reject);
   });
+
+// Shape guard for any user id that reaches an ARGV position (--terminate):
+// alnum first char (never a leading `-`), then alnum/_/.//- up to 128 chars
+// total. The harness only ever passes fixed ids ('u-term', ...) — this is
+// pure flag-injection guarding, not identity validation.
+const USER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 
 // Parse an auth-request body: JSON per the harness contract, with a
 // urlencoded fallback (what pusher-js's classic AJAX authorizer posts).
@@ -303,7 +309,8 @@ const SCENARIOS = {
 const isSkip = (o) => o !== null && typeof o === 'object' && typeof o.skip === 'string';
 
 // ---------------------------------------------------------------------------
-// Webhook verification (shared by the scenario and --verify-webhook).
+// Webhook verification (used by the S-WEBHOOK-VERIFY scenario, which fetches
+// the envelope from the harness receiver's /last endpoint directly).
 // ---------------------------------------------------------------------------
 
 // Build the SDK webhook object from a receiver envelope {headers, body}:
@@ -393,22 +400,25 @@ async function signMode() {
   process.stdout.write(JSON.stringify(resp) + '\n');
 }
 
-// --fire '<json>': one server-side publish through the SDK's trigger.
-// The client is configured with encryptionMasterKeyBase64, so triggering on a
-// private-encrypted-* channel encrypts end-to-end automatically.
-async function fireMode(specRaw) {
+// --fire-stdin: one server-side publish through the SDK's trigger, with the
+// spec JSON read from STDIN (never argv — a value token in a flag position is
+// the flag-injection shape). The client is configured with
+// encryptionMasterKeyBase64, so triggering on a private-encrypted-* channel
+// encrypts end-to-end automatically.
+async function fireStdinMode() {
+  const specRaw = await readStdin();
   let spec;
   try {
     spec = JSON.parse(specRaw);
   } catch (e) {
-    throw new Error('--fire argument is not valid JSON');
+    throw new Error('--fire-stdin body is not valid JSON');
   }
   const { channel, name, data, encrypted } = spec || {};
   if (typeof channel !== 'string' || typeof name !== 'string') {
-    throw new Error('--fire needs {channel: string, name: string, data}');
+    throw new Error('--fire-stdin needs {channel: string, name: string, data}');
   }
   if (encrypted === true && !channel.startsWith('private-encrypted-')) {
-    throw new Error(`--fire encrypted:true but channel ${channel} is not private-encrypted-*`);
+    throw new Error(`--fire-stdin encrypted:true but channel ${channel} is not private-encrypted-*`);
   }
   const r = await client().trigger(channel, name, data);
   if (r.status < 200 || r.status >= 300) {
@@ -419,23 +429,18 @@ async function fireMode(specRaw) {
 
 // --terminate <user-id>: terminate the user's connections through the SDK's
 // own terminateUserConnections (drives pylon's
-// POST /apps/{app}/users/{user}/terminate_connections).
+// POST /apps/{app}/users/{user}/terminate_connections). The id arrives in an
+// argv position, so it is shape-guarded (USER_ID_RE) by the caller BEFORE
+// this runs — no leading dash, bounded length.
 async function terminateMode(userId) {
-  if (!userId) throw new Error('--terminate needs a user id');
+  if (!userId || !USER_ID_RE.test(userId)) {
+    throw new Error('--terminate needs a user id matching ' + USER_ID_RE);
+  }
   const r = await client().terminateUserConnections(userId);
   if (r.status < 200 || r.status >= 300) {
     throw new Error(`terminateUserConnections(${userId}) -> status ${r.status}`);
   }
   log(`terminate: ${userId} -> ${r.status}`);
-}
-
-// --verify-webhook <path>: {headers, body} file, verifier verdict on STDOUT.
-function verifyWebhookMode(envelopePath) {
-  const envelope = JSON.parse(fs.readFileSync(envelopePath, 'utf8'));
-  const result = verifyWebhookEnvelope(envelope);
-  const out = { valid: result.valid, events: result.events };
-  if (result.error) out.error = result.error;
-  console.log(JSON.stringify(out));
 }
 
 // --version: the SDK's own package version.
@@ -500,26 +505,28 @@ async function scenarioMode() {
     await signMode();
     return;
   }
-  const fireSpec = arg('--fire');
-  if (fireSpec) {
-    await fireMode(fireSpec);
+  if (has('--fire-stdin')) {
+    await fireStdinMode();
     return;
   }
   const terminateId = arg('--terminate');
-  if (terminateId) {
+  if (terminateId !== null) {
+    // Shape-guard BEFORE routing: a value starting with `-`/`--` must never
+    // reach a flag position in this (or any downstream) argv scan.
+    if (!USER_ID_RE.test(terminateId)) {
+      console.error(
+        `--terminate: malformed user id (want ${USER_ID_RE}): ${terminateId.slice(0, 64)}`
+      );
+      process.exit(2);
+    }
     await terminateMode(terminateId);
-    return;
-  }
-  const envelopePath = arg('--verify-webhook');
-  if (envelopePath) {
-    verifyWebhookMode(envelopePath);
     return;
   }
   if (has('--scenario')) {
     await scenarioMode();
     return;
   }
-  console.error('usage: runner.js --scenario <id> --env <path> | --sign --env <path> | --fire <json> --env <path> | --terminate <user-id> --env <path> | --verify-webhook <path> | --version | --list');
+  console.error('usage: runner.js --scenario <id> --env <path> | --sign --env <path> | --fire-stdin --env <path> (spec on stdin) | --terminate <user-id> --env <path> | --version | --list');
   process.exit(2);
 })().catch((e) => {
   // Modes other than --scenario have no verdict contract: errors on stderr,

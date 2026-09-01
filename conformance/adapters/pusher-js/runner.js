@@ -15,9 +15,10 @@
 //   node runner.js --list       Print implemented scenario ids, one per line.
 //
 // Server-side publishes (C-PUB-SUB/PRIV/CACHE/ENC) shell out to the sibling
-// pusher-http-node runner's `--fire` mode, so ALL server-plane protocol work
-// rides on the official server SDK. User termination (U-TERMINATE) shells out
-// to the same runner's `--terminate` mode.
+// pusher-http-node runner's `--fire-stdin` mode (spec JSON on the child's
+// stdin — never argv), so ALL server-plane protocol work rides on the
+// official server SDK. User termination (U-TERMINATE) shells out to the same
+// runner's `--terminate` mode (id shape-guarded on both sides).
 //
 // Verified SDK facts this runner relies on (pusher-js 8.6.0, dist inspected):
 //   - `require('pusher-js/node')` exports the Pusher class directly.
@@ -344,11 +345,14 @@ const eventRecorder = (p) => {
 
 const HTTP_ADAPTER_DIR = path.join(__dirname, '..', 'pusher-http-node');
 
+// Publish one event server-side. The spec rides child STDIN (`--fire-stdin`
+// mode), NEVER argv: execFile uses no shell, but a value token in a flag
+// position is still the flag-injection shape — JSON belongs on a pipe.
 const fire = (spec) =>
   new Promise((resolve, reject) => {
-    execFile(
+    const child = execFile(
       process.execPath,
-      ['runner.js', '--fire', JSON.stringify(spec), '--env', arg('--env')],
+      ['runner.js', '--fire-stdin', '--env', arg('--env')],
       { cwd: HTTP_ADAPTER_DIR },
       (err, stdout, stderr) => {
         if (err) {
@@ -358,13 +362,28 @@ const fire = (spec) =>
         }
       }
     );
+    // EPIPE if the child dies before reading: swallowed here so the callback
+    // above is the single failure path.
+    child.stdin.on('error', () => {});
+    child.stdin.end(JSON.stringify(spec));
   });
+
+// Shape guard for any user id that reaches an ARGV position: alnum first
+// char (never a leading `-`), then alnum/_/.//- up to 128 chars total. The
+// harness only ever passes fixed ids ('u-term', ...) — pure flag-injection
+// guarding, not identity validation. Mirrored in the http runner (receiver).
+const USER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 
 // Terminate every connection of a signed-in user, server-side, through the
 // sibling http adapter's --terminate mode (the official server SDK's
-// terminateUserConnections → POST /users/<id>/terminate_connections).
+// terminateUserConnections → POST /users/<id>/terminate_connections). The id
+// occupies an argv position in the child, so it is shape-guarded HERE and
+// again at the receiver.
 const terminateUser = (userId) =>
   new Promise((resolve, reject) => {
+    if (typeof userId !== 'string' || !USER_ID_RE.test(userId)) {
+      return reject(new Error('terminateUser: malformed user id (want ' + USER_ID_RE + ')'));
+    }
     execFile(
       process.execPath,
       ['runner.js', '--terminate', userId, '--env', arg('--env')],
