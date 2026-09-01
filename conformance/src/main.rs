@@ -20,6 +20,12 @@ mod server;
 #[cfg(test)]
 mod adapter;
 
+// Task-5 report layer: `Report`/`render_human`/`write_json`/`exit_code` gain
+// their runtime consumer in Task 6 (the orchestrating runner); test-gated
+// like the rest until then.
+#[cfg(test)]
+mod report;
+
 fn main() {}
 
 #[cfg(test)]
