@@ -42,9 +42,13 @@ use crate::server::AppSpec;
 /// cap.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The `--smoke` subset: one client-plane liveness scenario plus the two
-/// server-plane scenarios that witness pylon's HTTP and webhook planes.
-const SMOKE_IDS: [&str; 3] = ["C-ESTABLISH", "S-TRIGGER", "S-WEBHOOK-VERIFY"];
+/// The `--smoke` subset: C-PUB-SUB's subscribe/unsubscribe records
+/// occupied/vacated webhook envelopes, so the two server-plane scenarios
+/// that follow (S-TRIGGER's HTTP plane, S-WEBHOOK-VERIFY's `/last` +
+/// SDK-verifier path) have something to consume — all three members
+/// actually exercise instead of S-WEBHOOK-VERIFY skipping on an empty
+/// receiver.
+const SMOKE_IDS: [&str; 3] = ["C-PUB-SUB", "S-TRIGGER", "S-WEBHOOK-VERIFY"];
 
 /// Wall-clock bound on one `--sign` child. Signing is pure crypto (no server
 /// I/O), so a healthy runner finishes in well under a second; a hung one must
@@ -566,7 +570,7 @@ mod tests {
         let selected =
             super::select_scenarios(None, None, true).expect("smoke subset always selects");
         let ids: Vec<&str> = selected.iter().map(|s| s.id).collect();
-        assert_eq!(ids, ["C-ESTABLISH", "S-TRIGGER", "S-WEBHOOK-VERIFY"]);
+        assert_eq!(ids, ["C-PUB-SUB", "S-TRIGGER", "S-WEBHOOK-VERIFY"]);
     }
 
     #[test]

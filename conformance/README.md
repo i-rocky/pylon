@@ -16,7 +16,7 @@ Pusher Channels behavior shows up here as a failing scenario.
 
 The harness implements **no auth or webhook crypto of its own**. Every
 signature — channel authorization, user signin, webhook verification — is
- produced or verified by the official `pusher-http-node` SDK:
+produced or verified by the official `pusher-http-node` SDK:
 
 - the harness's auth endpoint receives an SDK auth request and shells out to
   the pusher-http-node runner's `--sign` mode (request on stdin, signed
@@ -55,7 +55,9 @@ All commands run from `conformance/`:
 
 ```sh
 cargo run                       # full suite: 26 scenarios, catalog order
-cargo run -- --smoke            # 3-scenario subset: C-ESTABLISH, S-TRIGGER, S-WEBHOOK-VERIFY
+cargo run -- --smoke            # 3-scenario subset: C-PUB-SUB, S-TRIGGER, S-WEBHOOK-VERIFY
+                                # (all three scenarios exercise in the smoke subset:
+                                # C-PUB-SUB's occupied/vacated envelopes feed S-WEBHOOK-VERIFY)
 cargo run -- --list             # print the catalog (id, sdk, plane, budget, summary)
 cargo run -- --audit            # binding-table honesty gate (see below)
 cargo run -- --sdk pusher-js    # only one SDK's scenarios

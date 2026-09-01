@@ -50,7 +50,7 @@ pub enum Command {
         sdk: Option<String>,
         /// Only this scenario id.
         scenario: Option<String>,
-        /// The three-scenario subset C-ESTABLISH + S-TRIGGER +
+        /// The three-scenario subset C-PUB-SUB + S-TRIGGER +
         /// S-WEBHOOK-VERIFY.
         smoke: bool,
         /// Where the JSON artifact goes.
