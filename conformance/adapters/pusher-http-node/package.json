@@ -1,0 +1,17 @@
+{
+  "name": "pylon-conformance-adapter-pusher-http-node",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Conformance runner for the server plane, driving the official Pusher Channels Node.js SDK (pusher-http-node, published as the `pusher` npm package).",
+  "main": "runner.js",
+  "scripts": {
+    "test": "node runner.js --list"
+  },
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "pusher": "5.3.4"
+  }
+}

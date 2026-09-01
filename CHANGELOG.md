@@ -6,6 +6,12 @@ pre-1.0 and versions track `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+- `conformance/` — an SDK-conformance harness: boots a real pylon and drives the
+  official `pusher-js` and `pusher-http-node` SDKs through every protocol
+  feature they can exercise (26 scenarios), with a coverage audit (`--audit`)
+  and an opt-in CI job (`conformance.yml`).
+
 ## [0.3.0] - 2026-09-01
 
 ### Phase 0 — CI & test integrity (audit remediation)
