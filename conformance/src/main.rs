@@ -108,14 +108,16 @@ fn list_scenarios() {
 
 /// `--audit`: the binding table's honesty gate.
 ///
-/// Two problem families, all printed, any of which exits nonzero:
+/// Three problem families, all printed, any of which exits nonzero:
 ///
-/// - per binding, `adapters/<sdk>/runner.js` must EXIST on disk — with no
-///   runners committed yet this fails for all 26 bindings, which is the
-///   correct scaffolding state (it is what keeps `--audit` from lying green
-///   before Tasks 7-9 land the runners). The deeper check — that each runner
-///   actually DECLARES the bound id in its `--list` output — is wired by
-///   Tasks 7/8 together with the runner `--list` mode itself.
+/// - per binding, `adapters/<sdk>/runner.js` must EXIST on disk;
+/// - per sdk, `node runner.js --list` must RUN and list ids, and every
+///   binding's id must appear in its runner's listing — a runner whose
+///   `--list` omits a bound id means the harness would spawn a scenario the
+///   adapter cannot run (the Task 7/8 note deferred this to the runners'
+///   `--list` mode; resolved here). Each sdk's listing is fetched ONCE and
+///   reused for all its bindings. Without a usable `node` on PATH this leg
+///   cannot run at all, which is itself a problem line (audit exits nonzero);
 /// - `catalog::audit` cross-checks the table against the catalog (missing /
 ///   orphaned / wrong-sdk / duplicate bindings).
 fn audit_bindings() -> i32 {
@@ -131,10 +133,40 @@ fn audit_bindings() -> i32 {
             ));
         }
     }
+
+    // The --list leg needs node; without it the audit cannot be honest.
+    if adapter::which_node().is_none() {
+        problems
+            .push("no usable `node` on PATH — cannot cross-check runner --list output".to_string());
+    } else {
+        // One `--list` invocation per sdk, cached across its bindings.
+        let mut listings: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (sdk, _) in &impls {
+            if listings.contains_key(sdk) {
+                continue;
+            }
+            let dir = adapters_dir().join(sdk);
+            if !dir.join("runner.js").is_file() {
+                continue; // already flagged as a missing runner above
+            }
+            match runner_listing(&dir) {
+                Ok(ids) => {
+                    listings.insert(sdk.clone(), ids);
+                }
+                Err(e) => problems.push(format!("runner --list failed for {sdk}: {e}")),
+            }
+        }
+        problems.extend(listing_problems(&listings, &impls));
+    }
+
     problems.extend(catalog::audit(&impls));
 
     if problems.is_empty() {
-        println!("audit: OK — {} bindings, all runners present", impls.len());
+        println!(
+            "audit: OK — {} bindings, all runners present and listing their ids",
+            impls.len()
+        );
         0
     } else {
         for p in &problems {
@@ -143,6 +175,51 @@ fn audit_bindings() -> i32 {
         eprintln!("audit: {} problem(s)", problems.len());
         1
     }
+}
+
+/// Run `node runner.js --list` in `adapter_dir` and collect the printed ids.
+/// `Err` carries a one-line reason: spawn failure, non-zero exit, or a
+/// listing that printed nothing (an adapter with no scenarios is not a
+/// listing, it is a broken one).
+fn runner_listing(adapter_dir: &Path) -> Result<Vec<String>, String> {
+    let output = std::process::Command::new("node")
+        .arg("runner.js")
+        .arg("--list")
+        .current_dir(adapter_dir)
+        .output()
+        .map_err(|e| format!("spawn failed: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("exit status {}", output.status));
+    }
+    let ids: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(String::from)
+        .collect();
+    if ids.is_empty() {
+        return Err("printed no scenario ids".to_string());
+    }
+    Ok(ids)
+}
+
+/// Cross-check the binding table against per-sdk `--list` outputs: every
+/// `(sdk, id)` binding must appear in that sdk's listing. Sdks absent from
+/// `listings` (missing runner, or a `--list` that failed) are skipped — the
+/// callers that know WHY they are absent already emitted their problem lines.
+fn listing_problems(
+    listings: &std::collections::HashMap<String, Vec<String>>,
+    impls: &[(String, String)],
+) -> Vec<String> {
+    impls
+        .iter()
+        .filter_map(|(sdk, id)| {
+            listings.get(sdk).and_then(|ids| {
+                (!ids.iter().any(|listed| listed == id))
+                    .then(|| format!("catalog entry {id} ({sdk}) not listed by its runner"))
+            })
+        })
+        .collect()
 }
 
 /// The binding table: all 26 `(sdk, scenario id)` pairs the harness claims
@@ -499,6 +576,82 @@ mod tests {
             catalog::audit(&impls).is_empty(),
             "the hardcoded binding table must satisfy catalog::audit"
         );
+    }
+
+    #[test]
+    fn listing_problems_flags_bindings_the_runner_omits() {
+        use std::collections::HashMap;
+        let impls = vec![
+            ("pusher-js".to_string(), "C-ESTABLISH".to_string()),
+            ("pusher-js".to_string(), "C-PING".to_string()),
+            ("pusher-http-node".to_string(), "S-TRIGGER".to_string()),
+        ];
+        // A listing covering everything: no problems.
+        let full: HashMap<String, Vec<String>> = HashMap::from([
+            (
+                "pusher-js".to_string(),
+                vec!["C-ESTABLISH".to_string(), "C-PING".to_string()],
+            ),
+            (
+                "pusher-http-node".to_string(),
+                vec!["S-TRIGGER".to_string()],
+            ),
+        ]);
+        assert!(super::listing_problems(&full, &impls).is_empty());
+
+        // The runner omits C-PING: exactly one problem, naming the binding.
+        let short: HashMap<String, Vec<String>> = HashMap::from([
+            ("pusher-js".to_string(), vec!["C-ESTABLISH".to_string()]),
+            (
+                "pusher-http-node".to_string(),
+                vec!["S-TRIGGER".to_string()],
+            ),
+        ]);
+        assert_eq!(
+            super::listing_problems(&short, &impls),
+            vec!["catalog entry C-PING (pusher-js) not listed by its runner".to_string()]
+        );
+
+        // A sdk with NO listing entry (failed --list / missing runner) is
+        // skipped here — its failure is reported by the caller.
+        let partial: HashMap<String, Vec<String>> = HashMap::from([(
+            "pusher-js".to_string(),
+            vec!["C-ESTABLISH".to_string(), "C-PING".to_string()],
+        )]);
+        assert!(super::listing_problems(&partial, &impls).is_empty());
+    }
+
+    #[test]
+    fn runner_listing_collects_ids_and_rejects_empty_or_failing_runners() {
+        if super::adapter::which_node().is_none() {
+            eprintln!("skipping: node not found");
+            return;
+        }
+        let dir = std::env::temp_dir().join("cf-audit-listing-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("runner.js"),
+            "console.log('A-ONE'); console.log(''); console.log('  A-TWO  ');",
+        )
+        .unwrap();
+        assert_eq!(
+            super::runner_listing(&dir).unwrap(),
+            vec!["A-ONE".to_string(), "A-TWO".to_string()]
+        );
+
+        let empty = dir.parent().unwrap().join("cf-audit-listing-empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(empty.join("runner.js"), "console.error('nothing');").unwrap();
+        assert!(super::runner_listing(&empty)
+            .unwrap_err()
+            .contains("no scenario ids"));
+
+        let failing = dir.parent().unwrap().join("cf-audit-listing-failing");
+        std::fs::create_dir_all(&failing).unwrap();
+        std::fs::write(failing.join("runner.js"), "process.exit(3);").unwrap();
+        assert!(super::runner_listing(&failing)
+            .unwrap_err()
+            .contains("exit status"));
     }
 
     #[test]
