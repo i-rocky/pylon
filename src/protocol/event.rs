@@ -12,7 +12,7 @@ pub struct WatchlistChange {
     pub user_ids: Vec<String>,
 }
 
-/// Presence roster. Empty in SP1 (no presence channels yet); filled in SP2.
+/// Presence roster for `subscription_succeeded` on presence channels.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PresencePayload {
     pub ids: Vec<String>,
@@ -37,7 +37,7 @@ pub enum ServerEvent {
         count: usize,
     },
     Error(PusherError),
-    /// Generic channel delivery (client events SP2, REST triggers SP2).
+    /// Generic channel delivery (client events, REST triggers).
     /// `user_id` is the originator's presence `user_id`, present ONLY on a
     /// presence client-event broadcast (pusher-js `presence_channel.ts` reads
     /// `event.user_id` → `metadata.user_id`). `None` everywhere else; the v7

@@ -13,14 +13,14 @@ pub enum ClientCommand {
     Unsubscribe {
         channel: String,
     },
-    /// `client-*` event. Parsed in SP1, rejected by the handler until SP2.
+    /// `client-*` event on a channel (validated at the handler).
     ClientEvent {
         event: String,
         channel: String,
         data: Value,
     },
-    /// `pusher:signin` — bind this connection to a user. Decoded in SP4 (A4);
-    /// handled by the signin handler in A7.
+    /// `pusher:signin` — bind this connection to a user (handled in
+    /// `ws::signin`).
     Signin {
         auth: String,
         user_data: String,

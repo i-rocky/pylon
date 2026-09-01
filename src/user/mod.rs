@@ -6,7 +6,7 @@ use serde_json::Value;
 pub mod registry;
 
 /// A connection's authenticated user, parsed from `user_data`. `user_info` is
-/// intentionally not split out (unused in SP4) — it stays inside `user_data_raw`.
+/// intentionally not split out — it stays inside `user_data_raw`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AuthenticatedUser {
     pub id: String,

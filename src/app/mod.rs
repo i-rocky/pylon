@@ -1,4 +1,4 @@
-//! App (tenant) definitions and the AppManager seam (static file now; DB in SP6).
+//! App (tenant) definitions and the AppManager seam (static file, SQL, or Mongo).
 
 pub mod cache;
 pub mod invalidation;
@@ -135,11 +135,11 @@ impl std::fmt::Display for AppLookupError {
 impl std::error::Error for AppLookupError {}
 
 /// The outcome of an app lookup, distinguishing a DISABLED app (found in the
-/// store, `enabled=false` — Pusher documents HTTP **403 Forbidden** for it) from
-/// a NOT-FOUND id/key (**401**, indistinguishable from a signature failure for
+/// store, `enabled=false` — Pusher documents HTTP **403 Forbidden** for it on
+/// REST and close code **4003 "Application disabled"** on WS) from a NOT-FOUND
+/// id/key (**401**, indistinguishable from a signature failure for
 /// anti-enumeration). REST auth maps the three states to 200/403/401; the WS
-/// establish path deliberately collapses `Disabled` and `NotFound` into the
-/// single 4001 "Could not find app by key" answer.
+/// establish path maps them to connection / 4003 / 4001.
 #[derive(Debug)]
 pub enum AppLookup {
     Found(Arc<App>),
@@ -150,7 +150,7 @@ pub enum AppLookup {
 impl AppLookup {
     /// Collapse to the pre-R1 `Option`: `Some` only when found AND enabled.
     /// For call sites that treat a disabled app exactly like a missing one
-    /// (WS 4001, webhook/cluster edges).
+    /// (webhook/cluster edges).
     pub fn into_enabled(self) -> Option<Arc<App>> {
         match self {
             AppLookup::Found(app) => Some(app),

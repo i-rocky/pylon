@@ -1,10 +1,12 @@
-//! LEGACY (axum-transport) broadcast fan-out benchmark: `Registry::broadcast`
+//! LEGACY mailbox broadcast fan-out benchmark: `Registry::broadcast`
 //! serially enqueues one `Box<ServerEvent>` per subscriber mailbox on the
-//! publishing thread — the path the axum server and standalone tests use, and
-//! the comparison baseline for the SHIPPING percore fan-out (encode + WS-frame
+//! publishing thread — the no-sink fallback that standalone tests exercise
+//! (production wires the percore sink into `LocalAdapter`), and the
+//! comparison baseline for the SHIPPING percore fan-out (encode + WS-frame
 //! once, per-worker hand-off, slab-enqueue drain), which is benchmarked
 //! separately in `benches/fanout_sink.rs` against the real
-//! `BroadcastSink`→`drain_broadcasts` path. SP8 builds the full load harness.
+//! `BroadcastSink`→`drain_broadcasts` path. The full protocol-level load
+//! harness lives in the `load/` crate.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use pylon::channel::registry::Registry;

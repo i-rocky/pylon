@@ -1,6 +1,6 @@
 //! In-memory user/connection index behind the Adapter seam. A user is "online"
 //! while signed in on >= 1 connection. Keyed by (app_id, user_id). The Redis
-//! equivalent lands in SP7 behind the same Adapter methods.
+//! equivalent lives in `adapter::redis::user` behind the same Adapter methods.
 
 use crate::connection::handle::ConnectionHandle;
 use crate::protocol::socket_id::SocketId;

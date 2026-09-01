@@ -11,6 +11,7 @@ their meanings, and the recommended client action.
 | Code | Meaning | Client action |
 |---|---|---|
 | `4001` | App key not found | Do not reconnect; check `key` in your Pusher client config |
+| `4003` | Application disabled (the key resolves to an app with `enabled: false` — the WS-plane close code; REST answers the same state with 403) | Do not reconnect; the app must be re-enabled server-side |
 | `4004` | App connection limit reached (per-app `capacity`) | Do not reconnect; contact the server operator |
 | `4005` | Connection path malformed (not `/app/{key}`, or empty key) | Do not reconnect; fix the WebSocket URL |
 | `4006` | Invalid protocol version string format | Do not reconnect; fix client configuration |

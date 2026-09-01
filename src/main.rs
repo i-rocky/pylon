@@ -29,8 +29,10 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 static GLOBAL: dhat::Alloc = dhat::Alloc;
 
 /// Spawn the webhook dispatcher with the production HTTP transport + system clock.
-/// `vacated_grace_ms` + `occupancy` enable the cluster-aware `channel_vacated` grace
-/// window (only the multi-node Redis paths pass them; the local paths pass `0` / `None`).
+/// `vacated_grace_ms` + `occupancy` enable the reconnect grace window (R12b): every
+/// path passes them now — the local paths use the local adapter as their oracle, the
+/// Redis paths the cluster adapter. `0` fires `channel_vacated` / `member_removed`
+/// immediately.
 /// Shared by every transport/adapter combination so the dispatcher is built identically.
 /// Fallible: a transport build failure (e.g. reqwest/TLS init — which happens even
 /// with zero webhooks configured) fails startup cleanly with the real error (G9).
@@ -212,10 +214,19 @@ async fn main() -> anyhow::Result<()> {
     ));
     let adapter: Arc<dyn Adapter> = local.clone();
 
-    // The single-node local path fires `channel_vacated` immediately (no grace
-    // window, no occupancy source — those are the Redis multi-node path's, handled
-    // in `run_redis_percore`).
-    let webhooks = spawn_webhooks(&config, apps.clone(), 0, None)?;
+    // R12b parity: the hosted doc scopes its "up to three seconds" reconnect
+    // delay + suppression to `channel_vacated` AND `member_removed` with no
+    // single-node/cluster distinction — so the local path takes the same grace
+    // window, with the local adapter as its own occupancy/presence oracle
+    // (in-process counts are exact; the Redis path's oracle is cluster-wide).
+    let local_occupancy: Option<Arc<dyn OccupancySource>> =
+        Some(Arc::new(pylon::webhook::AdapterOccupancy(adapter.clone())));
+    let webhooks = spawn_webhooks(
+        &config,
+        apps.clone(),
+        config.webhook_vacated_grace_ms,
+        local_occupancy,
+    )?;
 
     // Shared connection counters (the axum REST `AppState` and the percore
     // `DispatchEnv` mirror this type exactly).
@@ -402,9 +413,10 @@ async fn run_redis_percore(
     // REST + occupancy drive the node's single `RedisAdapter` through the bridge.
     let adapter: Arc<dyn Adapter> = bridge.adapter();
 
-    // Webhook dispatcher with the cluster-aware `channel_vacated` grace window (Task D1),
-    // same as the redis-legacy path: debounce + re-check the cluster subscription_count
-    // (via `AdapterOccupancy` over the RedisAdapter) before firing a surviving vacated.
+    // Webhook dispatcher with the reconnect grace window (Task D1 + R12b), same
+    // as the redis-legacy path: debounce `channel_vacated` / `member_removed` +
+    // re-check the cluster (subscription_count / user presence, via
+    // `AdapterOccupancy` over the RedisAdapter) before firing a survivor.
     let occupancy: Option<Arc<dyn OccupancySource>> =
         Some(Arc::new(pylon::webhook::AdapterOccupancy(adapter.clone())));
     let webhooks = spawn_webhooks(

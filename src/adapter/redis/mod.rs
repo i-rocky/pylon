@@ -1,11 +1,10 @@
 //! Redis scaling adapter — key schema, broadcast envelope, fred client wiring,
 //! and the `RedisAdapter` itself.
 //!
-//! A3 ships a *skeleton*: every [`Adapter`] method delegates to a private
-//! [`LocalAdapter`] so a `redis`-configured node behaves exactly like a `local`
-//! node. Real cross-node behavior (PUBLISH/SUBSCRIBE broadcast, Redis-backed
-//! presence/cache/users) is layered on in later phases (B–E) without changing
-//! handler code.
+//! The `RedisAdapter` implements the full cross-node behavior — PUBLISH/
+//! SUBSCRIBE broadcast (plain or sharded), Redis-backed presence/cache/users,
+//! and cluster-wide per-app capacity — behind the same [`Adapter`] trait, so no
+//! handler code changes between `local` and `redis` nodes.
 
 pub mod client;
 pub mod envelope;
@@ -271,9 +270,9 @@ async fn node_heartbeat_loop(
     }
 }
 
-/// The few `ServerConfig` knobs the Redis adapter needs to keep around for the
-/// later phases (TTLs, heartbeat cadence, grace window). Cheap `Copy` struct so
-/// it can be read on any task without locking.
+/// The few `ServerConfig` knobs the Redis adapter keeps around (TTLs,
+/// heartbeat cadence, grace window). Cheap `Copy` struct so it can be read on
+/// any task without locking.
 #[derive(Clone, Copy, Debug)]
 pub struct RedisConfig {
     pub membership_ttl_secs: u64,

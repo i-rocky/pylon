@@ -1055,7 +1055,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
             // `drain_broadcasts` empties the bounded hand-off inbox (its
             // `while rx.try_recv()` loop runs to `Empty`), so the channel now has
             // headroom: clear the sink's saturation flag. The publish-admission
-            // path (Phase 2) thereby resumes accepting once delivery catches up.
+            // path thereby resumes accepting once delivery catches up.
             if let Some(sat) = &saturated {
                 sat.store(false, Ordering::Relaxed);
             }
@@ -1722,11 +1722,14 @@ fn handle_handshake(
                     Some(Ok(crate::app::AppLookup::Found(app))) => {
                         finish_establish(env, app, codec, notify, cfg.mailbox_dropped_slot.clone())
                     }
-                    // R1: unknown AND disabled keys share the single WS answer
-                    // (4001 "Could not find app by key") — only REST carries the
-                    // 403 distinction.
-                    Some(Ok(crate::app::AppLookup::Disabled))
-                    | Some(Ok(crate::app::AppLookup::NotFound)) => Err(Reject {
+                    // P13: a DISABLED key gets its dedicated doc close code —
+                    // 4003 "Application disabled" (the protocol's close-code
+                    // table); only an UNKNOWN key keeps 4001.
+                    Some(Ok(crate::app::AppLookup::Disabled)) => Err(Reject {
+                        error: PusherError::app_disabled(),
+                        codec: Some(codec),
+                    }),
+                    Some(Ok(crate::app::AppLookup::NotFound)) => Err(Reject {
                         error: PusherError::app_not_found(),
                         codec: Some(codec),
                     }),
@@ -2558,8 +2561,9 @@ fn drain_dirty_sessions(
 ///   * `Ok(Found(app))` → `finish_establish`; on `Ok(session)` queue
 ///     `connection_established` + store the session + flush; on `Err(reject)`
 ///     queue the reject + flush + `remove`.
-///   * `Ok(Disabled | NotFound)` → reject `app_not_found` (4001) + flush +
-///     `remove` (R1: the WS side keeps ONE answer for an unusable key).
+///   * `Ok(Disabled)`  → reject `app_disabled` (4003) + flush + `remove`
+///     (P13: the doc's close-code table gives disabled its own code).
+///   * `Ok(NotFound)`  → reject `app_not_found` (4001) + flush + `remove`.
 ///   * `Err(_)`    → reject `backend_unavailable` (4103) + flush + `remove`.
 ///
 /// Returns whether it wrote anything (so the adaptive poll stays tight). O(1) when
@@ -2610,14 +2614,16 @@ fn drain_resolved(
             Ok(crate::app::AppLookup::Found(app)) => {
                 finish_establish(env, app, pe.codec, pe.notify, pe.mailbox_dropped)
             }
-            // R1: unknown AND disabled keys share the 4001 WS answer (REST
-            // distinguishes disabled via 403; WS keeps one unusable-key code).
-            Ok(crate::app::AppLookup::Disabled) | Ok(crate::app::AppLookup::NotFound) => {
-                Err(Reject {
-                    error: PusherError::app_not_found(),
-                    codec: Some(pe.codec),
-                })
-            }
+            // P13: disabled vs unknown split on the parked path too — 4003
+            // "Application disabled" for a disabled key, 4001 for unknown.
+            Ok(crate::app::AppLookup::Disabled) => Err(Reject {
+                error: PusherError::app_disabled(),
+                codec: Some(pe.codec),
+            }),
+            Ok(crate::app::AppLookup::NotFound) => Err(Reject {
+                error: PusherError::app_not_found(),
+                codec: Some(pe.codec),
+            }),
             Err(e) => {
                 tracing::warn!(key = %pe.key, error = %e, "offloaded app lookup failed (transient)");
                 Err(Reject {

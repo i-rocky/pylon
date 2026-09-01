@@ -1,6 +1,6 @@
 //! Cross-node presence operations: the atomic join/leave refcount and the cluster
 //! roster read. All return `anyhow::Result`; callers fall back to the node-local
-//! adapter on error. (members/user_count/reap land in later SP7b tasks.)
+//! adapter on error.
 
 use super::client;
 use super::client::Scripts;

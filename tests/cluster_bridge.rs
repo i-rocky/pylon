@@ -1,4 +1,4 @@
-//! Integration test for the percore [`ClusterBridge`] skeleton (SP11 Task 3.2).
+//! Integration test for the percore [`ClusterBridge`].
 //!
 //! The bridge owns a DEDICATED tokio runtime (on its own OS thread) hosting a
 //! `RedisAdapter`; the percore workers fire fire-and-forget commands at it over a cheap-

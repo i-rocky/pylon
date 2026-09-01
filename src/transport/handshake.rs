@@ -1,7 +1,7 @@
 //! HTTP request-head parsing and the RFC 6455 server handshake for the
 //! per-core transport.
 //!
-//! A per-core `mio` worker (a later SP9 task) accepts raw TCP and reads the
+//! A per-core `mio` worker accepts raw TCP and reads the
 //! HTTP request head out of the connection's initial bytes. This module is the
 //! pure, socket-free logic that decides what that head *is*:
 //!

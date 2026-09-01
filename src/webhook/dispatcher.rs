@@ -46,13 +46,15 @@ pub struct WebhookDispatcher {
     transport: Arc<dyn WebhookTransport>,
     clock: Arc<dyn Clock>,
     batch_ms: u64,
-    /// Grace window before a cluster `channel_vacated` fires (Task D1). `0`
-    /// (with `occupancy = None`) means fire immediately (local-adapter path).
+    /// Grace window before a debounced `channel_vacated` / `member_removed`
+    /// fires (Task D1; extended to member_removed by re-audit R12b). `0` means
+    /// fire immediately.
     vacated_grace_ms: u64,
-    /// Cluster occupancy lookup used to re-check the subscription_count before a
-    /// debounced vacated fires. `None` on the local-adapter path; if ever
-    /// combined with a grace window, the re-check is skipped and the vacated
-    /// fires after the grace (see `flush`).
+    /// Occupancy/presence lookup used to re-check (a) the subscription_count
+    /// before a debounced vacated fires and (b) the user's presence before a
+    /// debounced member_removed fires. If ever combined with a grace window as
+    /// `None`, the re-check is skipped and the event fires after the grace
+    /// (see `flush`).
     occupancy: Option<Arc<dyn OccupancySource>>,
 }
 
@@ -113,22 +115,23 @@ impl WebhookDispatcher {
     /// (https://pusher.com/docs/channels/server_api/webhooks/) scopes its
     /// "delay of up to three seconds" and its reconnect-only suppression to
     /// `channel_vacated` / `member_removed` — an already-fired
-    /// `channel_occupied` is never cancelled. So a channel created and vacated
-    /// within one window still gets BOTH events on hosted Channels. The former
-    /// 1:1 occupied↔vacated / member_added↔member_removed cancellation (audit
-    /// finding R12a) delivered NEITHER and was removed for parity; reconnect
-    /// suppression is provided by the cluster-path vacated grace + occupancy
-    /// recheck below.
+    /// `channel_occupied` or `member_added` is never cancelled. So a channel
+    /// created and vacated within one window still gets BOTH events on hosted
+    /// Channels. The former 1:1 occupied↔vacated / member_added↔member_removed
+    /// cancellation (audit finding R12a) delivered NEITHER and was removed for
+    /// parity; reconnect suppression is provided by the grace + occupancy
+    /// recheck below (extended to `member_removed` by re-audit R12b).
     ///
-    /// When `vacated_grace_ms > 0` each surviving `channel_vacated` is NOT
-    /// delivered inline; instead a detached task sleeps `vacated_grace_ms`,
-    /// re-checks the cluster subscription_count, and fires only if the channel
-    /// is still empty (Task D1). All other survivors deliver inline exactly as
-    /// before.
+    /// When `vacated_grace_ms > 0` each surviving `channel_vacated` AND
+    /// `member_removed` is NOT delivered inline; instead a detached task sleeps
+    /// `vacated_grace_ms`, re-checks occupancy (the channel's cluster
+    /// subscription_count for vacated; the user's presence for member_removed),
+    /// and fires only if the channel is still empty / the user still gone
+    /// (Task D1 + R12b). All other survivors deliver inline exactly as before.
     ///
     /// The re-check needs an occupancy source. With `occupancy = None` (a
     /// wiring the production paths never produce — grace is only ever passed
-    /// alongside a source) the re-check is SKIPPED and the vacated still fires
+    /// alongside a source) the re-check is SKIPPED and the event still fires
     /// after the grace window: fire-without-re-check matches single-node
     /// behavior, and an event delivered late-but-once beats a dropped webhook.
     /// The misconfiguration is logged once per event as an `error!` instead of
@@ -144,7 +147,7 @@ impl WebhookDispatcher {
         // needs an occupancy source — see the spawned task below), so a
         // grace-without-source wiring degrades gracefully instead of hitting a
         // construction invariant.
-        let defer_vacated = self.vacated_grace_ms > 0;
+        let defer_reconnect_grace = self.vacated_grace_ms > 0;
 
         for (app_id, events) in by_app {
             // No coalescing — see the doc comment above (R12a: Pusher delivers
@@ -152,13 +155,19 @@ impl WebhookDispatcher {
             // belongs to the reconnect path, not the batch window).
             let survivors = events;
 
-            // With a grace window configured, peel surviving vacated events off
-            // for the debounced grace+recheck; everything else delivers inline now.
-            let (deferred_vacated, immediate): (Vec<WebhookEvent>, Vec<WebhookEvent>) =
-                if defer_vacated {
-                    survivors
-                        .into_iter()
-                        .partition(|e| matches!(e, WebhookEvent::ChannelVacated { .. }))
+            // With a grace window configured, peel surviving vacated and
+            // member_removed events off for the debounced grace+recheck
+            // (R12b: the doc scopes the delay to BOTH); everything else
+            // delivers inline now.
+            let (deferred_grace, immediate): (Vec<WebhookEvent>, Vec<WebhookEvent>) =
+                if defer_reconnect_grace {
+                    survivors.into_iter().partition(|e| {
+                        matches!(
+                            e,
+                            WebhookEvent::ChannelVacated { .. }
+                                | WebhookEvent::MemberRemoved { .. }
+                        )
+                    })
                 } else {
                     (Vec::new(), survivors)
                 };
@@ -185,28 +194,36 @@ impl WebhookDispatcher {
             }
 
             // Grace-configured path: spawn one detached grace task per surviving
-            // vacated event. It re-fetches the app at FIRE time (config may have
-            // changed) and re-times the envelope with the fire-time clock. The
-            // occupancy re-check runs only when a source is configured: with
-            // `None` the task logs one `error!` per event and fires after the
-            // grace WITHOUT the re-check (single-node parity) — deliberately not
-            // a panic and not a drop: an event delivered late-but-once beats a
-            // dropped webhook (G9).
-            if !deferred_vacated.is_empty() {
+            // vacated / member_removed event. It re-fetches the app at FIRE time
+            // (config may have changed) and re-times the envelope with the
+            // fire-time clock. The occupancy re-check runs only when a source is
+            // configured: with `None` the task logs one `error!` per event and
+            // fires after the grace WITHOUT the re-check (single-node parity) —
+            // deliberately not a panic and not a drop: an event delivered
+            // late-but-once beats a dropped webhook (G9).
+            if !deferred_grace.is_empty() {
                 let occupancy = self.occupancy.clone();
-                for event in deferred_vacated {
-                    let (app, channel) = match &event {
+                for event in deferred_grace {
+                    // The re-check key: the channel (vacated) or the user in the
+                    // channel (member_removed).
+                    let (app, channel, user_id) = match &event {
                         WebhookEvent::ChannelVacated { app, channel } => {
-                            (app.clone(), channel.clone())
+                            (app.clone(), channel.clone(), None)
                         }
-                        _ => unreachable!("partitioned to ChannelVacated only"),
+                        WebhookEvent::MemberRemoved {
+                            app,
+                            channel,
+                            user_id,
+                        } => (app.clone(), channel.clone(), Some(user_id.clone())),
+                        _ => unreachable!("partitioned to grace-deferred events only"),
                     };
                     if occupancy.is_none() {
                         tracing::error!(
                             app = %app,
                             channel = %channel,
                             grace_ms = self.vacated_grace_ms,
-                            "channel_vacated grace configured without an occupancy source; \
+                            event = event.name(),
+                            "reconnect grace configured without an occupancy source; \
                              firing after grace without the cluster re-check"
                         );
                     }
@@ -218,15 +235,30 @@ impl WebhookDispatcher {
                     tokio::spawn(async move {
                         tokio::time::sleep(Duration::from_millis(grace)).await;
                         if let Some(occ) = occupancy.as_ref() {
-                            let count = occ.subscription_count(&app, &channel).await;
-                            if count != 0 {
-                                tracing::trace!(
-                                    app = %app,
-                                    channel = %channel,
-                                    count,
-                                    "channel re-occupied within grace; suppressing channel_vacated"
-                                );
-                                return;
+                            match user_id.as_deref() {
+                                Some(uid) => {
+                                    if occ.is_member_present(&app, &channel, uid).await {
+                                        tracing::trace!(
+                                            app = %app,
+                                            channel = %channel,
+                                            user_id = %uid,
+                                            "member re-joined within grace; suppressing member_removed"
+                                        );
+                                        return;
+                                    }
+                                }
+                                None => {
+                                    let count = occ.subscription_count(&app, &channel).await;
+                                    if count != 0 {
+                                        tracing::trace!(
+                                            app = %app,
+                                            channel = %channel,
+                                            count,
+                                            "channel re-occupied within grace; suppressing channel_vacated"
+                                        );
+                                        return;
+                                    }
+                                }
                             }
                         }
                         let resolved = match apps.by_id(&app).await {
@@ -298,7 +330,7 @@ mod tests {
     use crate::webhook::occupancy::OccupancySource;
     use crate::webhook::transport::{RecordingTransport, WebhookDelivery};
     use async_trait::async_trait;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     // A tiny single-app AppManager for the dispatcher test.
     struct OneApp(App);
@@ -317,13 +349,29 @@ mod tests {
         }
     }
 
-    // A fake cluster-occupancy source: returns the stored count at fire time.
-    struct FakeOccupancy(Arc<AtomicUsize>);
+    // A fake occupancy/presence source: returns the stored count (subscription
+    // re-check) and the stored presence flag (member re-check) at fire time.
+    struct FakeOccupancy {
+        count: Arc<AtomicUsize>,
+        present: Arc<AtomicBool>,
+    }
+
+    impl FakeOccupancy {
+        fn new(count: Arc<AtomicUsize>) -> Self {
+            Self {
+                count,
+                present: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
 
     #[async_trait]
     impl OccupancySource for FakeOccupancy {
         async fn subscription_count(&self, _app: &str, _channel: &str) -> usize {
-            self.0.load(Ordering::SeqCst)
+            self.count.load(Ordering::SeqCst)
+        }
+        async fn is_member_present(&self, _app: &str, _channel: &str, _user_id: &str) -> bool {
+            self.present.load(Ordering::SeqCst)
         }
     }
 
@@ -505,7 +553,7 @@ mod tests {
         let apps: Arc<dyn AppManager> = Arc::new(OneApp(vacated_app()));
         let transport = Arc::new(RecordingTransport::new());
         let count = Arc::new(AtomicUsize::new(0)); // still empty at recheck
-        let occupancy: Arc<dyn OccupancySource> = Arc::new(FakeOccupancy(count.clone()));
+        let occupancy: Arc<dyn OccupancySource> = Arc::new(FakeOccupancy::new(count.clone()));
 
         let (tx, rx) = mpsc::channel(64);
         let dispatcher = WebhookDispatcher {
@@ -550,7 +598,7 @@ mod tests {
         let apps: Arc<dyn AppManager> = Arc::new(OneApp(vacated_app()));
         let transport = Arc::new(RecordingTransport::new());
         let count = Arc::new(AtomicUsize::new(1)); // re-occupied at recheck
-        let occupancy: Arc<dyn OccupancySource> = Arc::new(FakeOccupancy(count.clone()));
+        let occupancy: Arc<dyn OccupancySource> = Arc::new(FakeOccupancy::new(count.clone()));
 
         let (tx, rx) = mpsc::channel(64);
         let dispatcher = WebhookDispatcher {
@@ -667,6 +715,189 @@ mod tests {
         assert_eq!(recorded.len(), 1, "local path delivers vacated immediately");
         let env: serde_json::Value = serde_json::from_str(&recorded[0].body).unwrap();
         assert_eq!(env["events"][0]["name"], "channel_vacated");
+
+        drop(tx);
+        let _ = task.await;
+    }
+
+    // ── R12b: member_removed debounce + reconnect suppression ─────────────────
+
+    fn rem() -> WebhookEvent {
+        WebhookEvent::MemberRemoved {
+            app: "app".into(),
+            channel: "presence-c".into(),
+            user_id: "u1".into(),
+        }
+    }
+    fn add() -> WebhookEvent {
+        WebhookEvent::MemberAdded {
+            app: "app".into(),
+            channel: "presence-c".into(),
+            user_id: "u1".into(),
+        }
+    }
+
+    fn member_app() -> App {
+        app_with(vec![WebhookConfig {
+            url: "https://e.test/members".into(),
+            event_types: vec!["member_added".into(), "member_removed".into()],
+            headers: Default::default(),
+        }])
+    }
+
+    /// R12b (a): the hosted doc scopes its "up to three seconds" delay to
+    /// `member_removed` too — with a grace window configured, a surviving
+    /// `member_removed` is deferred behind it and fires only once the window
+    /// elapses with the user still gone (presence re-check says absent).
+    #[tokio::test(start_paused = true)]
+    async fn member_removed_fires_after_grace_when_user_stays_gone() {
+        let apps: Arc<dyn AppManager> = Arc::new(OneApp(member_app()));
+        let transport = Arc::new(RecordingTransport::new());
+        let occupancy: Arc<dyn OccupancySource> =
+            Arc::new(FakeOccupancy::new(Arc::new(AtomicUsize::new(0)))); // user still gone at recheck
+
+        let (tx, rx) = mpsc::channel(64);
+        let dispatcher = WebhookDispatcher {
+            rx,
+            apps,
+            transport: transport.clone(),
+            clock: Arc::new(FixedClock(1700000000000)),
+            batch_ms: 50,
+            vacated_grace_ms: 3000,
+            occupancy: Some(occupancy),
+        };
+        let task = tokio::spawn(dispatcher.run());
+
+        tx.send(rem()).await.unwrap();
+        // Arm the trailing window before advancing time (harness ordering only).
+        tokio::task::yield_now().await;
+        // Past the 50ms batch window → flush runs, member_removed must be
+        // deferred behind the grace (nothing fires yet).
+        tokio::time::advance(Duration::from_millis(60)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            transport.recorded().await.len(),
+            0,
+            "member_removed must NOT fire before the grace window elapses"
+        );
+        // Elapse the 3000ms grace with the user still absent → it fires.
+        tokio::time::advance(Duration::from_millis(3001)).await;
+
+        let recorded = wait_for(&transport, 1).await;
+        assert_eq!(
+            recorded.len(),
+            1,
+            "member_removed fires after grace when the user stays gone"
+        );
+        let env: serde_json::Value = serde_json::from_str(&recorded[0].body).unwrap();
+        let events = env["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["name"], "member_removed");
+        assert_eq!(events[0]["user_id"], "u1");
+
+        drop(tx);
+        let _ = task.await;
+    }
+
+    /// R12b (b): "if the client reconnects within this delay, no webhooks will
+    /// be sent" — scoped by the doc to `member_removed` as well. The user
+    /// re-joins the channel during the grace window (presence re-check says
+    /// present) → the debounced `member_removed` is suppressed entirely.
+    #[tokio::test(start_paused = true)]
+    async fn member_removed_suppressed_when_user_rejoins_within_grace() {
+        let apps: Arc<dyn AppManager> = Arc::new(OneApp(member_app()));
+        let transport = Arc::new(RecordingTransport::new());
+        let fake = FakeOccupancy::new(Arc::new(AtomicUsize::new(0)));
+        fake.present.store(true, Ordering::SeqCst); // user rejoined at recheck
+        let occupancy: Arc<dyn OccupancySource> = Arc::new(fake);
+
+        let (tx, rx) = mpsc::channel(64);
+        let dispatcher = WebhookDispatcher {
+            rx,
+            apps,
+            transport: transport.clone(),
+            clock: Arc::new(FixedClock(1700000000000)),
+            batch_ms: 50,
+            vacated_grace_ms: 3000,
+            occupancy: Some(occupancy),
+        };
+        let task = tokio::spawn(dispatcher.run());
+
+        tx.send(rem()).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(60)).await;
+        tokio::task::yield_now().await;
+        // Elapse the full grace with the user back in the channel.
+        tokio::time::advance(Duration::from_millis(3001)).await;
+
+        // Give the deferred task ample scheduling slots; it must NOT deliver.
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            transport.recorded().await.len(),
+            0,
+            "member_removed suppressed when the user rejoins within the grace"
+        );
+
+        drop(tx);
+        let _ = task.await;
+    }
+
+    /// R12b asymmetry: the doc's suppression is on the removal side only —
+    /// `member_added` (the rejoin signal) keeps firing inline at flush time,
+    /// never deferred, never suppressed. A leave+rejoin inside one window
+    /// yields member_added now and (once the grace re-check sees the user) a
+    /// suppressed member_removed.
+    #[tokio::test(start_paused = true)]
+    async fn member_added_fires_inline_member_removed_suppressed_on_rejoin() {
+        let apps: Arc<dyn AppManager> = Arc::new(OneApp(member_app()));
+        let transport = Arc::new(RecordingTransport::new());
+        let fake = FakeOccupancy::new(Arc::new(AtomicUsize::new(0)));
+        fake.present.store(true, Ordering::SeqCst); // rejoined by fire time
+        let occupancy: Arc<dyn OccupancySource> = Arc::new(fake);
+
+        let (tx, rx) = mpsc::channel(64);
+        let dispatcher = WebhookDispatcher {
+            rx,
+            apps,
+            transport: transport.clone(),
+            clock: Arc::new(FixedClock(1700000000000)),
+            batch_ms: 50,
+            vacated_grace_ms: 3000,
+            occupancy: Some(occupancy),
+        };
+        let task = tokio::spawn(dispatcher.run());
+
+        // Leave + rejoin inside ONE batch window.
+        tx.send(rem()).await.unwrap();
+        tx.send(add()).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(60)).await;
+        tokio::task::yield_now().await;
+
+        // member_added is immediate: delivered at the flush, before any grace.
+        let recorded = wait_for(&transport, 1).await;
+        assert_eq!(
+            recorded.len(),
+            1,
+            "member_added fires inline (never deferred)"
+        );
+        let env: serde_json::Value = serde_json::from_str(&recorded[0].body).unwrap();
+        assert_eq!(env["events"].as_array().unwrap().len(), 1);
+        assert_eq!(env["events"][0]["name"], "member_added");
+
+        // Elapse the grace; the rejoined user suppresses the member_removed.
+        tokio::time::advance(Duration::from_millis(3001)).await;
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
+        let recorded = transport.recorded().await;
+        assert_eq!(
+            recorded.len(),
+            1,
+            "rejoined user: only the member_added delivery, member_removed suppressed"
+        );
 
         drop(tx);
         let _ = task.await;
