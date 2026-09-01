@@ -1617,6 +1617,183 @@ async fn cluster_publish_broadcast_fans_out_only_remote() {
     .expect("cluster_publish_broadcast direct test must not hang (Redis up?)");
 }
 
+/// F-1 (`PYLON_CLUSTER_ENVELOPE_COMPAT`): the knob's end-to-end behavior, sniffed
+/// on the actual Redis bus. The cluster suites boot adapters from struct-literal
+/// configs (they never read `PYLON_*` env), so the compat=false SERVER path is
+/// covered HERE: the test exports `PYLON_CLUSTER_ENVELOPE_COMPAT=0`, boots the
+/// publisher via `ServerConfig::from_env()` (proving the env plumbing), and a raw
+/// probe subscriber on the `msg`/`usermsg` channels pins the PUBLISHED envelope
+/// bytes — no `event` member, `frame_b64` the sole carrier — while a default
+/// (compat=on) publisher keeps the double-carry shape. Cross-node relay of the
+/// frame_b64-only envelope is proven end-to-end by B (a DEFAULT compat receiver —
+/// receivers are knob-independent) delivering A's compat=off frames locally.
+#[tokio::test]
+async fn cluster_envelope_compat_knob_shapes_the_wire_and_relay_still_works() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        // ── Part 1: DEFAULT (compat on) — the bus carries BOTH fields. ─────────
+        let prefix_on = random_prefix();
+        let adapter_on = connect_adapter_with_prefix(&prefix_on).await;
+        let msg_on = Keys::new(&prefix_on).msg(TEST_APP, "compat-room");
+
+        // A raw probe subscriber sniffs the published envelope bytes.
+        let probe = fred::prelude::Builder::from_config(
+            fred::prelude::Config::from_url(test_redis_url().as_str()).unwrap(),
+        )
+        .build_subscriber_client()
+        .unwrap();
+        probe.init().await.expect("probe must connect");
+        let mut probe_rx = probe.message_rx();
+        // fred's `subscribe` future resolves on the server's confirmation, so
+        // the first sniffed publish cannot race the subscription.
+        probe
+            .subscribe(msg_on.clone())
+            .await
+            .expect("probe SUBSCRIBE");
+
+        adapter_on
+            .broadcast(
+                TEST_APP,
+                "compat-room",
+                ServerEvent::Raw(std::sync::Arc::from("ping")),
+                None,
+            )
+            .await;
+        let wire = next_probe_json(&mut probe_rx).await;
+        assert!(
+            wire.get("event").is_some() && wire.get("frame_b64").is_some(),
+            "compat=on must double-carry on the wire, got: {wire}"
+        );
+
+        // ── Part 2: compat OFF via the exported env var. ───────────────────────
+        std::env::set_var("PYLON_CLUSTER_ENVELOPE_COMPAT", "0");
+        let prefix_off = random_prefix();
+        // Boot the publisher from the ENVIRONMENT (the env knob's whole point) —
+        // then stamp the test Redis wiring on top, mirroring `redis_test_config`.
+        let mut cfg = ServerConfig::from_env();
+        assert!(
+            !cfg.cluster_envelope_compat,
+            "PYLON_CLUSTER_ENVELOPE_COMPAT=0 must reach ServerConfig"
+        );
+        cfg.adapter = "redis".into();
+        cfg.redis_url = test_redis_url();
+        cfg.redis_prefix = prefix_off.clone();
+        let adapter_a = RedisAdapter::new(&cfg)
+            .await
+            .expect("compat=off adapter must connect");
+        // B is a DEFAULT-config receiver: receivers decode both envelope shapes
+        // regardless of their own knob — the mixed-fleet guarantee.
+        let adapter_b = connect_adapter_with_prefix(&prefix_off).await;
+        let keys_off = Keys::new(&prefix_off);
+        let msg_off = keys_off.msg(TEST_APP, "compat-room");
+        let usermsg_off = keys_off.usermsg(TEST_APP, "u1");
+
+        // B subscribes locally (broadcast leg) and signs in u1 (user-send leg) so
+        // its receive loop re-delivers A's compat=off envelopes.
+        let (sock_b, handle_b, mut rx_b) = recording_handle();
+        adapter_b
+            .subscribe(TEST_APP, "compat-room", handle_b, None)
+            .await;
+        let (user_sock, user_handle, mut user_rx) = recording_handle();
+        adapter_b.signin_user(TEST_APP, "u1", user_handle).await;
+
+        probe
+            .subscribe(msg_off.clone())
+            .await
+            .expect("probe SUBSCRIBE");
+        probe
+            .subscribe(usermsg_off.clone())
+            .await
+            .expect("probe SUBSCRIBE");
+
+        // A (compat=off) broadcasts: the bus envelope must omit `event`.
+        adapter_a
+            .broadcast(
+                TEST_APP,
+                "compat-room",
+                ServerEvent::Raw(std::sync::Arc::from("ping")),
+                None,
+            )
+            .await;
+        let wire = next_probe_json(&mut probe_rx).await;
+        assert_eq!(wire.get("kind").and_then(|v| v.as_str()), Some("Broadcast"));
+        assert!(
+            wire.get("event").is_none(),
+            "compat=off must omit the legacy event member on the wire, got: {wire}"
+        );
+        assert!(
+            wire.get("frame_b64").is_some(),
+            "compat=off still carries frame_b64, got: {wire}"
+        );
+        // And B (default receiver) relays the frame_b64-only envelope locally.
+        // (`Raw` frames pass through the relay verbatim — see `wire::encode`.)
+        let received = *tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
+            .await
+            .expect("B must relay A's compat=off broadcast")
+            .expect("B's mailbox must yield the broadcast");
+        match received {
+            ServerEvent::Raw(f) => assert_eq!(&*f, "ping"),
+            other => panic!("expected a Raw frame, got {other:?}"),
+        }
+
+        // A (compat=off) sends to u1: the UserSend envelope also omits `event`,
+        // and B still delivers the frame to its local u1 connection.
+        adapter_a
+            .send_to_user(
+                TEST_APP,
+                "u1",
+                ServerEvent::Raw(std::sync::Arc::from("pong")),
+            )
+            .await;
+        let wire = next_probe_json(&mut probe_rx).await;
+        assert_eq!(wire.get("kind").and_then(|v| v.as_str()), Some("UserSend"));
+        assert!(
+            wire.get("event").is_none(),
+            "compat=off UserSend must omit event on the wire, got: {wire}"
+        );
+        assert!(wire.get("frame_b64").is_some());
+        let received = *tokio::time::timeout(Duration::from_secs(2), user_rx.recv())
+            .await
+            .expect("B must relay A's compat=off user send")
+            .expect("u1's mailbox must yield the frame");
+        match received {
+            ServerEvent::Raw(f) => assert_eq!(&*f, "pong"),
+            other => panic!("expected a Raw frame, got {other:?}"),
+        }
+
+        // Cleanup: drop the memberships and the env override.
+        adapter_b
+            .unsubscribe(TEST_APP, "compat-room", &sock_b)
+            .await;
+        adapter_b.signout_user(TEST_APP, "u1", &user_sock).await;
+        let _ = probe.quit().await;
+        std::env::remove_var("PYLON_CLUSTER_ENVELOPE_COMPAT");
+    })
+    .await
+    .expect("compat knob test must not hang (Redis up?)");
+}
+
+/// Read the probe's next pub/sub message as JSON (fails loud on stall/close).
+async fn next_probe_json(
+    rx: &mut tokio::sync::broadcast::Receiver<fred::types::Message>,
+) -> serde_json::Value {
+    match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+        Ok(Ok(msg)) => {
+            let payload = msg
+                .value
+                .into_string()
+                .expect("envelope payload must be a string");
+            serde_json::from_str(&payload).expect("envelope must be JSON")
+        }
+        Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+            panic!("probe stream lagged by {n} envelopes while awaiting one")
+        }
+        Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+            panic!("probe stream closed while awaiting an envelope")
+        }
+        Err(_) => panic!("timed out awaiting an envelope on the probe"),
+    }
+}
+
 /// `purge_app` on a `RedisAdapter` closes all local connections with 4009 and
 /// removes the app from the Redis `apps` set so the sweeper stops enumerating it.
 #[tokio::test]

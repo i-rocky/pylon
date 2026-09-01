@@ -49,8 +49,31 @@ The apps list must be **identical** on every node; pylon does not replicate it t
 | `PYLON_REDIS_NODE_HEARTBEAT` | `5` | Heartbeat interval (seconds) each node publishes to Redis. |
 | `PYLON_REDIS_PRESENCE_HEARTBEAT` | `25` | Interval (seconds) at which presence-member entries are refreshed. |
 | `PYLON_REDIS_SHARDED_PUBSUB` | `false` | Use Redis 7+ sharded Pub/Sub (`SSUBSCRIBE`/`SPUBLISH`) for higher-throughput clusters. Requires Redis 7.0+, and **every** node must set the same value — sharded and ordinary Pub/Sub are separate namespaces. |
+| `PYLON_CLUSTER_ENVELOPE_COMPAT` | `true` | Drop the legacy `event` field from relayed envelopes when set `0`/`false` — halves cluster-bus bandwidth. **Only safe once every node is ≥0.3.0** (see [below](#cluster-envelope-compat-030-only)). |
 
 See [Configuration](configuration.md) for the full variable reference.
+
+### Cluster envelope compat (≥0.3.0 only)
+
+Since v0.3.0, every relayed frame travels on the Redis bus with **both** an
+`event` field (the pre-0.3 wire shape) and a `frame_b64` field — receivers
+prefer `frame_b64` and fall back to `event`, which is what makes a
+0.2.x ↔ 0.3.x rolling upgrade safe in both directions. The cost is that each
+frame is carried twice, roughly doubling cluster-bus bandwidth.
+
+Once **every node in the cluster runs ≥0.3.0**, set this on all nodes to retire
+the duplicate:
+
+```env
+PYLON_CLUSTER_ENVELOPE_COMPAT=0
+```
+
+Frame-carrying envelopes then omit the legacy `event` field (`frame_b64` is the
+sole carrier); control envelopes are unchanged, and receivers decode both
+shapes either way. Do **not** enable this during a mixed-version rollout: a
+0.2.x node cannot decode a frame relayed without the `event` field. The setting
+only changes what a node *sends* — as with `PYLON_REDIS_SHARDED_PUBSUB`, keep
+it uniform across the fleet.
 
 ---
 

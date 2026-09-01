@@ -68,6 +68,7 @@ per-connection and per-publish lookups stay fast. See
 | `PYLON_REDIS_NODE_HEARTBEAT` | `5` | Interval (seconds) at which each node publishes its heartbeat to Redis. |
 | `PYLON_REDIS_SWEEP_INTERVAL` | `10` | Interval (seconds) at which stale presence and membership entries are swept. |
 | `PYLON_REDIS_SHARDED_PUBSUB` | `false` | Enable Redis 7+ sharded Pub/Sub. Set `1` or `true` to enable. |
+| `PYLON_CLUSTER_ENVELOPE_COMPAT` | `true` | Emit the Redis cluster relay envelope in its compat shape — every relayed frame travels with BOTH the legacy `event` field and the `frame_b64` field, so 0.2.x↔0.3.x mixed fleets relay in both directions during rolling upgrades. Set `0`/`false` — **only once every node in the cluster is ≥0.3.0** — to drop the legacy `event` field for frame-carrying envelopes and halve cluster-bus bandwidth. Receivers decode both shapes regardless of their own setting. See [Clustering: envelope compat](clustering.md#cluster-envelope-compat-030-only). |
 
 ---
 

@@ -114,6 +114,10 @@ pub(super) async fn user_count(
 /// cross-node via the channel's msg pub/sub, and a webhook). Best-effort: logs + returns
 /// on any Redis error, never panics. The broadcast envelope's `node_id` is the DEAD node
 /// (the token prefix) so every LIVE node — including this sweeper's — delivers it.
+/// `compat` is the cluster-wide `PYLON_CLUSTER_ENVELOPE_COMPAT` setting: with compat
+/// off the member_removed envelope omits the legacy `event` member (frame_b64 is the
+/// sole carrier — a homogeneous ≥0.3.0 fleet).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn reap_member(
     pool: &Pool,
     keys: &Keys,
@@ -121,6 +125,7 @@ pub(super) async fn reap_member(
     channel: &str,
     token: &str,
     sharded: bool,
+    compat: bool,
     webhooks: &WebhookHandle,
 ) {
     let presmembers = keys.presmembers(app, channel);
@@ -193,10 +198,11 @@ pub(super) async fn reap_member(
             event: Value::String(frame.clone()),
             except: None,
             // Additive (F16): raw frame bytes as base64 alongside the legacy
-            // `event` JSON string (see `Envelope::frame_b64`).
+            // `event` JSON string (see `Envelope::frame_b64`). F-1: with the
+            // compat knob off the envelope drops the `event` member instead.
             frame_b64: Some(Envelope::encode_frame_b64(&frame)),
         };
-        if let Ok(payload) = String::from_utf8(env.encode()) {
+        if let Ok(payload) = String::from_utf8(env.encode_with(compat)) {
             if let Err(e) =
                 client::publish_channel(pool, &keys.msg(app, channel), payload, sharded).await
             {

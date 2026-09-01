@@ -25,22 +25,46 @@ pub struct Envelope {
     #[serde(default)]
     pub kind: EnvelopeKind,
     pub channel: String,
+    // F-1: `event` is `#[serde(default)]` so a NEW-only envelope — emitted with
+    // `PYLON_CLUSTER_ENVELOPE_COMPAT=0` (frame_b64, no `event` member) — decodes
+    // on every receiver (the field resolves to `Null`; `frame()` then takes
+    // `frame_b64`). Old-only envelopes (event, no frame_b64) decode as before.
+    #[serde(default)]
     pub event: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub except: Option<String>,
     /// Additive (F16): the pre-encoded v7 frame as base64 of its RAW bytes.
-    /// `event` still carries the frame as a JSON string — its exact pre-F16
-    /// shape — so the two fields travel together and BOTH old and new nodes
-    /// relay correctly during a mixed-version rolling upgrade:
+    /// By default (`PYLON_CLUSTER_ENVELOPE_COMPAT=1`) `event` still carries the
+    /// frame as a JSON string — its exact pre-F16 shape — so the two fields
+    /// travel together and BOTH old and new nodes relay correctly during a
+    /// mixed-version rolling upgrade:
     /// * an OLD receiver ignores this unknown field (the struct does NOT use
     ///   `deny_unknown_fields`, so serde skips it) and reads `event`;
     /// * a NEW receiver prefers this field ([`Envelope::frame`]) because base64
     ///   needs no JSON escape/unescape round-trip, falling back to `event`
     ///   when an old sender emitted none.
     ///
+    /// With the compat knob OFF ([`Envelope::encode_with`]) this field is the
+    /// ONLY carrier: emitters omit the legacy `event` member for frame kinds.
+    ///
     /// `None` for the non-frame kinds (`event` is `Null` there).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub frame_b64: Option<String>,
+}
+
+/// The `legacy_event = false` wire shape of a frame-carrying [`Envelope`]: every
+/// field in the SAME declaration order minus the legacy `event` member, so the
+/// only difference from the compat (default) shape is that one missing field.
+/// A borrowed shim (zero-clone) used only by [`Envelope::encode_with`].
+#[derive(serde::Serialize)]
+struct FrameOnlyWire<'a> {
+    node_id: &'a str,
+    app: &'a str,
+    kind: &'a EnvelopeKind,
+    channel: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    except: Option<&'a String>,
+    frame_b64: &'a str,
 }
 
 impl Envelope {
@@ -54,6 +78,32 @@ impl Envelope {
     /// Serialize to JSON bytes for PUBLISH.
     pub fn encode(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("Envelope is always serializable")
+    }
+
+    /// Serialize to JSON bytes for PUBLISH, choosing the wire shape per the
+    /// cluster envelope compat knob (`PYLON_CLUSTER_ENVELOPE_COMPAT`).
+    ///
+    /// `legacy_event = true` (the default; identical to [`Envelope::encode`])
+    /// emits BOTH the legacy `event` JSON string and the additive `frame_b64` —
+    /// the exact F16 double-carry that keeps a 0.2.x↔0.3.x mixed fleet relaying
+    /// in both directions. `legacy_event = false` — legal only on a homogeneous
+    /// ≥0.3.0 fleet — OMITS `event` for frame-carrying envelopes (halving the
+    /// cluster-bus bandwidth); frame-less control envelopes (the `Null` /
+    /// watch / terminate kinds, which carry no `frame_b64`) keep their exact
+    /// shape either way.
+    pub fn encode_with(&self, legacy_event: bool) -> Vec<u8> {
+        if legacy_event || self.frame_b64.is_none() {
+            return self.encode();
+        }
+        serde_json::to_vec(&FrameOnlyWire {
+            node_id: &self.node_id,
+            app: &self.app,
+            kind: &self.kind,
+            channel: &self.channel,
+            except: self.except.as_ref(),
+            frame_b64: self.frame_b64.as_deref().unwrap_or_default(),
+        })
+        .expect("Envelope is always serializable")
     }
 
     /// Deserialize from the bytes received in a SUBSCRIBE message.
@@ -292,5 +342,147 @@ mod tests {
         };
         let got = Envelope::decode(&e.encode()).unwrap();
         assert_eq!(got.frame().as_deref(), Some(raw.as_str()));
+    }
+
+    // ── F-1: the PYLON_CLUSTER_ENVELOPE_COMPAT knob (encode_with) ─────────────
+
+    /// A representative frame-carrying envelope with both fields populated —
+    /// the exact struct today's emitters build.
+    fn frame_envelope() -> Envelope {
+        let frame = frame_payload();
+        Envelope {
+            node_id: "n1".into(),
+            app: "a".into(),
+            kind: EnvelopeKind::Broadcast,
+            channel: "c".into(),
+            event: serde_json::Value::String(frame.clone()),
+            except: None,
+            frame_b64: Some(Envelope::encode_frame_b64(&frame)),
+        }
+    }
+
+    /// A representative frame-less control envelope — the watch/terminate shape
+    /// (Null event, no frame_b64) whose wire form must NOT change under the knob.
+    fn control_envelope() -> Envelope {
+        Envelope {
+            node_id: "n1".into(),
+            app: "a".into(),
+            kind: EnvelopeKind::UserTerminate,
+            channel: "u7".into(),
+            event: serde_json::Value::Null,
+            except: None,
+            frame_b64: None,
+        }
+    }
+
+    #[test]
+    fn compat_true_is_byte_pinned_to_the_f16_shape() {
+        // compat=ON (the default) is the EXACT pre-knob wire shape: both fields,
+        // in declaration order, `event` carrying the frame as the legacy escaped
+        // JSON string. Pinned as a literal so any accidental reshape of the
+        // envelope (field order, renaming, extra members) fails here.
+        let e = frame_envelope();
+        let frame = frame_payload();
+        let expected = format!(
+            concat!(
+                r#"{{"node_id":"n1","app":"a","kind":"Broadcast","channel":"c","event":{},"#,
+                r#""frame_b64":"{}"}}"#
+            ),
+            serde_json::Value::String(frame.clone()),
+            Envelope::encode_frame_b64(&frame),
+        );
+        assert_eq!(
+            String::from_utf8(e.encode_with(true)).unwrap(),
+            expected,
+            "compat=on must keep the byte-exact F16 double-carry shape"
+        );
+        assert_eq!(
+            e.encode_with(true),
+            e.encode(),
+            "compat=on is byte-identical to the derived (pre-knob) encode"
+        );
+    }
+
+    #[test]
+    fn compat_false_omits_event_for_frame_kinds_and_keeps_control_shapes() {
+        // compat=OFF: a frame-carrying envelope drops the legacy `event` member
+        // (frame_b64 is the sole carrier) — same field order otherwise.
+        let e = frame_envelope();
+        let bytes = e.encode_with(false);
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            json.get("event").is_none(),
+            "compat=off must omit the legacy event member for frame kinds, got: {json}"
+        );
+        assert_eq!(
+            json.get("frame_b64").and_then(|v| v.as_str()),
+            Some(Envelope::encode_frame_b64(&frame_payload()).as_str())
+        );
+        // Every other member is untouched.
+        assert_eq!(json.get("node_id").and_then(|v| v.as_str()), Some("n1"));
+        assert_eq!(json.get("app").and_then(|v| v.as_str()), Some("a"));
+        assert_eq!(json.get("kind").and_then(|v| v.as_str()), Some("Broadcast"));
+        assert_eq!(json.get("channel").and_then(|v| v.as_str()), Some("c"));
+
+        // A frame-less control envelope keeps its exact shape under BOTH
+        // settings — still `"event":null`, still no `frame_b64`.
+        let ctrl = control_envelope();
+        let ctrl_pinned =
+            r#"{"node_id":"n1","app":"a","kind":"UserTerminate","channel":"u7","event":null}"#;
+        assert_eq!(
+            String::from_utf8(ctrl.encode_with(true)).unwrap(),
+            ctrl_pinned
+        );
+        assert_eq!(
+            String::from_utf8(ctrl.encode_with(false)).unwrap(),
+            ctrl_pinned
+        );
+    }
+
+    #[test]
+    fn mixed_fleet_matrix_both_envelope_directions_decode_under_both_settings() {
+        let frame = frame_payload();
+        // The 2x2 matrix: an envelope emitted under EITHER setting decodes on a
+        // receiver running under EITHER setting (decode is setting-independent —
+        // receivers prefer frame_b64 and fall back to event — but the matrix
+        // proves the emitted bytes of both modes round-trip cleanly).
+        for compat in [true, false] {
+            let got = Envelope::decode(&frame_envelope().encode_with(compat)).unwrap();
+            assert_eq!(
+                got.frame().as_deref(),
+                Some(frame.as_str()),
+                "compat={compat} emission must decode back to the exact frame"
+            );
+        }
+        // OLD-only envelope (event, no frame_b64): a pre-0.3 sender's payload.
+        let old_only = format!(
+            r#"{{"node_id":"n2","app":"a","channel":"c","event":{}}}"#,
+            serde_json::Value::String(frame.clone())
+        );
+        let got = Envelope::decode(old_only.as_bytes()).unwrap();
+        assert_eq!(got.frame_b64, None);
+        assert_eq!(got.frame().as_deref(), Some(frame.as_str()));
+        // NEW-only envelope (frame_b64, NO event member): a compat=off sender's
+        // payload. Must decode (event defaults to Null) and still yield the frame.
+        let new_only = format!(
+            r#"{{"node_id":"n3","app":"a","channel":"c","frame_b64":"{}"}}"#,
+            Envelope::encode_frame_b64(&frame)
+        );
+        let got = Envelope::decode(new_only.as_bytes()).unwrap();
+        assert_eq!(
+            got.event,
+            serde_json::Value::Null,
+            "missing event defaults to Null"
+        );
+        assert_eq!(got.frame().as_deref(), Some(frame.as_str()));
+        // And the compat=off emission is exactly the new-only shape: decoding it
+        // through the OLD pre-F16 receiver struct must FAIL on the missing
+        // required `event` — the documented reason the knob demands a ≥0.3 fleet.
+        let old: Result<OldEnvelopeShape, _> =
+            serde_json::from_slice(&frame_envelope().encode_with(false));
+        assert!(
+            old.is_err(),
+            "an old receiver cannot decode a compat=off frame envelope"
+        );
     }
 }

@@ -281,6 +281,12 @@ pub struct RedisConfig {
     pub sweep_interval_secs: u64,
     pub webhook_vacated_grace_ms: u64,
     pub sharded_pubsub: bool,
+    /// F-1 (`PYLON_CLUSTER_ENVELOPE_COMPAT`, default `true`): emit the compat
+    /// double-carry envelope shape (`event` + `frame_b64`). When `false` the
+    /// emitters omit the legacy `event` member for frame-carrying envelopes —
+    /// legal only on a homogeneous ≥0.3.0 fleet (see
+    /// [`Envelope::encode_with`](envelope::Envelope::encode_with)).
+    pub envelope_compat: bool,
 }
 
 impl RedisConfig {
@@ -292,6 +298,7 @@ impl RedisConfig {
             sweep_interval_secs: cfg.redis_sweep_interval_secs,
             webhook_vacated_grace_ms: cfg.webhook_vacated_grace_ms,
             sharded_pubsub: cfg.redis_sharded_pubsub,
+            envelope_compat: cfg.cluster_envelope_compat,
         }
     }
 
@@ -486,6 +493,7 @@ impl RedisAdapter {
         let keys = self.keys.clone();
         let node_id = self.node_id.clone();
         let sharded = self.cfg.sharded_pubsub;
+        let envelope_compat = self.cfg.envelope_compat;
         let handle = tokio::spawn(async move {
             sweeper::sweeper_loop(
                 pool,
@@ -494,6 +502,7 @@ impl RedisAdapter {
                 lease_ms,
                 interval_secs,
                 sharded,
+                envelope_compat,
                 webhooks,
             )
             .await
@@ -521,6 +530,7 @@ impl RedisAdapter {
             &self.node_id,
             lease_ms,
             self.cfg.sharded_pubsub,
+            self.cfg.envelope_compat,
             webhooks,
             now_ms,
         )
@@ -869,6 +879,7 @@ impl RedisAdapter {
                         envelope::EnvelopeKind::WatchOnline,
                         serde_json::Value::Null,
                         self.cfg.sharded_pubsub,
+                        self.cfg.envelope_compat,
                     )
                     .await;
                 }
@@ -931,6 +942,7 @@ impl RedisAdapter {
                         envelope::EnvelopeKind::WatchOffline,
                         serde_json::Value::Null,
                         self.cfg.sharded_pubsub,
+                        self.cfg.envelope_compat,
                     )
                     .await;
                 }
@@ -1090,9 +1102,12 @@ impl RedisAdapter {
             // `event` JSON string, so mixed old/new nodes relay either shape.
             frame_b64: Some(envelope::Envelope::encode_frame_b64(&frame)),
         };
-        // Publish as a UTF-8 string (the envelope JSON is valid UTF-8); the receive
-        // loop reads it back with `Value::into_string()` — a proven round-trip.
-        let payload = match String::from_utf8(env.encode()) {
+        // F-1: with the compat knob off (homogeneous ≥0.3.0 fleet) the envelope
+        // drops the legacy `event` member for this frame kind; receivers are
+        // unchanged (they prefer `frame_b64` either way). Publish as a UTF-8
+        // string (the envelope JSON is valid UTF-8); the receive loop reads it
+        // back with `Value::into_string()` — a proven round-trip.
+        let payload = match String::from_utf8(env.encode_with(self.cfg.envelope_compat)) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, app, channel, "envelope was not valid UTF-8");
@@ -1488,6 +1503,7 @@ impl Adapter for RedisAdapter {
             envelope::EnvelopeKind::UserSend,
             serde_json::Value::String(frame),
             self.cfg.sharded_pubsub,
+            self.cfg.envelope_compat,
         )
         .await;
     }
@@ -1505,6 +1521,7 @@ impl Adapter for RedisAdapter {
             envelope::EnvelopeKind::UserTerminate,
             serde_json::Value::Null,
             self.cfg.sharded_pubsub,
+            self.cfg.envelope_compat,
         )
         .await;
         ids

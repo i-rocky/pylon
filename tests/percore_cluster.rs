@@ -25,7 +25,7 @@ mod common;
 
 use common::{
     connect, established_socket_id, next_event_named, next_json_within, send_json,
-    spawn_percore_cluster, wait_pubsub_subscribers, Ws, KEY, SECRET,
+    spawn_percore_cluster, spawn_percore_cluster_with, wait_pubsub_subscribers, Ws, KEY, SECRET,
 };
 use pylon::adapter::redis::keys::Keys;
 use pylon::auth::signature::{hmac_sha256_hex, md5_hex};
@@ -218,5 +218,51 @@ async fn cross_node_subscription_count() {
     assert!(
         await_subscription_count(&mut ws_a, channel, 2, Duration::from_secs(5)).await,
         "a must observe an updated cross-node subscription_count == 2 once b subscribes on B"
+    );
+}
+
+/// F-1 (`PYLON_CLUSTER_ENVELOPE_COMPAT=0`): the full clustered hot path with the
+/// knob OFF on the publishing node. Node A is booted with
+/// `cluster_envelope_compat = false` (the harness-config equivalent of exporting
+/// `PYLON_CLUSTER_ENVELOPE_COMPAT=0` — the env plumbing itself is pinned by the
+/// config unit tests and the `redis_cluster.rs` knob test), so its bridge's
+/// `ClusterCmd::Publish` arm emits frame_b64-only envelopes on the Redis bus.
+/// Node B stays on the DEFAULT config — receivers are knob-independent — and
+/// still delivers the event to its WS client end-to-end. (The wire bytes —
+/// `event` absent, `frame_b64` present — are sniffed and pinned by the
+/// `redis_cluster.rs` knob test; this test pins the WORKER → BRIDGE → ADAPTER
+/// emission path a real clustered publish takes.)
+#[tokio::test]
+async fn cross_node_broadcast_with_envelope_compat_off_still_delivers() {
+    let prefix = random_prefix();
+    // A publishes with the legacy envelope field dropped; B is a default node.
+    let (addr_a, _guard_a) =
+        spawn_percore_cluster_with(&prefix, |cfg| cfg.cluster_envelope_compat = false).await;
+    let (addr_b, _guard_b) = spawn_percore_cluster(&prefix).await;
+
+    let channel = "compat-off-chan";
+    let mut ws_a = connect_and_subscribe(addr_a, channel).await;
+    let mut ws_b = connect_and_subscribe(addr_b, channel).await;
+
+    let msg_key = Keys::new(&prefix).msg(APP_ID, channel);
+    assert!(
+        wait_pubsub_subscribers(&msg_key, 2, Duration::from_secs(5)).await,
+        "both nodes' bridges must SUBSCRIBE {msg_key} before the cross-node publish"
+    );
+
+    let payload = "{\"hello\":\"compat-off\"}";
+    publish_event(addr_a, "my-event", channel, payload).await;
+
+    // Both nodes deliver the published payload verbatim — A locally, B through
+    // the frame_b64-only envelope on the bus.
+    let frame_a = next_event_named(&mut ws_a, "my-event").await;
+    assert_eq!(
+        frame_a["data"], payload,
+        "a must receive the payload verbatim"
+    );
+    let frame_b = next_event_named(&mut ws_b, "my-event").await;
+    assert_eq!(
+        frame_b["data"], payload,
+        "b must receive the compat=off cross-node payload verbatim"
     );
 }
