@@ -8,6 +8,9 @@
     "test": "node runner.js --list"
   },
   "license": "UNLICENSED",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "pusher": "5.3.4"
   }

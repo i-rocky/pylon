@@ -161,14 +161,15 @@ const SCENARIOS = {
     return { occupied: Boolean(body.occupied) };
   },
 
-  // Both shapes are valid observations: 200 with a users array (occupied in a
-  // full run, or empty-but-present on pylon), 400 when the server refuses an
-  // unoccupied/non-presence query.
+  // Query the presence channel C-PRES-SUB occupies (`presence-cf-pres`), so a
+  // full run observes the 200/users shape. Both shapes stay valid: 200 with a
+  // users array (occupied, or empty-but-present before Task 8 lands), 400 when
+  // the server refuses the query (unoccupied).
   'S-USERS': async () => {
     let status;
     let users = null;
     try {
-      const r = await client().get({ path: '/channels/cf-presence/users' });
+      const r = await client().get({ path: '/channels/presence-cf-pres/users' });
       status = r.status;
       const body = await r.json();
       users = Array.isArray(body && body.users) ? body.users.map(() => '<id>') : null;
@@ -237,28 +238,35 @@ const SCENARIOS = {
       );
     const outcomes = {};
 
+    // A resolve is a FAILURE (the auth-enforcement regression this scenario
+    // guards), so the rejection assertion lives OUTSIDE each try/catch — a
+    // deliberate throw inside the try would be swallowed by its own catch.
     const bad = mk({ appId: e.app_id, key: e.app_key, secret: 'wrong-secret-0123456789abcdef0' });
+    let badAccepted = null;
     try {
       const r = await bad.trigger('cf-test-channel', 'x', {});
-      throw new Error(`bad secret resolved (status ${r.status})`);
+      badAccepted = r.status;
     } catch (err) {
       outcomes.bad_signature = '<rejected>';
       outcomes.bad_signature_status = String(statusOf(err));
     }
+    if (badAccepted !== null) {
+      throw new Error(`bad secret was accepted (status ${badAccepted})`);
+    }
 
     const unknown = mk({ appId: 'nope', key: 'nope', secret: 'x'.repeat(32) });
+    let unknownAccepted = null;
     try {
       const r = await unknown.trigger('cf-test-channel', 'x', {});
-      throw new Error(`unknown app resolved (status ${r.status})`);
+      unknownAccepted = r.status;
     } catch (err) {
       outcomes.unknown_app = '<rejected>';
       outcomes.unknown_app_status = String(statusOf(err));
     }
+    if (unknownAccepted !== null) {
+      throw new Error(`unknown app was accepted (status ${unknownAccepted})`);
+    }
 
-    assertOk(
-      outcomes.bad_signature === '<rejected>' && outcomes.unknown_app === '<rejected>',
-      'expected both error triggers to be rejected'
-    );
     return outcomes;
   },
 };
