@@ -206,9 +206,12 @@ const SCENARIOS = {
     const socketId = p.connection.socket_id;
     assertOk(typeof socketId === 'string' && SOCKET_ID_RE.test(socketId),
       `socket_id shape: ${socketId}`);
+    // Normalization contract: observations carry no run-unique values — the
+    // raw id goes to stderr as evidence, the placeholder into observations.
+    log('socket_id:', socketId);
     const state = p.connection.state;
     p.disconnect();
-    return { socket_id: socketId, state };
+    return { socket_id: '<socket_id>', state };
   },
 
   'C-RECONNECT': async () => {
@@ -244,8 +247,11 @@ const SCENARIOS = {
     assertOk(p.connection.state === 'connected',
       `connection not alive after 8s: ${p.connection.state}`);
     assertOk(pongs >= 1, `no pusher:pong observed in 8s (${pongs})`);
+    // Normalization contract: the pong count varies run to run with timing —
+    // raw count to stderr as evidence, the assert floor into observations.
+    log('pusher:pong count in 8s:', pongs);
     p.disconnect();
-    return { alive_after_8s: true, activity_timeout_used_ms: 2000, pongs_observed: pongs };
+    return { alive_after_8s: true, activity_timeout_used_ms: 2000, pongs_observed: '>=1' };
   },
 
   'C-PUB-SUB': async () => {
