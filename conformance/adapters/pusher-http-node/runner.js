@@ -20,6 +20,18 @@
 //       presence auth sends `user_id` alongside `channel_name` — for a
 //       `presence-*` channel that becomes channelData {user_id, user_info:{}}.
 //
+//   node runner.js --fire '<json>' --env <env.json>
+//       Publish one event server-side via the SDK: `client().trigger`. The
+//       JSON spec is {channel, name, data, encrypted?} — `data` may be any
+//       JSON value (strings pass verbatim, objects are JSON-serialized by the
+//       SDK). `encrypted: true` is accepted as an assertion that the channel
+//       is private-encrypted-*: the SDK encrypts automatically on those
+//       channels (this client carries encryptionMasterKeyBase64), so the flag
+//       only cross-checks the channel prefix. Exit 0 on a 2xx response,
+//       non-zero with a stderr message otherwise. Used by the client-plane
+//       (pusher-js) scenarios for their server-side publishes, keeping ALL
+//       server-side protocol work on the official server SDK.
+//
 //   node runner.js --verify-webhook <envelope.json> [--env <env.json>]
 //       Read {headers, body}, verify with the SDK's webhook checker, print
 //       {"valid": bool, "events": [...], "error"?: string}.
@@ -348,6 +360,30 @@ async function signMode() {
   process.stdout.write(JSON.stringify(resp) + '\n');
 }
 
+// --fire '<json>': one server-side publish through the SDK's trigger.
+// The client is configured with encryptionMasterKeyBase64, so triggering on a
+// private-encrypted-* channel encrypts end-to-end automatically.
+async function fireMode(specRaw) {
+  let spec;
+  try {
+    spec = JSON.parse(specRaw);
+  } catch (e) {
+    throw new Error('--fire argument is not valid JSON');
+  }
+  const { channel, name, data, encrypted } = spec || {};
+  if (typeof channel !== 'string' || typeof name !== 'string') {
+    throw new Error('--fire needs {channel: string, name: string, data}');
+  }
+  if (encrypted === true && !channel.startsWith('private-encrypted-')) {
+    throw new Error(`--fire encrypted:true but channel ${channel} is not private-encrypted-*`);
+  }
+  const r = await client().trigger(channel, name, data);
+  if (r.status < 200 || r.status >= 300) {
+    throw new Error(`trigger ${channel}/${name} -> status ${r.status}`);
+  }
+  log(`fire: ${channel}/${name} -> ${r.status}`);
+}
+
 // --verify-webhook <path>: {headers, body} file, verifier verdict on STDOUT.
 function verifyWebhookMode(envelopePath) {
   const envelope = JSON.parse(fs.readFileSync(envelopePath, 'utf8'));
@@ -419,6 +455,11 @@ async function scenarioMode() {
     await signMode();
     return;
   }
+  const fireSpec = arg('--fire');
+  if (fireSpec) {
+    await fireMode(fireSpec);
+    return;
+  }
   const envelopePath = arg('--verify-webhook');
   if (envelopePath) {
     verifyWebhookMode(envelopePath);
@@ -428,7 +469,7 @@ async function scenarioMode() {
     await scenarioMode();
     return;
   }
-  console.error('usage: runner.js --scenario <id> --env <path> | --sign --env <path> | --verify-webhook <path> | --version | --list');
+  console.error('usage: runner.js --scenario <id> --env <path> | --sign --env <path> | --fire <json> --env <path> | --verify-webhook <path> | --version | --list');
   process.exit(2);
 })().catch((e) => {
   // Modes other than --scenario have no verdict contract: errors on stderr,
