@@ -6,14 +6,6 @@ pre-1.0 and versions track `Cargo.toml`.
 
 ## [Unreleased]
 
-### Changed
-- `RedisAdapter::send_to_user` now encodes the user event ONCE per send and
-  feeds the same frame to both halves (the node-local delivery runs as a `Raw`
-  frame; the `usermsg` publish reuses the identical string) — previously the
-  typed event was encoded once inside the local half and again for the Redis
-  publish. Wire bytes are unchanged (the same `wire::encode` at
-  `ACTIVE_VERSIONS[0]`; the encode-once shape already proven for broadcasts).
-
 ### Added
 - `PYLON_CLUSTER_ENVELOPE_COMPAT` (default `true`) — retire the Redis cluster
   envelope's legacy `event` double-carry. The default keeps emitting both the
@@ -28,6 +20,22 @@ pre-1.0 and versions track `Cargo.toml`.
   official `pusher-js` and `pusher-http-node` SDKs through every protocol
   feature they can exercise (26 scenarios), with a coverage audit (`--audit`)
   and an opt-in CI job (`conformance.yml`).
+
+### Changed
+- `RedisAdapter::send_to_user` now encodes the user event ONCE per send and
+  feeds the same frame to both halves (the node-local delivery runs as a `Raw`
+  frame; the `usermsg` publish reuses the identical string) — previously the
+  typed event was encoded once inside the local half and again for the Redis
+  publish. Wire bytes are unchanged (the same `wire::encode` at
+  `ACTIVE_VERSIONS[0]`; the encode-once shape already proven for broadcasts).
+
+### Security
+- Webhook SSRF classifier: NAT64 (`64:ff9b::/96`) and class-E reserved
+  (`240.0.0.0/4`) targets are now classified as private. A NAT64 gateway
+  translates the embedded IPv4 into interior address space, so both public and
+  private embedded v4s are refused; class E has no legitimate webhook
+  receivers. `PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS=1` still relaxes the whole
+  address classification.
 
 ## [0.3.0] - 2026-09-01
 

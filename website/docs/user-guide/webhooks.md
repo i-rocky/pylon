@@ -252,11 +252,16 @@ HTTP is sent, every delivery runs a pre-flight check:
      and RFC1918 (`10/8`, `172.16/12`, `192.168/16`).
    - IPv4 shared/CGNAT (`100.64.0.0/10`, RFC 6598) — Tailscale and several
      Kubernetes CNIs run real internal infrastructure there.
-   - IPv4 multicast (`224.0.0.0/4`) and broadcast (`255.255.255.255`).
+   - IPv4 multicast (`224.0.0.0/4`), broadcast (`255.255.255.255`), and
+     class-E reserved (`240.0.0.0/4`) — no legitimate webhook receiver lives
+     in any of them.
    - IPv6 loopback (`::1`), unspecified (`::`), unique-local (`fc00::/7`),
      link-local (`fe80::/10`), and multicast (`ff00::/8`).
    - IPv4-mapped (`::ffff:10.0.0.5`) and IPv4-compatible (`::10.0.0.5`) IPv6
      forms are classified by their embedded IPv4 address.
+   - NAT64 well-known prefix (`64:ff9b::/96`, RFC 6052) — a NAT64 gateway
+     translates the embedded IPv4 into interior address space, so these are
+     refused whether the embedded v4 is public or private.
 3. **Pinning**: for hostname URLs the delivery is pinned to the addresses the
    pre-flight resolved (`ClientBuilder::resolve_to_addrs`), so the actual
    connect cannot drift to a second, un-checked DNS lookup between the check
