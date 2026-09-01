@@ -74,12 +74,22 @@ spawn pylon on `port_base + 2` with it, bind the auth endpoint on
 `env.json` for the whole run, then execute each selected scenario under its
 catalog budget (enforced with a process-group kill — a hung runner cannot
 stall the run). At the end the harness prints a human matrix and writes the
-JSON artifact. Exit code: `0` all pass/skip, `1` any failure, `2` harness
-error (bad flags, missing binary, ...).
+JSON artifact. The matrix ends with a summary line like
+
+```
+26 passed, 0 failed, 0 skipped — pusher-js@8.6.0, pusher-http-node@5.3.4, pylon 0.3.0
+```
+
+SDKs are keyed by adapter id (`pusher-http-node`, not its npm package name
+`pusher`) — the same id the catalog, `--sdk`, and the matrix's SDK column
+use. A failed version probe drops that pair with a stderr warning and the
+run proceeds (version is metadata, not a gate). Exit code: `0` all
+pass/skip, `1` any failure, `2` harness error (bad flags, missing binary,
+...).
 
 The JSON artifact is stable and diffable: run metadata (timestamp, pylon
-version, target) plus one entry per scenario with its verdict, observations,
-error, and duration.
+version, both SDK versions, target) plus one entry per scenario with its
+verdict, observations, error, and duration.
 
 ## `--audit`: keep the catalog honest
 

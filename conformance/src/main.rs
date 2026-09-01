@@ -62,6 +62,10 @@ const SIGNER_TIMEOUT: Duration = Duration::from_secs(15);
 /// instead of listing cannot stall `--audit` indefinitely.
 const LISTING_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Wall-clock bound on one `--version` probe — metadata must never stall a
+/// run (same cancellation-safe pattern as the listing and signer bounds).
+const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[tokio::main]
 async fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -221,6 +225,67 @@ async fn runner_listing(adapter_dir: &Path) -> Result<Vec<String>, String> {
     Ok(ids)
 }
 
+/// One adapter's SDK version: `node runner.js --version` in `adapter_dir`,
+/// trimmed stdout (e.g. `8.6.0`). `None` on any failure — spawn error,
+/// non-zero exit, hang past [`VERSION_TIMEOUT`], or empty output — with the
+/// reason warned on stderr: version is metadata, not a gate, so the run
+/// proceeds without the pair. Same bounded, cancellation-safe spawn pattern
+/// as [`runner_listing`].
+async fn sdk_version(adapter_dir: &Path) -> Option<String> {
+    let child = tokio::process::Command::new("node")
+        .arg("runner.js")
+        .arg("--version")
+        .current_dir(adapter_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn();
+    let child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "warning: spawn `node runner.js --version` in {}: {e}",
+                adapter_dir.display()
+            );
+            return None;
+        }
+    };
+    let output = match tokio::time::timeout(VERSION_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            eprintln!(
+                "warning: wait for --version runner in {}: {e}",
+                adapter_dir.display()
+            );
+            return None;
+        }
+        Err(_) => {
+            eprintln!(
+                "warning: --version runner in {} timed out after {VERSION_TIMEOUT:?}",
+                adapter_dir.display()
+            );
+            return None;
+        }
+    };
+    if !output.status.success() {
+        eprintln!(
+            "warning: --version runner in {} exited {}",
+            adapter_dir.display(),
+            output.status
+        );
+        return None;
+    }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if version.is_empty() {
+        eprintln!(
+            "warning: --version runner in {} printed nothing",
+            adapter_dir.display()
+        );
+        return None;
+    }
+    Some(version)
+}
+
 /// Cross-check the binding table against per-sdk `--list` outputs: every
 /// `(sdk, id)` binding must appear in that sdk's listing. Sdks absent from
 /// `listings` (missing runner, or a `--list` that failed) are skipped — the
@@ -348,13 +413,22 @@ async fn run_scenarios(
         hooks.envelopes().len()
     );
 
-    // SDK versions come from each adapter's `--version` mode (Task 7); the
-    // table is empty until those runners exist.
+    // SDK versions, keyed by ADAPTER id (the same id the catalog, `--sdk`,
+    // and the matrix's SDK column use — the http SDK's npm package is
+    // `pusher`, but the harness calls it `pusher-http-node` everywhere).
+    // A failed probe drops that pair with a warning; the run proceeds.
+    let mut sdk_versions = Vec::new();
+    for sdk in ["pusher-js", "pusher-http-node"] {
+        if let Some(version) = sdk_version(&adapters_dir().join(sdk)).await {
+            sdk_versions.push((sdk.to_string(), version));
+        }
+    }
+
     let report = report::Report {
         run: report::RunMeta {
             timestamp: rfc3339_now(),
             pylon_version,
-            sdk_versions: Vec::new(),
+            sdk_versions,
             target: "local".to_string(),
         },
         results,
@@ -693,6 +767,52 @@ mod tests {
             started.elapsed() >= super::LISTING_TIMEOUT,
             "the bound is actually enforced (elapsed {:?})",
             started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn sdk_version_trims_stdout_and_degrades_to_none() {
+        if super::adapter::which_node().is_none() {
+            eprintln!("skipping: node not found");
+            return;
+        }
+        let dir = std::env::temp_dir().join("cf-version-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("runner.js"), "console.log('  1.2.3  ');").unwrap();
+        assert_eq!(
+            super::sdk_version(&dir).await,
+            Some("1.2.3".to_string()),
+            "stdout is trimmed to the bare version"
+        );
+
+        let failing = dir.parent().unwrap().join("cf-version-failing");
+        std::fs::create_dir_all(&failing).unwrap();
+        std::fs::write(
+            failing.join("runner.js"),
+            "console.log('nope'); process.exit(4);",
+        )
+        .unwrap();
+        assert_eq!(
+            super::sdk_version(&failing).await,
+            None,
+            "non-zero exit → None"
+        );
+
+        let silent = dir.parent().unwrap().join("cf-version-silent");
+        std::fs::create_dir_all(&silent).unwrap();
+        std::fs::write(silent.join("runner.js"), "console.error('to stderr');").unwrap();
+        assert_eq!(
+            super::sdk_version(&silent).await,
+            None,
+            "empty stdout → None"
+        );
+
+        let missing = dir.parent().unwrap().join("cf-version-missing");
+        std::fs::create_dir_all(&missing).unwrap(); // no runner.js at all
+        assert_eq!(
+            super::sdk_version(&missing).await,
+            None,
+            "spawn failure → None"
         );
     }
 
