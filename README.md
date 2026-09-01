@@ -7,7 +7,8 @@ client SDKs (pusher-js, Laravel Echo, …) and server SDKs (pusher-http-node, pu
 work against it unchanged — you just point them at your Pylon host instead of the hosted service.
 
 > Status: actively developed, pre-1.0. The protocol/REST surface is feature-complete against
-> hosted Pusher v7; APIs and defaults may still change before 1.0.
+> hosted Pusher v7 and was re-verified end-to-end by a full parity audit in v0.3.0;
+> APIs and defaults may still change before 1.0.
 
 ## Why Pylon
 
