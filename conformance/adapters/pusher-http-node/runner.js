@@ -20,6 +20,15 @@
 //       presence auth sends `user_id` alongside `channel_name` — for a
 //       `presence-*` channel that becomes channelData {user_id, user_info:{}}.
 //
+//       User-auth watchlist: pusher-js CANNOT carry the watchlist itself — its
+//       signin posts only `socket_id` + `userAuthentication.params` (dist
+//       src/core/auth/user_authenticator.ts composes exactly that query), and
+//       the user_data on the wire comes verbatim from THIS response. So the
+//       watchlist rides the params: a body param `watchlist` (JSON string, the
+//       official Pusher docs shape — a BARE ARRAY of user ids, see
+//       https://pusher.com/docs/channels/server_api/authenticating-users/) is
+//       parsed and merged into the userData signed here.
+//
 //   node runner.js --fire '<json>' --env <env.json>
 //       Publish one event server-side via the SDK: `client().trigger`. The
 //       JSON spec is {channel, name, data, encrypted?} — `data` may be any
@@ -32,6 +41,12 @@
 //       (pusher-js) scenarios for their server-side publishes, keeping ALL
 //       server-side protocol work on the official server SDK.
 //
+//   node runner.js --terminate <user-id> --env <env.json>
+//       Terminate every connection of a signed-in user server-side via the
+//       SDK's `terminateUserConnections` (POST
+//       /apps/{app}/users/{user}/terminate_connections). Exit 0 on a 2xx
+//       response. Used by the pusher-js U-TERMINATE scenario.
+
 //   node runner.js --verify-webhook <envelope.json> [--env <env.json>]
 //       Read {headers, body}, verify with the SDK's webhook checker, print
 //       {"valid": bool, "events": [...], "error"?: string}.
@@ -204,7 +219,8 @@ const SCENARIOS = {
     });
     const usr = p.authenticateUser('123.456', {
       id: 'u1',
-      watchlist: { user_ids: ['u2'] },
+      // Official docs shape: a bare array of user ids (NOT {user_ids: [...]}).
+      watchlist: ['u2'],
     });
     for (const [name, resp] of [
       ['private', priv],
@@ -351,8 +367,25 @@ async function signMode() {
   } else if (body.user_data !== undefined || body.user_id !== undefined) {
     const userData =
       body.user_data !== undefined ? body.user_data : { id: String(body.user_id) };
+    // pusher-js carries the watchlist as a `watchlist` param (a JSON string);
+    // merge it into the userData the SDK signs — the user_data that reaches
+    // the server is THIS response's, verbatim.
+    if (body.watchlist !== undefined) {
+      let wl = body.watchlist;
+      if (typeof wl === 'string') {
+        try {
+          wl = JSON.parse(wl);
+        } catch (e) {
+          throw new Error('watchlist param is not valid JSON');
+        }
+      }
+      if (!Array.isArray(wl)) {
+        throw new Error('watchlist param must be a JSON array of user ids');
+      }
+      userData.watchlist = wl;
+    }
     resp = p.authenticateUser(socketId, userData);
-    log('sign: authenticateUser');
+    log('sign: authenticateUser', userData.id, 'watchlist:', (userData.watchlist || []).length, 'id(s)');
   } else {
     throw new Error('unroutable auth body: need channel_name, or user_data/user_id');
   }
@@ -382,6 +415,18 @@ async function fireMode(specRaw) {
     throw new Error(`trigger ${channel}/${name} -> status ${r.status}`);
   }
   log(`fire: ${channel}/${name} -> ${r.status}`);
+}
+
+// --terminate <user-id>: terminate the user's connections through the SDK's
+// own terminateUserConnections (drives pylon's
+// POST /apps/{app}/users/{user}/terminate_connections).
+async function terminateMode(userId) {
+  if (!userId) throw new Error('--terminate needs a user id');
+  const r = await client().terminateUserConnections(userId);
+  if (r.status < 200 || r.status >= 300) {
+    throw new Error(`terminateUserConnections(${userId}) -> status ${r.status}`);
+  }
+  log(`terminate: ${userId} -> ${r.status}`);
 }
 
 // --verify-webhook <path>: {headers, body} file, verifier verdict on STDOUT.
@@ -460,6 +505,11 @@ async function scenarioMode() {
     await fireMode(fireSpec);
     return;
   }
+  const terminateId = arg('--terminate');
+  if (terminateId) {
+    await terminateMode(terminateId);
+    return;
+  }
   const envelopePath = arg('--verify-webhook');
   if (envelopePath) {
     verifyWebhookMode(envelopePath);
@@ -469,7 +519,7 @@ async function scenarioMode() {
     await scenarioMode();
     return;
   }
-  console.error('usage: runner.js --scenario <id> --env <path> | --sign --env <path> | --fire <json> --env <path> | --verify-webhook <path> | --version | --list');
+  console.error('usage: runner.js --scenario <id> --env <path> | --sign --env <path> | --fire <json> --env <path> | --terminate <user-id> --env <path> | --verify-webhook <path> | --version | --list');
   process.exit(2);
 })().catch((e) => {
   // Modes other than --scenario have no verdict contract: errors on stderr,
