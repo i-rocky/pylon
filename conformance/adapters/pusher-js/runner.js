@@ -829,10 +829,12 @@ const SCENARIOS = {
       await terminateUser('u-term');
       await errP;
       // The in-band error is followed by the WS close (4009 → 'refused' →
-      // disconnect): the connection must leave `connected`.
+      // disconnect): the connection must leave `connected` — ASSERTED, not
+      // just recorded (a socket that survives its own terminate is a fail).
       const state = await waitForStateAny(A.connection, ['disconnected', 'failed'], 5000).catch(
         () => A.connection.state
       );
+      assertOk(state !== 'connected', `socket still ${state} after in-band 4009 terminate`);
       await sleep(1000);
       assertOk(B.connection.state === 'connected', `plain peer affected by terminate (${B.connection.state})`);
       return { terminated: true, close_class: '4009', post_terminate_state: state, plain_peer_unaffected: true };

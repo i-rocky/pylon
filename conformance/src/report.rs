@@ -37,7 +37,9 @@ pub struct Report {
 /// Render the human-readable matrix: the client-plane block first, then the
 /// server-plane block (catalog order), one `ID | SDK | VERDICT | <ms>ms` row
 /// per scenario, then a blank line and the summary
-/// `P passed, F failed, S skipped — <sdk>@<ver>, ..., pylon <version>`.
+/// `P passed, F failed, S skipped — <sdk>@<ver>, ..., pylon <version>`
+/// (the sdk segment is omitted entirely when `sdk_versions` is empty — no
+/// dangling `— ,`).
 ///
 /// A scenario id missing from the catalog cannot occur through the
 /// orchestrator ([`catalog::audit`] rejects such bindings up front); if one
@@ -73,11 +75,16 @@ pub fn render_human(report: &Report) -> String {
         .iter()
         .map(|(sdk, version)| format!("{sdk}@{version}"))
         .collect();
+    // The sdk segment only renders when there is one — an empty table would
+    // otherwise leave a dangling `— , pylon ...`.
+    let sdk_segment = if sdks.is_empty() {
+        format!("pylon {}", report.run.pylon_version)
+    } else {
+        format!("{}, pylon {}", sdks.join(", "), report.run.pylon_version)
+    };
     out.push('\n');
     out.push_str(&format!(
-        "{passed} passed, {failed} failed, {skipped} skipped — {}, pylon {}\n",
-        sdks.join(", "),
-        report.run.pylon_version
+        "{passed} passed, {failed} failed, {skipped} skipped — {sdk_segment}\n"
     ));
     out
 }
@@ -228,6 +235,28 @@ mod tests {
             "run metadata is serialized before the results array"
         );
         assert_eq!(serde_json::from_str::<Report>(&raw).unwrap(), r);
+    }
+
+    #[test]
+    fn empty_sdk_versions_leave_no_dangling_separator() {
+        // The run is over before any adapter reported a version (e.g. a
+        // single-scenario run): the summary must go straight to `pylon ...`.
+        let r = Report {
+            run: RunMeta {
+                timestamp: String::new(),
+                pylon_version: "0.3.0".into(),
+                sdk_versions: vec![],
+                target: "local".into(),
+            },
+            results: vec![verdict_row("C-ESTABLISH", "pass", 120)],
+        };
+        let text = render_human(&r);
+        assert!(
+            text.contains("1 passed, 0 failed, 0 skipped — pylon 0.3.0"),
+            "summary renders without a dangling separator: {}",
+            text.trim_end()
+        );
+        assert!(!text.contains("— ,"));
     }
 
     #[test]

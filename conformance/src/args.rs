@@ -13,14 +13,20 @@
 //! `run` is the default command (also spellable as the literal word `run`);
 //! `--list` and `--audit` are selector-style flags so the common invocations
 //! stay short. Everything is validated eagerly: unknown flags, missing flag
-//! values, a non-numeric `--port-base`, or mixing `--list`/`--audit` with run
-//! flags all fail with a message naming the offending argument.
+//! values, a non-numeric or out-of-range `--port-base` (pylon binds
+//! `base + 2`, so the base is capped at [`MAX_PORT_BASE`]), or mixing
+//! `--list`/`--audit` with run flags all fail with a message naming the
+//! offending argument.
 
 use std::path::PathBuf;
 
 /// Default port the plumbing's auth endpoint binds (`port_base + 0`;
 /// webhooks get `+1`, pylon `+2`).
 pub const DEFAULT_PORT_BASE: u16 = 19800;
+
+/// Highest usable `--port-base`: pylon itself binds `port_base + 2`, which
+/// must still fit a `u16` port.
+pub const MAX_PORT_BASE: u16 = 65533;
 
 /// Default JSON artifact path (written into the current working directory).
 pub const DEFAULT_REPORT: &str = "conformance-report.json";
@@ -85,10 +91,16 @@ pub fn parse(argv: &[&str]) -> Result<Args, String> {
             "--report" => report = Some(PathBuf::from(value(argv, &mut i, "--report")?)),
             "--port-base" => {
                 let raw = value(argv, &mut i, "--port-base")?;
-                port_base =
-                    Some(raw.parse().map_err(|_| {
-                        format!("invalid --port-base {raw:?}: expected a port number")
-                    })?);
+                let parsed: u16 = raw
+                    .parse()
+                    .map_err(|_| format!("invalid --port-base {raw:?}: expected a port number"))?;
+                // pylon binds port_base + 2, so the base itself is capped.
+                if parsed > MAX_PORT_BASE {
+                    return Err(format!(
+                        "invalid --port-base {parsed}: must be <= {MAX_PORT_BASE} (pylon binds port_base + 2)"
+                    ));
+                }
+                port_base = Some(parsed);
             }
             "--pylon-bin" => pylon_bin = Some(PathBuf::from(value(argv, &mut i, "--pylon-bin")?)),
             other => return Err(format!("unknown argument {other:?}")),
@@ -233,5 +245,10 @@ mod tests {
             parse(&["--port-base", "99999"]).is_err(),
             "u16 overflow is an error"
         );
+        // base + 2 must fit u16: 65534/65535 are rejected at parse time,
+        // 65533 is the highest accepted base.
+        assert!(parse(&["--port-base", "65534"]).is_err());
+        assert!(parse(&["--port-base", "65535"]).is_err());
+        assert!(parse(&["--port-base", "65533"]).is_ok());
     }
 }

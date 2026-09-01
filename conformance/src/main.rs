@@ -53,6 +53,11 @@ const SMOKE_IDS: [&str; 3] = ["C-ESTABLISH", "S-TRIGGER", "S-WEBHOOK-VERIFY"];
 /// cannot orphan the process.
 const SIGNER_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Wall-clock bound on one audit `--list` child — same pattern as the signer:
+/// `kill_on_drop` makes the timeout cancellation-safe, so a runner that hangs
+/// instead of listing cannot stall `--audit` indefinitely.
+const LISTING_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[tokio::main]
 async fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -63,7 +68,7 @@ async fn main() {
                 list_scenarios();
                 0
             }
-            Command::Audit => audit_bindings(),
+            Command::Audit => audit_bindings().await,
             Command::Run {
                 sdk,
                 scenario,
@@ -120,7 +125,7 @@ fn list_scenarios() {
 ///   cannot run at all, which is itself a problem line (audit exits nonzero);
 /// - `catalog::audit` cross-checks the table against the catalog (missing /
 ///   orphaned / wrong-sdk / duplicate bindings).
-fn audit_bindings() -> i32 {
+async fn audit_bindings() -> i32 {
     let impls = catalog_impls();
     let mut problems = Vec::new();
     for (sdk, id) in &impls {
@@ -150,7 +155,7 @@ fn audit_bindings() -> i32 {
             if !dir.join("runner.js").is_file() {
                 continue; // already flagged as a missing runner above
             }
-            match runner_listing(&dir) {
+            match runner_listing(&dir).await {
                 Ok(ids) => {
                     listings.insert(sdk.clone(), ids);
                 }
@@ -178,16 +183,25 @@ fn audit_bindings() -> i32 {
 }
 
 /// Run `node runner.js --list` in `adapter_dir` and collect the printed ids.
-/// `Err` carries a one-line reason: spawn failure, non-zero exit, or a
-/// listing that printed nothing (an adapter with no scenarios is not a
-/// listing, it is a broken one).
-fn runner_listing(adapter_dir: &Path) -> Result<Vec<String>, String> {
-    let output = std::process::Command::new("node")
+/// `Err` carries a one-line reason: spawn failure, non-zero exit, a hang past
+/// [`LISTING_TIMEOUT`], or a listing that printed nothing (an adapter with no
+/// scenarios is not a listing, it is a broken one). The child is spawned with
+/// `kill_on_drop`, so the timeout's cancellation path cannot orphan it — the
+/// same pattern as the signer.
+async fn runner_listing(adapter_dir: &Path) -> Result<Vec<String>, String> {
+    let child = tokio::process::Command::new("node")
         .arg("runner.js")
         .arg("--list")
         .current_dir(adapter_dir)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
         .map_err(|e| format!("spawn failed: {e}"))?;
+    let output = tokio::time::timeout(LISTING_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| format!("timed out after {LISTING_TIMEOUT:?}"))?
+        .map_err(|e| format!("wait failed: {e}"))?;
     if !output.status.success() {
         return Err(format!("exit status {}", output.status));
     }
@@ -469,9 +483,11 @@ fn signer_fn(http_adapter_dir: &Path, env_path: &Path) -> SignerFn {
     })
 }
 
-/// The pylon server's version: `<bin> --version`, trimmed stdout (e.g.
-/// `pylon 0.3.0`). Any failure degrades to `"unknown"` — a version probe
-/// must not kill a run.
+/// The pylon server's version: `<bin> --version`, trimmed stdout, with the
+/// leading `pylon ` program-name prefix stripped via [`strip_program_prefix`]
+/// (pylon prints e.g. `pylon 0.3.0`; the report summary adds its own
+/// `pylon ` prefix, so keeping it here would double it). Any failure degrades
+/// to `"unknown"` — a version probe must not kill a run.
 async fn pylon_version(bin: &Path) -> String {
     match tokio::process::Command::new(bin)
         .arg("--version")
@@ -479,10 +495,16 @@ async fn pylon_version(bin: &Path) -> String {
         .await
     {
         Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
+            strip_program_prefix(String::from_utf8_lossy(&output.stdout).trim()).to_string()
         }
         _ => "unknown".to_string(),
     }
+}
+
+/// Drop a leading `pylon ` from a `--version` line (`pylon 0.3.0` → `0.3.0`);
+/// anything without the prefix (a bare version, `unknown`) passes through.
+fn strip_program_prefix(line: &str) -> &str {
+    line.strip_prefix("pylon ").unwrap_or(line)
 }
 
 /// RFC 3339 UTC timestamp of right now, e.g. `2026-09-01T12:34:56Z`.
@@ -621,8 +643,8 @@ mod tests {
         assert!(super::listing_problems(&partial, &impls).is_empty());
     }
 
-    #[test]
-    fn runner_listing_collects_ids_and_rejects_empty_or_failing_runners() {
+    #[tokio::test]
+    async fn runner_listing_collects_ids_and_rejects_empty_or_failing_runners() {
         if super::adapter::which_node().is_none() {
             eprintln!("skipping: node not found");
             return;
@@ -635,7 +657,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            super::runner_listing(&dir).unwrap(),
+            super::runner_listing(&dir).await.unwrap(),
             vec!["A-ONE".to_string(), "A-TWO".to_string()]
         );
 
@@ -643,6 +665,7 @@ mod tests {
         std::fs::create_dir_all(&empty).unwrap();
         std::fs::write(empty.join("runner.js"), "console.error('nothing');").unwrap();
         assert!(super::runner_listing(&empty)
+            .await
             .unwrap_err()
             .contains("no scenario ids"));
 
@@ -650,8 +673,32 @@ mod tests {
         std::fs::create_dir_all(&failing).unwrap();
         std::fs::write(failing.join("runner.js"), "process.exit(3);").unwrap();
         assert!(super::runner_listing(&failing)
+            .await
             .unwrap_err()
             .contains("exit status"));
+
+        // A runner that never lists is bounded by LISTING_TIMEOUT, not
+        // forever — and the timeout names itself in the error.
+        let hanging = dir.parent().unwrap().join("cf-audit-listing-hanging");
+        std::fs::create_dir_all(&hanging).unwrap();
+        std::fs::write(hanging.join("runner.js"), "setInterval(() => {}, 1000);").unwrap();
+        let started = std::time::Instant::now();
+        let err = super::runner_listing(&hanging).await.unwrap_err();
+        assert!(err.contains("timed out"), "error was: {err}");
+        assert!(
+            started.elapsed() >= super::LISTING_TIMEOUT,
+            "the bound is actually enforced (elapsed {:?})",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn version_prefix_is_stripped_exactly_once() {
+        // pylon prints `pylon 0.3.0`; the summary re-adds `pylon `, so the
+        // captured line must lose its own prefix.
+        assert_eq!(super::strip_program_prefix("pylon 0.3.0"), "0.3.0");
+        assert_eq!(super::strip_program_prefix("0.3.0"), "0.3.0");
+        assert_eq!(super::strip_program_prefix("unknown"), "unknown");
     }
 
     #[test]
