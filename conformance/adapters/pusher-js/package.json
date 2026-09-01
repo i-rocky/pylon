@@ -1,0 +1,17 @@
+{
+  "name": "pylon-conformance-adapter-pusher-js",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Conformance runner for the client plane, driving the official pusher-js SDK (pusher-js, Node runtime).",
+  "main": "runner.js",
+  "scripts": {
+    "test": "node runner.js --list"
+  },
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "pusher-js": "8.6.0"
+  }
+}
