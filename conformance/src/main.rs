@@ -14,6 +14,12 @@ mod plumbing;
 #[cfg(test)]
 mod server;
 
+// Task-4 adapter runner: `run`/`AdapterEnv` gain their runtime consumer in
+// Task 5 (the orchestrator); until then the module is test-gated like the
+// ones above — Task 6 flips it together with the rest.
+#[cfg(test)]
+mod adapter;
+
 fn main() {}
 
 #[cfg(test)]
