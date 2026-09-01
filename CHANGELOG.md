@@ -22,6 +22,16 @@ pre-1.0 and versions track `Cargo.toml`.
   and an opt-in CI job (`conformance.yml`).
 
 ### Changed
+- Per-core worker broadcast index consolidated to the single-map layout: each
+  `local_subs` channel entry now carries its subscribers' `(slab token,
+  negotiated protocol version)` directly (`(app, channel) → {socket_id →
+  (token, version)}`), replacing the parallel `socket_id → (token, version)`
+  map. The broadcast drain's per-subscriber loop now resolves the token and
+  version from the subscriber iteration itself — the standalone per-subscriber
+  probe lookup is gone, roughly halving per-subscriber fan-out cost at 1k
+  subscribers and ~2.7x-ing it at 100k on the `fanout_sink` bench (33–64%
+  faster end-to-end publish+drain). Delivery, close deindexing, per-version
+  fan-out, and eviction semantics are unchanged.
 - `RedisAdapter::send_to_user` now encodes the user event ONCE per send and
   feeds the same frame to both halves (the node-local delivery runs as a `Raw`
   frame; the `usermsg` publish reuses the identical string) — previously the
