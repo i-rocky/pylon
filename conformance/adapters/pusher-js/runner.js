@@ -348,15 +348,27 @@ const HTTP_ADAPTER_DIR = path.join(__dirname, '..', 'pusher-http-node');
 // Publish one event server-side. The spec rides child STDIN (`--fire-stdin`
 // mode), NEVER argv: execFile uses no shell, but a value token in a flag
 // position is still the flag-injection shape — JSON belongs on a pipe.
+// The child is bounded: 8s timeout, SIGTERM kill signal — the last unbounded
+// child wait in this runner (everything else already ran under an explicit
+// deadline or the harness budget's process-group kill).
+const FIRE_TIMEOUT_MS = 8000;
 const fire = (spec) =>
   new Promise((resolve, reject) => {
     const child = execFile(
       process.execPath,
       ['runner.js', '--fire-stdin', '--env', arg('--env')],
-      { cwd: HTTP_ADAPTER_DIR },
+      { cwd: HTTP_ADAPTER_DIR, timeout: FIRE_TIMEOUT_MS, killSignal: 'SIGTERM' },
       (err, stdout, stderr) => {
         if (err) {
-          reject(new Error('fire failed: ' + (String(stderr).trim() || err.message)));
+          const timedOut = err.killed && err.signal === 'SIGTERM';
+          reject(
+            new Error(
+              'fire failed: ' +
+                (timedOut
+                  ? `child killed after ${FIRE_TIMEOUT_MS}ms (SIGTERM)`
+                  : String(stderr).trim() || err.message)
+            )
+          );
         } else {
           resolve(String(stdout).trim());
         }
@@ -443,7 +455,10 @@ const SCENARIOS = {
   // at least one observed pong is the honest assertion.
   'C-PING': async () => {
     const p = connect({ activityTimeout: 2000, pongTimeout: 4000 });
-    await waitConnected(p);
+    // Connect wait is capped at 6s so the WORST case fits the 15s catalog
+    // budget: 6s connect + 8s hold = 14s, leaving 1s of headroom (the old
+    // 10s default connect wait could burn 18s+ alone).
+    await waitConnected(p, 6000);
     let pongs = 0;
     p.connection.bind('message', (m) => {
       if (m && m.event === 'pusher:pong') pongs++;
@@ -672,10 +687,12 @@ const SCENARIOS = {
         log('oversized payload rejected client-side:', payloadThrown);
         outcomes.payload_limit = 'client-rejected';
       } else {
-        // The payload's 4301 is the (name-leg + 1)-th: if the name leg was
-        // also sent, its error must land too before this one is counted.
-        const want = outcomes.name_limit === 'server-4301' ? 2 : 1;
-        await waitCount(rec, (e) => connErrorCode(e) === 4301, want, 10000);
+        // Per-leg expectation: count from THIS leg's baseline, not from the
+        // name leg's outcome — whether the name leg also sent (and was
+        // counted) must not change what this leg waits for. One NEW 4301
+        // since the baseline is the payload leg's own rejection.
+        const baseline = rec.count((e) => connErrorCode(e) === 4301);
+        await waitCount(rec, (e) => connErrorCode(e) === 4301, baseline + 1, 10000);
         outcomes.payload_limit = 'server-4301';
       }
 

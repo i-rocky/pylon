@@ -15,11 +15,13 @@
 //!    inside `run` via a process-group kill, and cancelling its future would
 //!    orphan the group (cancellation never signals anything)
 //! 6. shut pylon down, render + write the report, print the human matrix,
-//!    exit with `report::exit_code`
+//!    run the observation-normalization scan (spec §7's third family), and
+//!    exit with `report::exit_code` — or 1 when the scan flags raw values
 
 mod adapter;
 mod args;
 mod catalog;
+mod normalization;
 mod plumbing;
 mod report;
 mod server;
@@ -121,18 +123,25 @@ fn list_scenarios() {
 
 /// `--audit`: the binding table's honesty gate.
 ///
-/// Three problem families, all printed, any of which exits nonzero:
+/// Problem families, all printed, any of which exits nonzero:
 ///
 /// - per binding, `adapters/<sdk>/runner.js` must EXIST on disk;
 /// - per sdk, `node runner.js --list` must RUN and list ids, and every
 ///   binding's id must appear in its runner's listing — a runner whose
 ///   `--list` omits a bound id means the harness would spawn a scenario the
 ///   adapter cannot run (the Task 7/8 note deferred this to the runners'
-///   `--list` mode; resolved here). Each sdk's listing is fetched ONCE and
+///   `--list` mode; resolved here). The check is BIDIRECTIONAL: a listing
+///   id the catalog does not bind is equally a problem (a scenario nobody
+///   selected or audited would run). Each sdk's listing is fetched ONCE and
 ///   reused for all its bindings. Without a usable `node` on PATH this leg
 ///   cannot run at all, which is itself a problem line (audit exits nonzero);
 /// - `catalog::audit` cross-checks the table against the catalog (missing /
 ///   orphaned / wrong-sdk / duplicate bindings).
+///
+/// Plus one ADVISORY family (never changes the exit code): the
+/// observation-normalization scan (spec §7's third family) over the last
+/// report artifact, if one exists — advisory because the artifact may
+/// predate a runner fix; the in-run scan is the mandatory gate.
 async fn audit_bindings() -> i32 {
     let impls = catalog_impls();
     let mut problems = Vec::new();
@@ -175,9 +184,52 @@ async fn audit_bindings() -> i32 {
 
     problems.extend(catalog::audit(&impls));
 
+    // Advisory family: scan the LAST report artifact (default path, resolved
+    // from the crate dir so CWD does not matter) for un-normalized
+    // observations. Advisory on purpose — the artifact may predate a runner
+    // fix, and `--audit` must stay runnable without a report at hand; the
+    // in-run scan is the one that fails runs.
+    let last_report = Path::new(env!("CARGO_MANIFEST_DIR")).join(args::DEFAULT_REPORT);
+    if !last_report.is_file() {
+        println!(
+            "audit: no report artifact at {} — normalization scan skipped (advisory family; run the suite first)",
+            last_report.display()
+        );
+    } else {
+        let parsed = std::fs::read_to_string(&last_report)
+            .map_err(|e| e.to_string())
+            .and_then(|raw| {
+                serde_json::from_str::<report::Report>(&raw).map_err(|e| e.to_string())
+            });
+        match parsed {
+            Ok(last) => {
+                let violations = normalization::scan(&last.results);
+                if violations.is_empty() {
+                    println!(
+                        "audit: normalization scan of the last report — clean ({} result(s))",
+                        last.results.len()
+                    );
+                } else {
+                    for v in &violations {
+                        eprintln!("audit advisory (normalization): {v}");
+                    }
+                    eprintln!(
+                        "audit advisory (normalization): {} violation(s) in {} — advisory here; rerun the suite to re-gate",
+                        violations.len(),
+                        last_report.display()
+                    );
+                }
+            }
+            Err(e) => eprintln!(
+                "audit advisory (normalization): cannot parse last report {}: {e}",
+                last_report.display()
+            ),
+        }
+    }
+
     if problems.is_empty() {
         println!(
-            "audit: OK — {} bindings, all runners present and listing their ids",
+            "audit: OK — {} bindings, all runners present, listings match the catalog both ways",
             impls.len()
         );
         0
@@ -286,15 +338,19 @@ async fn sdk_version(adapter_dir: &Path) -> Option<String> {
     Some(version)
 }
 
-/// Cross-check the binding table against per-sdk `--list` outputs: every
-/// `(sdk, id)` binding must appear in that sdk's listing. Sdks absent from
-/// `listings` (missing runner, or a `--list` that failed) are skipped — the
-/// callers that know WHY they are absent already emitted their problem lines.
+/// Cross-check the binding table against per-sdk `--list` outputs,
+/// BIDIRECTIONALLY: every `(sdk, id)` binding must appear in that sdk's
+/// listing, and every id a runner lists must be a binding of that sdk — a
+/// listed-but-unbound id is a scenario nobody selected, budgeted, or audited,
+/// which is exactly the kind of drift the catalog exists to prevent. Sdks
+/// absent from `listings` (missing runner, or a `--list` that failed) are
+/// skipped — the callers that know WHY they are absent already emitted their
+/// problem lines.
 fn listing_problems(
     listings: &std::collections::HashMap<String, Vec<String>>,
     impls: &[(String, String)],
 ) -> Vec<String> {
-    impls
+    let mut problems: Vec<String> = impls
         .iter()
         .filter_map(|(sdk, id)| {
             listings.get(sdk).and_then(|ids| {
@@ -302,7 +358,18 @@ fn listing_problems(
                     .then(|| format!("catalog entry {id} ({sdk}) not listed by its runner"))
             })
         })
-        .collect()
+        .collect();
+    // Reverse direction: listing → catalog.
+    for (sdk, ids) in listings {
+        for id in ids {
+            if !impls.iter().any(|(s, i)| s == sdk && i == id) {
+                problems.push(format!(
+                    "runner {sdk} lists {id} but the catalog does not bind it"
+                ));
+            }
+        }
+    }
+    problems
 }
 
 /// The binding table: all 26 `(sdk, scenario id)` pairs the harness claims
@@ -334,9 +401,13 @@ async fn run_scenarios(
 
     // One env for the whole run: every scenario talks to the same servers and
     // the same app, so one scratch file serves the runners and the signer.
+    // The guard makes the dir's lifetime match the flow: removed explicitly
+    // after the loop below in the happy path, and by Drop on every early
+    // error return (or panic) between here and there.
     let scratch =
         std::env::temp_dir().join(format!("pylon-conformance-env-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).with_context(|| format!("create {}", scratch.display()))?;
+    let _scratch_guard = ScratchDir(scratch.clone());
     let env_path = scratch.join("env.json");
 
     // Signing mode: the auth endpoint delegates ALL crypto to the official
@@ -407,6 +478,8 @@ async fn run_scenarios(
     }
 
     pylon.shutdown().await;
+    // Happy-path removal (the Drop guard above is the idempotent backstop
+    // for the early-error paths).
     let _ = std::fs::remove_dir_all(&scratch);
     eprintln!(
         "webhook receiver captured {} envelope(s) this run",
@@ -435,7 +508,38 @@ async fn run_scenarios(
     };
     report::write_json(&report, report_path)?;
     print!("{}", report::render_human(&report));
-    Ok(report::exit_code(&report))
+
+    // Observation-normalization audit (spec §7's third family), mandatory
+    // in-run: a raw socket id or timestamp in the artifact poisons the
+    // stable-and-diffable report contract even when every verdict passed,
+    // so violations fail the run outright.
+    let violations = normalization::scan(&report.results);
+    if violations.is_empty() {
+        println!("normalization scan: clean — no run-unique values in any observation");
+        Ok(report::exit_code(&report))
+    } else {
+        eprintln!();
+        for v in &violations {
+            eprintln!("normalization: {v}");
+        }
+        eprintln!(
+            "normalization: {} violation(s) — observations must carry placeholders, not run-unique values (raw evidence belongs on runner stderr)",
+            violations.len()
+        );
+        Ok(1)
+    }
+}
+
+/// RAII removal for the run's scratch env dir: `run_scenarios` has several
+/// early error returns between the dir's creation and its post-loop removal
+/// (spawn/health/write failures) — the guard closes that window for all of
+/// them at once, where per-call-site cleanups would drift.
+struct ScratchDir(PathBuf);
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// `--pylon-bin` if given, else `<repo>/target/release/pylon` where `<repo>`
@@ -622,6 +726,22 @@ mod tests {
     use crate::catalog;
     use crate::server::{self, render_apps_json, AppSpec};
 
+    /// A unique fixture dir under the system temp dir: `<stem>-<pid>-<seq>`.
+    /// Fixed names (the pre-audit-family shape) let two concurrent audits —
+    /// or two `cargo test` invocations — on one host fight over the same
+    /// `runner.js`; pid + an in-process counter makes every fixture its own.
+    fn fixture_dir(stem: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "cf-{stem}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        dir
+    }
+
     #[test]
     fn args_parse_run_list_audit_and_smoke_selects_three() {
         let a = args::parse(&["run", "--smoke"]).unwrap();
@@ -712,6 +832,27 @@ mod tests {
             vec!["catalog entry C-PING (pusher-js) not listed by its runner".to_string()]
         );
 
+        // Reverse direction: a runner listing an id the catalog does not
+        // bind is a problem of its own — exactly one line, naming the pair.
+        let extra: HashMap<String, Vec<String>> = HashMap::from([
+            (
+                "pusher-js".to_string(),
+                vec![
+                    "C-ESTABLISH".to_string(),
+                    "C-PING".to_string(),
+                    "C-GHOST".to_string(),
+                ],
+            ),
+            (
+                "pusher-http-node".to_string(),
+                vec!["S-TRIGGER".to_string()],
+            ),
+        ]);
+        assert_eq!(
+            super::listing_problems(&extra, &impls),
+            vec!["runner pusher-js lists C-GHOST but the catalog does not bind it".to_string()]
+        );
+
         // A sdk with NO listing entry (failed --list / missing runner) is
         // skipped here — its failure is reported by the caller.
         let partial: HashMap<String, Vec<String>> = HashMap::from([(
@@ -727,8 +868,7 @@ mod tests {
             eprintln!("skipping: node not found");
             return;
         }
-        let dir = std::env::temp_dir().join("cf-audit-listing-test");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = fixture_dir("audit-listing-test");
         std::fs::write(
             dir.join("runner.js"),
             "console.log('A-ONE'); console.log(''); console.log('  A-TWO  ');",
@@ -739,16 +879,14 @@ mod tests {
             vec!["A-ONE".to_string(), "A-TWO".to_string()]
         );
 
-        let empty = dir.parent().unwrap().join("cf-audit-listing-empty");
-        std::fs::create_dir_all(&empty).unwrap();
+        let empty = fixture_dir("audit-listing-empty");
         std::fs::write(empty.join("runner.js"), "console.error('nothing');").unwrap();
         assert!(super::runner_listing(&empty)
             .await
             .unwrap_err()
             .contains("no scenario ids"));
 
-        let failing = dir.parent().unwrap().join("cf-audit-listing-failing");
-        std::fs::create_dir_all(&failing).unwrap();
+        let failing = fixture_dir("audit-listing-failing");
         std::fs::write(failing.join("runner.js"), "process.exit(3);").unwrap();
         assert!(super::runner_listing(&failing)
             .await
@@ -757,8 +895,7 @@ mod tests {
 
         // A runner that never lists is bounded by LISTING_TIMEOUT, not
         // forever — and the timeout names itself in the error.
-        let hanging = dir.parent().unwrap().join("cf-audit-listing-hanging");
-        std::fs::create_dir_all(&hanging).unwrap();
+        let hanging = fixture_dir("audit-listing-hanging");
         std::fs::write(hanging.join("runner.js"), "setInterval(() => {}, 1000);").unwrap();
         let started = std::time::Instant::now();
         let err = super::runner_listing(&hanging).await.unwrap_err();
@@ -776,8 +913,7 @@ mod tests {
             eprintln!("skipping: node not found");
             return;
         }
-        let dir = std::env::temp_dir().join("cf-version-test");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = fixture_dir("version-test");
         std::fs::write(dir.join("runner.js"), "console.log('  1.2.3  ');").unwrap();
         assert_eq!(
             super::sdk_version(&dir).await,
@@ -785,8 +921,7 @@ mod tests {
             "stdout is trimmed to the bare version"
         );
 
-        let failing = dir.parent().unwrap().join("cf-version-failing");
-        std::fs::create_dir_all(&failing).unwrap();
+        let failing = fixture_dir("version-failing");
         std::fs::write(
             failing.join("runner.js"),
             "console.log('nope'); process.exit(4);",
@@ -798,8 +933,7 @@ mod tests {
             "non-zero exit → None"
         );
 
-        let silent = dir.parent().unwrap().join("cf-version-silent");
-        std::fs::create_dir_all(&silent).unwrap();
+        let silent = fixture_dir("version-silent");
         std::fs::write(silent.join("runner.js"), "console.error('to stderr');").unwrap();
         assert_eq!(
             super::sdk_version(&silent).await,
@@ -807,13 +941,20 @@ mod tests {
             "empty stdout → None"
         );
 
-        let missing = dir.parent().unwrap().join("cf-version-missing");
-        std::fs::create_dir_all(&missing).unwrap(); // no runner.js at all
+        let missing = fixture_dir("version-missing"); // no runner.js at all
         assert_eq!(
             super::sdk_version(&missing).await,
             None,
             "spawn failure → None"
         );
+    }
+
+    #[test]
+    fn scratch_dir_guard_removes_on_drop() {
+        let dir = fixture_dir("scratch-guard");
+        std::fs::write(dir.join("env.json"), "{}").unwrap();
+        drop(super::ScratchDir(dir.clone()));
+        assert!(!dir.exists(), "guard removed the scratch dir on drop");
     }
 
     #[test]
