@@ -1188,7 +1188,22 @@ impl Adapter for RedisAdapter {
             {
                 Ok((first_for_user, roster)) => {
                     join.first_for_user = first_for_user;
-                    join.roster = roster;
+                    // F-5: cluster truth REPLACES the node-local cached frame —
+                    // the cluster-wide roster is fresh data on every join, so it
+                    // encodes here through the same `wire::encode` seam
+                    // (byte-identical shape to the node-local path's frame). The
+                    // node-local cache itself is untouched: it tracks only
+                    // node-local membership.
+                    join.roster_frame = Arc::from(
+                        crate::protocol::wire::encode(
+                            crate::protocol::wire::ACTIVE_VERSIONS[0],
+                            &ServerEvent::SubscriptionSucceeded {
+                                channel: channel.to_string(),
+                                presence: Some(roster),
+                            },
+                        )
+                        .as_str(),
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, app, channel, "redis presence join failed; keeping node-local roster");

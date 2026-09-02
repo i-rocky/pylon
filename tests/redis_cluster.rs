@@ -866,34 +866,48 @@ async fn cross_node_presence_roster_is_cluster_wide() {
             .await;
 
         // u3 subscribes on A — its roster must reflect the whole cluster.
+        // F-5: the join carries the PRE-ENCODED `subscription_succeeded` frame
+        // (the Redis overwrite path encoded the cluster-truth roster through
+        // `wire::encode`), so the assertions decode the frame's double-encoded
+        // `data` string.
         let (_s3, h3, m3) = presence_handle("u3", serde_json::json!({"name":"Cleo"}));
         let out3 = adapter_a
             .subscribe(TEST_APP, "presence-room", h3, Some(m3))
             .await;
-        let roster = out3
+        let frame = out3
             .presence
             .expect("presence join for u3 must be Some")
-            .roster;
+            .roster_frame;
+        let j: serde_json::Value = serde_json::from_str(&frame).expect("frame must be JSON");
+        assert_eq!(j["event"], "pusher_internal:subscription_succeeded");
+        assert_eq!(j["channel"], "presence-room");
+        let roster: serde_json::Value =
+            serde_json::from_str(j["data"].as_str().expect("data is a JSON string"))
+                .expect("roster data must be JSON");
+        let presence = &roster["presence"];
 
-        assert_eq!(roster.count, 3, "cluster roster must count all 3 users");
         assert_eq!(
-            roster.ids,
-            vec!["u1".to_string(), "u2".to_string(), "u3".to_string()],
+            presence["count"], 3,
+            "cluster roster must count all 3 users"
+        );
+        assert_eq!(
+            presence["ids"],
+            serde_json::json!(["u1", "u2", "u3"]),
             "cluster roster ids must be sorted and contain u1,u2,u3"
         );
         assert_eq!(
-            roster.hash.get("u1"),
-            Some(&serde_json::json!({"name":"Ann"})),
+            presence["hash"]["u1"],
+            serde_json::json!({"name":"Ann"}),
             "roster hash must carry u1's user_info"
         );
         assert_eq!(
-            roster.hash.get("u2"),
-            Some(&serde_json::json!({"name":"Bob"})),
+            presence["hash"]["u2"],
+            serde_json::json!({"name":"Bob"}),
             "roster hash must carry u2's user_info"
         );
         assert_eq!(
-            roster.hash.get("u3"),
-            Some(&serde_json::json!({"name":"Cleo"})),
+            presence["hash"]["u3"],
+            serde_json::json!({"name":"Cleo"}),
             "roster hash must carry u3's user_info"
         );
     })

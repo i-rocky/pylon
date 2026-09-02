@@ -317,10 +317,15 @@ impl ConnectionContext {
                     // handler must NOT emit the node-local versions — they would carry a
                     // node-local roster and double/wrong-count `member_added` cross-node.
                     if !self.clustered {
-                        self.send_self(ServerEvent::SubscriptionSucceeded {
-                            channel: channel.clone(),
-                            presence: Some(join.roster),
-                        });
+                        // F-5: the pre-encoded `subscription_succeeded` frame
+                        // cached in the channel state — ONE encode per
+                        // membership generation, shared by every join of that
+                        // generation. Delivered as `Raw` (the established
+                        // verbatim no-copy path — `Raw` delivery is
+                        // version-agnostic by design, see `transport::fanout`);
+                        // the bytes are exactly a fresh encode of the roster
+                        // (built BY `wire::encode`; the state goldens pin them).
+                        self.send_self(ServerEvent::Raw(join.roster_frame));
                         if join.first_for_user {
                             let uid = join.member.user_id.clone();
                             self.adapter

@@ -29,7 +29,9 @@ impl Registry {
         let key = (app.to_string(), channel.to_string());
         let mut state = self.channels.entry(key).or_default();
         let was_empty = state.subscription_count() == 0;
-        let presence = state.add(handle, member);
+        // `channel` (this entry's own key) is baked into the join's cached
+        // `subscription_succeeded` frame (F-5).
+        let presence = state.add(channel, handle, member);
         let count = state.subscription_count();
         SubscribeOutcome {
             subscription_count: count,

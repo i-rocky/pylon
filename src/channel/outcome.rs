@@ -2,7 +2,7 @@
 //! registry, returned by the `Adapter` trait — so they live in a neutral module.
 
 use crate::presence::member::PresenceMember;
-use crate::protocol::event::PresencePayload;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubscribeOutcome {
@@ -15,7 +15,14 @@ pub struct SubscribeOutcome {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PresenceJoin {
     pub first_for_user: bool,
-    pub roster: PresencePayload,
+    /// The pre-encoded `pusher_internal:subscription_succeeded` wire frame for
+    /// the roster generation this join landed in: encoded ONCE per distinct-user
+    /// set (membership generation) in the channel state and shared (`Arc`) by
+    /// every join of that generation (F-5) — no per-join roster clone + encode.
+    /// The clustered subscribe REPLACES it with the freshly-encoded
+    /// cluster-truth frame; the node-local cache is untouched (it tracks only
+    /// node-local membership).
+    pub roster_frame: Arc<str>,
     pub member: PresenceMember,
 }
 

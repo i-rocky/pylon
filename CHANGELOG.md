@@ -38,6 +38,16 @@ pre-1.0 and versions track `Cargo.toml`.
   typed event was encoded once inside the local half and again for the Redis
   publish. Wire bytes are unchanged (the same `wire::encode` at
   `ACTIVE_VERSIONS[0]`; the encode-once shape already proven for broadcasts).
+- Presence `subscription_succeeded` rosters are now encoded ONCE per membership
+  generation, not once per join: `ChannelState` caches the encoded roster frame
+  (the same `wire::encode` seam every frame uses), invalidated only when the
+  distinct-user set changes (a new user's first connection or a user's last
+  disconnection), and every join of that generation shares the cached frame
+  (`Arc`) instead of deep-cloning the roster into an owned payload. Wire bytes
+  are byte-identical (pinned by the roster goldens and the end-to-end literal
+  pins); the Redis adapter's cluster-roster overwrite still re-encodes fresh
+  cluster truth per join (it replaces the frame in the join outcome, not the
+  node-local cache).
 
 ### Security
 - Webhook SSRF classifier: NAT64 (`64:ff9b::/96`) and class-E reserved
