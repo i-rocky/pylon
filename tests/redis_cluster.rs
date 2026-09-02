@@ -2191,3 +2191,298 @@ async fn vacate_cas_sweep_first_unsubscribe_silent() {
     .await
     .expect("vacate CAS ordering-2 test must not hang (Redis up?)");
 }
+
+// ---------------------------------------------------------------------------
+// Reap-member CAS (duplicate member_removed regression — F-6).
+//
+// The `member_removed` emission right belongs to whichever caller's atomic
+// operation takes the user's refcount to EXACTLY 0 (the member analog of the
+// vacate CAS above). Two writers can reach the user-removal edge concurrently —
+// the live leave (PRESENCE_LEAVE_LUA, driven by the bridge, emitting iff the
+// script returns `== 0`) and the sweeper's stale-token reap (REAP_MEMBER_LUA,
+// emitting iff `won == 1`) — and before the CAS the sweeper's separate
+// HGET→HDEL→HINCRBY commands could double-decrement a refcount the live path
+// had already zeroed, its `<= 0` gate firing a second `member_removed` for one
+// user removal. These tests drive the two scripts DIRECTLY, in BOTH orderings
+// of the race, and assert exactly one winner each — deterministic where the
+// full-system straddle is not.
+// ---------------------------------------------------------------------------
+
+/// Run the bridge's PRESENCE_LEAVE_LUA for `user_id`/`token`; returns the
+/// remaining refcount (the live path emits `member_removed` iff it is `== 0`).
+async fn run_presence_leave(
+    scripts: &Scripts,
+    pool: &fred::clients::Pool,
+    keys: &Keys,
+    channel: &str,
+    user_id: &str,
+    token: &str,
+) -> i64 {
+    scripts
+        .presence_leave
+        .evalsha_with_reload::<i64, _, _>(
+            pool.next(),
+            vec![
+                keys.presusers(TEST_APP, channel),
+                keys.presinfo(TEST_APP, channel),
+                keys.presmembers(TEST_APP, channel),
+            ],
+            vec![user_id.to_string(), token.to_string()],
+        )
+        .await
+        .expect("PRESENCE_LEAVE_LUA must eval")
+}
+
+/// Run the sweeper's REAP_MEMBER_LUA for `token`; returns `(user_id, remaining,
+/// won)` (`won == 1` iff THIS call took the user's refcount to exactly 0 and
+/// owns the single `member_removed` emission right).
+async fn run_reap_member(
+    scripts: &Scripts,
+    pool: &fred::clients::Pool,
+    keys: &Keys,
+    channel: &str,
+    token: &str,
+) -> (String, i64, i64) {
+    scripts
+        .reap_member
+        .evalsha_with_reload::<(String, i64, i64), _, _>(
+            pool.next(),
+            vec![
+                keys.presusers(TEST_APP, channel),
+                keys.presinfo(TEST_APP, channel),
+                keys.presmembers(TEST_APP, channel),
+            ],
+            vec![token.to_string()],
+        )
+        .await
+        .expect("REAP_MEMBER_LUA must eval")
+}
+
+/// Seed the presence state `user_id`'s connections produce: `presmembers`
+/// token→user_id for each token, `presusers` user_id→`count`, `presinfo`
+/// user_id→user_info (what PRESENCE_JOIN_LUA leaves behind).
+async fn seed_presence_user(
+    clients: &RedisClients,
+    keys: &Keys,
+    channel: &str,
+    user_id: &str,
+    tokens: &[&str],
+    count: i64,
+) {
+    let pool = clients.pool.next();
+    for token in tokens {
+        let _: () = pool
+            .hset(
+                keys.presmembers(TEST_APP, channel),
+                (token.to_string(), user_id.to_string()),
+            )
+            .await
+            .expect("hset presmembers");
+    }
+    let _: () = pool
+        .hset(
+            keys.presusers(TEST_APP, channel),
+            (user_id.to_string(), count),
+        )
+        .await
+        .expect("hset presusers");
+    let _: () = pool
+        .hset(
+            keys.presinfo(TEST_APP, channel),
+            (user_id.to_string(), format!(r#"{{"name":"{user_id}"}}"#)),
+        )
+        .await
+        .expect("hset presinfo");
+}
+
+/// Assert the channel's three presence hashes hold nothing (user fully
+/// reclaimed, no ghost token or refcount residue).
+async fn assert_presence_fully_reclaimed(clients: &RedisClients, keys: &Keys, channel: &str) {
+    for key in [
+        keys.presusers(TEST_APP, channel),
+        keys.presinfo(TEST_APP, channel),
+        keys.presmembers(TEST_APP, channel),
+    ] {
+        let len: i64 = clients.pool.next().hlen(&key).await.expect("hlen");
+        assert_eq!(len, 0, "presence hash {key} must be empty");
+    }
+}
+
+/// Ordering 1 — the live leave wins, the sweeper's later stale-token reap must
+/// stay silent. u1 has one connection whose node's heartbeat went stale; the
+/// socket then closes orderly. The live PRESENCE_LEAVE_LUA takes the refcount
+/// to exactly 0 (returns 0 → the bridge emits the single `member_removed`);
+/// the sweeper's later REAP_MEMBER_LUA finds the token already gone
+/// (`won == 0`) — exactly one emission right in total, in the ordering that
+/// used to double-fire via the `<= 0` gate on a double-decrement.
+#[tokio::test]
+async fn reap_cas_live_leave_first_reap_silent() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let scripts = Scripts::new();
+        let clients = RedisClients::connect(&test_redis_url(), 2)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let channel = format!("presence-cas-{}", Uuid::new_v4());
+
+        seed_presence_user(&clients, &keys, &channel, "u1", &["n1:s1"], 1).await;
+
+        // The live leave: takes the refcount 1→0 → returns 0 → the bridge
+        // owns the single member_removed emission.
+        let left =
+            run_presence_leave(&scripts, &clients.pool, &keys, &channel, "u1", "n1:s1").await;
+        assert_eq!(left, 0, "the live leave must own the →0 emission right");
+
+        // The sweeper's late reap of the same stale token: the token is
+        // already gone → won == 0 → silent.
+        let (user_id, left, won) =
+            run_reap_member(&scripts, &clients.pool, &keys, &channel, "n1:s1").await;
+        assert_eq!(
+            (user_id.as_str(), left, won),
+            ("", 0, 0),
+            "a reap after the live leave already won must NOT win the emission right"
+        );
+
+        assert_presence_fully_reclaimed(&clients, &keys, &channel).await;
+    })
+    .await
+    .expect("reap CAS ordering-1 test must not hang (Redis up?)");
+}
+
+/// Ordering 2 — the sweeper wins the straddle, the later live leave must stay
+/// silent. The sweeper's REAP_MEMBER_LUA observes the refcount at exactly 1 and
+/// atomically removes the token AND the user (`won == 1` → the sweeper emits
+/// the single `member_removed`); the bridge's late PRESENCE_LEAVE_LUA — whose
+/// HDEL no-ops on the gone token — HINCRBYs the HDEL'd field to −1 (not 0),
+/// so the live path's `== 0` emit gate suppresses it. Exactly one emission
+/// right in total, in the ordering that used to double-fire.
+#[tokio::test]
+async fn reap_cas_reap_first_live_leave_silent() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let scripts = Scripts::new();
+        let clients = RedisClients::connect(&test_redis_url(), 2)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let channel = format!("presence-cas-{}", Uuid::new_v4());
+
+        seed_presence_user(&clients, &keys, &channel, "u1", &["n1:s1"], 1).await;
+
+        // The sweeper's atomic reap: resolves the token, sees the refcount at
+        // exactly 1, removes token + user → WINS the emission right.
+        let (user_id, left, won) =
+            run_reap_member(&scripts, &clients.pool, &keys, &channel, "n1:s1").await;
+        assert_eq!(
+            (user_id.as_str(), left, won),
+            ("u1", 0, 1),
+            "the reap of a 1-connection user must WIN the emission right"
+        );
+
+        // The bridge's late live leave: HDEL no-ops, HINCRBY on the HDEL'd
+        // field yields −1 — NOT 0, so the live path stays silent (and the
+        // script's `<= 0` cleanup leaves no −1 residue behind).
+        let left =
+            run_presence_leave(&scripts, &clients.pool, &keys, &channel, "u1", "n1:s1").await;
+        assert_eq!(
+            left, -1,
+            "a late live leave must NOT see == 0 after the reap already won"
+        );
+
+        assert_presence_fully_reclaimed(&clients, &keys, &channel).await;
+    })
+    .await
+    .expect("reap CAS ordering-2 test must not hang (Redis up?)");
+}
+
+/// Shared user, both writers legitimate: u1 holds one stale token (crashed
+/// node) and one live connection. The stale reap is a PLAIN DECREMENT
+/// (`won == 0`, refcount 2→1, no emission — the user is still present); the
+/// live connection's leave then takes 1→0 and owns the single emission. A
+/// further late reap of the live token stays silent.
+#[tokio::test]
+async fn reap_cas_shared_user_reap_decrements_leave_wins() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let scripts = Scripts::new();
+        let clients = RedisClients::connect(&test_redis_url(), 2)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let channel = format!("presence-cas-{}", Uuid::new_v4());
+
+        seed_presence_user(&clients, &keys, &channel, "u1", &["n1:s1", "n2:s2"], 2).await;
+
+        // Reap the crashed node's token: the user still has a live connection,
+        // so this is a decrement, not the →0 edge — no emission right.
+        let (user_id, left, won) =
+            run_reap_member(&scripts, &clients.pool, &keys, &channel, "n1:s1").await;
+        assert_eq!(
+            (user_id.as_str(), left, won),
+            ("u1", 1, 0),
+            "a reap while the user still holds a connection must NOT win"
+        );
+
+        // The live connection's leave takes 1→0 → it owns the emission.
+        let left =
+            run_presence_leave(&scripts, &clients.pool, &keys, &channel, "u1", "n2:s2").await;
+        assert_eq!(
+            left, 0,
+            "the last live leave must own the →0 emission right"
+        );
+
+        // A late reap of the already-left live token stays silent.
+        let (user_id, left, won) =
+            run_reap_member(&scripts, &clients.pool, &keys, &channel, "n2:s2").await;
+        assert_eq!(
+            (user_id.as_str(), left, won),
+            ("", 0, 0),
+            "a late reap must NOT win after the live leave already won"
+        );
+
+        assert_presence_fully_reclaimed(&clients, &keys, &channel).await;
+    })
+    .await
+    .expect("reap CAS shared-user test must not hang (Redis up?)");
+}
+
+/// Ghost token: the token lingers in `presmembers` but the user's refcount
+/// field is already gone (the →0 edge was taken — and emitted — by another
+/// writer). The reap still garbage-collects the stale token but returns
+/// `won == 0` — no second `member_removed` for a removal that already fired.
+#[tokio::test]
+async fn reap_cas_ghost_token_reaped_without_emission() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let scripts = Scripts::new();
+        let clients = RedisClients::connect(&test_redis_url(), 2)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let channel = format!("presence-cas-{}", Uuid::new_v4());
+
+        // Seed ONLY the token — no presusers/presinfo entries for u1.
+        let _: () = clients
+            .pool
+            .next()
+            .hset(
+                keys.presmembers(TEST_APP, &channel),
+                ("n1:s1".to_string(), "u1".to_string()),
+            )
+            .await
+            .expect("hset presmembers");
+
+        let (user_id, left, won) =
+            run_reap_member(&scripts, &clients.pool, &keys, &channel, "n1:s1").await;
+        assert_eq!(
+            (user_id.as_str(), left, won),
+            ("u1", 0, 0),
+            "a ghost token must be reaped WITHOUT a second emission right"
+        );
+
+        assert_presence_fully_reclaimed(&clients, &keys, &channel).await;
+    })
+    .await
+    .expect("reap CAS ghost-token test must not hang (Redis up?)");
+}

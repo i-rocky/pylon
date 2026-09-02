@@ -49,6 +49,24 @@ pre-1.0 and versions track `Cargo.toml`.
   cluster truth per join (it replaces the frame in the join outcome, not the
   node-local cache).
 
+### Fixed
+- **Duplicate `member_removed` webhooks/events in cluster mode** (audit G11
+  class, follow-up F-6): the Redis sweeper's stale-member reap ran
+  HGET→HDEL→HINCRBY as SEPARATE commands and gated its emission on `<= 0`,
+  so a stale-heartbeat member racing the socket's orderly live leave (whose
+  atomic `PRESENCE_LEAVE_LUA` emits on `== 0`) could double-decrement the
+  user's refcount and fire a second `member_removed` for one user removal.
+  The reap is now one `REAP_MEMBER_LUA` compare-and-swap — the member analog
+  of the `channel_vacated` vacate CAS: the emission right belongs to whichever
+  caller's atomic op takes the refcount to exactly 0. The script resolves the
+  stale token to its user, decrements (or, on the 1→0 edge, removes the user
+  from `presusers`/`presinfo`) and returns `won`; the sweeper enqueues the
+  compensating cross-node `member_removed` + webhook only on `won`. Redis
+  serializes the two scripts, so exactly one of {live leave, sweeper reap} can
+  ever observe the 1→0 edge — the live path needed no change (after a reap
+  win HDELs the refcount field, a racing live leave returns −1, not 0, and
+  its `== 0` gate stays silent).
+
 ### Security
 - Webhook SSRF classifier: NAT64 (`64:ff9b::/96`) and class-E reserved
   (`240.0.0.0/4`) targets are now classified as private. A NAT64 gateway

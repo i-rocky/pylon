@@ -122,12 +122,17 @@ pub(crate) async fn sweep_once(
                 .collect();
 
             // Presence side-table reap: for a presence channel, each stale token's user
-            // loses a connection; the →0 user edge emits member_removed (cross-node +
-            // webhook). Per-token via the user refcount, so multi-connection users and
-            // users still live on another node are handled correctly.
+            // loses a connection via the atomic REAP_MEMBER_LUA CAS; the →0 user edge
+            // (won == 1) is the ONLY branch that emits member_removed (cross-node +
+            // webhook) — the emission right belongs to whichever caller's atomic op
+            // took the refcount to 0, so a racing live PRESENCE_LEAVE and this reap
+            // can never BOTH fire it. Per-token via the user refcount, so
+            // multi-connection users and users still live on another node are
+            // handled correctly.
             if super::presence::is_presence(&channel) {
                 for token in &stale {
                     super::presence::reap_member(
+                        scripts,
                         pool,
                         keys,
                         &app,

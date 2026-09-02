@@ -109,17 +109,30 @@ pub(super) async fn user_count(
     Ok(n.max(0) as usize)
 }
 
-/// Sweeper crash-time reap of ONE stale presence member token. Decrements the user's
-/// cluster refcount; on the →0 edge removes the user + emits `member_removed` (broadcast
-/// cross-node via the channel's msg pub/sub, and a webhook). Best-effort: logs + returns
-/// on any Redis error, never panics. The broadcast envelope's `node_id` is the DEAD node
-/// (the token prefix) so every LIVE node — including this sweeper's — delivers it.
-/// `compat` is the cluster-wide `PYLON_CLUSTER_ENVELOPE_COMPAT` setting: with compat
-/// off the member_removed envelope omits the legacy `event` member (frame_b64 is the
-/// sole carrier — legal only on a fleet whose every node ships the knob; v0.3.0
-/// alone does not qualify, its receivers drop compat-off envelopes silently).
+/// Sweeper crash-time reap of ONE stale presence member token — the atomic CAS
+/// (F-6, the member analog of the vacate CAS `VACATE_LUA` in `client.rs`). One
+/// `REAP_MEMBER_LUA` invocation resolves the token to its user, decrements the
+/// user's cluster refcount (or removes the user on the 1→0 edge), and returns the
+/// CAS verdict: `won == 1` iff THIS call took the refcount to EXACTLY 0 — the
+/// single cluster-wide `member_removed` emission right. The emit below gates on
+/// `won`; a racing live `leave` (the atomic `PRESENCE_LEAVE_LUA`) is the only
+/// other contender, and Redis serializes the two scripts, so exactly one of them
+/// can ever observe the 1→0 edge — no duplicate `member_removed` in any
+/// interleaving (the pre-CAS HGET→HDEL→HINCRBY sequence could double-decrement
+/// and emit on `<= 0` while the live path emitted on `== 0`).
+///
+/// On `won` the broadcast half is the same as before: `member_removed` broadcast
+/// cross-node via the channel's msg pub/sub plus a webhook. Best-effort: logs +
+/// returns on any Redis error, never panics. The broadcast envelope's `node_id` is
+/// the DEAD node (the token prefix) so every LIVE node — including this sweeper's —
+/// delivers it. `compat` is the cluster-wide `PYLON_CLUSTER_ENVELOPE_COMPAT`
+/// setting: with compat off the member_removed envelope omits the legacy `event`
+/// member (frame_b64 is the sole carrier — legal only on a fleet whose every node
+/// ships the knob; v0.3.0 alone does not qualify, its receivers drop compat-off
+/// envelopes silently).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn reap_member(
+    scripts: &Scripts,
     pool: &Pool,
     keys: &Keys,
     app: &str,
@@ -129,93 +142,71 @@ pub(super) async fn reap_member(
     compat: bool,
     webhooks: &WebhookHandle,
 ) {
-    let presmembers = keys.presmembers(app, channel);
-    let user_id: Option<String> = match pool.next().hget(&presmembers, token).await {
+    let (user_id, _remaining, won): (String, i64, i64) = match scripts
+        .reap_member
+        .evalsha_with_reload::<(String, i64, i64), _, _>(
+            pool.next(),
+            vec![
+                keys.presusers(app, channel),
+                keys.presinfo(app, channel),
+                keys.presmembers(app, channel),
+            ],
+            vec![token.to_string()],
+        )
+        .await
+    {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(error = %e, app, channel, token, "sweeper: HGET presmembers failed");
+            tracing::warn!(error = %e, app, channel, token, "sweeper: REAP_MEMBER cas failed");
             return;
         }
     };
-    let Some(user_id) = user_id else { return };
-    if let Err(e) = pool
-        .next()
-        .hdel::<i64, _, _>(&presmembers, token.to_string())
-        .await
-    {
-        tracing::warn!(error = %e, app, channel, token, "sweeper: HDEL presmembers failed");
+    if won != 1 {
+        // The token was already gone (the live PRESENCE_LEAVE ran), or the user's
+        // refcount was >1 (this was a plain decrement), or the →0 edge was already
+        // taken and emitted by another writer. Either way another caller owns or
+        // has spent the emission right: stay silent. (On the absent verdicts the
+        // script has still reaped the stale token itself — no ghost entry.)
+        return;
     }
-    let conn: i64 = match pool
-        .next()
-        .hincrby(keys.presusers(app, channel), &user_id, -1)
-        .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, app, channel, user_id, "sweeper: HINCRBY presusers failed");
-            return;
-        }
+    let dead_node = token
+        .split_once(':')
+        .map(|(n, _)| n.to_string())
+        .unwrap_or_default();
+    // The sweeper's compensating `member_removed` is one frame shared
+    // cluster-wide; it encodes at `ACTIVE_VERSIONS[0]` (the cluster
+    // envelope stays single-version until a v8 relay format exists).
+    let frame = crate::protocol::wire::encode(
+        crate::protocol::wire::ACTIVE_VERSIONS[0],
+        &ServerEvent::MemberRemoved {
+            channel: channel.to_string(),
+            user_id: user_id.clone(),
+        },
+    );
+    let env = Envelope {
+        node_id: dead_node,
+        app: app.to_string(),
+        kind: EnvelopeKind::Broadcast,
+        channel: channel.to_string(),
+        event: Value::String(frame.clone()),
+        except: None,
+        // Additive (F16): raw frame bytes as base64 alongside the legacy
+        // `event` JSON string (see `Envelope::frame_b64`). F-1: with the
+        // compat knob off the envelope drops the `event` member instead.
+        frame_b64: Some(Envelope::encode_frame_b64(&frame)),
     };
-    if conn <= 0 {
-        // Best-effort de-index on the →0 user edge (log-only on error). These side
-        // tables carry no TTL backstop and the token is already gone, so the next
-        // sweep will not revisit this user; a stale field self-heals when the user
-        // next joins/leaves (the refcount field is reused, and PRESENCE_LEAVE's →0
-        // edge re-HDELs both). Until then this warn is the only signal of the ghost
-        // roster/refcount entry.
-        if let Err(e) = pool
-            .next()
-            .hdel::<i64, _, _>(keys.presusers(app, channel), user_id.clone())
-            .await
+    if let Ok(payload) = String::from_utf8(env.encode_with(compat)) {
+        if let Err(e) =
+            client::publish_channel(pool, &keys.msg(app, channel), payload, sharded).await
         {
-            tracing::warn!(error = %e, app, channel, user_id, "sweeper: HDEL presusers failed");
+            tracing::warn!(error = %e, app, channel, "sweeper: PUBLISH member_removed failed");
         }
-        if let Err(e) = pool
-            .next()
-            .hdel::<i64, _, _>(keys.presinfo(app, channel), user_id.clone())
-            .await
-        {
-            tracing::warn!(error = %e, app, channel, user_id, "sweeper: HDEL presinfo failed");
-        }
-        let dead_node = token
-            .split_once(':')
-            .map(|(n, _)| n.to_string())
-            .unwrap_or_default();
-        // The sweeper's compensating `member_removed` is one frame shared
-        // cluster-wide; it encodes at `ACTIVE_VERSIONS[0]` (the cluster
-        // envelope stays single-version until a v8 relay format exists).
-        let frame = crate::protocol::wire::encode(
-            crate::protocol::wire::ACTIVE_VERSIONS[0],
-            &ServerEvent::MemberRemoved {
-                channel: channel.to_string(),
-                user_id: user_id.clone(),
-            },
-        );
-        let env = Envelope {
-            node_id: dead_node,
-            app: app.to_string(),
-            kind: EnvelopeKind::Broadcast,
-            channel: channel.to_string(),
-            event: Value::String(frame.clone()),
-            except: None,
-            // Additive (F16): raw frame bytes as base64 alongside the legacy
-            // `event` JSON string (see `Envelope::frame_b64`). F-1: with the
-            // compat knob off the envelope drops the `event` member instead.
-            frame_b64: Some(Envelope::encode_frame_b64(&frame)),
-        };
-        if let Ok(payload) = String::from_utf8(env.encode_with(compat)) {
-            if let Err(e) =
-                client::publish_channel(pool, &keys.msg(app, channel), payload, sharded).await
-            {
-                tracing::warn!(error = %e, app, channel, "sweeper: PUBLISH member_removed failed");
-            }
-        }
-        webhooks.enqueue(WebhookEvent::MemberRemoved {
-            app: app.to_string(),
-            channel: channel.to_string(),
-            user_id,
-        });
     }
+    webhooks.enqueue(WebhookEvent::MemberRemoved {
+        app: app.to_string(),
+        channel: channel.to_string(),
+        user_id,
+    });
 }
 
 /// Cluster roster from `presinfo`: sorted ids, id→user_info hash, distinct count.

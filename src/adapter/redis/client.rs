@@ -160,6 +160,49 @@ if conn <= 0 then redis.call('HDEL', KEYS[1], ARGV[1]); redis.call('HDEL', KEYS[
 return conn
 "#;
 
+/// REAP_MEMBER CAS script (the sweeper's stale-connection reap — F-6, the member
+/// analog of [`VACATE_LUA`]'s R8 rule: the `member_removed` emission right belongs
+/// to whichever caller's atomic op takes the user's refcount to exactly 0).
+/// Atomically: resolve the stale `member_token` to its `user_id`; read the user's
+/// connection refcount; then EITHER — if this reap brings the count to EXACTLY 0 —
+/// HDEL the member AND de-index the user from `presusers` + `presinfo`, returning
+/// `won == 1` (this caller owns the single cluster-wide `member_removed`), OR
+/// simply apply the decrement (`HINCRBY -1`) and return `won == 0`.
+///
+/// Absent verdicts (both `won == 0`, silent — another writer already owns or has
+/// already spent the emission right): the token is gone from `presmembers`
+/// (the live [`PRESENCE_LEAVE_LUA`] already ran), or the user's refcount field is
+/// gone/≤0 while a stale token lingered (the →0 edge was already taken and
+/// emitted; the ghost token is still reaped, just without a second emission).
+/// Together with the live path this guarantees exactly one `member_removed` per
+/// user-removal edge in every interleaving: Redis serializes scripts, so exactly
+/// one of the two racing writers can observe the 1→0 edge. The live path needs no
+/// change — after a reap win HDELs the refcount field, the racing
+/// `PRESENCE_LEAVE_LUA` returns −1 (not 0), and the bridge emits only on `== 0`.
+///
+/// Returns `{user_id, remaining, won}` (`user_id` is `''` on the absent verdict;
+/// `remaining` is the post-reap refcount).
+/// KEYS\[1\]=presusers KEYS\[2\]=presinfo KEYS\[3\]=presmembers
+/// ARGV\[1\]=member_token
+const REAP_MEMBER_LUA: &str = r#"
+local user_id = redis.call('HGET', KEYS[3], ARGV[1])
+if not user_id then return {'', 0, 0} end
+redis.call('HDEL', KEYS[3], ARGV[1])
+local conn = tonumber(redis.call('HGET', KEYS[1], user_id) or '0') or 0
+if conn == 1 then
+  redis.call('HDEL', KEYS[1], user_id)
+  redis.call('HDEL', KEYS[2], user_id)
+  return {user_id, 0, 1}
+end
+if conn <= 0 then
+  redis.call('HDEL', KEYS[1], user_id)
+  redis.call('HDEL', KEYS[2], user_id)
+  return {user_id, 0, 0}
+end
+local left = redis.call('HINCRBY', KEYS[1], user_id, -1)
+return {user_id, left, 0}
+"#;
+
 /// USER_SIGNIN. Records this connection's binding token, refreshes the whole-key
 /// TTL backstop, and — on the cluster 0→1 user edge (HLEN == 1) — indexes the user
 /// in the app's `users` set. Returns the new `HLEN` (cluster-wide connection count).
@@ -270,6 +313,10 @@ pub struct Scripts {
     pub presence_join: Script,
     /// Records a presence leave and returns the user's remaining connection refcount.
     pub presence_leave: Script,
+    /// The sweeper's atomic member reap: returns `{user_id, remaining, won}` —
+    /// `won == 1` iff THIS call took the user's refcount to exactly 0 and owns
+    /// the single `member_removed` emission right.
+    pub reap_member: Script,
     /// Records a user signin and returns the user's new cluster connection count.
     pub user_signin: Script,
     /// Records a user signout and returns the user's remaining cluster connection count.
@@ -293,6 +340,7 @@ impl Scripts {
             vacate: Script::from_lua(VACATE_LUA),
             presence_join: Script::from_lua(PRESENCE_JOIN_LUA),
             presence_leave: Script::from_lua(PRESENCE_LEAVE_LUA),
+            reap_member: Script::from_lua(REAP_MEMBER_LUA),
             user_signin: Script::from_lua(USER_SIGNIN_LUA),
             user_signout: Script::from_lua(USER_SIGNOUT_LUA),
             admit_app: Script::from_lua(ADMIT_APP_LUA),
@@ -317,6 +365,8 @@ mod tests {
         let s = Scripts::new();
         assert_ne!(s.presence_join.sha1(), s.presence_leave.sha1());
         assert_ne!(s.subscribe.sha1(), s.presence_join.sha1());
+        assert_ne!(s.reap_member.sha1(), s.presence_leave.sha1());
+        assert_ne!(s.reap_member.sha1(), s.vacate.sha1());
     }
 
     #[test]
