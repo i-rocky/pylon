@@ -14,10 +14,11 @@
 //! 2. **drain half** — `drain_broadcasts`' real inbox pump (factored into
 //!    `pylon::transport::worker::drain_broadcast_inbox` for exactly this
 //!    bench): the `(app, channel) → local_subs` lookup, then per subscriber
-//!    the shed-band reclassify, sender exclusion, `sid_to_token` resolve
-//!    (token + negotiated version in ONE probe), the graduated skip, and the
+//!    the shed-band reclassify, sender exclusion, the graduated skip, and the
 //!    `Connection::queue(frame.clone(), ..)` refcount-bump enqueue with live
-//!    inflight/drop-head accounting.
+//!    inflight/drop-head accounting — the subscriber iteration itself yields
+//!    the slab token and negotiated version (the F12 single-layout entry
+//!    value), so there is NO per-subscriber resolve lookup at all.
 //!
 //! No drain logic is reimplemented here: the bench calls the production
 //! function through the production `ConnIndex` shape (its impl adds the same
@@ -81,7 +82,7 @@ use pylon::transport::conn::{ConnState, Connection};
 use pylon::transport::fanout::{
     frames_for, BroadcastMsg, BroadcastSink, WorkerSlot, DEFAULT_BROADCAST_HANDOFF_CAP,
 };
-use pylon::transport::worker::{drain_broadcast_inbox, ConnIndex};
+use pylon::transport::worker::{drain_broadcast_inbox, ConnIndex, LocalSubs};
 use slab::Slab;
 
 /// Subscriber scales mandated by the plan.
@@ -112,9 +113,9 @@ impl ConnIndex for BenchConns {
 }
 
 /// One worker's world: the sink (one slot), its inbox receiver, and the
-/// worker-local indexes the drain walks — `local_subs` in the exact
-/// single-map `(app, channel) → {SocketId}` shape the worker keeps, plus the
-/// `socket_id → (slab token, negotiated version)` reverse map (the bench's
+/// worker-local subscriber index the drain walks — `local_subs` in the exact
+/// single-layout `(app, channel) → {socket_id → (slab token, negotiated
+/// version)}` shape the worker keeps (the F12 absorbed entry value; the bench's
 /// connections all negotiate v7, the sole active version).
 struct SinkWorld {
     conns: BenchConns,
@@ -125,8 +126,7 @@ struct SinkWorld {
     spare: Option<MioTcpStream>,
     rx: std::sync::mpsc::Receiver<BroadcastMsg>,
     sink: BroadcastSink,
-    local_subs: HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
-    sid_to_token: HashMap<SocketId, (usize, u8)>,
+    local_subs: LocalSubs,
     app: Arc<str>,
     channel: Arc<str>,
 }
@@ -158,19 +158,17 @@ fn build_world(n: usize) -> SinkWorld {
     // Setup ends with one spare socket (its subscriber never joins local_subs)
     // so the reset below has a spare to rotate through.
     let mut slab: Slab<Connection> = Slab::with_capacity(n);
-    let mut sid_to_token: HashMap<SocketId, (usize, u8)> = HashMap::with_capacity(n);
-    let mut subs: HashSet<SocketId> = HashSet::with_capacity(n);
+    let mut subs: HashMap<SocketId, (usize, u8)> = HashMap::with_capacity(n);
 
     for _ in 0..n {
         let mut conn = Connection::new(accepted_stream(&listener), HIGH_WATER);
         conn.state = ConnState::Open; // bench conns model established sessions
         let token = slab.insert(conn);
         let sid = SocketId::generate();
-        // The production value shape: (slab token, negotiated protocol
+        // The production entry value: (slab token, negotiated protocol
         // version) — the bench's connections all negotiated the sole active
         // version, so the drain's fast single-frame path is exercised.
-        sid_to_token.insert(sid, (token, wire::ACTIVE_VERSIONS[0]));
-        subs.insert(sid);
+        subs.insert(sid, (token, wire::ACTIVE_VERSIONS[0]));
     }
     let spare_sock = accepted_stream(&listener);
 
@@ -198,7 +196,6 @@ fn build_world(n: usize) -> SinkWorld {
         rx,
         sink,
         local_subs,
-        sid_to_token,
         app,
         channel,
     }
@@ -255,7 +252,6 @@ fn broadcast_and_drain(world: &mut SinkWorld, event: &ServerEvent, now_ns: u64) 
     drain_broadcast_inbox(
         &world.rx,
         &world.local_subs,
-        &world.sid_to_token,
         &mut world.conns,
         EFFECTIVE_BUDGET,
         &mut inflight,
@@ -268,11 +264,15 @@ fn broadcast_and_drain(world: &mut SinkWorld, event: &ServerEvent, now_ns: u64) 
     // Self-check (O(1), not a per-subscriber cost): no `except`, every conn
     // Open, band Normal ⇒ every subscriber was queued onto this iteration —
     // each distinct SocketId owns a distinct token, so `touched` must cover
-    // the whole reverse map. A silent skip-path regression would otherwise
+    // the whole subscriber map. A silent skip-path regression would otherwise
     // make the bench "faster" while delivering nothing.
     assert_eq!(
         touched.len(),
-        world.sid_to_token.len(),
+        world
+            .local_subs
+            .values()
+            .map(|subs| subs.len())
+            .sum::<usize>(),
         "every subscriber must be delivered"
     );
     black_box(drophead);

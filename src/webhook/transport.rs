@@ -19,9 +19,11 @@ use tokio::sync::{Mutex, Semaphore};
 ///
 /// * IPv4: loopback (127/8), unspecified (`0.0.0.0`), link-local
 ///   (169.254.0.0/16 — includes the cloud metadata addresses), RFC1918
-///   (10/8, 172.16/12, 192.168/16).
+///   (10/8, 172.16/12, 192.168/16), class-E reserved (240.0.0.0/4).
 /// * IPv6: loopback (`::1`), unspecified (`::`), unique-local (fc00::/7),
-///   link-local (fe80::/10).
+///   link-local (fe80::/10), NAT64 well-known prefix (64:ff9b::/96 — refused
+///   regardless of the embedded v4: a NAT64 gateway translates to interior
+///   space).
 /// * IPv4-mapped (`::ffff:a.b.c.d`) and the deprecated IPv4-compatible
 ///   (`::a.b.c.d`) IPv6 forms are classified by their embedded IPv4 address —
 ///   a dual-stack socket interprets them as that v4 address.
@@ -40,10 +42,14 @@ pub fn is_private_target(ip: IpAddr) -> bool {
                 // is matched on octets: 100.64.0.0 — 100.127.255.255.)
                 || (v4.octets()[0] == 100 && (0x40..=0x7f).contains(&v4.octets()[1]))
                 // Multicast and broadcast are never legitimate webhook
-                // receivers. (240.0.0.0/4 class-E and NAT64 64:ff9b::/96 are
-                // deliberately NOT classified here — ledgered only.)
+                // receivers.
                 || v4.is_multicast()
                 || v4.is_broadcast()
+                // Class-E reserved (240.0.0.0/4, octets[0] 240..=255) —
+                // reserved-for-future-use space with no legitimate webhook
+                // receiver. (255.255.255.255 is already classified as
+                // broadcast above; the /4 subsumes it.)
+                || (0xf0..=0xff).contains(&v4.octets()[0])
         }
         IpAddr::V6(v6) => {
             // The v6 special forms come FIRST: `to_ipv4` also converts the
@@ -55,6 +61,14 @@ pub fn is_private_target(ip: IpAddr) -> bool {
             // IPv4-mapped ::ffff:a.b.c.d — classify by the embedded v4.
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_private_target(IpAddr::V4(v4));
+            }
+            // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052): a NAT64
+            // gateway TRANSLATES the embedded v4 to interior address space,
+            // so the target is refused whether the embedded v4 is public or
+            // private — the same embedded-v4 reading as the mapped form
+            // above, but always interior (fail closed).
+            if v6.segments()[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return true;
             }
             // The (deprecated) IPv4-compatible form ::a.b.c.d — still
             // interpreted as the v4 address by dual-stack sockets; classify
@@ -1294,22 +1308,77 @@ mod tests {
     }
 
     /// Fix-round 1 (authorized extra): multicast and broadcast targets are
-    /// never legitimate webhook receivers — refuse them too. NAT64
-    /// (64:ff9b::/96) is deliberately NOT classified here (ledgered only).
+    /// never legitimate webhook receivers — refuse them too. (Class-E and
+    /// NAT64 have their own dedicated boundary tests below.)
     #[test]
     fn classifier_blocks_multicast_and_broadcast() {
         // v4 multicast 224.0.0.0/4
         assert!(!private("223.255.255.255"), "just below 224/4");
         assert!(private("224.0.0.1"));
         assert!(private("239.255.255.255"), "top of 224/4");
-        // 240.0.0.0/4 (class E reserved) is out of scope — stays public here.
-        assert!(!private("240.0.0.1"));
         // v4 broadcast
         assert!(private("255.255.255.255"));
         // v6 multicast ff00::/8
         assert!(private("ff02::1"));
         assert!(private("ffff::1"), "top of ff00::/8");
         assert!(!private("fe00::1"), "below ff00::/8");
+    }
+
+    /// F-2 (b): NAT64 well-known prefix (`64:ff9b::/96`, RFC 6052). A NAT64
+    /// gateway TRANSLATES the embedded IPv4 into interior address space, so the
+    /// target is refused regardless of whether the embedded v4 is itself public
+    /// or private — the attacker's webhook would land inside the translator's
+    /// interior network either way.
+    #[test]
+    fn classifier_blocks_nat64_64_ff9b_slash_96() {
+        assert!(
+            private("64:ff9b::195.0.0.1"),
+            "embedded PUBLIC v4 → still private (the gateway translates interior)"
+        );
+        assert!(
+            private("64:ff9b::10.0.0.1"),
+            "embedded private v4 → private"
+        );
+        assert!(private("64:ff9b::0.0.0.0"), "bottom of the /96");
+        assert!(private("64:ff9b::255.255.255.255"), "top of the /96");
+        // /96-scope precision: neighbors OUTSIDE the prefix keep their own
+        // classification (this classifier refuses listed classes only).
+        assert!(
+            !private("64:ff9b:1::195.0.0.1"),
+            "bits set inside the prefix (segment 3) — not the /96"
+        );
+        assert!(
+            !private("64:ff9c::195.0.0.1"),
+            "the well-known prefix is 64:ff9b, not 64:ff9c"
+        );
+    }
+
+    /// F-2 (b): class-E reserved space (`240.0.0.0/4`, RFC 1112) — reserved for
+    /// future use; no legitimate unicast webhook receiver lives there. The /4
+    /// subsumes the broadcast address (already classified above); the boundary
+    /// against multicast (239.255.255.255) and public space (223.255.255.255)
+    /// is pinned here.
+    #[test]
+    fn classifier_blocks_class_e_240_slash_4() {
+        assert!(
+            !private("223.255.255.255"),
+            "just below multicast — stays public"
+        );
+        assert!(
+            private("239.255.255.255"),
+            "top of multicast 224/4 stays multicast-private"
+        );
+        assert!(private("240.0.0.0"), "bottom of the /4");
+        assert!(private("240.0.0.1"));
+        assert!(private("250.100.50.25"), "mid /4");
+        assert!(
+            private("255.255.255.254"),
+            "top of the /4 minus the last host"
+        );
+        assert!(
+            private("255.255.255.255"),
+            "broadcast stays broadcast-private (subsumed)"
+        );
     }
 
     // ── S2: SSRF guard — the pre-flight over a mock resolver ──────────────────

@@ -866,34 +866,48 @@ async fn cross_node_presence_roster_is_cluster_wide() {
             .await;
 
         // u3 subscribes on A — its roster must reflect the whole cluster.
+        // F-5: the join carries the PRE-ENCODED `subscription_succeeded` frame
+        // (the Redis overwrite path encoded the cluster-truth roster through
+        // `wire::encode`), so the assertions decode the frame's double-encoded
+        // `data` string.
         let (_s3, h3, m3) = presence_handle("u3", serde_json::json!({"name":"Cleo"}));
         let out3 = adapter_a
             .subscribe(TEST_APP, "presence-room", h3, Some(m3))
             .await;
-        let roster = out3
+        let frame = out3
             .presence
             .expect("presence join for u3 must be Some")
-            .roster;
+            .roster_frame;
+        let j: serde_json::Value = serde_json::from_str(&frame).expect("frame must be JSON");
+        assert_eq!(j["event"], "pusher_internal:subscription_succeeded");
+        assert_eq!(j["channel"], "presence-room");
+        let roster: serde_json::Value =
+            serde_json::from_str(j["data"].as_str().expect("data is a JSON string"))
+                .expect("roster data must be JSON");
+        let presence = &roster["presence"];
 
-        assert_eq!(roster.count, 3, "cluster roster must count all 3 users");
         assert_eq!(
-            roster.ids,
-            vec!["u1".to_string(), "u2".to_string(), "u3".to_string()],
+            presence["count"], 3,
+            "cluster roster must count all 3 users"
+        );
+        assert_eq!(
+            presence["ids"],
+            serde_json::json!(["u1", "u2", "u3"]),
             "cluster roster ids must be sorted and contain u1,u2,u3"
         );
         assert_eq!(
-            roster.hash.get("u1"),
-            Some(&serde_json::json!({"name":"Ann"})),
+            presence["hash"]["u1"],
+            serde_json::json!({"name":"Ann"}),
             "roster hash must carry u1's user_info"
         );
         assert_eq!(
-            roster.hash.get("u2"),
-            Some(&serde_json::json!({"name":"Bob"})),
+            presence["hash"]["u2"],
+            serde_json::json!({"name":"Bob"}),
             "roster hash must carry u2's user_info"
         );
         assert_eq!(
-            roster.hash.get("u3"),
-            Some(&serde_json::json!({"name":"Cleo"})),
+            presence["hash"]["u3"],
+            serde_json::json!({"name":"Cleo"}),
             "roster hash must carry u3's user_info"
         );
     })
@@ -1211,6 +1225,96 @@ async fn send_to_user_reaches_connection_on_another_node() {
         }
         other => panic!("expected Raw frame on node B, got {other:?}"),
     }
+}
+
+/// F-2 encode-once pin: `RedisAdapter::send_to_user` must encode the frame ONCE
+/// and feed the SAME bytes to BOTH halves — the node-local delivery (a `Raw`
+/// frame, byte-identical to a fresh `wire::encode` of the event) and the
+/// usermsg publish's `event` string — so the encode-once construction can never
+/// let the two halves diverge (the same contract `ClusterAdapter::broadcast`'s
+/// F17 pin enforces). A caller-supplied pre-encoded `Raw` payload must reach
+/// both halves VERBATIM (no re-encode, no mutation).
+#[tokio::test]
+async fn send_to_user_feeds_the_same_encoded_bytes_to_local_and_publish_halves() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let adapter = connect_adapter_with_prefix(&prefix).await;
+
+        // A local connection of the user on THIS node (the local half's target).
+        let (_sid, handle, mut rx) = recording_handle();
+        adapter.signin_user(TEST_APP, "u-half", handle).await;
+
+        // A raw probe subscriber sniffs the published envelope bytes (fred's
+        // `subscribe` future resolves on the server's confirmation, so the
+        // sniffed publish cannot race the subscription).
+        let probe = fred::prelude::Builder::from_config(
+            fred::prelude::Config::from_url(test_redis_url().as_str()).unwrap(),
+        )
+        .build_subscriber_client()
+        .unwrap();
+        probe.init().await.expect("probe must connect");
+        let mut probe_rx = probe.message_rx();
+        let usermsg = keys.usermsg(TEST_APP, "u-half");
+        probe
+            .subscribe(usermsg.clone())
+            .await
+            .expect("probe SUBSCRIBE");
+
+        // Typed event → ONE encode shared by both halves.
+        let event = ServerEvent::ChannelEvent {
+            channel: "x".into(),
+            event: "e".into(),
+            data: serde_json::json!({"k":1}),
+            user_id: None,
+        };
+        adapter
+            .send_to_user(TEST_APP, "u-half", event.clone())
+            .await;
+
+        let expected =
+            pylon::protocol::wire::encode(pylon::protocol::wire::ACTIVE_VERSIONS[0], &event);
+        let local = with_timeout(async { rx.recv().await }).await.map(|b| *b);
+        match local {
+            Some(ServerEvent::Raw(f)) => assert_eq!(
+                &*f, &expected,
+                "local half must get the shared frame (byte-identical to a fresh encode)"
+            ),
+            other => panic!("expected Raw frame locally, got {other:?}"),
+        }
+        let wire = next_probe_json(&mut probe_rx).await;
+        assert_eq!(
+            wire["kind"], "UserSend",
+            "the probed envelope is the user send"
+        );
+        assert_eq!(
+            wire["event"].as_str(),
+            Some(expected.as_str()),
+            "publish half must relay the SAME bytes the local half delivered, got: {wire}"
+        );
+
+        // `Raw` passthrough: a caller-supplied pre-encoded payload reaches both
+        // halves VERBATIM.
+        let raw: Arc<str> = Arc::from("{\"event\":\"pre\"}");
+        adapter
+            .send_to_user(TEST_APP, "u-half", ServerEvent::Raw(raw.clone()))
+            .await;
+        let local = with_timeout(async { rx.recv().await }).await.map(|b| *b);
+        match local {
+            Some(ServerEvent::Raw(f)) => assert_eq!(&*f, &*raw, "Raw payload verbatim locally"),
+            other => panic!("expected the verbatim Raw frame locally, got {other:?}"),
+        }
+        let wire = next_probe_json(&mut probe_rx).await;
+        assert_eq!(
+            wire["event"].as_str(),
+            Some(&*raw),
+            "publish half must relay the Raw payload verbatim, got: {wire}"
+        );
+
+        let _ = probe.quit().await;
+    })
+    .await
+    .expect("send_to_user encode-once pin must not hang (Redis up?)");
 }
 
 /// B1: `terminate_user` from one node closes the user's connection on ANOTHER node
@@ -1617,6 +1721,210 @@ async fn cluster_publish_broadcast_fans_out_only_remote() {
     .expect("cluster_publish_broadcast direct test must not hang (Redis up?)");
 }
 
+/// F-1 (`PYLON_CLUSTER_ENVELOPE_COMPAT`): the knob's end-to-end behavior, sniffed
+/// on the actual Redis bus. The cluster suites boot adapters from struct-literal
+/// configs (they never read `PYLON_*` env), so the compat=false SERVER path is
+/// covered HERE: the test exports `PYLON_CLUSTER_ENVELOPE_COMPAT=0`, boots the
+/// publisher via `ServerConfig::from_env()` (proving the env plumbing), and a raw
+/// probe subscriber on the `msg`/`usermsg` channels pins the PUBLISHED envelope
+/// bytes — no `event` member, `frame_b64` the sole carrier — while a default
+/// (compat=on) publisher keeps the double-carry shape. Cross-node relay of the
+/// frame_b64-only envelope is proven end-to-end by B (a DEFAULT compat receiver —
+/// receivers are knob-independent) delivering A's compat=off frames locally.
+#[tokio::test]
+async fn cluster_envelope_compat_knob_shapes_the_wire_and_relay_still_works() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        // ── Part 1: DEFAULT (compat on) — the bus carries BOTH fields. ─────────
+        let prefix_on = random_prefix();
+        let adapter_on = connect_adapter_with_prefix(&prefix_on).await;
+        let msg_on = Keys::new(&prefix_on).msg(TEST_APP, "compat-room");
+
+        // A raw probe subscriber sniffs the published envelope bytes.
+        let probe = fred::prelude::Builder::from_config(
+            fred::prelude::Config::from_url(test_redis_url().as_str()).unwrap(),
+        )
+        .build_subscriber_client()
+        .unwrap();
+        probe.init().await.expect("probe must connect");
+        let mut probe_rx = probe.message_rx();
+        // fred's `subscribe` future resolves on the server's confirmation, so
+        // the first sniffed publish cannot race the subscription.
+        probe
+            .subscribe(msg_on.clone())
+            .await
+            .expect("probe SUBSCRIBE");
+
+        adapter_on
+            .broadcast(
+                TEST_APP,
+                "compat-room",
+                ServerEvent::Raw(std::sync::Arc::from("ping")),
+                None,
+            )
+            .await;
+        let wire = next_probe_json(&mut probe_rx).await;
+        assert!(
+            wire.get("event").is_some() && wire.get("frame_b64").is_some(),
+            "compat=on must double-carry on the wire, got: {wire}"
+        );
+
+        // ── Part 2: compat OFF via the exported env var. ───────────────────────
+        // The guard restores the var's PRIOR value on scope exit — even when a
+        // later assertion panics — so a leaked `=0` can never re-knob the rest
+        // of this test binary (the lib suite's ENV_LOCK discipline, scoped to
+        // the one variable this test owns).
+        let _env_guard = EnvCompatGuard::capture();
+        std::env::set_var("PYLON_CLUSTER_ENVELOPE_COMPAT", "0");
+        let prefix_off = random_prefix();
+        // Boot the publisher from the ENVIRONMENT (the env knob's whole point) —
+        // then stamp the test Redis wiring on top, mirroring `redis_test_config`.
+        let mut cfg = ServerConfig::from_env();
+        assert!(
+            !cfg.cluster_envelope_compat,
+            "PYLON_CLUSTER_ENVELOPE_COMPAT=0 must reach ServerConfig"
+        );
+        cfg.adapter = "redis".into();
+        cfg.redis_url = test_redis_url();
+        cfg.redis_prefix = prefix_off.clone();
+        let adapter_a = RedisAdapter::new(&cfg)
+            .await
+            .expect("compat=off adapter must connect");
+        // B is a DEFAULT-config receiver: receivers decode both envelope shapes
+        // regardless of their own knob — the mixed-fleet guarantee.
+        let adapter_b = connect_adapter_with_prefix(&prefix_off).await;
+        let keys_off = Keys::new(&prefix_off);
+        let msg_off = keys_off.msg(TEST_APP, "compat-room");
+        let usermsg_off = keys_off.usermsg(TEST_APP, "u1");
+
+        // B subscribes locally (broadcast leg) and signs in u1 (user-send leg) so
+        // its receive loop re-delivers A's compat=off envelopes.
+        let (sock_b, handle_b, mut rx_b) = recording_handle();
+        adapter_b
+            .subscribe(TEST_APP, "compat-room", handle_b, None)
+            .await;
+        let (user_sock, user_handle, mut user_rx) = recording_handle();
+        adapter_b.signin_user(TEST_APP, "u1", user_handle).await;
+
+        probe
+            .subscribe(msg_off.clone())
+            .await
+            .expect("probe SUBSCRIBE");
+        probe
+            .subscribe(usermsg_off.clone())
+            .await
+            .expect("probe SUBSCRIBE");
+
+        // A (compat=off) broadcasts: the bus envelope must omit `event`.
+        adapter_a
+            .broadcast(
+                TEST_APP,
+                "compat-room",
+                ServerEvent::Raw(std::sync::Arc::from("ping")),
+                None,
+            )
+            .await;
+        let wire = next_probe_json(&mut probe_rx).await;
+        assert_eq!(wire.get("kind").and_then(|v| v.as_str()), Some("Broadcast"));
+        assert!(
+            wire.get("event").is_none(),
+            "compat=off must omit the legacy event member on the wire, got: {wire}"
+        );
+        assert!(
+            wire.get("frame_b64").is_some(),
+            "compat=off still carries frame_b64, got: {wire}"
+        );
+        // And B (default receiver) relays the frame_b64-only envelope locally.
+        // (`Raw` frames pass through the relay verbatim — see `wire::encode`.)
+        let received = *tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
+            .await
+            .expect("B must relay A's compat=off broadcast")
+            .expect("B's mailbox must yield the broadcast");
+        match received {
+            ServerEvent::Raw(f) => assert_eq!(&*f, "ping"),
+            other => panic!("expected a Raw frame, got {other:?}"),
+        }
+
+        // A (compat=off) sends to u1: the UserSend envelope also omits `event`,
+        // and B still delivers the frame to its local u1 connection.
+        adapter_a
+            .send_to_user(
+                TEST_APP,
+                "u1",
+                ServerEvent::Raw(std::sync::Arc::from("pong")),
+            )
+            .await;
+        let wire = next_probe_json(&mut probe_rx).await;
+        assert_eq!(wire.get("kind").and_then(|v| v.as_str()), Some("UserSend"));
+        assert!(
+            wire.get("event").is_none(),
+            "compat=off UserSend must omit event on the wire, got: {wire}"
+        );
+        assert!(wire.get("frame_b64").is_some());
+        let received = *tokio::time::timeout(Duration::from_secs(2), user_rx.recv())
+            .await
+            .expect("B must relay A's compat=off user send")
+            .expect("u1's mailbox must yield the frame");
+        match received {
+            ServerEvent::Raw(f) => assert_eq!(&*f, "pong"),
+            other => panic!("expected a Raw frame, got {other:?}"),
+        }
+
+        // Cleanup: drop the memberships. The env override is restored by
+        // `_env_guard`'s Drop (which also runs on a panic unwind).
+        adapter_b
+            .unsubscribe(TEST_APP, "compat-room", &sock_b)
+            .await;
+        adapter_b.signout_user(TEST_APP, "u1", &user_sock).await;
+        let _ = probe.quit().await;
+    })
+    .await
+    .expect("compat knob test must not hang (Redis up?)");
+}
+
+/// Restores `PYLON_CLUSTER_ENVELOPE_COMPAT` to its pre-test value when dropped
+/// (removed when it was unset) — panic-safe env hygiene for the knob test: a
+/// leaked `=0` would silently re-knob any later env-reading code in this
+/// binary. Mirrors the lib suite's `ENV_LOCK` discipline, scoped to the one
+/// variable that test owns (the binary's tests run `--test-threads=1`).
+struct EnvCompatGuard(Option<String>);
+
+impl EnvCompatGuard {
+    fn capture() -> Self {
+        Self(std::env::var("PYLON_CLUSTER_ENVELOPE_COMPAT").ok())
+    }
+}
+
+impl Drop for EnvCompatGuard {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(prior) => std::env::set_var("PYLON_CLUSTER_ENVELOPE_COMPAT", prior),
+            None => std::env::remove_var("PYLON_CLUSTER_ENVELOPE_COMPAT"),
+        }
+    }
+}
+
+/// Read the probe's next pub/sub message as JSON (fails loud on stall/close).
+async fn next_probe_json(
+    rx: &mut tokio::sync::broadcast::Receiver<fred::types::Message>,
+) -> serde_json::Value {
+    match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+        Ok(Ok(msg)) => {
+            let payload = msg
+                .value
+                .into_string()
+                .expect("envelope payload must be a string");
+            serde_json::from_str(&payload).expect("envelope must be JSON")
+        }
+        Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+            panic!("probe stream lagged by {n} envelopes while awaiting one")
+        }
+        Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+            panic!("probe stream closed while awaiting an envelope")
+        }
+        Err(_) => panic!("timed out awaiting an envelope on the probe"),
+    }
+}
+
 /// `purge_app` on a `RedisAdapter` closes all local connections with 4009 and
 /// removes the app from the Redis `apps` set so the sweeper stops enumerating it.
 #[tokio::test]
@@ -1882,4 +2190,299 @@ async fn vacate_cas_sweep_first_unsubscribe_silent() {
     })
     .await
     .expect("vacate CAS ordering-2 test must not hang (Redis up?)");
+}
+
+// ---------------------------------------------------------------------------
+// Reap-member CAS (duplicate member_removed regression — F-6).
+//
+// The `member_removed` emission right belongs to whichever caller's atomic
+// operation takes the user's refcount to EXACTLY 0 (the member analog of the
+// vacate CAS above). Two writers can reach the user-removal edge concurrently —
+// the live leave (PRESENCE_LEAVE_LUA, driven by the bridge, emitting iff the
+// script returns `== 0`) and the sweeper's stale-token reap (REAP_MEMBER_LUA,
+// emitting iff `won == 1`) — and before the CAS the sweeper's separate
+// HGET→HDEL→HINCRBY commands could double-decrement a refcount the live path
+// had already zeroed, its `<= 0` gate firing a second `member_removed` for one
+// user removal. These tests drive the two scripts DIRECTLY, in BOTH orderings
+// of the race, and assert exactly one winner each — deterministic where the
+// full-system straddle is not.
+// ---------------------------------------------------------------------------
+
+/// Run the bridge's PRESENCE_LEAVE_LUA for `user_id`/`token`; returns the
+/// remaining refcount (the live path emits `member_removed` iff it is `== 0`).
+async fn run_presence_leave(
+    scripts: &Scripts,
+    pool: &fred::clients::Pool,
+    keys: &Keys,
+    channel: &str,
+    user_id: &str,
+    token: &str,
+) -> i64 {
+    scripts
+        .presence_leave
+        .evalsha_with_reload::<i64, _, _>(
+            pool.next(),
+            vec![
+                keys.presusers(TEST_APP, channel),
+                keys.presinfo(TEST_APP, channel),
+                keys.presmembers(TEST_APP, channel),
+            ],
+            vec![user_id.to_string(), token.to_string()],
+        )
+        .await
+        .expect("PRESENCE_LEAVE_LUA must eval")
+}
+
+/// Run the sweeper's REAP_MEMBER_LUA for `token`; returns `(user_id, remaining,
+/// won)` (`won == 1` iff THIS call took the user's refcount to exactly 0 and
+/// owns the single `member_removed` emission right).
+async fn run_reap_member(
+    scripts: &Scripts,
+    pool: &fred::clients::Pool,
+    keys: &Keys,
+    channel: &str,
+    token: &str,
+) -> (String, i64, i64) {
+    scripts
+        .reap_member
+        .evalsha_with_reload::<(String, i64, i64), _, _>(
+            pool.next(),
+            vec![
+                keys.presusers(TEST_APP, channel),
+                keys.presinfo(TEST_APP, channel),
+                keys.presmembers(TEST_APP, channel),
+            ],
+            vec![token.to_string()],
+        )
+        .await
+        .expect("REAP_MEMBER_LUA must eval")
+}
+
+/// Seed the presence state `user_id`'s connections produce: `presmembers`
+/// token→user_id for each token, `presusers` user_id→`count`, `presinfo`
+/// user_id→user_info (what PRESENCE_JOIN_LUA leaves behind).
+async fn seed_presence_user(
+    clients: &RedisClients,
+    keys: &Keys,
+    channel: &str,
+    user_id: &str,
+    tokens: &[&str],
+    count: i64,
+) {
+    let pool = clients.pool.next();
+    for token in tokens {
+        let _: () = pool
+            .hset(
+                keys.presmembers(TEST_APP, channel),
+                (token.to_string(), user_id.to_string()),
+            )
+            .await
+            .expect("hset presmembers");
+    }
+    let _: () = pool
+        .hset(
+            keys.presusers(TEST_APP, channel),
+            (user_id.to_string(), count),
+        )
+        .await
+        .expect("hset presusers");
+    let _: () = pool
+        .hset(
+            keys.presinfo(TEST_APP, channel),
+            (user_id.to_string(), format!(r#"{{"name":"{user_id}"}}"#)),
+        )
+        .await
+        .expect("hset presinfo");
+}
+
+/// Assert the channel's three presence hashes hold nothing (user fully
+/// reclaimed, no ghost token or refcount residue).
+async fn assert_presence_fully_reclaimed(clients: &RedisClients, keys: &Keys, channel: &str) {
+    for key in [
+        keys.presusers(TEST_APP, channel),
+        keys.presinfo(TEST_APP, channel),
+        keys.presmembers(TEST_APP, channel),
+    ] {
+        let len: i64 = clients.pool.next().hlen(&key).await.expect("hlen");
+        assert_eq!(len, 0, "presence hash {key} must be empty");
+    }
+}
+
+/// Ordering 1 — the live leave wins, the sweeper's later stale-token reap must
+/// stay silent. u1 has one connection whose node's heartbeat went stale; the
+/// socket then closes orderly. The live PRESENCE_LEAVE_LUA takes the refcount
+/// to exactly 0 (returns 0 → the bridge emits the single `member_removed`);
+/// the sweeper's later REAP_MEMBER_LUA finds the token already gone
+/// (`won == 0`) — exactly one emission right in total, in the ordering that
+/// used to double-fire via the `<= 0` gate on a double-decrement.
+#[tokio::test]
+async fn reap_cas_live_leave_first_reap_silent() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let scripts = Scripts::new();
+        let clients = RedisClients::connect(&test_redis_url(), 2)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let channel = format!("presence-cas-{}", Uuid::new_v4());
+
+        seed_presence_user(&clients, &keys, &channel, "u1", &["n1:s1"], 1).await;
+
+        // The live leave: takes the refcount 1→0 → returns 0 → the bridge
+        // owns the single member_removed emission.
+        let left =
+            run_presence_leave(&scripts, &clients.pool, &keys, &channel, "u1", "n1:s1").await;
+        assert_eq!(left, 0, "the live leave must own the →0 emission right");
+
+        // The sweeper's late reap of the same stale token: the token is
+        // already gone → won == 0 → silent.
+        let (user_id, left, won) =
+            run_reap_member(&scripts, &clients.pool, &keys, &channel, "n1:s1").await;
+        assert_eq!(
+            (user_id.as_str(), left, won),
+            ("", 0, 0),
+            "a reap after the live leave already won must NOT win the emission right"
+        );
+
+        assert_presence_fully_reclaimed(&clients, &keys, &channel).await;
+    })
+    .await
+    .expect("reap CAS ordering-1 test must not hang (Redis up?)");
+}
+
+/// Ordering 2 — the sweeper wins the straddle, the later live leave must stay
+/// silent. The sweeper's REAP_MEMBER_LUA observes the refcount at exactly 1 and
+/// atomically removes the token AND the user (`won == 1` → the sweeper emits
+/// the single `member_removed`); the bridge's late PRESENCE_LEAVE_LUA — whose
+/// HDEL no-ops on the gone token — HINCRBYs the HDEL'd field to −1 (not 0),
+/// so the live path's `== 0` emit gate suppresses it. Exactly one emission
+/// right in total, in the ordering that used to double-fire.
+#[tokio::test]
+async fn reap_cas_reap_first_live_leave_silent() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let scripts = Scripts::new();
+        let clients = RedisClients::connect(&test_redis_url(), 2)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let channel = format!("presence-cas-{}", Uuid::new_v4());
+
+        seed_presence_user(&clients, &keys, &channel, "u1", &["n1:s1"], 1).await;
+
+        // The sweeper's atomic reap: resolves the token, sees the refcount at
+        // exactly 1, removes token + user → WINS the emission right.
+        let (user_id, left, won) =
+            run_reap_member(&scripts, &clients.pool, &keys, &channel, "n1:s1").await;
+        assert_eq!(
+            (user_id.as_str(), left, won),
+            ("u1", 0, 1),
+            "the reap of a 1-connection user must WIN the emission right"
+        );
+
+        // The bridge's late live leave: HDEL no-ops, HINCRBY on the HDEL'd
+        // field yields −1 — NOT 0, so the live path stays silent (and the
+        // script's `<= 0` cleanup leaves no −1 residue behind).
+        let left =
+            run_presence_leave(&scripts, &clients.pool, &keys, &channel, "u1", "n1:s1").await;
+        assert_eq!(
+            left, -1,
+            "a late live leave must NOT see == 0 after the reap already won"
+        );
+
+        assert_presence_fully_reclaimed(&clients, &keys, &channel).await;
+    })
+    .await
+    .expect("reap CAS ordering-2 test must not hang (Redis up?)");
+}
+
+/// Shared user, both writers legitimate: u1 holds one stale token (crashed
+/// node) and one live connection. The stale reap is a PLAIN DECREMENT
+/// (`won == 0`, refcount 2→1, no emission — the user is still present); the
+/// live connection's leave then takes 1→0 and owns the single emission. A
+/// further late reap of the live token stays silent.
+#[tokio::test]
+async fn reap_cas_shared_user_reap_decrements_leave_wins() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let scripts = Scripts::new();
+        let clients = RedisClients::connect(&test_redis_url(), 2)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let channel = format!("presence-cas-{}", Uuid::new_v4());
+
+        seed_presence_user(&clients, &keys, &channel, "u1", &["n1:s1", "n2:s2"], 2).await;
+
+        // Reap the crashed node's token: the user still has a live connection,
+        // so this is a decrement, not the →0 edge — no emission right.
+        let (user_id, left, won) =
+            run_reap_member(&scripts, &clients.pool, &keys, &channel, "n1:s1").await;
+        assert_eq!(
+            (user_id.as_str(), left, won),
+            ("u1", 1, 0),
+            "a reap while the user still holds a connection must NOT win"
+        );
+
+        // The live connection's leave takes 1→0 → it owns the emission.
+        let left =
+            run_presence_leave(&scripts, &clients.pool, &keys, &channel, "u1", "n2:s2").await;
+        assert_eq!(
+            left, 0,
+            "the last live leave must own the →0 emission right"
+        );
+
+        // A late reap of the already-left live token stays silent.
+        let (user_id, left, won) =
+            run_reap_member(&scripts, &clients.pool, &keys, &channel, "n2:s2").await;
+        assert_eq!(
+            (user_id.as_str(), left, won),
+            ("", 0, 0),
+            "a late reap must NOT win after the live leave already won"
+        );
+
+        assert_presence_fully_reclaimed(&clients, &keys, &channel).await;
+    })
+    .await
+    .expect("reap CAS shared-user test must not hang (Redis up?)");
+}
+
+/// Ghost token: the token lingers in `presmembers` but the user's refcount
+/// field is already gone (the →0 edge was taken — and emitted — by another
+/// writer). The reap still garbage-collects the stale token but returns
+/// `won == 0` — no second `member_removed` for a removal that already fired.
+#[tokio::test]
+async fn reap_cas_ghost_token_reaped_without_emission() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let scripts = Scripts::new();
+        let clients = RedisClients::connect(&test_redis_url(), 2)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let channel = format!("presence-cas-{}", Uuid::new_v4());
+
+        // Seed ONLY the token — no presusers/presinfo entries for u1.
+        let _: () = clients
+            .pool
+            .next()
+            .hset(
+                keys.presmembers(TEST_APP, &channel),
+                ("n1:s1".to_string(), "u1".to_string()),
+            )
+            .await
+            .expect("hset presmembers");
+
+        let (user_id, left, won) =
+            run_reap_member(&scripts, &clients.pool, &keys, &channel, "n1:s1").await;
+        assert_eq!(
+            (user_id.as_str(), left, won),
+            ("u1", 0, 0),
+            "a ghost token must be reaped WITHOUT a second emission right"
+        );
+
+        assert_presence_fully_reclaimed(&clients, &keys, &channel).await;
+    })
+    .await
+    .expect("reap CAS ghost-token test must not hang (Redis up?)");
 }

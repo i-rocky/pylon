@@ -87,12 +87,16 @@ pub(super) async fn is_online(
 /// The WatchOffline envelope's publisher `node_id` is the DEAD node (the stale token's
 /// prefix, or an empty sentinel for an already-gone hash) so this sweeper's OWN receive
 /// loop does NOT self-dedup it — A must still notify its local watchers of u7's offline.
+/// `compat` is the cluster-wide `PYLON_CLUSTER_ENVELOPE_COMPAT` setting (the
+/// WatchOffline control envelope keeps its shape either way; threaded for
+/// uniformity with the frame-carrying reap paths).
 pub(super) async fn reap_user(
     pool: &Pool,
     keys: &Keys,
     app: &str,
     user_id: &str,
     sharded: bool,
+    compat: bool,
     now: u64,
 ) {
     let usr = keys.usr(app, user_id);
@@ -176,6 +180,7 @@ pub(super) async fn reap_user(
         super::envelope::EnvelopeKind::WatchOffline,
         serde_json::Value::Null,
         sharded,
+        compat,
     )
     .await;
 }
@@ -185,8 +190,11 @@ pub(super) async fn reap_user(
 /// the publisher (self) for live paths, or the DEAD node (token prefix) from the
 /// sweeper so every live node — including the sweeper's own — acts on it.
 /// `sharded` routes the publish through SPUBLISH vs PUBLISH (the cluster-wide
-/// `PYLON_REDIS_SHARDED_PUBSUB` setting). Best-effort: logs + continues on any
-/// Redis error.
+/// `PYLON_REDIS_SHARDED_PUBSUB` setting). `compat` is the cluster-wide
+/// `PYLON_CLUSTER_ENVELOPE_COMPAT` setting: with compat off a `UserSend`
+/// envelope omits the legacy `event` member (frame_b64 is the sole carrier);
+/// the `Null` control kinds keep their shape either way. Best-effort: logs +
+/// continues on any Redis error.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn publish(
     pool: &Pool,
@@ -197,6 +205,7 @@ pub(super) async fn publish(
     kind: EnvelopeKind,
     frame: Value,
     sharded: bool,
+    compat: bool,
 ) {
     let env = Envelope {
         node_id: node_id.to_string(),
@@ -211,7 +220,7 @@ pub(super) async fn publish(
         event: frame,
         except: None,
     };
-    if let Ok(payload) = String::from_utf8(env.encode()) {
+    if let Ok(payload) = String::from_utf8(env.encode_with(compat)) {
         if let Err(e) = client::publish_channel(pool, channel, payload, sharded).await {
             tracing::warn!(error = %e, app, user_id, "redis user publish failed");
         }

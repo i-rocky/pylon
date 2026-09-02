@@ -7,10 +7,96 @@ pre-1.0 and versions track `Cargo.toml`.
 ## [Unreleased]
 
 ### Added
+- `PYLON_CLUSTER_ENVELOPE_COMPAT` (default `true`) — retire the Redis cluster
+  envelope's legacy `event` double-carry. The default keeps emitting both the
+  `event` escaped-JSON string and the additive `frame_b64` field, preserving
+  0.2.x↔0.3.x mixed-fleet rolling upgrades. Set `0`/`false`/`off` — only once
+  every node runs a build that ships this knob (**v0.3.0 does NOT qualify**: a
+  0.3.0 receiver cannot decode a compat-off envelope and drops it silently) —
+  and frame-carrying envelopes omit the legacy field, roughly halving
+  cluster-bus bandwidth (frame-less control envelopes unchanged; receivers on
+  knob-shipping builds decode both shapes regardless).
 - `conformance/` — an SDK-conformance harness: boots a real pylon and drives the
   official `pusher-js` and `pusher-http-node` SDKs through every protocol
   feature they can exercise (26 scenarios), with a coverage audit (`--audit`)
-  and an opt-in CI job (`conformance.yml`).
+  and a CI job (`conformance.yml`, nightly at 03:00 UTC plus manual dispatch).
+- Conformance harness: **observation-normalization audit family** — after
+  every run, all recorded observations are scanned for run-unique shapes
+  (socket-id-like dotted integer pairs, ISO-8601 timestamps, raw
+  epoch-millis, bare epoch-sized integers); a violation prints a warning
+  block and fails the run (exit 1) even when every verdict passed, keeping
+  the JSON artifact stable and diffable. `--audit` runs the same scan
+  against the last report artifact, advisorially. Shapes are conservative
+  (legitimately-fixed values like `activity_timeout_used_ms: 2000` or
+  version strings stay silent), with a documented per-scenario key allowlist
+  for reviewed exceptions (empty today).
+
+### Changed
+- Per-core worker broadcast index consolidated to the single-map layout: each
+  `local_subs` channel entry now carries its subscribers' `(slab token,
+  negotiated protocol version)` directly (`(app, channel) → {socket_id →
+  (token, version)}`), replacing the parallel `socket_id → (token, version)`
+  map. The broadcast drain's per-subscriber loop now resolves the token and
+  version from the subscriber iteration itself — the standalone per-subscriber
+  probe lookup is gone, roughly halving per-subscriber fan-out cost at 1k
+  subscribers and ~2.7x-ing it at 100k on the `fanout_sink` bench (33–64%
+  faster end-to-end publish+drain). Delivery, close deindexing, per-version
+  fan-out, and eviction semantics are unchanged.
+- `RedisAdapter::send_to_user` now encodes the user event ONCE per send and
+  feeds the same frame to both halves (the node-local delivery runs as a `Raw`
+  frame; the `usermsg` publish reuses the identical string) — previously the
+  typed event was encoded once inside the local half and again for the Redis
+  publish. Wire bytes are unchanged (the same `wire::encode` at
+  `ACTIVE_VERSIONS[0]`; the encode-once shape already proven for broadcasts).
+- Presence `subscription_succeeded` rosters are now encoded ONCE per membership
+  generation, not once per join: `ChannelState` caches the encoded roster frame
+  (the same `wire::encode` seam every frame uses), invalidated only when the
+  distinct-user set changes (a new user's first connection or a user's last
+  disconnection), and every join of that generation shares the cached frame
+  (`Arc`) instead of deep-cloning the roster into an owned payload. Wire bytes
+  are byte-identical (pinned by the roster goldens and the end-to-end literal
+  pins); the Redis adapter's cluster-roster overwrite still re-encodes fresh
+  cluster truth per join (it replaces the frame in the join outcome, not the
+  node-local cache).
+
+### Fixed
+- Conformance harness hardening batch: the pusher-js runner's `fire()`
+  helper now bounds its `--fire-stdin` child (8s timeout, SIGTERM kill
+  signal) — the last unbounded child wait in the runner; the run's scratch
+  env dir is removed on early-error paths too (RAII guard; previously it
+  leaked when the auth/webhook/pylon spawns or the health check failed);
+  C-PING's connect wait is capped at 6s so the worst case (6s connect + 8s
+  hold) fits the 15s catalog budget; C-EVENT-LIMITS' payload leg counts its
+  expected 4301 rejection from a per-leg baseline instead of the name leg's
+  cumulative count (the legs are independent observations);
+  `--audit`'s listing↔catalog cross-check is bidirectional (a runner
+  listing an id the catalog does not bind is now flagged, not just the
+  missing-binding direction); audit-fixture temp dirs are unique
+  (pid + counter) so concurrent audits on one host cannot collide.
+- **Duplicate `member_removed` webhooks/events in cluster mode** (audit G11
+  class, follow-up F-6): the Redis sweeper's stale-member reap ran
+  HGET→HDEL→HINCRBY as SEPARATE commands and gated its emission on `<= 0`,
+  so a stale-heartbeat member racing the socket's orderly live leave (whose
+  atomic `PRESENCE_LEAVE_LUA` emits on `== 0`) could double-decrement the
+  user's refcount and fire a second `member_removed` for one user removal.
+  The reap is now one `REAP_MEMBER_LUA` compare-and-swap — the member analog
+  of the `channel_vacated` vacate CAS: the emission right belongs to whichever
+  caller's atomic op takes the refcount to exactly 0. The script resolves the
+  stale token to its user, decrements (or, on the 1→0 edge, removes the user
+  from `presusers`/`presinfo`) and returns `won`; the sweeper enqueues the
+  compensating cross-node `member_removed` + webhook only on `won`. Redis
+  serializes the two scripts, so exactly one of {live leave, sweeper reap} can
+  ever observe the 1→0 edge — the live path needed no change (after a reap
+  win HDELs the refcount field, a racing live leave returns −1, not 0, and
+  its `== 0` gate stays silent).
+
+### Security
+- Webhook SSRF classifier: NAT64 (`64:ff9b::/96`) and class-E reserved
+  (`240.0.0.0/4`) targets are now classified as private. A NAT64 gateway
+  translates the embedded IPv4 into interior address space, so both public and
+  private embedded v4s are refused; class E has no legitimate webhook
+  receivers. `PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS=1` still relaxes the whole
+  address classification.
 
 ## [0.3.0] - 2026-09-01
 

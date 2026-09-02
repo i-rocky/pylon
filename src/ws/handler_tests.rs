@@ -357,13 +357,23 @@ async fn presence_subscribe_returns_roster_and_broadcasts_member_added() {
     })
     .await;
     match rx.try_recv().map(|b| *b) {
-        Ok(ServerEvent::SubscriptionSucceeded {
-            presence: Some(p), ..
-        }) => {
-            assert_eq!(p.count, 1);
-            assert_eq!(p.ids, vec!["u1".to_string()]);
+        // F-5: the presence roster arrives as the pre-encoded cached frame
+        // (`Raw` — one encode per membership generation). Assert on its wire
+        // content: the roster JSON is the double-encoded `data` string.
+        Ok(ev @ ServerEvent::Raw(_)) => {
+            let j = raw_json(&ev);
+            assert_eq!(j["event"], "pusher_internal:subscription_succeeded");
+            assert_eq!(j["channel"], "presence-x");
+            let data: serde_json::Value =
+                serde_json::from_str(j["data"].as_str().unwrap()).unwrap();
+            assert_eq!(data["presence"]["count"], 1);
+            assert_eq!(data["presence"]["ids"], serde_json::json!(["u1"]));
+            assert_eq!(
+                data["presence"]["hash"]["u1"],
+                serde_json::json!({"name":"Ann"})
+            );
         }
-        other => panic!("expected presence SubscriptionSucceeded, got {other:?}"),
+        other => panic!("expected presence subscription_succeeded frame, got {other:?}"),
     }
     // Self is excluded from its own member_added, so no further self-delivered event.
     assert!(rx.try_recv().map(|b| *b).is_err());
@@ -726,11 +736,13 @@ async fn presence_cache_subscribe_replays_after_join() {
         channel_data: Some(channel_data),
     })
     .await;
-    // First the roster success frame, then the replayed cached event.
-    assert!(matches!(
-        rx.try_recv().map(|b| *b),
-        Ok(ServerEvent::SubscriptionSucceeded { .. })
-    ));
+    // First the roster success frame (F-5: the pre-encoded cached `Raw` frame),
+    // then the replayed cached event.
+    let roster_ev = rx.try_recv().map(|b| *b).expect("roster success frame");
+    assert!(
+        raw_event_is(&roster_ev, "pusher_internal:subscription_succeeded"),
+        "expected the cached subscription_succeeded frame, got {roster_ev:?}"
+    );
     match rx.try_recv().map(|b| *b) {
         Ok(ServerEvent::ChannelEvent { channel, event, .. }) => {
             assert_eq!(channel, "presence-cache-room");
@@ -1713,8 +1725,11 @@ async fn presence_subscribe_with_valid_sized_data_succeeds() {
     let cmd = signed_presence_sub(&c, &cd);
     c.dispatch(cmd).await;
     match rx.try_recv().map(|b| *b) {
-        Ok(ServerEvent::SubscriptionSucceeded { channel, .. }) => {
-            assert_eq!(channel, "presence-x");
+        // F-5: the presence success arrives as the pre-encoded cached frame.
+        Ok(ev @ ServerEvent::Raw(_)) => {
+            let j = raw_json(&ev);
+            assert_eq!(j["event"], "pusher_internal:subscription_succeeded");
+            assert_eq!(j["channel"], "presence-x");
         }
         other => panic!("expected SubscriptionSucceeded for valid presence data, got {other:?}"),
     }

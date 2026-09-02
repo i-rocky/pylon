@@ -49,6 +49,8 @@ pub(crate) struct SweepReport {
 /// `sharded` is the cluster-wide `PYLON_REDIS_SHARDED_PUBSUB` setting, threading
 /// into the reap paths' WatchOffline/member_removed publishes so they ride the
 /// same pub/sub namespace (SPUBLISH vs PUBLISH) the live nodes subscribe on.
+/// `envelope_compat` is the cluster-wide `PYLON_CLUSTER_ENVELOPE_COMPAT` setting
+/// threading into the same reap publishes' envelope shape.
 ///
 /// Lease protocol: try `SET sweeplock node_id NX PX lease_ms`. If acquired, sweep.
 /// If not, `GET sweeplock`: if we already own it, renew (`SET … PX lease_ms`, no NX)
@@ -61,6 +63,7 @@ pub(crate) async fn sweep_once(
     node_id: &str,
     lease_ms: u64,
     sharded: bool,
+    envelope_compat: bool,
     webhooks: &WebhookHandle,
     now: u64,
 ) -> SweepReport {
@@ -119,13 +122,25 @@ pub(crate) async fn sweep_once(
                 .collect();
 
             // Presence side-table reap: for a presence channel, each stale token's user
-            // loses a connection; the →0 user edge emits member_removed (cross-node +
-            // webhook). Per-token via the user refcount, so multi-connection users and
-            // users still live on another node are handled correctly.
+            // loses a connection via the atomic REAP_MEMBER_LUA CAS; the →0 user edge
+            // (won == 1) is the ONLY branch that emits member_removed (cross-node +
+            // webhook) — the emission right belongs to whichever caller's atomic op
+            // took the refcount to 0, so a racing live PRESENCE_LEAVE and this reap
+            // can never BOTH fire it. Per-token via the user refcount, so
+            // multi-connection users and users still live on another node are
+            // handled correctly.
             if super::presence::is_presence(&channel) {
                 for token in &stale {
                     super::presence::reap_member(
-                        pool, keys, &app, &channel, token, sharded, webhooks,
+                        scripts,
+                        pool,
+                        keys,
+                        &app,
+                        &channel,
+                        token,
+                        sharded,
+                        envelope_compat,
+                        webhooks,
                     )
                     .await;
                 }
@@ -214,7 +229,7 @@ pub(crate) async fn sweep_once(
             }
         };
         for user_id in users {
-            super::user::reap_user(pool, keys, app, &user_id, sharded, now).await;
+            super::user::reap_user(pool, keys, app, &user_id, sharded, envelope_compat, now).await;
         }
     }
 
@@ -351,7 +366,8 @@ async fn acquire_lease(pool: &Pool, keys: &Keys, node_id: &str, lease_ms: u64) -
 /// the current wall-clock millis. The lease (`lease_ms`) is sized to outlive a tick so
 /// the holder keeps sweeping, but auto-frees (PX expiry) if the holder dies — letting
 /// another node take over within a couple of ticks. `sharded` threads the cluster's
-/// pub/sub mode into the reap publishes (see [`sweep_once`]).
+/// pub/sub mode into the reap publishes (see [`sweep_once`]); `envelope_compat`
+/// threads the cluster's envelope shape setting into the same publishes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn sweeper_loop(
     pool: Pool,
@@ -360,6 +376,7 @@ pub(crate) async fn sweeper_loop(
     lease_ms: u64,
     interval_secs: u64,
     sharded: bool,
+    envelope_compat: bool,
     webhooks: WebhookHandle,
 ) {
     // Compiled once (pure local SHA-1 hashing, no Redis round-trip); reused by
@@ -375,6 +392,7 @@ pub(crate) async fn sweeper_loop(
             &node_id,
             lease_ms,
             sharded,
+            envelope_compat,
             &webhooks,
             super::now_ms(),
         )

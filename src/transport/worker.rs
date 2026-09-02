@@ -108,9 +108,9 @@ pub fn percore_poll_zero_timeouts() -> u64 {
 /// Test-hooks instrumentation (G5): a live gauge of the worker-local delivery
 /// indexes across this process — the number of `(app, channel) → socket_id`
 /// membership slots held in every worker's `local_subs` (the sum of every
-/// channel set's length). Maintained exactly at the two `local_subs` mutation
+/// channel map's length). Maintained exactly at the two `local_subs` mutation
 /// sites (`reconcile_membership`'s insert/remove and `deindex_connection`'s
-/// remove, both keyed off the boolean return of the set operation), so a test
+/// remove, both keyed off the presence return of the map operation), so a test
 /// can assert the index fully EMPTIES when a connection closes — including the
 /// same-batch [subscribe, Close] case, where the close path runs before any
 /// reconcile ever saw the subscription. Signed so a bookkeeping bug surfaces as
@@ -126,6 +126,20 @@ pub static LOCAL_SUBS_SLOTS: AtomicI64 = AtomicI64::new(0);
 pub fn percore_local_subs_len() -> i64 {
     LOCAL_SUBS_SLOTS.load(Ordering::Relaxed)
 }
+
+/// The worker-local subscriber index (the Phase-6 F12 SINGLE-layout shape):
+/// which of THIS worker's connections are in each `(app, channel)`, each entry
+/// carrying the subscriber's `(slab token, negotiated protocol version)` (U3).
+/// The token+version value map is ABSORBED into the per-channel subscriber
+/// map — there is NO parallel `socket_id → (token, version)` index — so the
+/// broadcast drain's per-subscriber loop resolves token AND version from the
+/// iteration itself, with no probe lookup.
+///
+/// `#[doc(hidden)]`: exposed ONLY so `benches/fanout_sink.rs` can build the
+/// index in the exact production shape (same hidden-seam pattern as
+/// [`drain_broadcast_inbox`] / [`ConnIndex`]).
+#[doc(hidden)]
+pub type LocalSubs = HashMap<(Arc<str>, Arc<str>), HashMap<SocketId, (usize, u8)>>;
 
 /// Reserved token for this worker's single [`mio::Waker`]. One below [`LISTENER`];
 /// slab keys grow from 0 so neither reserved value can collide with a connection
@@ -537,18 +551,17 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     // `drophead_dropped_slot` (same pattern as the CoDel accumulator above).
     let mut drophead_dropped_total: u64 = 0;
 
-    // Worker-local subscription index: which of THIS worker's connections are in
-    // each `(app, channel)`. Populated by reconciling `ctx.subscribed` after each
+    // Worker-local subscription index (the Phase-6 F12 SINGLE-layout shape):
+    // which of THIS worker's connections are in each `(app, channel)`, each
+    // entry carrying the subscriber's `(slab token, negotiated protocol
+    // version)` (U3) — the token+version value map is ABSORBED into the
+    // subscriber map instead of living in a parallel `socket_id → (token,
+    // version)` index. Populated by reconciling `ctx.subscribed` after each
     // dispatch; consulted when a `BroadcastMsg` arrives to fan the frame out to
-    // exactly this worker's local subscribers.
-    let mut local_subs: HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>> = HashMap::new();
-    // Reverse lookup: a subscriber's `socket_id` → (slab token, negotiated
-    // protocol version), so a broadcast delivery can find the connection in O(1)
-    // without scanning the slab — and, U3, pick the frame for that subscriber's
-    // version out of the broadcast's per-version `frames` with NO second
-    // lookup (the version rides the same probe; stamped at reconcile from the
-    // session's negotiated codec).
-    let mut sid_to_token: HashMap<SocketId, (usize, u8)> = HashMap::new();
+    // exactly this worker's local subscribers — the per-subscriber loop
+    // resolves token AND version from the iteration itself, with no second
+    // lookup.
+    let mut local_subs: LocalSubs = HashMap::new();
 
     // SP11 §4: per-worker liveness timer wheel. Idle-pings a silent connection
     // after `activity_timeout` and closes it `4201` if a pong doesn't follow
@@ -684,7 +697,6 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         &mut conns,
                         k,
                         &mut local_subs,
-                        &mut sid_to_token,
                         &mut wheel,
                         &mut inflight_bytes,
                         &conn_counts,
@@ -860,7 +872,6 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             &mut conns,
                             key,
                             &mut local_subs,
-                            &mut sid_to_token,
                             &mut wheel,
                             &mut inflight_bytes,
                             &conn_counts,
@@ -905,7 +916,6 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                     &mut conns,
                                     key,
                                     &mut local_subs,
-                                    &mut sid_to_token,
                                     &mut wheel,
                                     &mut inflight_bytes,
                                     &conn_counts,
@@ -941,12 +951,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                 // index so later broadcasts route correctly.
                                 if let Some(entry) = conns.get_mut(key) {
                                     if let Some(session) = entry.session.as_mut() {
-                                        reconcile_membership(
-                                            session,
-                                            key,
-                                            &mut local_subs,
-                                            &mut sid_to_token,
-                                        );
+                                        reconcile_membership(session, key, &mut local_subs);
                                     }
                                 }
                             }
@@ -979,7 +984,6 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                     &mut conns,
                                     key,
                                     &mut local_subs,
-                                    &mut sid_to_token,
                                     &mut wheel,
                                     &mut inflight_bytes,
                                     &conn_counts,
@@ -1003,12 +1007,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                 // keeping the paths symmetric.
                                 if let Some(entry) = conns.get_mut(key) {
                                     if let Some(session) = entry.session.as_mut() {
-                                        reconcile_membership(
-                                            session,
-                                            key,
-                                            &mut local_subs,
-                                            &mut sid_to_token,
-                                        );
+                                        reconcile_membership(session, key, &mut local_subs);
                                     }
                                 }
                             }
@@ -1030,7 +1029,6 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 &mut conns,
                 rx,
                 &mut local_subs,
-                &mut sid_to_token,
                 &mut wheel,
                 effective_budget,
                 &mut inflight_bytes,
@@ -1079,7 +1077,6 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 &dirty_rx,
                 &mut dirty_set,
                 &mut local_subs,
-                &mut sid_to_token,
                 &mut wheel,
                 &mut inflight_bytes,
                 &mut codel_dropped_total,
@@ -1106,7 +1103,6 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                     &resolved_rx,
                     env,
                     &mut local_subs,
-                    &mut sid_to_token,
                     &mut wheel,
                     &mut inflight_bytes,
                     &mut codel_dropped_total,
@@ -1154,7 +1150,6 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                         &mut conns,
                                         key,
                                         &mut local_subs,
-                                        &mut sid_to_token,
                                         &mut wheel,
                                         &mut inflight_bytes,
                                         &conn_counts,
@@ -1194,7 +1189,6 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             &mut conns,
                             key,
                             &mut local_subs,
-                            &mut sid_to_token,
                             &mut wheel,
                             &mut inflight_bytes,
                             &conn_counts,
@@ -1223,7 +1217,6 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             &mut conns,
                             key,
                             &mut local_subs,
-                            &mut sid_to_token,
                             &mut wheel,
                             &mut inflight_bytes,
                             &conn_counts,
@@ -1254,7 +1247,6 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                 &mut conns,
                                 key,
                                 &mut local_subs,
-                                &mut sid_to_token,
                                 &mut wheel,
                                 &mut inflight_bytes,
                                 &conn_counts,
@@ -2473,8 +2465,7 @@ fn drain_dirty_sessions(
     conns: &mut slab::Slab<Entry>,
     dirty_rx: &std::sync::mpsc::Receiver<usize>,
     dirty_set: &mut HashSet<usize>,
-    local_subs: &mut HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
-    sid_to_token: &mut HashMap<SocketId, (usize, u8)>,
+    local_subs: &mut LocalSubs,
     wheel: &mut TimerWheel,
     inflight_bytes: &mut u64,
     codel_total: &mut u64,
@@ -2523,7 +2514,6 @@ fn drain_dirty_sessions(
                 conns,
                 key,
                 local_subs,
-                sid_to_token,
                 wheel,
                 inflight_bytes,
                 conn_counts,
@@ -2542,7 +2532,7 @@ fn drain_dirty_sessions(
         if result.subs_changed {
             if let Some(entry) = conns.get_mut(key) {
                 if let Some(session) = entry.session.as_mut() {
-                    reconcile_membership(session, key, local_subs, sid_to_token);
+                    reconcile_membership(session, key, local_subs);
                 }
             }
         }
@@ -2574,8 +2564,7 @@ fn drain_resolved(
     conns: &mut slab::Slab<Entry>,
     resolved_rx: &std::sync::mpsc::Receiver<ResolvedApp>,
     env: &Arc<DispatchEnv>,
-    local_subs: &mut HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
-    sid_to_token: &mut HashMap<SocketId, (usize, u8)>,
+    local_subs: &mut LocalSubs,
     wheel: &mut TimerWheel,
     inflight_bytes: &mut u64,
     codel_total: &mut u64,
@@ -2662,7 +2651,6 @@ fn drain_resolved(
                         conns,
                         token,
                         local_subs,
-                        sid_to_token,
                         wheel,
                         inflight_bytes,
                         conn_counts,
@@ -2707,7 +2695,6 @@ fn drain_resolved(
                     conns,
                     token,
                     local_subs,
-                    sid_to_token,
                     wheel,
                     inflight_bytes,
                     conn_counts,
@@ -2962,8 +2949,7 @@ fn remove(
     poll: &Poll,
     conns: &mut slab::Slab<Entry>,
     key: usize,
-    local_subs: &mut HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
-    sid_to_token: &mut HashMap<SocketId, (usize, u8)>,
+    local_subs: &mut LocalSubs,
     wheel: &mut TimerWheel,
     inflight_bytes: &mut u64,
     conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
@@ -2986,7 +2972,7 @@ fn remove(
             .wrapping_sub(entry.conn.out_bytes() as u64);
         entry.conn.send_close_notify();
         if let Some(mut session) = entry.session.take() {
-            deindex_connection(&session, local_subs, sid_to_token);
+            deindex_connection(&session, local_subs);
             futures_executor::block_on(session.ctx.on_close());
             let app_id = &session.ctx.app.id;
             // Drop this connection from the per-app registry (remove_if-empty inside).
@@ -3018,8 +3004,9 @@ fn remove(
     }
 }
 
-/// Drop a closing connection's `socket_id` from every `(app, channel)` it was
-/// indexed under, and from the reverse `socket_id → token` map.
+/// Drop a closing connection's `socket_id` — and its `(token, version)` entry
+/// value, absorbed into the subscriber map — from every `(app, channel)` it was
+/// indexed under.
 ///
 /// G5: walks the UNION of the session's last-reconciled baseline (`subs`) and
 /// the live protocol set (`ctx.subscribed`). The baseline alone covers every
@@ -3038,11 +3025,7 @@ fn remove(
 /// and the removal itself is idempotent anyway — removing an absent
 /// `(key, socket_id)` is a no-op, so a second pass over an overlapping channel
 /// cannot double-subtract the test gauge or disturb another subscriber.
-fn deindex_connection(
-    session: &Session,
-    local_subs: &mut HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
-    sid_to_token: &mut HashMap<SocketId, (usize, u8)>,
-) {
+fn deindex_connection(session: &Session, local_subs: &mut LocalSubs) {
     let app: Arc<str> = Arc::from(session.ctx.app.id.as_str());
     let sid = &session.ctx.socket_id;
     // `difference` yields the baseline-only channels, so the chain enumerates
@@ -3054,37 +3037,37 @@ fn deindex_connection(
         .chain(session.subs.difference(&session.ctx.subscribed));
     for channel in union {
         let k = (Arc::clone(&app), Arc::<str>::from(channel.as_str()));
-        if let Some(set) = local_subs.get_mut(&k) {
-            if set.remove(sid) {
+        if let Some(subs) = local_subs.get_mut(&k) {
+            if subs.remove(sid).is_some() {
                 #[cfg(any(test, feature = "test-hooks"))]
                 LOCAL_SUBS_SLOTS.fetch_sub(1, Ordering::Relaxed);
             }
-            if set.is_empty() {
+            if subs.is_empty() {
                 local_subs.remove(&k);
             }
         }
     }
-    sid_to_token.remove(sid);
 }
 
 /// Reconcile a connection's worker-local subscription index against the protocol
 /// state after a dispatch. Diffs the session's previously-recorded channel set
 /// (`session.subs`) against `ctx.subscribed`: channels newly joined are inserted
-/// into `local_subs` (and the `socket_id → (token, version)` reverse map is
-/// (re)stamped), channels left are removed. Cheap when nothing changed (two set
-/// diffs over the usually-tiny per-connection channel set). `token` is this
-/// connection's slab key. No-op for a connection in no channels with no change.
-fn reconcile_membership(
-    session: &mut Session,
-    token: usize,
-    local_subs: &mut HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
-    sid_to_token: &mut HashMap<SocketId, (usize, u8)>,
-) {
+/// into `local_subs` — each entry stamped with the connection's `(slab token,
+/// negotiated version)` (U3), so the broadcast drain resolves both from the
+/// subscriber iteration with no second lookup — channels left are removed.
+/// Cheap when nothing changed (two set diffs over the usually-tiny
+/// per-connection channel set). `token` is this connection's slab key. No-op for
+/// a connection in no channels with no change.
+fn reconcile_membership(session: &mut Session, token: usize, local_subs: &mut LocalSubs) {
     if session.subs == session.ctx.subscribed {
         return;
     }
     let app: Arc<str> = Arc::from(session.ctx.app.id.as_str());
     let sid = &session.ctx.socket_id;
+    // The entry value every channel of this subscriber carries: its slab token
+    // (stable for the connection's life) and its negotiated protocol version
+    // (fixed at establish) — read once, stamped into every added channel.
+    let entry = (token, session.codec.version());
 
     // Added channels: present in ctx.subscribed, absent from the recorded set.
     // The `difference` iterator borrows `session.subs`, so the added names are
@@ -3102,7 +3085,8 @@ fn reconcile_membership(
         let inserted = local_subs
             .entry((Arc::clone(&app), Arc::<str>::from(channel.as_str())))
             .or_default()
-            .insert(*sid);
+            .insert(*sid, entry)
+            .is_none();
         if inserted {
             #[cfg(any(test, feature = "test-hooks"))]
             LOCAL_SUBS_SLOTS.fetch_add(1, Ordering::Relaxed);
@@ -3120,23 +3104,17 @@ fn reconcile_membership(
             return true;
         }
         let k = (Arc::clone(&app), Arc::<str>::from(channel.as_str()));
-        if let Some(set) = local_subs.get_mut(&k) {
-            if set.remove(sid) {
+        if let Some(subs) = local_subs.get_mut(&k) {
+            if subs.remove(sid).is_some() {
                 #[cfg(any(test, feature = "test-hooks"))]
                 LOCAL_SUBS_SLOTS.fetch_sub(1, Ordering::Relaxed);
             }
-            if set.is_empty() {
+            if subs.is_empty() {
                 local_subs.remove(&k);
             }
         }
         false
     });
-    // Keep the reverse map current (stamp on first subscribe; harmless
-    // re-stamp). The value carries the connection's negotiated protocol
-    // version (U3), read from the session's codec at the same stamp, so the
-    // broadcast drain can select the subscriber's frame out of the
-    // per-version `frames` with no second lookup.
-    sid_to_token.insert(*sid, (token, session.codec.version()));
 }
 
 /// SP10 graduated-shed band, derived from this worker's `inflight_bytes` as a
@@ -3243,8 +3221,7 @@ impl ConnIndex for slab::Slab<Entry> {
 #[allow(clippy::too_many_arguments)]
 pub fn drain_broadcast_inbox<C: ConnIndex>(
     rx: &std::sync::mpsc::Receiver<crate::transport::fanout::BroadcastMsg>,
-    local_subs: &HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
-    sid_to_token: &HashMap<SocketId, (usize, u8)>,
+    local_subs: &LocalSubs,
     conns: &mut C,
     effective_budget: u64,
     inflight_bytes: &mut u64,
@@ -3276,14 +3253,16 @@ pub fn drain_broadcast_inbox<C: ConnIndex>(
         // looping `wire::ACTIVE_VERSIONS` (a 1-element slice today), so
         // `fast` is `Some(&frames[0].1)` and the per-subscriber loop below
         // costs exactly what the 6.3 single-frame shape cost: one nullable-
-        // pointer `Option` check (perfectly predicted, no scan, no allocation)
-        // — the subscriber's version byte rides the reverse-map probe that
-        // already happens. Only when a second protocol version goes active
-        // does the multi-version arm below start scanning (a first-match walk
-        // of the ≤2-element vec, falling back to the first frame so an
-        // unknown version byte never DROPS a broadcast).
+        // pointer `Option` check (perfectly predicted, no scan, no
+        // allocation) — the subscriber's version byte rides the SAME
+        // iteration that yields its slab token (the entry's absorbed
+        // `(token, version)` value), so no lookup at all. Only when a second
+        // protocol version goes active does the multi-version arm below
+        // start scanning (a first-match walk of the ≤2-element vec, falling
+        // back to the first frame so an unknown version byte never DROPS a
+        // broadcast).
         let fast: Option<&Bytes> = (frames.len() == 1).then(|| &frames[0].1);
-        for sid in subs.iter() {
+        for (sid, &(token, version)) in subs.iter() {
             // Reclassify PER SUBSCRIBER: the band tightens as `inflight_bytes`
             // grows within this drain, so once the worker crosses 100% mid-fan-out
             // it stops enqueueing for the remaining subscribers of this very
@@ -3300,12 +3279,11 @@ pub fn drain_broadcast_inbox<C: ConnIndex>(
             if except.as_ref() == Some(sid) {
                 continue; // sender exclusion
             }
-            // One probe yields BOTH the slab token and the subscriber's
-            // negotiated version (the map value was widened for U3 — no
-            // second lookup was added).
-            let Some(&(token, version)) = sid_to_token.get(sid) else {
-                continue; // stale index entry; connection gone
-            };
+            // F12 single-layout: the iteration itself yields BOTH the slab
+            // token and the subscriber's negotiated version (the entry value
+            // absorbed from the old standalone `socket_id → (token, version)`
+            // map) — the per-subscriber probe lookup is GONE, which is the
+            // point of the layout: one hash walk per subscriber total.
             if to_close.contains(&token) {
                 continue;
             }
@@ -3371,8 +3349,7 @@ fn drain_broadcasts(
     poll: &Poll,
     conns: &mut slab::Slab<Entry>,
     rx: &std::sync::mpsc::Receiver<crate::transport::fanout::BroadcastMsg>,
-    local_subs: &mut HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
-    sid_to_token: &mut HashMap<SocketId, (usize, u8)>,
+    local_subs: &mut LocalSubs,
     wheel: &mut TimerWheel,
     effective_budget: u64,
     inflight_bytes: &mut u64,
@@ -3395,7 +3372,6 @@ fn drain_broadcasts(
     drain_broadcast_inbox(
         rx,
         local_subs,
-        sid_to_token,
         conns,
         effective_budget,
         inflight_bytes,
@@ -3442,7 +3418,6 @@ fn drain_broadcasts(
             conns,
             token,
             local_subs,
-            sid_to_token,
             wheel,
             inflight_bytes,
             conn_counts,
@@ -3944,20 +3919,18 @@ mod tests {
         let token7 = conns.slab.insert(conn7);
         let token8 = conns.slab.insert(conn8);
 
-        // The worker's reverse map: socket_id → (slab token, negotiated
-        // version). One subscriber negotiated v7, the other the test v8.
+        // The worker's single-layout subscriber index: `(app, channel) →
+        // socket_id → (slab token, negotiated version)`. One subscriber
+        // negotiated v7, the other the test v8 — the entry values carry the
+        // tokens the fixture's slab assigned.
         let sid7 = SocketId::generate();
         let sid8 = SocketId::generate();
-        let mut sid_to_token: HashMap<SocketId, (usize, u8)> = HashMap::new();
-        sid_to_token.insert(sid7, (token7, 7));
-        sid_to_token.insert(sid8, (token8, 8));
-
         let app: Arc<str> = Arc::from("app");
         let channel: Arc<str> = Arc::from("presence-room-42");
-        let mut local_subs: HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>> = HashMap::new();
-        let mut subs = HashSet::new();
-        subs.insert(sid7);
-        subs.insert(sid8);
+        let mut local_subs: LocalSubs = HashMap::new();
+        let mut subs: HashMap<SocketId, (usize, u8)> = HashMap::new();
+        subs.insert(sid7, (token7, 7));
+        subs.insert(sid8, (token8, 8));
         local_subs.insert((app.clone(), channel.clone()), subs);
 
         let event = ServerEvent::ChannelEvent {
@@ -3990,7 +3963,6 @@ mod tests {
         drain_broadcast_inbox(
             &rx,
             &local_subs,
-            &sid_to_token,
             &mut conns,
             64 << 20, // Normal band: every subscriber delivered
             &mut inflight,

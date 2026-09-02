@@ -281,6 +281,14 @@ pub struct RedisConfig {
     pub sweep_interval_secs: u64,
     pub webhook_vacated_grace_ms: u64,
     pub sharded_pubsub: bool,
+    /// F-1 (`PYLON_CLUSTER_ENVELOPE_COMPAT`, default `true`): emit the compat
+    /// double-carry envelope shape (`event` + `frame_b64`). When `false` the
+    /// emitters omit the legacy `event` member for frame-carrying envelopes —
+    /// legal only on a fleet whose EVERY node ships this knob (v0.3.0 alone
+    /// does NOT qualify: a 0.3.0 receiver requires `event` and drops
+    /// compat-off envelopes silently; see
+    /// [`Envelope::encode_with`](envelope::Envelope::encode_with)).
+    pub envelope_compat: bool,
 }
 
 impl RedisConfig {
@@ -292,6 +300,7 @@ impl RedisConfig {
             sweep_interval_secs: cfg.redis_sweep_interval_secs,
             webhook_vacated_grace_ms: cfg.webhook_vacated_grace_ms,
             sharded_pubsub: cfg.redis_sharded_pubsub,
+            envelope_compat: cfg.cluster_envelope_compat,
         }
     }
 
@@ -486,6 +495,7 @@ impl RedisAdapter {
         let keys = self.keys.clone();
         let node_id = self.node_id.clone();
         let sharded = self.cfg.sharded_pubsub;
+        let envelope_compat = self.cfg.envelope_compat;
         let handle = tokio::spawn(async move {
             sweeper::sweeper_loop(
                 pool,
@@ -494,6 +504,7 @@ impl RedisAdapter {
                 lease_ms,
                 interval_secs,
                 sharded,
+                envelope_compat,
                 webhooks,
             )
             .await
@@ -521,6 +532,7 @@ impl RedisAdapter {
             &self.node_id,
             lease_ms,
             self.cfg.sharded_pubsub,
+            self.cfg.envelope_compat,
             webhooks,
             now_ms,
         )
@@ -869,6 +881,7 @@ impl RedisAdapter {
                         envelope::EnvelopeKind::WatchOnline,
                         serde_json::Value::Null,
                         self.cfg.sharded_pubsub,
+                        self.cfg.envelope_compat,
                     )
                     .await;
                 }
@@ -931,6 +944,7 @@ impl RedisAdapter {
                         envelope::EnvelopeKind::WatchOffline,
                         serde_json::Value::Null,
                         self.cfg.sharded_pubsub,
+                        self.cfg.envelope_compat,
                     )
                     .await;
                 }
@@ -1090,9 +1104,12 @@ impl RedisAdapter {
             // `event` JSON string, so mixed old/new nodes relay either shape.
             frame_b64: Some(envelope::Envelope::encode_frame_b64(&frame)),
         };
-        // Publish as a UTF-8 string (the envelope JSON is valid UTF-8); the receive
-        // loop reads it back with `Value::into_string()` — a proven round-trip.
-        let payload = match String::from_utf8(env.encode()) {
+        // F-1: with the compat knob off (a fleet whose every node ships the
+        // knob) the envelope drops the legacy `event` member for this frame
+        // kind; receivers are unchanged (they prefer `frame_b64` either way). Publish as a UTF-8
+        // string (the envelope JSON is valid UTF-8); the receive loop reads it
+        // back with `Value::into_string()` — a proven round-trip.
+        let payload = match String::from_utf8(env.encode_with(self.cfg.envelope_compat)) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, app, channel, "envelope was not valid UTF-8");
@@ -1171,7 +1188,22 @@ impl Adapter for RedisAdapter {
             {
                 Ok((first_for_user, roster)) => {
                     join.first_for_user = first_for_user;
-                    join.roster = roster;
+                    // F-5: cluster truth REPLACES the node-local cached frame —
+                    // the cluster-wide roster is fresh data on every join, so it
+                    // encodes here through the same `wire::encode` seam
+                    // (byte-identical shape to the node-local path's frame). The
+                    // node-local cache itself is untouched: it tracks only
+                    // node-local membership.
+                    join.roster_frame = Arc::from(
+                        crate::protocol::wire::encode(
+                            crate::protocol::wire::ACTIVE_VERSIONS[0],
+                            &ServerEvent::SubscriptionSucceeded {
+                                channel: channel.to_string(),
+                                presence: Some(roster),
+                            },
+                        )
+                        .as_str(),
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, app, channel, "redis presence join failed; keeping node-local roster");
@@ -1470,15 +1502,33 @@ impl Adapter for RedisAdapter {
     }
 
     async fn send_to_user(&self, app: &str, user_id: &str, event: ServerEvent) {
-        // Deliver to this node's local connections of the user, then fan the
-        // pre-encoded frame out to every other node holding a connection of the
-        // user. The published frame is shared cluster-wide, so it encodes at
-        // `ACTIVE_VERSIONS[0]` (the sink's per-version fan-out is a local
-        // delivery concern; the user-message relay stays single-version until
-        // a v8 cluster envelope exists).
-        self.local.send_to_user(app, user_id, event.clone()).await;
-        let frame =
-            crate::protocol::wire::encode(crate::protocol::wire::ACTIVE_VERSIONS[0], &event);
+        // Encode-once (the same shape `ClusterAdapter::broadcast` and the REST
+        // `broadcast` above proved): encode the frame ONCE (reusing the payload
+        // verbatim when the caller already encoded it as `Raw`) and feed the
+        // SAME bytes to BOTH halves — the local delivery runs as a `Raw` frame
+        // (its F10 flatten would have encoded the identical bytes at
+        // `ACTIVE_VERSIONS[0]` anyway) and the usermsg publish relays the
+        // identical string. Previously the typed event was encoded once inside
+        // the local half and AGAIN here for the publish.
+        //
+        // One frame is shared cluster-wide, so it encodes at
+        // `ACTIVE_VERSIONS[0]` (the user-message relay stays single-version
+        // until a v8 cluster envelope exists).
+        let frame: Arc<str> = match &event {
+            ServerEvent::Raw(f) => f.clone(),
+            other => Arc::from(
+                crate::protocol::wire::encode(crate::protocol::wire::ACTIVE_VERSIONS[0], other)
+                    .as_str(),
+            ),
+        };
+
+        // 1. Deliver to this node's local connections of the user — the shared frame.
+        self.local
+            .send_to_user(app, user_id, ServerEvent::Raw(frame.clone()))
+            .await;
+
+        // 2. Fan the pre-encoded frame out to every other node holding a
+        //    connection of the user.
         user::publish(
             &self.clients.pool,
             &self.keys.usermsg(app, user_id),
@@ -1486,8 +1536,9 @@ impl Adapter for RedisAdapter {
             app,
             user_id,
             envelope::EnvelopeKind::UserSend,
-            serde_json::Value::String(frame),
+            serde_json::Value::String(frame.to_string()),
             self.cfg.sharded_pubsub,
+            self.cfg.envelope_compat,
         )
         .await;
     }
@@ -1505,6 +1556,7 @@ impl Adapter for RedisAdapter {
             envelope::EnvelopeKind::UserTerminate,
             serde_json::Value::Null,
             self.cfg.sharded_pubsub,
+            self.cfg.envelope_compat,
         )
         .await;
         ids
