@@ -97,6 +97,22 @@ pre-1.0 and versions track `Cargo.toml`.
   private embedded v4s are refused; class E has no legitimate webhook
   receivers. `PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS=1` still relaxes the whole
   address classification.
+- Dependency advisories (lockfile-only bumps; no `Cargo.toml` changes):
+  `anyhow` 1.0.102→1.0.103 (RUSTSEC-2026-0190), `crossbeam-epoch`
+  0.9.18→0.9.20 (RUSTSEC-2026-0204), `event-listener` 5.4.1→5.4.2
+  (RUSTSEC-2026-0221), `h2` 0.4.14→0.4.16 (RUSTSEC-2026-0258), and
+  `quinn-proto` 0.11.14→0.11.15 (GHSA-4w2j-m93h-cj5j / RUSTSEC-2026-0185);
+  the re-resolution also pruned an orphaned `concurrent-queue` 2.5.0 lock
+  entry (zero reverse deps).
+- Triaged RUSTSEC-2023-0071 (`rsa` 0.9.10, Marvin-attack timing sidechannel —
+  no fixed release exists): `rsa` reaches the build only via `sqlx-mysql`,
+  whose sole use is client-side RSA *public-key* encryption (OAEP) of the
+  nonce-XORed password during `caching_sha2_password`/`sha256_password` full
+  auth; the advisory's attack surface is private-key operations, which pylon
+  never performs — the vulnerable code path is unreachable.
+- Noted RUSTSEC-2025-0134 (`rustls-pemfile` 2.2.0, unmaintained —
+  informational, not a vulnerability): no fixed version exists; migrating to
+  a maintained alternative is a future option, not part of this change.
 
 ## [0.3.0] - 2026-09-01
 
