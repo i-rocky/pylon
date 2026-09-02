@@ -97,13 +97,42 @@ The catalog (in `src/catalog.rs`) claims each scenario is implemented by a
 specific adapter's `runner.js`. `--audit` verifies that claim:
 
 - every bound `adapters/<sdk>/runner.js` exists;
-- each runner's `--list` output actually contains every id bound to it;
+- each runner's `--list` output matches the catalog **both ways**: every
+  bound id must be listed, and every listed id must be bound (a runner
+  listing an id the catalog does not bind is a scenario nobody selected,
+  budgeted, or audited);
 - the binding table matches the catalog (no missing, orphaned, wrong-SDK, or
   duplicate bindings).
+
+It also runs one **advisory** family: the observation-normalization scan
+over the last report artifact (`conformance-report.json`), if one exists —
+see below. Advisory there, mandatory in a run.
 
 Run it after any change to the catalog or a runner. CI runs the full suite,
 which is itself an end-to-end audit; `--audit` is the cheap early-warning
 version.
+
+## Observation normalization
+
+Runner observations carry facts that are true of **every** run —
+placeholders (`<socket_id>`, `<1..29>`), pinned statuses (`200`, `4301`),
+SDK-mandated constants (`activity_timeout_used_ms: 2000`). Run-unique
+values (socket ids, timestamps, epoch counters) go to runner stderr as
+evidence, never into the report artifact — that is what keeps the JSON
+stable and diffable across runs.
+
+After every run the harness scans all recorded observations for run-unique
+shapes (socket-id-like dotted integer pairs, ISO-8601 timestamps, raw
+epoch-millis, bare epoch-sized integers). A clean run prints
+`normalization scan: clean`; any violation prints a warning block and fails
+the run (exit 1) even if all 26 verdicts passed. `--audit` re-runs the same
+scan against the last report artifact, advisorially.
+
+The shapes are conservative; if a scenario ever legitimately observes a
+fixed value that trips one, add a `(scenario id, observation key)` pair to
+`ALLOWED_RAW_KEYS` in `src/normalization.rs` — that exempts exactly that
+leaf key within exactly that scenario. Keep it empty unless a reviewed case
+demands an entry.
 
 ## Adding a scenario
 
@@ -150,5 +179,5 @@ report).
 
 `.github/workflows/conformance.yml` runs the whole suite on a freshly built
 release pylon (Node 18, adapter `npm ci`s, `--report` artifact uploaded on
-every outcome). It is opt-in via `workflow_dispatch`; to run it nightly,
-uncomment the `schedule`/`cron` block at the top of the workflow file.
+every outcome). It runs **nightly** (03:00 UTC cron) and on manual
+`workflow_dispatch`.

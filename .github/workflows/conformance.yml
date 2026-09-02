@@ -1,19 +1,24 @@
 name: conformance
 
 # Runs the SDK conformance crate against a freshly built pylon.
-# Opt-in (workflow_dispatch); uncomment the schedule block to run nightly.
+# Nightly (03:00 UTC) plus manual dispatch.
 on:
   workflow_dispatch:
-  # schedule:
-  #   - cron: "0 3 * * *"
+  schedule:
+    - cron: "0 3 * * *"
 
 jobs:
   conformance:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: "18" }
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "18"
+          # The adapter lockfiles live under conformance/adapters/*, not the
+          # repo root — setup-node v5's default package-manager cache would
+          # find nothing there, so opt out (the npm ci steps below handle it).
+          package-manager-cache: false
       - name: Install adapter deps
         run: |
           cd conformance/adapters/pusher-js && npm ci
@@ -24,5 +29,5 @@ jobs:
         run: cd conformance && cargo run --release -- --report conformance-report.json
       - name: Upload report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with: { name: conformance-report, path: conformance/conformance-report.json }

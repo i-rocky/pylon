@@ -19,7 +19,17 @@ pre-1.0 and versions track `Cargo.toml`.
 - `conformance/` — an SDK-conformance harness: boots a real pylon and drives the
   official `pusher-js` and `pusher-http-node` SDKs through every protocol
   feature they can exercise (26 scenarios), with a coverage audit (`--audit`)
-  and an opt-in CI job (`conformance.yml`).
+  and a CI job (`conformance.yml`, nightly at 03:00 UTC plus manual dispatch).
+- Conformance harness: **observation-normalization audit family** — after
+  every run, all recorded observations are scanned for run-unique shapes
+  (socket-id-like dotted integer pairs, ISO-8601 timestamps, raw
+  epoch-millis, bare epoch-sized integers); a violation prints a warning
+  block and fails the run (exit 1) even when every verdict passed, keeping
+  the JSON artifact stable and diffable. `--audit` runs the same scan
+  against the last report artifact, advisorially. Shapes are conservative
+  (legitimately-fixed values like `activity_timeout_used_ms: 2000` or
+  version strings stay silent), with a documented per-scenario key allowlist
+  for reviewed exceptions (empty today).
 
 ### Changed
 - Per-core worker broadcast index consolidated to the single-map layout: each
@@ -50,6 +60,19 @@ pre-1.0 and versions track `Cargo.toml`.
   node-local cache).
 
 ### Fixed
+- Conformance harness hardening batch: the pusher-js runner's `fire()`
+  helper now bounds its `--fire-stdin` child (8s timeout, SIGTERM kill
+  signal) — the last unbounded child wait in the runner; the run's scratch
+  env dir is removed on early-error paths too (RAII guard; previously it
+  leaked when the auth/webhook/pylon spawns or the health check failed);
+  C-PING's connect wait is capped at 6s so the worst case (6s connect + 8s
+  hold) fits the 15s catalog budget; C-EVENT-LIMITS' payload leg counts its
+  expected 4301 rejection from a per-leg baseline instead of the name leg's
+  cumulative count (the legs are independent observations);
+  `--audit`'s listing↔catalog cross-check is bidirectional (a runner
+  listing an id the catalog does not bind is now flagged, not just the
+  missing-binding direction); audit-fixture temp dirs are unique
+  (pid + counter) so concurrent audits on one host cannot collide.
 - **Duplicate `member_removed` webhooks/events in cluster mode** (audit G11
   class, follow-up F-6): the Redis sweeper's stale-member reap ran
   HGET→HDEL→HINCRBY as SEPARATE commands and gated its emission on `<= 0`,
