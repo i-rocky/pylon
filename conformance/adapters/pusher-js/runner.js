@@ -615,6 +615,23 @@ const SCENARIOS = {
     }
   },
 
+  // Two clients subscribe to the SAME private channel simultaneously, then a
+  // client event on A must reach B but not A (sender exclusion). The two
+  // subscription waits are PRE-BOUND before either is awaited: each private
+  // subscribe rides its own auth-endpoint round trip (one `node runner.js
+  // --sign` spawn per client), and the two replies can complete in EITHER
+  // order — under CPU contention the SECOND client's reply regularly lands
+  // first. pusher-js channels do not buffer events, so with the sequential
+  // shape (`await waitEvent(a); await waitEvent(b);`) B's listener was bound
+  // only after A's event resolved; whenever B's `subscription_succeeded` was
+  // emitted first it hit a channel with no listener and was lost forever —
+  // the wait then burned its full 10s and failed with "no
+  // pusher:subscription_succeeded within 10000ms" even though both
+  // subscriptions had succeeded (observed on the 2-core CI runner and
+  // reproduced under local CPU starvation; connect-level message trace showed
+  // BOTH `pusher_internal:subscription_succeeded` frames arriving, B first).
+  // Pre-binding also starts both 10s windows at the same instant, so the
+  // worst case is ONE 10s window (concurrent), not two stacked ones.
   'C-EVENT-ECHO': async () => {
     const A = connect();
     const B = connect();
@@ -623,8 +640,10 @@ const SCENARIOS = {
       await waitConnected(B);
       const a = A.subscribe('private-cf-echo');
       const b = B.subscribe('private-cf-echo');
-      await waitEvent(a, 'pusher:subscription_succeeded');
-      await waitEvent(b, 'pusher:subscription_succeeded');
+      const aSub = waitEvent(a, 'pusher:subscription_succeeded');
+      const bSub = waitEvent(b, 'pusher:subscription_succeeded');
+      await aSub;
+      await bSub;
       // Watch for self-delivery BEFORE triggering.
       let selfDeliveries = 0;
       a.bind('client-x', () => selfDeliveries++);
@@ -739,6 +758,12 @@ const SCENARIOS = {
   // checks only the `client-` prefix — no channel-kind gate). The trigger IS
   // sent and the server must silently drop it (client events are private/
   // presence-only). The observation records which side refused.
+  // Same pre-bound subscription waits as C-EVENT-ECHO: today both
+  // `pusher:subscribe` frames are sent synchronously in A-then-B order, so
+  // the sequential awaits happen to be safe — but the server's two replies
+  // ride two independent connections (possibly different workers) with no
+  // FIFO guarantee, so B-first ordering would lose B's event exactly the way
+  // C-EVENT-ECHO did. Pre-binding removes the dependence on reply order.
   'C-EVENT-PUB': async () => {
     const A = connect();
     const B = connect();
@@ -747,8 +772,10 @@ const SCENARIOS = {
       await waitConnected(B);
       const a = A.subscribe('cf-pub-client');
       const b = B.subscribe('cf-pub-client');
-      await waitEvent(a, 'pusher:subscription_succeeded');
-      await waitEvent(b, 'pusher:subscription_succeeded');
+      const aSub = waitEvent(a, 'pusher:subscription_succeeded');
+      const bSub = waitEvent(b, 'pusher:subscription_succeeded');
+      await aSub;
+      await bSub;
       let peerGot = 0;
       b.bind('client-x', () => peerGot++);
       let sent;
