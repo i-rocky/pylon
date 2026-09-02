@@ -412,7 +412,8 @@ async fn run_scenarios(
 
     // Signing mode: the auth endpoint delegates ALL crypto to the official
     // pusher-http-node runner. Every auth hit spawns
-    // `node runner.js --sign --env <env.json>` with the request body on
+    // `node runner.js --sign --env -- <env.json>` (env path after the
+    // runner's `--` option terminator) with the request body on
     // STDIN and answers with the runner's stdout. The runner's `--sign` mode
     // lands in Task 7 — until then this closure is fully wired but fails at
     // call time (a spawn error surfacing as the auth endpoint's 500), which
@@ -628,7 +629,10 @@ fn signer_fn(http_adapter_dir: &Path, env_path: &Path) -> SignerFn {
             let mut child = tokio::process::Command::new("node")
                 .arg("runner.js")
                 .arg("--sign")
+                // The env path is dynamic: after the runner's `--` option
+                // terminator it can never be misparsed as an option.
                 .arg("--env")
+                .arg("--")
                 .arg(&env_path)
                 .current_dir(&adapter_dir)
                 .stdin(Stdio::piped())

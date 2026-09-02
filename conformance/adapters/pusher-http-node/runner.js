@@ -5,14 +5,16 @@
 // Node.js SDK (github.com/pusher/pusher-http-node, published on npm as
 // `pusher`).
 //
-// Modes (the harness spawns these; see conformance/src/adapter.rs):
+// Modes (the harness spawns these; see conformance/src/adapter.rs). Dynamic
+// values ride after a bare `--` option terminator, where this runner's argv
+// parser never treats them as flags (see the parser block below):
 //
-//   node runner.js --scenario <id> --env <env.json>
+//   node runner.js --scenario <id> --env -- <env.json>
 //       Run one scenario; the FINAL stdout line is the verdict JSON
 //       {scenario, verdict: pass|fail|skip, observations, error, duration_ms}.
 //       All logs go to stderr; stdout carries only the verdict.
 //
-//   node runner.js --sign --env <env.json>          (auth body on STDIN)
+//   node runner.js --sign --env -- <env.json>          (auth body on STDIN)
 //       Sign ONE auth request with the SDK's own crypto and print the SDK's
 //       response object as JSON on stdout. Routing: a body with `channel_name`
 //       (+ optional `channel_data`) goes to authorizeChannel; a body with
@@ -29,7 +31,7 @@
 //       https://pusher.com/docs/channels/server_api/authenticating-users/) is
 //       parsed and merged into the userData signed here.
 //
-//   node runner.js --fire-stdin --env <env.json>   (spec JSON on STDIN)
+//   node runner.js --fire-stdin --env -- <env.json>  (spec JSON on STDIN)
 //       Publish one event server-side via the SDK: `client().trigger`. The
 //       JSON spec arrives on STDIN — never argv, where a value token can be
 //       misparsed as an option by this runner's own argv scanner — as
@@ -43,12 +45,12 @@
 //       scenarios for their server-side publishes, keeping ALL server-side
 //       protocol work on the official server SDK.
 //
-//   node runner.js --terminate <user-id> --env <env.json>
+//   node runner.js --terminate --env -- <user-id> <env.json>
 //       Terminate every connection of a signed-in user server-side via the
 //       SDK's `terminateUserConnections` (POST
-//       /apps/{app}/users/{user}/terminate_connections). The id is
-//       shape-guarded (USER_ID_RE) BEFORE routing — a value starting with
-//       `-`/`--` must never reach a flag position. Exit 0 on a 2xx response.
+//       /apps/{app}/users/{user}/terminate_connections). The id rides AFTER
+//       the `--` option terminator (never flag-parseable) and is additionally
+//       shape-guarded (USER_ID_RE) BEFORE routing. Exit 0 on a 2xx response.
 //       Used by the pusher-js U-TERMINATE scenario.
 //
 //   node runner.js --version    Print the SDK's package version.
@@ -64,12 +66,44 @@ const Pusher = require('pusher');
 // adapters' key so private-encrypted channels round-trip (C-ENC-SUB).
 const ENCRYPTION_KEY_BASE64 = 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=';
 
+// argv contract — option terminator. A bare `--` token ends flag parsing:
+// tokens BEFORE it are the flag region (flags and their inline values);
+// tokens AFTER it are OPERANDS and are never treated as a flag or a flag's
+// value. A value-taking flag whose value is DYNAMIC (a path, an external id)
+// rides BARE in the flag region and draws its value from the operand queue —
+// bare value-flags draw operands left-to-right in argv order — so an
+// external value beginning with `-` can never be misparsed as an option by
+// this (or any child) argv scan. Static, harness-fixed values may still ride
+// inline before the terminator.
 const argv = process.argv.slice(2);
+const TERM_INDEX = argv.indexOf('--');
+const flagArgs = TERM_INDEX >= 0 ? argv.slice(0, TERM_INDEX) : argv;
+const operands = TERM_INDEX >= 0 ? argv.slice(TERM_INDEX + 1) : [];
+// The value-taking flags; every other flag this runner knows is boolean.
+const VALUE_FLAGS = ['--terminate', '--env', '--scenario'];
+
+// A `-`-leading token is flag-shaped and is never consumed as an inline
+// value (the flag then falls through to the operand queue).
+const isFlagToken = (t) => typeof t === 'string' && t.startsWith('-');
+
 const arg = (n) => {
-  const i = argv.indexOf(n);
-  return i >= 0 && i + 1 < argv.length ? argv[i + 1] : null;
+  const i = flagArgs.indexOf(n);
+  if (i < 0) return null;
+  const next = flagArgs[i + 1];
+  if (next !== undefined && !isFlagToken(next)) return next; // inline value
+  if (!VALUE_FLAGS.includes(n)) return null; // boolean flag: no value
+  // Bare value-flag: draw the operand owned by the k-th bare value-flag.
+  let slot = 0;
+  for (let k = 0; k < flagArgs.length; k++) {
+    if (!VALUE_FLAGS.includes(flagArgs[k])) continue;
+    const v = flagArgs[k + 1];
+    if (v !== undefined && !isFlagToken(v)) continue; // inline-valued
+    if (k === i) return slot < operands.length ? operands[slot] : null;
+    slot++;
+  }
+  return null;
 };
-const has = (n) => argv.includes(n);
+const has = (n) => flagArgs.includes(n);
 const log = (...a) => console.error('[runner]', ...a);
 
 // Read all of STDIN (the --sign auth-request body, the --fire-stdin spec).
@@ -82,10 +116,11 @@ const readStdin = () =>
     process.stdin.on('error', reject);
   });
 
-// Shape guard for any user id that reaches an ARGV position (--terminate):
-// alnum first char (never a leading `-`), then alnum/_/.//- up to 128 chars
-// total. The harness only ever passes fixed ids ('u-term', ...) — this is
-// pure flag-injection guarding, not identity validation.
+// Shape guard for the --terminate user id. The id rides AFTER the `--`
+// option terminator, so it can never occupy a flag position; this guard is
+// defense-in-depth (alnum first char, then alnum/_/.//- up to 128 chars
+// total) on top of that. The harness only ever passes fixed ids ('u-term',
+// ...) — flag-injection guarding, not identity validation.
 const USER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 
 // Parse an auth-request body: JSON per the harness contract, with a
@@ -429,9 +464,10 @@ async function fireStdinMode() {
 
 // --terminate <user-id>: terminate the user's connections through the SDK's
 // own terminateUserConnections (drives pylon's
-// POST /apps/{app}/users/{user}/terminate_connections). The id arrives in an
-// argv position, so it is shape-guarded (USER_ID_RE) by the caller BEFORE
-// this runs — no leading dash, bounded length.
+// POST /apps/{app}/users/{user}/terminate_connections). The id arrives as an
+// operand after the `--` terminator (never flag-parseable) and is
+// additionally shape-guarded (USER_ID_RE) here — no leading dash, bounded
+// length.
 async function terminateMode(userId) {
   if (!userId || !USER_ID_RE.test(userId)) {
     throw new Error('--terminate needs a user id matching ' + USER_ID_RE);
@@ -511,8 +547,9 @@ async function scenarioMode() {
   }
   const terminateId = arg('--terminate');
   if (terminateId !== null) {
-    // Shape-guard BEFORE routing: a value starting with `-`/`--` must never
-    // reach a flag position in this (or any downstream) argv scan.
+    // Shape-guard BEFORE routing: the id already rode past the `--`
+    // terminator, and this second gate keeps a malformed id from reaching
+    // the SDK call even if a caller ever regresses to inline passing.
     if (!USER_ID_RE.test(terminateId)) {
       console.error(
         `--terminate: malformed user id (want ${USER_ID_RE}): ${terminateId.slice(0, 64)}`
@@ -526,7 +563,7 @@ async function scenarioMode() {
     await scenarioMode();
     return;
   }
-  console.error('usage: runner.js --scenario <id> --env <path> | --sign --env <path> | --fire-stdin --env <path> (spec on stdin) | --terminate <user-id> --env <path> | --version | --list');
+  console.error('usage: runner.js --scenario <id> --env -- <path> | --sign --env -- <path> | --fire-stdin --env -- <path> (spec on stdin) | --terminate --env -- <user-id> <path> | --version | --list');
   process.exit(2);
 })().catch((e) => {
   // Modes other than --scenario have no verdict contract: errors on stderr,

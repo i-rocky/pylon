@@ -4,9 +4,11 @@
 // pylon conformance adapter — client plane on the official pusher-js SDK
 // (npm `pusher-js`, Node runtime via `pusher-js/node`).
 //
-// Modes (the harness spawns these; see conformance/src/adapter.rs):
+// Modes (the harness spawns these; see conformance/src/adapter.rs). Dynamic
+// values ride after a bare `--` option terminator, where this runner's argv
+// parser never treats them as flags (see the parser block below):
 //
-//   node runner.js --scenario <id> --env <env.json>
+//   node runner.js --scenario <id> --env -- <env.json>
 //       Run one scenario; the FINAL stdout line is the verdict JSON
 //       {scenario, verdict: pass|fail|skip, observations, error, duration_ms}.
 //       All logs go to stderr; stdout carries only the verdict.
@@ -16,9 +18,11 @@
 //
 // Server-side publishes (C-PUB-SUB/PRIV/CACHE/ENC) shell out to the sibling
 // pusher-http-node runner's `--fire-stdin` mode (spec JSON on the child's
-// stdin — never argv), so ALL server-plane protocol work rides on the
-// official server SDK. User termination (U-TERMINATE) shells out to the same
-// runner's `--terminate` mode (id shape-guarded on both sides).
+// stdin — never argv; env path after the child's `--` terminator), so ALL
+// server-plane protocol work rides on the official server SDK. User
+// termination (U-TERMINATE) shells out to the same runner's `--terminate`
+// mode (id and env path after the child's `--` terminator; id additionally
+// shape-guarded on both sides).
 //
 // Verified SDK facts this runner relies on (pusher-js 8.6.0, dist inspected):
 //   - `require('pusher-js/node')` exports the Pusher class directly.
@@ -71,12 +75,44 @@ const { execFile } = require('child_process');
 // The SDK: `require('pusher-js/node')` IS the Pusher class.
 const Pusher = require('pusher-js/node');
 
+// argv contract — option terminator. A bare `--` token ends flag parsing:
+// tokens BEFORE it are the flag region (flags and their inline values);
+// tokens AFTER it are OPERANDS and are never treated as a flag or a flag's
+// value. A value-taking flag whose value is DYNAMIC (a path, an external id)
+// rides BARE in the flag region and draws its value from the operand queue —
+// bare value-flags draw operands left-to-right in argv order — so an
+// external value beginning with `-` can never be misparsed as an option by
+// this (or any child) argv scan. Static, harness-fixed values may still ride
+// inline before the terminator.
 const argv = process.argv.slice(2);
+const TERM_INDEX = argv.indexOf('--');
+const flagArgs = TERM_INDEX >= 0 ? argv.slice(0, TERM_INDEX) : argv;
+const operands = TERM_INDEX >= 0 ? argv.slice(TERM_INDEX + 1) : [];
+// The value-taking flags; every other flag this runner knows is boolean.
+const VALUE_FLAGS = ['--scenario', '--env'];
+
+// A `-`-leading token is flag-shaped and is never consumed as an inline
+// value (the flag then falls through to the operand queue).
+const isFlagToken = (t) => typeof t === 'string' && t.startsWith('-');
+
 const arg = (n) => {
-  const i = argv.indexOf(n);
-  return i >= 0 && i + 1 < argv.length ? argv[i + 1] : null;
+  const i = flagArgs.indexOf(n);
+  if (i < 0) return null;
+  const next = flagArgs[i + 1];
+  if (next !== undefined && !isFlagToken(next)) return next; // inline value
+  if (!VALUE_FLAGS.includes(n)) return null; // boolean flag: no value
+  // Bare value-flag: draw the operand owned by the k-th bare value-flag.
+  let slot = 0;
+  for (let k = 0; k < flagArgs.length; k++) {
+    if (!VALUE_FLAGS.includes(flagArgs[k])) continue;
+    const v = flagArgs[k + 1];
+    if (v !== undefined && !isFlagToken(v)) continue; // inline-valued
+    if (k === i) return slot < operands.length ? operands[slot] : null;
+    slot++;
+  }
+  return null;
 };
-const has = (n) => argv.includes(n);
+const has = (n) => flagArgs.includes(n);
 const log = (...a) => console.error('[runner]', ...a);
 
 // The env contract (conformance AdapterEnv): ws_url, http_host, http_port,
@@ -347,16 +383,19 @@ const HTTP_ADAPTER_DIR = path.join(__dirname, '..', 'pusher-http-node');
 
 // Publish one event server-side. The spec rides child STDIN (`--fire-stdin`
 // mode), NEVER argv: execFile uses no shell, but a value token in a flag
-// position is still the flag-injection shape — JSON belongs on a pipe.
-// The child is bounded: 8s timeout, SIGTERM kill signal — the last unbounded
-// child wait in this runner (everything else already ran under an explicit
-// deadline or the harness budget's process-group kill).
+// position is still the flag-injection shape — JSON belongs on a pipe. The
+// env path is dynamic, so it rides after the child's `--` option terminator
+// (a bare `--env` flag draws it from the operand queue): it can never be
+// parsed as an option even if it began with a dash. The child is bounded:
+// 8s timeout, SIGTERM kill signal — the last unbounded child wait in this
+// runner (everything else already ran under an explicit deadline or the
+// harness budget's process-group kill).
 const FIRE_TIMEOUT_MS = 8000;
 const fire = (spec) =>
   new Promise((resolve, reject) => {
     const child = execFile(
       process.execPath,
-      ['runner.js', '--fire-stdin', '--env', arg('--env')],
+      ['runner.js', '--fire-stdin', '--env', '--', arg('--env')],
       { cwd: HTTP_ADAPTER_DIR, timeout: FIRE_TIMEOUT_MS, killSignal: 'SIGTERM' },
       (err, stdout, stderr) => {
         if (err) {
@@ -380,17 +419,21 @@ const fire = (spec) =>
     child.stdin.end(JSON.stringify(spec));
   });
 
-// Shape guard for any user id that reaches an ARGV position: alnum first
-// char (never a leading `-`), then alnum/_/.//- up to 128 chars total. The
-// harness only ever passes fixed ids ('u-term', ...) — pure flag-injection
-// guarding, not identity validation. Mirrored in the http runner (receiver).
+// Shape guard for any user id passed to the sibling --terminate mode:
+// alnum first char (never a leading `-`), then alnum/_/.//- up to 128 chars
+// total. The id rides AFTER the child's `--` option terminator (never
+// flag-parseable); this guard is defense-in-depth on top of that, mirrored
+// in the http runner (receiver). The harness only ever passes fixed ids
+// ('u-term', ...) — flag-injection guarding, not identity validation.
 const USER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 
 // Terminate every connection of a signed-in user, server-side, through the
 // sibling http adapter's --terminate mode (the official server SDK's
-// terminateUserConnections → POST /users/<id>/terminate_connections). The id
-// occupies an argv position in the child, so it is shape-guarded HERE and
-// again at the receiver.
+// terminateUserConnections → POST /users/<id>/terminate_connections). BOTH
+// dynamic values — the id and the env path — ride after the child's `--`
+// option terminator (bare `--terminate`/`--env` flags draw them from the
+// operand queue in order), so neither can be parsed as an option; the id is
+// additionally shape-guarded HERE and again at the receiver.
 const terminateUser = (userId) =>
   new Promise((resolve, reject) => {
     if (typeof userId !== 'string' || !USER_ID_RE.test(userId)) {
@@ -398,7 +441,7 @@ const terminateUser = (userId) =>
     }
     execFile(
       process.execPath,
-      ['runner.js', '--terminate', userId, '--env', arg('--env')],
+      ['runner.js', '--terminate', '--env', '--', userId, arg('--env')],
       { cwd: HTTP_ADAPTER_DIR },
       (err, stdout, stderr) => {
         if (err) {
@@ -1006,7 +1049,7 @@ async function scenarioMode() {
     await scenarioMode();
     return;
   }
-  console.error('usage: runner.js --scenario <id> --env <env.json> | --version | --list');
+  console.error('usage: runner.js --scenario <id> --env -- <env.json> | --version | --list');
   process.exit(2);
 })().catch((e) => {
   console.error((e && e.stack) || String(e));
