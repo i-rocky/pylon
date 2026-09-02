@@ -2,7 +2,7 @@
 //! execution crosses (spec §4).
 //!
 //! An adapter is a directory containing a `runner.js`. [`run`] spawns
-//! `node runner.js --scenario <id> --env <env.json>` with its working
+//! `node runner.js --scenario <id> --env -- <env.json>` with its working
 //! directory set to the adapter directory (so the runner resolves its own
 //! `node_modules`), stdout piped, stderr inherited (runner logs go to stderr;
 //! stdout carries the verdict). The environment file is written by the
@@ -112,9 +112,14 @@ pub async fn run(adapter_dir: &Path, scenario: &str, env_path: &Path, budget_ms:
     let mut command = Command::new("node");
     command
         .arg("runner.js")
+        // The scenario id is catalog-fixed (C-*/S-*/U-*/E-*) and rides
+        // inline; the env path is dynamic, so it rides after the runner's
+        // `--` option terminator — the runner never flag-parses operands
+        // past `--`, so the path cannot be misread as an option.
         .arg("--scenario")
         .arg(scenario)
         .arg("--env")
+        .arg("--")
         .arg(&env_path)
         .current_dir(adapter_dir)
         .stdout(Stdio::piped())
