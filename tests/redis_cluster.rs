@@ -126,22 +126,93 @@ async fn smoke_connectivity() {
 
     // Publish from the pool side. `Pool` itself is not a `PubsubInterface`;
     // pub/sub commands go through a pooled `Client` (`pool.next()`).
-    let _: i64 = clients
+    // PUBLISH returns the number of subscribers the SERVER delivered to —
+    // pinning it (>= 1) turns a server-side loss (subscription gone, e.g. a
+    // subscriber reconnect between the SUBSCRIBE confirmation and the PUBLISH)
+    // into a loud, diagnosable failure instead of a silent recv timeout.
+    let first_count: i64 = clients
         .pool
         .next()
         .publish(channel.clone(), payload.clone())
         .await
         .expect("PUBLISH must succeed");
+    assert!(
+        first_count >= 1,
+        "PUBLISH delivered to {first_count} subscribers — the server-side subscription \
+         was gone at publish time (subscriber reconnect?)"
+    );
 
-    // Receive, with a hard timeout so a broken stream fails instead of hanging.
-    // Generous-but-bounded: the loopback round trip is sub-millisecond (p99
-    // well under 10ms), but a loaded runner can stall the runtime far past
-    // that — the old 2s window was observed to flake ~1/13 full-sequence runs
-    // while never failing solo. Same semantics: the message MUST arrive.
-    let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .expect("must receive the published message within 5s")
-        .expect("broadcast receiver must yield a message");
+    // Receive, event-bound on arrival (`broadcast::recv` is cancel-safe: a
+    // dropped pending recv consumes nothing), with a hard PER-COPY bound so a
+    // broken stream fails instead of hanging.
+    //
+    // Flake history (PR #14 CI, 2-core runner, job 100255097741): the 5s bound
+    // expired once — with SUBSCRIBE confirmed, PUBLISH returned, every
+    // neighboring pub/sub round trip 10-15ms, and the runner healthy directly
+    // before AND after (the next suite ran 4 round trips in 60ms). The failure
+    // is an ISOLATED loss/delay of exactly one message on one connection —
+    // the environmental tail (docker-bridge segment loss + TCP RTO backoff,
+    // hypervisor steal stalling the runtime, or a subscriber blip) — not a
+    // wall-clock settle window that a bigger deadline fixes: two of those
+    // classes only ever DELIVER LATE, the blip class NEVER delivers.
+    //
+    // Redis pub/sub is best-effort by contract — a subscriber reconnected at
+    // publish time legitimately misses the copy. The smoke's purpose is "the
+    // round trip works", so on a per-copy timeout we re-verify the
+    // subscription server-side (PUBSUB NUMSUB — the observable, event-based
+    // gate the de-flake program established), re-publish ONE second copy with
+    // the SAME payload (whichever copy lands, the assert below holds), and
+    // only fail if BOTH are lost. A genuinely broken stream still fails loud;
+    // a single environmental loss no longer fails a healthy runner.
+    let msg = match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+        Ok(Ok(msg)) => msg,
+        Ok(Err(e)) => panic!("broadcast receiver must yield a message: {e:?}"),
+        Err(_) => {
+            // First copy did not arrive within its bound. Gate the retry on
+            // the server-side subscription being attached (covers a blip
+            // whose resubscribe is still in flight), bounded and loud.
+            let attached = tokio::time::timeout(
+                Duration::from_secs(2),
+                poll_numsub_at_least(&clients, &channel, 1),
+            )
+            .await
+            .unwrap_or(false);
+            assert!(
+                attached,
+                "first copy lost and the server reports no subscriber on {channel} \
+                 (tracked: {:?}) — pub/sub round trip is broken, not slow",
+                clients.sub.tracked_channels()
+            );
+
+            eprintln!(
+                "smoke_connectivity: first publish not received within 5s \
+                 (server had {first_count} subscriber(s) at publish time) — \
+                 re-publishing one retry copy"
+            );
+            let retry_count: i64 = clients
+                .pool
+                .next()
+                .publish(channel.clone(), payload.clone())
+                .await
+                .expect("retry PUBLISH must succeed");
+            assert!(
+                retry_count >= 1,
+                "retry PUBLISH delivered to {retry_count} subscribers"
+            );
+
+            // Wait for EITHER copy, then assert below (same payload/channel).
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(msg)) => msg,
+                Ok(Err(e)) => panic!("broadcast receiver must yield a message: {e:?}"),
+                Err(_) => panic!(
+                    "neither of two PUBLISHes (each confirmed delivered to >=1 \
+                     subscriber server-side) arrived within 5s per copy on {channel} \
+                     (tracked: {:?}) — the subscriber stream is broken",
+                    clients.sub.tracked_channels()
+                ),
+            }
+        }
+    };
 
     assert_eq!(msg.channel.to_string(), channel);
     assert_eq!(
@@ -153,6 +224,27 @@ async fn smoke_connectivity() {
     // Clean shutdown of the test clients (the adapter drops on scope exit).
     let _ = clients.sub.quit().await;
     let _ = clients.pool.quit().await;
+}
+
+/// Poll Redis `PUBSUB NUMSUB <channel>` (via the command pool) until the server
+/// reports at least `want` subscribers attached to the pub/sub channel. The
+/// observable "the SUBSCRIBE really is live server-side" — used to gate a
+/// re-publish after a lost copy so the retry can never race a still-in-flight
+/// resubscribe. Only ever resolves `true`; the caller's timeout supplies the
+/// `false`. Never panics.
+async fn poll_numsub_at_least(clients: &RedisClients, channel: &str, want: i64) -> bool {
+    loop {
+        let counts: std::collections::HashMap<String, i64> = clients
+            .pool
+            .next()
+            .pubsub_numsub(channel)
+            .await
+            .unwrap_or_default();
+        if counts.get(channel).copied().unwrap_or(0) >= want {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// B1: the per-(app,channel) Redis-subscription lifecycle. A node's SubscriberClient
