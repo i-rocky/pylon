@@ -60,6 +60,35 @@ fn wants(info: Option<&str>, attr: &str) -> bool {
     info.is_some_and(|s| s.split(',').any(|a| a.trim() == attr))
 }
 
+/// Cheap upper bound on `socket_id` length, checked before the shape scan so a
+/// multi-megabyte string is rejected in O(1) instead of walking every byte
+/// first. Every id pylon itself hands out (`SocketId::generate`) is two
+/// decimal `u64`s and a dot — at most 41 bytes — so this is generous headroom
+/// for any client-supplied id shaped like hosted Pusher's.
+const MAX_SOCKET_ID_LEN: usize = 64;
+
+/// Hosted Pusher's HTTP API validates `socket_id` server-side and rejects a
+/// malformed value with 400; `pusher-http-node`'s `validateSocketId` enforces
+/// the same shape client-side: `\A\d+\.\d+\z` — two non-empty runs of ASCII
+/// digits joined by exactly one `.`, no sign, no whitespace, no extra dots.
+/// Pylon previously fed the raw string straight into `SocketId::from_raw`
+/// (which silently truncates rather than rejecting), so any string excluded
+/// nothing and still returned 200.
+fn valid_socket_id(s: &str) -> bool {
+    if s.is_empty() || s.len() > MAX_SOCKET_ID_LEN {
+        return false;
+    }
+    match s.split_once('.') {
+        Some((a, b)) => {
+            !a.is_empty()
+                && !b.is_empty()
+                && a.bytes().all(|c| c.is_ascii_digit())
+                && b.bytes().all(|c| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
 /// R9 — Pusher REST doc (General): "For POST requests, parameters MAY be
 /// submitted in the query string but SHOULD be submitted in the POST body as a
 /// JSON hash". After parsing the JSON body, any top-level trigger field the
@@ -236,6 +265,14 @@ pub async fn post_events(
     if t.name.len() > state.config.max_event_name_length {
         return Err(RestError::bad_request("Event name too long"));
     }
+    // Validated on the MERGED body (`t`), not the raw JSON, so the R9
+    // query-string fallback path is covered too — a trigger with
+    // `socket_id` only in the query string must not bypass this check.
+    if let Some(sid) = t.socket_id.as_deref() {
+        if !valid_socket_id(sid) {
+            return Err(RestError::bad_request("Invalid socket id"));
+        }
+    }
     let channels = match (&t.channels, &t.channel) {
         (Some(list), _) => list.clone(),
         (None, Some(c)) => vec![c.clone()],
@@ -345,6 +382,16 @@ pub async fn post_batch(
             return Err(RestError::bad_request("Invalid channel name"));
         }
     }
+    // Validate every item's `socket_id` (see `post_events`) BEFORE the delivery
+    // loop below — a batch must not partially deliver and then reject on a
+    // later item's bad socket_id.
+    for item in &b.batch {
+        if let Some(sid) = item.socket_id.as_deref() {
+            if !valid_socket_id(sid) {
+                return Err(RestError::bad_request("Invalid socket id"));
+            }
+        }
+    }
     for item in &b.batch {
         deliver(
             &state,
@@ -446,5 +493,26 @@ mod tests {
         assert!(merged_trigger_body(b"definitely not json", &HashMap::new()).is_err());
         // Valid JSON but not an object (and no query rescue possible).
         assert!(merged_trigger_body(b"[1,2]", &HashMap::new()).is_err());
+    }
+
+    /// `\A\d+\.\d+\z` — two non-empty runs of ASCII digits joined by exactly
+    /// one `.`. Matches hosted Pusher / `pusher-http-node`'s `validateSocketId`.
+    #[test]
+    fn valid_socket_id_accepts_the_documented_shape() {
+        assert!(valid_socket_id("123.456"));
+        assert!(valid_socket_id("1.1"));
+    }
+
+    #[test]
+    fn valid_socket_id_rejects_malformed_strings() {
+        assert!(!valid_socket_id(""));
+        assert!(!valid_socket_id("not-a-socket-id"));
+        assert!(!valid_socket_id("123")); // no dot
+        assert!(!valid_socket_id("123.")); // empty second run
+        assert!(!valid_socket_id(".456")); // empty first run
+        assert!(!valid_socket_id("1.2.3")); // extra dot
+        assert!(!valid_socket_id("12 3.4")); // whitespace
+        assert!(!valid_socket_id("-1.2")); // sign
+        assert!(!valid_socket_id(&"1".repeat(100))); // huge, no dot
     }
 }
