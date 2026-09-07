@@ -86,6 +86,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
+      # Default-features-only lint. The dev-dependency self-reference enables
+      # `test-hooks` on the lib whenever test targets are in the graph, so
+      # `--all-targets` cannot see warnings that only appear in the build our
+      # users actually run (`cargo build --release`, `cargo install`).
+      - name: Clippy (default features)
+        run: cargo clippy --locked --lib --bins -- -D warnings
+
       # Unit tests + non-cluster integration tests — the reliable gate. Serial
       # (`--test-threads=1`) for deterministic, resource-isolated runs.
       - name: Test (unit + integration)
