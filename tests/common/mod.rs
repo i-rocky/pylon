@@ -115,6 +115,9 @@ pub async fn spawn_default(config: ServerConfig) -> SocketAddr {
 /// router. The worker thread + shutdown flag are leaked (the OS reclaims the
 /// listener + threads at process exit) — test processes are short-lived.
 pub async fn spawn_percore(spec: SpawnSpec) -> SocketAddr {
+    // reqwest here is pylon's `rustls-no-provider` build: it panics unless the
+    // process already has a rustls provider.
+    pylon::transport::tls::install_crypto_provider();
     let SpawnSpec {
         mut config,
         apps,
@@ -281,6 +284,9 @@ pub async fn spawn_percore_cluster_with_apps(
     apps_json: &str,
     with: impl FnOnce(&mut ServerConfig),
 ) -> (SocketAddr, ClusterNodeGuard) {
+    // reqwest here is pylon's `rustls-no-provider` build: it panics unless the
+    // process already has a rustls provider.
+    pylon::transport::tls::install_crypto_provider();
     // The single shared LocalAdapter: the bridge's RedisAdapter shares it (so the
     // pub/sub recv loop's `local.broadcast(Raw)` shards remote frames to this
     // node's workers), the REST plane reads the saturation flag off it, and the

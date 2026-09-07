@@ -1,19 +1,14 @@
 //! rustls `ServerConfig` loader for native TLS support (Part A foundation).
 //!
-//! This module is the **only** place in pylon that touches rustls directly.
+//! This module is the **only** place in pylon that builds a rustls `ServerConfig`.
 //! It exposes two public entry points:
 //!
 //! - [`load_server_config`]: build an `Arc<rustls::ServerConfig>` from PEM files.
 //! - [`resolve_tls`]: the high-level helper that interprets the three config knobs
 //!   (`tls_cert_path`, `tls_key_path`, `tls_ca_path`) and either returns a ready
 //!   `ServerConfig`, plain-mode `None`, or a fatal `Err` on misconfiguration.
-//!
-//! # CryptoProvider note
-//! rustls 0.23 requires a process-global `CryptoProvider` to be installed before
-//! any `ServerConfig` is built.  `load_server_config` calls
-//! `rustls::crypto::ring::default_provider().install_default()` and silently
-//! ignores the `Err(AlreadyInstalled)` return value, so the call is idempotent
-//! whether reqwest/fred have already installed a provider or not.
+//! - [`install_crypto_provider`]: pylon's one rustls backend, for any process
+//!   that reaches rustls without going through `load_server_config`.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -22,6 +17,18 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig as RustlsServerConfig;
+
+/// Install `ring` as this process's rustls `CryptoProvider`, pylon's one TLS
+/// backend. Idempotent — a provider installed earlier keeps its place.
+///
+/// rustls 0.23 needs a process-global provider before a `ServerConfig` is built,
+/// and reqwest (`rustls-no-provider`) reads the same slot and PANICS when it is
+/// empty. Anything that reaches rustls without going through
+/// [`load_server_config`] — a reqwest client, an embedder, a test harness — must
+/// call this first.
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
 
 /// Build a `rustls::ServerConfig` from PEM cert chain + private key files.
 ///
@@ -41,10 +48,7 @@ pub fn load_server_config(
     ca_path: Option<&str>,
 ) -> anyhow::Result<Arc<RustlsServerConfig>> {
     // ── 1. Ensure a CryptoProvider is installed ──────────────────────────────
-    // rustls 0.23 requires a process-default `CryptoProvider` before any
-    // `ServerConfig` can be built. `install_default()` is idempotent: it returns
-    // `Err(Arc<CryptoProvider>)` when one is already installed, which we ignore.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    install_crypto_provider();
 
     // ── 2. Load the certificate chain ────────────────────────────────────────
     let cert_file = File::open(cert_path)

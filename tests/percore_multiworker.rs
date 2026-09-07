@@ -74,6 +74,9 @@ fn free_port() -> u16 {
 /// `LocalAdapter` (sharded sink installed by `run_percore`) and a REST plane
 /// served on the test's tokio runtime. Waits for the listeners to bind.
 async fn spawn() -> Harness {
+    // reqwest here is pylon's `rustls-no-provider` build: it panics unless the
+    // process already has a rustls provider.
+    pylon::transport::tls::install_crypto_provider();
     let port = free_port();
     let config = ServerConfig {
         bind: "127.0.0.1".to_string(),

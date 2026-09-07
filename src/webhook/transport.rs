@@ -335,6 +335,10 @@ impl ReqwestSender {
 
 /// The common client recipe: per-attempt timeout + NO redirect following.
 fn reqwest_client_builder(timeout_ms: u64) -> reqwest::ClientBuilder {
+    // reqwest is built on `rustls-no-provider`, so `build()` panics unless a
+    // process-global provider is already installed. In plain (non-TLS) mode
+    // nothing else in the process installs one.
+    crate::transport::tls::install_crypto_provider();
     reqwest::Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
         .redirect(reqwest::redirect::Policy::none())

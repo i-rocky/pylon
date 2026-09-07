@@ -65,7 +65,9 @@ thiserror = "2.0.20"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pemfile = "2"
 # Outbound HTTP for webhook delivery. rustls (no OpenSSL system dep) to reach https endpoints.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `rustls-no-provider`, NOT `rustls`: the latter links aws-lc-rs as a second crypto
+# backend alongside the ring provider this crate installs process-globally.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 # Redis client for the scaling adapter
 fred = { version = "10", default-features = false, features = ["subscriber-client", "i-pubsub", "i-scripts", "i-std", "sha-1", "enable-rustls"] }
 uuid = { version = "1", features = ["v4"] }

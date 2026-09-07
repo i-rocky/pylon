@@ -112,6 +112,9 @@ async fn spawn() -> Harness {
 /// Start a percore harness from an explicit `config` (so a test can set the SP10
 /// budget/cap knobs directly without touching process-global env).
 async fn spawn_with(config: ServerConfig) -> Harness {
+    // reqwest here is pylon's `rustls-no-provider` build: it panics unless the
+    // process already has a rustls provider.
+    pylon::transport::tls::install_crypto_provider();
     let port = config.port;
 
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());

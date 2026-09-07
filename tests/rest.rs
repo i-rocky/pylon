@@ -56,6 +56,9 @@ async fn spawn_with_apps(apps_json: &str) -> SocketAddr {
 /// [`spawn_with_apps`] plus a [`ServerConfig`] tuning hook — e.g. a short
 /// `cache_ttl_secs` for expired-cache tests.
 async fn spawn_configured(apps_json: &str, with: impl FnOnce(&mut ServerConfig)) -> SocketAddr {
+    // reqwest here is pylon's `rustls-no-provider` build: it panics unless the
+    // process already has a rustls provider.
+    pylon::transport::tls::install_crypto_provider();
     use std::sync::atomic::AtomicBool;
 
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(apps_json).unwrap());
