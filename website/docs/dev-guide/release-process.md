@@ -71,7 +71,11 @@ on all pull requests. It gates on:
 
 1. `cargo fmt --all --check`
 2. `cargo clippy --all-targets --locked -- -D warnings`
-3. Unit + integration tests (`--test-threads=1`)
+3. `cargo clippy --locked --lib --bins -- -D warnings` — default features only. A dev-dependency
+   self-reference enables the `test-hooks` feature whenever test targets are in the build graph, so
+   step 2 alone cannot see warnings that only appear in the default-features build (`cargo build
+   --release`, `cargo install`); this step is the one that catches those.
+4. Unit + integration tests (`--test-threads=1`)
 
 Cluster/Redis tests are run in the same CI job (with a Redis service container)
 but are marked `continue-on-error: true` because they assert on short Redis
