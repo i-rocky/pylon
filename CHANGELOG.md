@@ -134,6 +134,23 @@ pre-1.0 and versions track `Cargo.toml`.
   effect and produces no warning.
 
 ### Fixed
+- **A presence roster no longer advertises the `user_info` of a connection that
+  has already left.** `ChannelState` keeps one `user_info` per distinct presence
+  user, seeded by that user's first connection; `remove` only decremented the
+  refcount, so once the seeding connection left, every later subscriber's
+  `subscription_succeeded` roster and every `GET /apps/{id}/channels/{c}/users`
+  kept serving a value **no live connection had ever presented** — for as long as
+  any other connection of that user remained. The everyday shape: update a
+  profile, open a new tab, close the old one, and everyone who joins afterwards
+  sees the old profile. The roster entry now follows the user's OLDEST LIVE
+  connection: unchanged while that connection lasts (a second connection of the
+  same user still does not displace it, and still emits no `member_added`), and
+  re-seated on the next-oldest survivor when it departs. Because a `user_info`
+  can now change without the user set changing, the memoised
+  `subscription_succeeded` frame is invalidated on that change too — a roster
+  generation is everything its encoded bytes depend on, not just the set of ids.
+  The cluster (Redis) roster keeps first-writer-wins for now; only the node-local
+  roster is re-seated.
 - **A presence join rejected by the cluster member cap no longer swallows the
   node's 0→1 Redis `SUBSCRIBE`, which left the node deaf to the channel it still
   held members of.** `node_first` is a one-shot token — exactly one in-flight
