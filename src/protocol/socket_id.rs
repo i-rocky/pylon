@@ -10,8 +10,7 @@ pub struct SocketId {
 }
 
 impl SocketId {
-    /// Longest `socket_id` a `SocketId` can hold; [`Self::from_raw`] truncates
-    /// past it, so anything client-supplied must be length-checked first.
+    /// Longest `socket_id` this holds; [`Self::from_raw`] truncates past it.
     pub const CAPACITY: usize = 24;
 
     /// Each half is drawn from `[1, 10^10)` — large enough to be unguessable.

@@ -1,8 +1,7 @@
-//! v7 wire (de)serialization. `data` has no uniform encoding: a double-encoded
-//! JSON string on `pusher:connection_established` and the `subscription_*` /
-//! `member_*` internals, an inline object on the rest, and absent altogether on
-//! `pusher:cache_miss`. Each arm pins its own shape against hosted Pusher — a
-//! new variant's shape must be looked up there, never inferred from a rule.
+//! v7 wire (de)serialization. `data` has no uniform encoding — a double-encoded
+//! JSON string on some frames, an inline object on others, absent on
+//! `pusher:cache_miss` — so each arm pins its own hosted-Pusher shape, and a new
+//! variant's must be looked up there rather than inferred from a rule.
 
 use crate::protocol::codec::DecodeError;
 use crate::protocol::command::ClientCommand;

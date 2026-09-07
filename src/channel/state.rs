@@ -72,10 +72,9 @@ pub struct ChannelState {
 impl ChannelState {
     /// Add a subscriber. Returns `Some(PresenceJoin)` for presence channels.
     ///
-    /// Idempotent per socket: a socket already in this channel has its previous
-    /// membership dropped first, so a re-add REPLACES rather than layers. The ws
-    /// layer's duplicate-subscribe guard is therefore an optimisation, not the
-    /// thing keeping the roster consistent.
+    /// Idempotent per socket: a re-add REPLACES the socket's previous membership,
+    /// so the ws layer's duplicate-subscribe guard is an optimisation rather than
+    /// what keeps the roster consistent.
     ///
     /// `channel` is the registry key's channel (this state IS that key's
     /// value; the sole production caller passes its own key): it is baked

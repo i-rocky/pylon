@@ -19,8 +19,6 @@ pub enum RestAuthError {
     BadBodyMd5,
     #[error("invalid auth_signature")]
     BadSignature,
-    /// Two query keys differ only by case, so the lowercased signing string
-    /// cannot be derived from the request.
     #[error("query keys differ only by case")]
     CaseCollidingParams,
 }
@@ -118,10 +116,9 @@ pub fn verify(
         }
     }
     let signature = get("auth_signature").ok_or(RestAuthError::MissingParam)?;
-    // The signing string lowercases every key, so two raw keys that differ only
-    // by case would collapse into one entry with the survivor picked by
-    // `HashMap` iteration order — the signature would not be a function of the
-    // request. Reject instead of signing one of two possible strings.
+    // Keys are lowercased here, so two raw keys differing only by case would
+    // collapse with the survivor picked by `HashMap` order — the signature must
+    // be a function of the request, not of iteration order.
     let mut signed: BTreeMap<String, String> = BTreeMap::new();
     for (k, v) in params {
         if signed.insert(k.to_lowercase(), v.clone()).is_some() {

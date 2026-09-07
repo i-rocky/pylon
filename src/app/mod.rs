@@ -100,9 +100,8 @@ impl App {
     /// `secret` — a blank secret is a zero-length HMAC-SHA256 key, and since the
     /// key ships in browser bundles by design, that lets anyone holding it forge
     /// REST signatures, channel-auth tokens and `pusher:signin`; a colon-free
-    /// `key`; plus non-empty `event_types`, every entry one of the seven,
-    /// non-empty `url`. A dynamic
-    /// backend row that fails here surfaces from the lookup as
+    /// `key`; plus non-empty `event_types`, every entry one of the seven, and a
+    /// non-empty `url`. A dynamic backend row that fails here surfaces as
     /// `AppLookupError::Decode`, which the REST auth path (`src/http/rest/auth.rs`)
     /// renders as `503` rather than the disabled/not-found response the row
     /// would otherwise produce.
