@@ -44,32 +44,45 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Membership TTL heartbeat loop. Every `interval_secs`, re-stamp each LOCAL
-/// member's `expireAt` (`ttl_secs` ahead) in its channel's occupancy hash and re-arm
-/// that hash's whole-key backstop (`occ_ttl_secs`, deliberately LONGER — see
-/// [`RedisConfig::occ_ttl_secs`]), so a live node never lets its members expire. A
-/// dead node simply stops ticking — its entries go stale and the sweeper reaps them.
+/// This node's local subscriptions or user bindings, grouped per `(app, channel)`
+/// / `(app, user_id)` with that group's socket ids — the shape
+/// [`LocalAdapter::local_members`] and [`LocalAdapter::local_user_bindings`]
+/// return, and the LEVEL truth every reconciliation below is derived from.
+type LocalGroups = [((String, String), Vec<SocketId>)];
+
+/// Membership reconciliation loop. Every `presence_heartbeat_secs` this node
+/// re-asserts, from its own registry, the whole of what Redis must know about it:
+/// each local member's and binding's `expireAt` stamp, those hashes' whole-key TTL
+/// backstops, the `apps` / `chans` / `users` sets they are enumerated through, and
+/// the pub/sub subscriptions that carry cross-node traffic to this node.
 ///
-/// F11 batching: ONE pipeline per tick carries every refresh. Members are grouped
-/// per channel hash into a single multi-field `HSET` (all of this node's member
-/// tokens → the tick's shared `expireAt`), followed immediately by that hash's
-/// whole-key `EXPIRE` re-arm; the user `usr(app,user)` hashes get the same
-/// treatment in the SAME pipeline. Every command is an idempotent re-seed (field
-/// writes overwrite in place, `EXPIRE` re-arms idempotently, and per key the
-/// `EXPIRE` still follows its `HSET` in command order), so a Redis error fails the
-/// tick's whole batch and the loop simply retries it next tick — the stamp horizon
-/// (`membership_ttl_secs`, default 60s) spans multiple ticks
-/// (`presence_heartbeat_secs`, default 25s). Logged and skipped, never fatal.
-async fn heartbeat_loop(
+/// Every write here is a LEVEL re-assertion of node-local truth, never an edge.
+/// That is what bounds the blast radius of a lost edge: an index entry or a Redis
+/// `SUBSCRIBE` missed because a bridge command was dropped, a Redis restart wiped
+/// the keyspace, or a sweeper false-reap removed live members is restored on the
+/// next tick instead of staying lost for the life of the process. A dead node
+/// simply stops ticking — its stamps go stale and the sweeper reaps them.
+///
+/// The pub/sub half costs no Redis round-trip when nothing is missing: the desired
+/// set is diffed against the subscriber client's own tracked-channel set in memory.
+///
+/// F11 batching: ONE pipeline per tick carries every Redis write. Members are
+/// grouped per channel hash into a single multi-field `HSET` (all of this node's
+/// member tokens → the tick's shared `expireAt`) followed by that hash's whole-key
+/// `EXPIRE` re-arm, then one `SADD` per app for each index. Every command is
+/// idempotent, so a Redis error fails the tick's whole batch and the loop simply
+/// retries it next tick — the stamp horizon (`membership_ttl_secs`, default 60s)
+/// spans multiple ticks. Logged and skipped, never fatal.
+async fn membership_reconcile_loop(
     local: Arc<LocalAdapter>,
     pool: Pool,
+    sub: fred::clients::SubscriberClient,
     keys: keys::Keys,
     node_id: String,
-    ttl_secs: u64,
-    occ_ttl_secs: u64,
-    interval_secs: u64,
+    cfg: RedisConfig,
 ) {
-    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
+    let interval = Duration::from_secs(cfg.presence_heartbeat_secs.max(1));
+    let mut ticker = tokio::time::interval(interval);
     loop {
         ticker.tick().await;
         let members = local.local_members();
@@ -77,59 +90,131 @@ async fn heartbeat_loop(
         if members.is_empty() && bindings.is_empty() {
             continue;
         }
-        let expire_at = (now_ms() + ttl_secs * 1000).to_string();
-        // One pipeline per tick: per occ/usr hash one multi-field HSET of all of
-        // this node's member tokens → expire_at, then the whole-key TTL re-arm —
-        // one round-trip for the entire tick instead of one per member.
-        let pipe = pool.next().pipeline();
-        let tick = async {
-            for ((app, channel), socket_ids) in &members {
-                let occ = keys.occ(app, channel);
-                let fields: Vec<(String, String)> = socket_ids
-                    .iter()
-                    .map(|sid| {
-                        (
-                            keys::member_token(&node_id, sid.as_str()),
-                            expire_at.clone(),
-                        )
-                    })
-                    .collect();
-                pipe.hset::<(), _, _>(&occ, fields).await?;
-                pipe.expire::<(), _>(&occ, occ_ttl_secs as i64, None)
-                    .await?;
-            }
-
-            // Re-stamp this node's own user bindings (the `usr(app,user)` HASH),
-            // exactly as for channel members above: a live node keeps its
-            // bindings' `expireAt` in the future so the sweeper never reaps
-            // them; a crashed node stops ticking and its bindings go stale,
-            // firing the cluster offline edge once the user's last cluster
-            // connection (on the dead node) is reaped.
-            for ((app, user_id), socket_ids) in &bindings {
-                let usr = keys.usr(app, user_id);
-                let fields: Vec<(String, String)> = socket_ids
-                    .iter()
-                    .map(|sid| {
-                        (
-                            keys::member_token(&node_id, sid.as_str()),
-                            expire_at.clone(),
-                        )
-                    })
-                    .collect();
-                pipe.hset::<(), _, _>(&usr, fields).await?;
-                pipe.expire::<(), _>(&usr, ttl_secs as i64, None).await?;
-            }
-            pipe.all::<()>().await
-        };
-        if let Err(e) = tick.await {
+        resubscribe_missing(&sub, &keys, &members, &bindings, cfg.sharded_pubsub).await;
+        if let Err(e) = restamp_and_reindex(&pool, &keys, &node_id, &members, &bindings, &cfg).await
+        {
             tracing::warn!(
                 error = %e,
                 channels = members.len(),
                 users = bindings.len(),
-                "redis membership heartbeat refresh failed; retrying the whole batch next tick"
+                "redis membership reconcile failed; retrying the whole batch next tick"
             );
         }
     }
+}
+
+/// SUBSCRIBE every `msg` / `usermsg` pub/sub key this node has local members or
+/// bindings for but is not already subscribed to.
+///
+/// The edge that normally performs these (`node_first` on the worker, applied by
+/// the bridge) rides a bounded, drop-on-full command channel, and a Redis
+/// `SUBSCRIBE` missed there is otherwise never retried — the node stays deaf to
+/// that channel's or user's cross-node traffic while reporting healthy. Subscribe
+/// only: a subscription this node no longer needs delivers into an empty local
+/// registry (a no-op) and is torn down by the next node-local 1→0 edge, whereas
+/// unsubscribing here would race a concurrent join into a full tick of deafness.
+async fn resubscribe_missing(
+    sub: &fred::clients::SubscriberClient,
+    keys: &keys::Keys,
+    members: &LocalGroups,
+    bindings: &LocalGroups,
+    sharded: bool,
+) {
+    let tracked: std::collections::BTreeSet<String> = sub
+        .tracked_channels()
+        .into_iter()
+        .chain(sub.tracked_shard_channels())
+        .map(|c| c.to_string())
+        .collect();
+    let wanted = members
+        .iter()
+        .map(|((app, channel), _)| keys.msg(app, channel))
+        .chain(
+            bindings
+                .iter()
+                .map(|((app, user_id), _)| keys.usermsg(app, user_id)),
+        );
+    for key in wanted.filter(|k| !tracked.contains(k)) {
+        match pubsub::sub_channel(sub, key.clone(), sharded).await {
+            Ok(()) => tracing::info!(
+                channel = %key,
+                "reconciled a missing Redis subscription this node has local members for"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e, channel = %key,
+                "failed to reconcile a missing Redis subscription; retrying next tick"
+            ),
+        }
+    }
+}
+
+/// One pipeline: re-stamp every local member/binding, re-arm the whole-key TTL of
+/// each hash, and re-seed the `apps` / `chans` / `users` enumeration indexes from
+/// the same live truth.
+///
+/// The index `SADD`s are ordered AFTER the `HSET`s that populate the hashes they
+/// point at, so a sweeper that reads an index entry from this tick always finds
+/// the membership behind it.
+async fn restamp_and_reindex(
+    pool: &Pool,
+    keys: &keys::Keys,
+    node_id: &str,
+    members: &LocalGroups,
+    bindings: &LocalGroups,
+    cfg: &RedisConfig,
+) -> Result<(), fred::error::Error> {
+    let expire_at = (now_ms() + cfg.membership_ttl_secs * 1000).to_string();
+    let stamps = |socket_ids: &Vec<SocketId>| -> Vec<(String, String)> {
+        socket_ids
+            .iter()
+            .map(|sid| (keys::member_token(node_id, sid.as_str()), expire_at.clone()))
+            .collect()
+    };
+
+    let pipe = pool.next().pipeline();
+    for ((app, channel), socket_ids) in members {
+        let occ = keys.occ(app, channel);
+        pipe.hset::<(), _, _>(&occ, stamps(socket_ids)).await?;
+        pipe.expire::<(), _>(&occ, cfg.occ_ttl_secs() as i64, None)
+            .await?;
+    }
+    for ((app, user_id), socket_ids) in bindings {
+        let usr = keys.usr(app, user_id);
+        pipe.hset::<(), _, _>(&usr, stamps(socket_ids)).await?;
+        pipe.expire::<(), _>(&usr, cfg.membership_ttl_secs as i64, None)
+            .await?;
+    }
+
+    let channels_by_app = group_by_app(members);
+    let users_by_app = group_by_app(bindings);
+    for (app, channels) in &channels_by_app {
+        pipe.sadd::<(), _, _>(keys.chans(app), channels.clone())
+            .await?;
+    }
+    for (app, users) in &users_by_app {
+        pipe.sadd::<(), _, _>(keys.users(app), users.clone())
+            .await?;
+    }
+    let apps: Vec<String> = channels_by_app
+        .keys()
+        .chain(users_by_app.keys())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    pipe.sadd::<(), _, _>(keys.apps(), apps).await?;
+    pipe.all::<()>().await
+}
+
+/// Collapse `(app, name)` groups into one `app → names` map, so each app's index
+/// takes a single multi-member `SADD` per tick rather than one per name.
+fn group_by_app(groups: &LocalGroups) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut by_app: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for ((app, name), _) in groups {
+        by_app.entry(app.clone()).or_default().push(name.clone());
+    }
+    by_app
 }
 
 /// Node-liveness heartbeat loop. Every `interval_secs`, advertise this node as alive:
@@ -348,11 +433,12 @@ pub struct RedisAdapter {
     /// it would abort cross-node delivery on this node.
     #[allow(dead_code)]
     recv_handle: JoinHandle<()>,
-    /// The membership TTL heartbeat. Re-stamps every local member's `expireAt` and
-    /// bumps the occ-hash TTL on each tick. Kept alive for the adapter's lifetime —
-    /// dropping it stops the refresh and this node's members would expire.
+    /// The membership reconciliation loop. Re-stamps every local member, re-seeds
+    /// the enumeration indexes and re-subscribes any missing pub/sub channel on
+    /// each tick. Kept alive for the adapter's lifetime — dropping it stops the
+    /// refresh and this node's members would expire.
     #[allow(dead_code)]
-    heartbeat_handle: JoinHandle<()>,
+    reconcile_handle: JoinHandle<()>,
     /// The node-liveness heartbeat. Re-stamps `node(node_id)` (with a TTL) and SADDs
     /// `node_id` to the `nodes` set each tick. Kept alive for the adapter's lifetime —
     /// dropping it stops the heartbeat and this node's `node` key TTL-expires.
@@ -440,28 +526,17 @@ impl RedisAdapter {
             );
         }
 
-        // Spawn the membership TTL heartbeat. It re-stamps every local member's
-        // `expireAt` and bumps the occ-hash TTL every `presence_heartbeat_secs`, so a
-        // live node never lets its members expire. fred clients are cheap clones; the
-        // handle is stored so the task is not dropped (which would stop the refresh).
-        let hb_local = local.clone();
-        let hb_pool = clients.pool.clone();
-        let hb_keys = keys.clone();
-        let hb_node = node_id.clone();
-        let hb_ttl = redis_cfg.membership_ttl_secs;
-        let hb_occ_ttl = redis_cfg.occ_ttl_secs();
-        let hb_interval = redis_cfg.presence_heartbeat_secs;
-        let heartbeat_handle = tokio::spawn(async move {
-            heartbeat_loop(
-                hb_local,
-                hb_pool,
-                hb_keys,
-                hb_node,
-                hb_ttl,
-                hb_occ_ttl,
-                hb_interval,
-            )
-            .await
+        // Spawn the membership reconciler. Every `presence_heartbeat_secs` it
+        // re-asserts this node's whole Redis footprint from its local registry. fred
+        // clients are cheap clones; the handle is stored so the task is not dropped
+        // (which would stop the refresh).
+        let rc_local = local.clone();
+        let rc_pool = clients.pool.clone();
+        let rc_sub = clients.sub.clone();
+        let rc_keys = keys.clone();
+        let rc_node = node_id.clone();
+        let reconcile_handle = tokio::spawn(async move {
+            membership_reconcile_loop(rc_local, rc_pool, rc_sub, rc_keys, rc_node, redis_cfg).await
         });
 
         // Spawn the node-liveness heartbeat. It advertises this node as alive every
@@ -494,7 +569,7 @@ impl RedisAdapter {
             // `from_lua` is local (SHA-1 only) — no Redis round-trip here.
             scripts: client::Scripts::new(),
             recv_handle,
-            heartbeat_handle,
+            reconcile_handle,
             node_heartbeat_handle,
             // The sweeper is started later via `start_sweeper` once the webhook
             // handle exists (see the doc on the field).
@@ -653,7 +728,7 @@ impl RedisAdapter {
         let mut occupied = false;
         match self
             .scripts
-            .subscribe
+            .membership_join
             .evalsha_with_reload::<i64, _, _>(self.clients.pool.next(), vec![occ, chans], argv)
             .await
         {
@@ -1151,14 +1226,14 @@ impl RedisAdapter {
 
 impl Drop for RedisAdapter {
     /// Dropping the adapter "crashes" this node: abort every background task so it
-    /// stops re-stamping its members' `expireAt` (membership heartbeat) and stops
+    /// stops re-stamping its members' `expireAt` (the membership reconciler) and stops
     /// advertising liveness (node heartbeat). A `tokio::JoinHandle` detaches on drop
     /// rather than aborting, so without this the heartbeats would outlive the adapter
     /// and the node's members would never go stale — defeating the sweeper. Aborting
     /// here makes a dropped adapter behave exactly like a crashed node.
     fn drop(&mut self) {
         self.recv_handle.abort();
-        self.heartbeat_handle.abort();
+        self.reconcile_handle.abort();
         self.node_heartbeat_handle.abort();
         if let Ok(guard) = self.sweeper_handle.lock() {
             if let Some(h) = guard.as_ref() {
@@ -1419,6 +1494,28 @@ impl Adapter for RedisAdapter {
             Err(e) => {
                 tracing::warn!(error = %e, app, channel, "redis presence_members failed; falling back to local");
                 self.local.presence_members(app, channel).await
+            }
+        }
+    }
+
+    async fn resend_presence_ack(
+        &self,
+        app: &str,
+        channel: &str,
+        mailbox: crate::connection::handle::Mailbox,
+    ) {
+        if !presence::is_presence(channel) {
+            return;
+        }
+        match presence::roster(&self.clients.pool, &self.keys, app, channel).await {
+            Ok(roster) => {
+                let _ = mailbox.send(ServerEvent::SubscriptionSucceeded {
+                    channel: channel.to_string(),
+                    presence: Some(roster),
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, app, channel, "redis presence roster read failed; subscription_succeeded not re-sent");
             }
         }
     }

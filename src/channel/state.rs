@@ -197,7 +197,7 @@ impl ChannelState {
     /// the fan-out frame, it encodes at `ACTIVE_VERSIONS[0]` (one frame is
     /// shared by every join of the generation; `Raw` delivery is
     /// version-agnostic by design — see `transport::fanout`).
-    fn cached_roster_frame(&self, channel: &str) -> Arc<str> {
+    pub(crate) fn cached_roster_frame(&self, channel: &str) -> Arc<str> {
         self.roster_frame
             .get_or_init(|| {
                 Arc::from(
