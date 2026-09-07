@@ -199,8 +199,8 @@ pub const CATALOG: &[Scenario] = &[
         id: "S-WEBHOOK-VERIFY",
         plane: Plane::Server,
         sdk: "pusher-http-node",
-        summary: "captured pylon envelopes → SDK webhook verifier",
-        budget_ms: 25000,
+        summary: "EVERY captured pylon envelope → SDK webhook verifier, over all seven event types",
+        budget_ms: 30000,
     },
     Scenario {
         id: "S-ERRORS",

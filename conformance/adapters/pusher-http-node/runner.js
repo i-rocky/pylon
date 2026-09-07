@@ -57,10 +57,10 @@
 //   node runner.js --list       Print implemented scenario ids, one per line.
 //
 // Occupied-server fixtures: the query scenarios (S-CHANNELS/S-CHANNEL/S-USERS)
-// establish the client state they assert on through the sibling pusher-js
-// runner's `--hold` mode, so each observes a server IT populated instead of
-// whatever an earlier scenario left behind — no query scenario depends on
-// another's leftovers or on catalog order.
+// and S-WEBHOOK-VERIFY establish the client state they assert on through the
+// sibling pusher-js runner's `--hold` mode, so each observes a server IT
+// populated instead of whatever an earlier scenario left behind — no scenario
+// depends on another's leftovers or on catalog order.
 
 const fs = require('fs');
 const path = require('path');
@@ -175,6 +175,8 @@ const statusOf = (e) => (e && typeof e.status === 'number' ? e.status : 0);
 const assertOk = (cond, msg) => {
   if (!cond) throw new Error(msg);
 };
+
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
 // ---------------------------------------------------------------------------
 // Occupied-server fixture: a real client connection, established through the
@@ -461,21 +463,62 @@ const SCENARIOS = {
     return { private: '<key:sig>', presence: '<key:sig>', user: '<token>' };
   },
 
-  // Verify the most recent webhook envelope captured by the harness receiver.
-  // In a server-only scoped run nothing has fired a webhook yet: /last is 404
-  // and the verdict is skip, not fail.
+  // EVERY envelope the receiver captured this run is verified — the signing
+  // headers, the SDK's own HMAC verifier, the envelope frame, and each event's
+  // documented payload shape — and the observed event-type set must cover all
+  // seven types, so a silently missing webhook type fails instead of passing
+  // unnoticed. The provocation is this scenario's own, so the requirement
+  // holds whether or not the client plane ran ahead of it.
   'S-WEBHOOK-VERIFY': async () => {
     const e = loadEnv();
-    const resp = await fetch(e.webhook_receiver + '/last');
-    if (resp.status === 404) {
-      return { skip: 'no webhook envelope recorded yet' };
+    const held = await holdChannels({
+      user_id: 'u-s-webhook',
+      channels: [
+        'cf-s-webhook',
+        'cache-cf-s-webhook-never-published',
+        'presence-cf-s-webhook',
+        'private-cf-s-webhook',
+      ],
+      client_event: {
+        channel: 'private-cf-s-webhook',
+        event: 'client-s-webhook',
+        data: { probe: 'cf-s-webhook' },
+      },
+    });
+    try {
+      // Synchronizes on effect, never on elapsed time: the client event is
+      // only known to have reached pylon once its webhook lands, and releasing
+      // the hold sooner would race the socket close against the frame.
+      await captureUntilProbeTypes(e.webhook_receiver, WEBHOOK_TYPES_WHILE_HELD);
+    } finally {
+      // The vacate-side types only fire once the hold is gone and pylon's
+      // reconnect grace has elapsed.
+      await held.release();
     }
-    assertOk(resp.status === 200, `webhook receiver status ${resp.status}`);
-    const envelope = await resp.json();
-    assertOk(envelope && typeof envelope.body === 'string', 'envelope shape');
-    const result = verifyWebhookEnvelope(envelope);
-    assertOk(result.valid, result.error || 'SDK webhook verification failed');
-    return { verified: true, events: result.events };
+
+    const envelopes = await captureUntilProbeTypes(e.webhook_receiver, WEBHOOK_EVENT_TYPES);
+    const names = new Set();
+    envelopes.forEach((envelope, i) => {
+      assertOk(
+        envelope && typeof envelope.body === 'string',
+        `envelope ${i} shape: ${JSON.stringify(envelope)}`
+      );
+      try {
+        for (const name of verifyWebhookEnvelope(envelope, e.app_key)) names.add(name);
+      } catch (err) {
+        throw new Error(
+          `envelope ${i + 1} of ${envelopes.length}: ${(err && err.message) || String(err)}`
+        );
+      }
+    });
+    const missing = WEBHOOK_EVENT_TYPES.filter((name) => !names.has(name));
+    assertOk(missing.length === 0, `webhook types never observed: ${missing.join(',')}`);
+    log(`verified ${envelopes.length} captured envelope(s)`);
+    return {
+      verified: '<every captured envelope>',
+      headers_verified: ['content-type', 'x-pusher-key', 'x-pusher-signature'],
+      event_types_verified: [...names].sort(),
+    };
   },
 
   // A bad secret and an unknown app must BOTH be rejected by the server (401)
@@ -528,30 +571,153 @@ const SCENARIOS = {
 const isSkip = (o) => o !== null && typeof o === 'object' && typeof o.skip === 'string';
 
 // ---------------------------------------------------------------------------
-// Webhook verification (used by the S-WEBHOOK-VERIFY scenario, which fetches
-// the envelope from the harness receiver's /last endpoint directly).
+// Webhook verification (S-WEBHOOK-VERIFY, over the receiver's /all capture).
 // ---------------------------------------------------------------------------
 
-// Build the SDK webhook object from a receiver envelope {headers, body}:
-// header names lowercased (the SDK reads x-pusher-key / x-pusher-signature /
-// content-type), content-type application/json added when absent (the SDK
-// refuses to even parse the body without it), rawBody = the body string.
-function verifyWebhookEnvelope(envelope) {
+// The seven types the harness app subscribes to (server.rs ALL_EVENT_TYPES),
+// split by the edge that produces them: S-WEBHOOK-VERIFY provokes one of each
+// and requires all seven to arrive.
+const WEBHOOK_TYPES_WHILE_HELD = [
+  'cache_miss',
+  'channel_occupied',
+  'client_event',
+  'member_added',
+  'subscription_count',
+];
+const WEBHOOK_TYPES_AFTER_RELEASE = ['channel_vacated', 'member_removed'];
+const WEBHOOK_EVENT_TYPES = [...WEBHOOK_TYPES_WHILE_HELD, ...WEBHOOK_TYPES_AFTER_RELEASE].sort();
+
+// Substring every channel S-WEBHOOK-VERIFY provokes on carries, and no other
+// scenario's channel does — the coverage assertion counts only these.
+const WEBHOOK_PROBE_MARKER = 'cf-s-webhook';
+
+const isNonEmptyString = (v) => typeof v === 'string' && v.length > 0;
+
+// https://pusher.com/docs/channels/server_api/webhooks/ — the payload keys
+// each `name` carries, and the shape of each key's value. `data` is the
+// client's own event payload, so only its presence is pinned.
+const WEBHOOK_PAYLOAD_KEYS = {
+  channel_occupied: { required: ['channel'], optional: [] },
+  channel_vacated: { required: ['channel'], optional: [] },
+  cache_miss: { required: ['channel'], optional: [] },
+  member_added: { required: ['channel', 'user_id'], optional: [] },
+  member_removed: { required: ['channel', 'user_id'], optional: [] },
+  subscription_count: { required: ['channel', 'subscription_count'], optional: [] },
+  client_event: {
+    required: ['channel', 'event', 'data', 'socket_id'],
+    optional: ['user_id'],
+  },
+};
+
+const WEBHOOK_FIELD_SHAPES = {
+  channel: isNonEmptyString,
+  user_id: isNonEmptyString,
+  event: isNonEmptyString,
+  socket_id: (v) => typeof v === 'string' && /^\d+\.\d+$/.test(v),
+  subscription_count: (v) => Number.isInteger(v) && v >= 0,
+  data: (v) => v !== undefined,
+};
+
+// Why this event does not match the documented shape for its `name`, or null.
+function payloadProblem(ev) {
+  if (ev === null || typeof ev !== 'object') return `event is not an object: ${JSON.stringify(ev)}`;
+  const shape = WEBHOOK_PAYLOAD_KEYS[ev.name];
+  if (shape === undefined) return `undocumented webhook name ${JSON.stringify(ev.name)}`;
+  const allowed = new Set(['name', ...shape.required, ...shape.optional]);
+  const extra = Object.keys(ev).filter((k) => !allowed.has(k));
+  if (extra.length > 0) return `${ev.name} carries undocumented key(s): ${extra.join(',')}`;
+  for (const key of shape.required) {
+    if (!(key in ev)) return `${ev.name} is missing ${key}`;
+  }
+  for (const key of [...shape.required, ...shape.optional]) {
+    if (key in ev && !WEBHOOK_FIELD_SHAPES[key](ev[key])) {
+      return `${ev.name}.${key}: ${JSON.stringify(ev[key])}`;
+    }
+  }
+  return null;
+}
+
+// Verify ONE captured envelope {headers, body} end to end and return its event
+// names. The signature is checked by the SDK's own verifier — never by this
+// runner — so the harness stays blind to pylon's signing implementation.
+// Header names arrive lowercased from the receiver, which is what the SDK
+// reads; nothing is filled in on pylon's behalf.
+function verifyWebhookEnvelope(envelope, appKey) {
   const headers = {};
   for (const [k, v] of Object.entries(envelope.headers || {})) {
     headers[String(k).toLowerCase()] = v;
   }
-  if (!headers['content-type']) headers['content-type'] = 'application/json';
+  assertOk(
+    headers['content-type'] === 'application/json',
+    `content-type: ${JSON.stringify(headers['content-type'])}`
+  );
+  assertOk(
+    headers['x-pusher-key'] === appKey,
+    `X-Pusher-Key: ${JSON.stringify(headers['x-pusher-key'])}`
+  );
+  assertOk(
+    /^[0-9a-f]{64}$/.test(headers['x-pusher-signature'] || ''),
+    `X-Pusher-Signature: ${JSON.stringify(headers['x-pusher-signature'])}`
+  );
 
-  try {
-    const wh = client().webhook({ headers, rawBody: envelope.body });
-    const valid = wh.isValid();
-    if (!valid) {
-      return { valid: false, events: [], error: 'SDK webhook verification failed (key/signature/body mismatch)' };
+  const wh = client().webhook({ headers, rawBody: envelope.body });
+  assertOk(wh.isValid(), 'SDK webhook verification failed (key/signature/body mismatch)');
+
+  const data = wh.getData();
+  const frame = Object.keys(data).sort().join(',');
+  assertOk(frame === 'events,time_ms', `envelope keys: ${frame}`);
+  assertOk(
+    Number.isInteger(data.time_ms) && data.time_ms > 0,
+    `time_ms: ${JSON.stringify(data.time_ms)}`
+  );
+  const events = wh.getEvents();
+  assertOk(Array.isArray(events) && events.length > 0, `events: ${JSON.stringify(events)}`);
+  for (const ev of events) {
+    const problem = payloadProblem(ev);
+    assertOk(problem === null, `payload shape — ${problem}`);
+  }
+  return events.map((ev) => ev.name);
+}
+
+// Poll the receiver's whole capture until every `required` type has landed FROM
+// S-WEBHOOK-VERIFY'S OWN probe channels — delivery is asynchronous and pylon
+// debounces the vacate-side events behind a reconnect grace window. Counting
+// only the probe's own channels is what keeps the coverage assertion
+// self-contained: an envelope another scenario left behind can neither satisfy
+// it nor hide a type this scenario provoked and never received. Returns the
+// whole capture; the timeout names what is still missing, which is the
+// diagnosis a bare "verified nothing" would not give.
+const WEBHOOK_SETTLE_TIMEOUT_MS = 8000;
+const WEBHOOK_POLL_INTERVAL_MS = 250;
+
+async function captureUntilProbeTypes(receiver, required) {
+  const deadline = Date.now() + WEBHOOK_SETTLE_TIMEOUT_MS;
+  for (;;) {
+    const resp = await fetch(receiver + '/all');
+    assertOk(resp.status === 200, `webhook receiver /all status ${resp.status}`);
+    const envelopes = await resp.json();
+    const seen = new Set();
+    for (const envelope of envelopes) {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(envelope && envelope.body);
+      } catch (e) {
+        continue; // a malformed body is the verification pass's failure to report
+      }
+      for (const ev of (parsed && parsed.events) || []) {
+        if (typeof ev.channel === 'string' && ev.channel.includes(WEBHOOK_PROBE_MARKER)) {
+          seen.add(ev.name);
+        }
+      }
     }
-    return { valid: true, events: wh.getEvents().map((ev) => ev.name), error: null };
-  } catch (e) {
-    return { valid: false, events: [], error: (e && e.message) || String(e) };
+    const missing = required.filter((name) => !seen.has(name));
+    if (missing.length === 0) return envelopes;
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `probe webhook types not delivered within ${WEBHOOK_SETTLE_TIMEOUT_MS}ms: ${missing.join(',')}`
+      );
+    }
+    await sleep(WEBHOOK_POLL_INTERVAL_MS);
   }
 }
 

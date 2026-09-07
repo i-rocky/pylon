@@ -44,12 +44,11 @@ use crate::server::AppSpec;
 /// cap.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The `--smoke` subset: C-PUB-SUB's subscribe/unsubscribe records
-/// occupied/vacated webhook envelopes, so the two server-plane scenarios
-/// that follow (S-TRIGGER's HTTP plane, S-WEBHOOK-VERIFY's `/last` +
-/// SDK-verifier path) have something to consume — all three members
-/// actually exercise instead of S-WEBHOOK-VERIFY skipping on an empty
-/// receiver.
+/// The `--smoke` subset: one scenario per plane per surface — C-PUB-SUB's
+/// WebSocket plane, S-TRIGGER's HTTP plane, and S-WEBHOOK-VERIFY's
+/// capture + SDK-verifier path. Each stands alone (S-WEBHOOK-VERIFY provokes
+/// the webhook types it verifies), so the subset needs no ordering between
+/// its members.
 const SMOKE_IDS: [&str; 3] = ["C-PUB-SUB", "S-TRIGGER", "S-WEBHOOK-VERIFY"];
 
 /// Wall-clock bound on one `--sign` child. Signing is pure crypto (no server
