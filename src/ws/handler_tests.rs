@@ -2183,15 +2183,15 @@ async fn client_event_rate_limit_returns_4301_and_drops() {
 
 // ── Task 3: memory-pressure subscription gate ────────────────────────────────
 
-/// Build a `ConnectionContext` with `saturated` forced to `true` via an
-/// `Arc<AtomicBool>` so the subscribe gate fires, and return both the context
-/// and the flag so the test can flip it back.
+/// Build a `ConnectionContext` with `saturated` forced to `true` so the
+/// subscribe gate fires, and return both the context and the flag so the test
+/// can flip it back.
 fn ctx_saturated(
     app: App,
 ) -> (
     ConnectionContext,
     mpsc::Receiver<Box<ServerEvent>>,
-    Arc<std::sync::atomic::AtomicBool>,
+    crate::transport::fanout::SaturationFlag,
 ) {
     let (tx, rx) = mpsc::channel(1024);
     let registry = Arc::new(Registry::new());
@@ -2199,7 +2199,8 @@ fn ctx_saturated(
         registry,
         Arc::new(crate::adapter::app_registry::AppRegistry::new()),
     ));
-    let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let flag = crate::transport::fanout::SaturationFlag::default();
+    flag.set_inbox_full();
     let c = ConnectionContext {
         app: std::sync::Arc::new(app),
         socket_id: SocketId::generate(),
@@ -2284,7 +2285,7 @@ async fn subscribe_rejected_under_saturation_private() {
 async fn subscribe_succeeds_when_not_saturated() {
     let (mut c, mut rx, flag) = ctx_saturated(app(false));
     // Clear the saturation flag — this is the normal (not-saturated) case.
-    flag.store(false, std::sync::atomic::Ordering::SeqCst);
+    flag.clear_inbox_full();
     c.dispatch(ClientCommand::Subscribe {
         channel: "public-ok".into(),
         auth: None,
@@ -2311,7 +2312,7 @@ async fn subscribe_succeeds_when_not_saturated() {
 async fn resub_already_held_channel_is_idempotent_under_saturation() {
     // First, subscribe normally (flag off).
     let (mut c, mut rx, flag) = ctx_saturated(app(false));
-    flag.store(false, std::sync::atomic::Ordering::SeqCst);
+    flag.clear_inbox_full();
     c.dispatch(ClientCommand::Subscribe {
         channel: "public-held".into(),
         auth: None,
@@ -2323,7 +2324,7 @@ async fn resub_already_held_channel_is_idempotent_under_saturation() {
     assert!(c.subscribed.contains("public-held"));
 
     // Now set saturation true and re-subscribe the same channel.
-    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    flag.set_inbox_full();
     c.dispatch(ClientCommand::Subscribe {
         channel: "public-held".into(),
         auth: None,

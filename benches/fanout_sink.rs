@@ -184,10 +184,11 @@ fn build_world(n: usize) -> SinkWorld {
         tx,
         waker: std::sync::OnceLock::new(),
         dropped: AtomicU64::new(0),
+        budget_saturated: AtomicBool::new(false),
     };
     let sink = BroadcastSink {
         workers: Arc::new(vec![Arc::new(slot)]),
-        saturated: Arc::new(AtomicBool::new(false)),
+        saturated: Default::default(),
     };
 
     SinkWorld {

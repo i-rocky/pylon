@@ -102,6 +102,53 @@ pub struct WorkerSlot {
     /// Count of broadcasts dropped because this worker's hand-off channel was
     /// full. A monotonic saturation metric (Relaxed is fine — it's diagnostic).
     pub dropped: AtomicU64,
+    /// Whether this worker's own out-queues are over its byte budget. Written
+    /// ONLY by the owning worker, so no other worker's drain can clear a
+    /// pressure this one is still under.
+    pub budget_saturated: AtomicBool,
+}
+
+/// The node's overload signal, read by every admission-control path (the REST
+/// `503` gate, the `client-*` ingress drop, the subscribe gate, the accept
+/// gate). It ORs two producers whose lifetimes are independent: a publisher
+/// that found some worker's bounded hand-off full — cleared by that worker once
+/// it drains its inbox to empty — and any worker sitting over its own byte
+/// budget, cleared by that worker alone.
+#[derive(Clone, Default)]
+pub struct SaturationFlag {
+    state: Arc<SaturationState>,
+}
+
+#[derive(Default)]
+struct SaturationState {
+    inbox_full: AtomicBool,
+    workers: std::sync::OnceLock<Arc<Vec<Arc<WorkerSlot>>>>,
+}
+
+impl SaturationFlag {
+    /// Called once by `run_percore`. The admission paths take their clone of the
+    /// flag off the `LocalAdapter` before any worker slot exists, so the
+    /// per-worker budget bits are bound late.
+    pub fn bind_workers(&self, workers: Arc<Vec<Arc<WorkerSlot>>>) {
+        let _ = self.state.workers.set(workers);
+    }
+
+    pub fn set_inbox_full(&self) {
+        self.state.inbox_full.store(true, Ordering::Relaxed);
+    }
+
+    pub fn clear_inbox_full(&self) {
+        self.state.inbox_full.store(false, Ordering::Relaxed);
+    }
+
+    pub fn is_saturated(&self) -> bool {
+        self.state.inbox_full.load(Ordering::Relaxed)
+            || self.state.workers.get().is_some_and(|workers| {
+                workers
+                    .iter()
+                    .any(|w| w.budget_saturated.load(Ordering::Relaxed))
+            })
+    }
 }
 
 /// Cloneable handle the adapter holds to route broadcasts to every worker. The
@@ -112,12 +159,7 @@ pub struct WorkerSlot {
 #[derive(Clone, Default)]
 pub struct BroadcastSink {
     pub workers: Arc<Vec<Arc<WorkerSlot>>>,
-    /// Set whenever any worker's bounded hand-off channel is `Full` (a broadcast
-    /// was dropped). The publish-admission path reads this via [`BroadcastSink::is_saturated`]
-    /// to fail fast (503) under sustained overload; a worker clears it after
-    /// fully draining its broadcast inbox to empty. Shared (`Arc`) so the cheap
-    /// `Clone` of the sink onto the adapter keeps pointing at the same flag.
-    pub saturated: Arc<AtomicBool>,
+    pub saturated: SaturationFlag,
 }
 
 impl BroadcastSink {
@@ -146,10 +188,8 @@ impl BroadcastSink {
             }) {
                 Ok(()) => {}
                 Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                    // Pipeline saturated for this worker: drop + flag. The worker
-                    // clears `saturated` once it drains its inbox to empty.
                     slot.dropped.fetch_add(1, Ordering::Relaxed);
-                    self.saturated.store(true, Ordering::Relaxed);
+                    self.saturated.set_inbox_full();
                     // Skip the wake: a full inbox needs no nudge to drain.
                     continue;
                 }
@@ -162,11 +202,8 @@ impl BroadcastSink {
         }
     }
 
-    /// Whether the broadcast pipeline is currently saturated (a hand-off channel
-    /// was found full). Read cheaply by the publish-admission path (the REST 503
-    /// gate). Cleared by a worker after it fully drains its broadcast inbox.
     pub fn is_saturated(&self) -> bool {
-        self.saturated.load(Ordering::Relaxed)
+        self.saturated.is_saturated()
     }
 }
 
@@ -180,21 +217,29 @@ mod tests {
     fn bytes(b: &[u8]) -> Bytes {
         Bytes::copy_from_slice(b)
     }
+    fn slot(tx: std::sync::mpsc::SyncSender<BroadcastMsg>) -> WorkerSlot {
+        WorkerSlot {
+            tx,
+            waker: std::sync::OnceLock::new(),
+            dropped: AtomicU64::new(0),
+            budget_saturated: AtomicBool::new(false),
+        }
+    }
+    /// A sink whose flag is bound to its own slots, exactly as `run_percore`
+    /// wires it — so `is_saturated` sees both producers.
+    fn sink_over(slots: Vec<Arc<WorkerSlot>>) -> BroadcastSink {
+        let workers = Arc::new(slots);
+        let saturated = SaturationFlag::default();
+        saturated.bind_workers(workers.clone());
+        BroadcastSink { workers, saturated }
+    }
 
     /// A bounded hand-off with no draining receiver: capacity 2, send 5 → exactly
     /// 2 queue and 3 are dropped + counted, and the sink reports saturated.
     #[test]
     fn bounded_handoff_drops_on_full_and_flags_saturation() {
         let (tx, _rx) = std::sync::mpsc::sync_channel::<BroadcastMsg>(2);
-        let slot = WorkerSlot {
-            tx,
-            waker: std::sync::OnceLock::new(),
-            dropped: AtomicU64::new(0),
-        };
-        let sink = BroadcastSink {
-            workers: Arc::new(vec![Arc::new(slot)]),
-            saturated: Arc::new(AtomicBool::new(false)),
-        };
+        let sink = sink_over(vec![Arc::new(slot(tx))]);
         for _ in 0..5 {
             sink.broadcast(arc("a"), arc("c"), vec![(7, bytes(b"x"))], None);
         }
@@ -245,5 +290,58 @@ mod tests {
         // The two slots alias the SAME allocation (clones of one frozen
         // buffer), not merely equal copies.
         assert!(std::ptr::eq(frames[0].1.as_ptr(), frames[1].1.as_ptr()));
+    }
+
+    /// Issue #48, producer 1: the inbox-full bit is owned by the publisher and
+    /// released by the drain, and clearing it leaves a worker's budget bit —
+    /// producer 2, a different condition with a different lifetime — untouched.
+    #[test]
+    fn clearing_inbox_full_leaves_a_workers_budget_bit_set() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<BroadcastMsg>(1);
+        let sink = sink_over(vec![Arc::new(slot(tx))]);
+        assert!(!sink.is_saturated());
+
+        sink.saturated.set_inbox_full();
+        assert!(sink.is_saturated());
+        sink.saturated.clear_inbox_full();
+        assert!(!sink.is_saturated());
+
+        sink.workers[0]
+            .budget_saturated
+            .store(true, Ordering::Relaxed);
+        sink.saturated.clear_inbox_full();
+        assert!(
+            sink.is_saturated(),
+            "a drain must not clear budget pressure"
+        );
+    }
+
+    /// Issue #48, cross-worker stomp: with three workers, ONE over its budget is
+    /// enough to hold the node saturated, and the other two clearing their own
+    /// (unset) bits cannot release it.
+    #[test]
+    fn one_workers_budget_bit_holds_the_node_saturated() {
+        let slots: Vec<Arc<WorkerSlot>> = (0..3)
+            .map(|_| {
+                let (tx, _rx) = std::sync::mpsc::sync_channel::<BroadcastMsg>(1);
+                Arc::new(slot(tx))
+            })
+            .collect();
+        let sink = sink_over(slots);
+
+        sink.workers[1]
+            .budget_saturated
+            .store(true, Ordering::Relaxed);
+        for idle in [0, 2] {
+            sink.workers[idle]
+                .budget_saturated
+                .store(false, Ordering::Relaxed);
+        }
+        assert!(sink.is_saturated());
+
+        sink.workers[1]
+            .budget_saturated
+            .store(false, Ordering::Relaxed);
+        assert!(!sink.is_saturated());
     }
 }

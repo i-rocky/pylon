@@ -183,7 +183,7 @@ pub struct DispatchEnv {
     /// each connection's [`ConnectionContext`] at session establish so a WS
     /// `client-*` event is dropped at ingress under saturation. `None` when no
     /// sink is wired (e.g. the redis+percore fallback), so the drop never fires.
-    pub saturated: Option<Arc<AtomicBool>>,
+    pub saturated: Option<crate::transport::fanout::SaturationFlag>,
     /// SP11 §3.6: clustering toggle stamped onto every connection's
     /// [`ConnectionContext`] at session establish. `true` ⇒ this is a clustered
     /// percore node: the single-emit cluster edges (`subscription_count`,
@@ -321,8 +321,9 @@ pub struct BroadcastWiring {
     pub slot: Arc<crate::transport::fanout::WorkerSlot>,
     /// The sink-shared saturation flag. After this worker fully drains its
     /// broadcast inbox to empty (so the bounded hand-off has headroom again), it
-    /// clears this flag, letting the publish-admission path resume accepting.
-    pub saturated: Arc<std::sync::atomic::AtomicBool>,
+    /// releases the inbox-full half, letting the publish-admission path resume
+    /// accepting. The budget half lives in `slot`, owned by this worker.
+    pub saturated: crate::transport::fanout::SaturationFlag,
 }
 
 /// Worker behaviour for inbound frames.
@@ -487,16 +488,10 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     // broadcasts route via the legacy registry mailbox path, which now also wakes
     // through `Mailbox::send` and is drained by `drain_dirty_sessions`.
     let broadcast = cfg.broadcast.take();
-    let broadcast_rx = match &broadcast {
-        Some(w) => {
-            // The slot is created with an empty `OnceLock`; this is its only set.
-            let _ = w.slot.waker.set(worker_waker.clone());
-            Some(&w.rx)
-        }
-        None => None,
-    };
-    // The sink-shared saturation flag, cleared after each full broadcast drain.
-    let saturated = broadcast.as_ref().map(|w| w.saturated.clone());
+    if let Some(w) = &broadcast {
+        // The slot is created with an empty `OnceLock`; this is its only set.
+        let _ = w.slot.waker.set(worker_waker.clone());
+    }
 
     // Waker-driven SELECTIVE mailbox drain: a per-worker dirty-token channel.
     // Every CROSS-connection delivery routes through `Mailbox::send`, which pushes
@@ -1025,18 +1020,18 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
         // iteration (the Waker wakes an idle worker; the unconditional drain is a
         // safety net under load when no Waker event fires). Drains are no-ops
         // when the inbox is empty.
-        if let Some(rx) = broadcast_rx {
+        if let Some(wiring) = &broadcast {
             if drain_broadcasts(
                 &poll,
                 &mut conns,
-                rx,
+                &wiring.rx,
                 &mut local_subs,
                 &mut wheel,
                 effective_budget,
                 &mut inflight_bytes,
                 &mut codel_dropped_total,
                 &mut drophead_dropped_total,
-                saturated.as_ref(),
+                Some(&wiring.slot.budget_saturated),
                 now_ns,
                 &conn_counts,
                 &app_registry,
@@ -1054,11 +1049,13 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
             }
             // `drain_broadcasts` empties the bounded hand-off inbox (its
             // `while rx.try_recv()` loop runs to `Empty`), so the channel now has
-            // headroom: clear the sink's saturation flag. The publish-admission
-            // path thereby resumes accepting once delivery catches up.
-            if let Some(sat) = &saturated {
-                sat.store(false, Ordering::Relaxed);
-            }
+            // headroom.
+            wiring.saturated.clear_inbox_full();
+            update_budget_pressure(
+                &wiring.slot.budget_saturated,
+                inflight_bytes,
+                effective_budget,
+            );
         }
 
         // SELECTIVE mailbox drain. A DIRECT send queued onto a connection's mailbox
@@ -1886,11 +1883,7 @@ fn finish_establish(
     // we MUST release the count we just took (same accounting discipline as the
     // node-ceiling reject above). `None` ⇒ flag is not wired (echo workers /
     // tests) → never saturated → never rejects.
-    if env
-        .saturated
-        .as_ref()
-        .is_some_and(|s| s.load(Ordering::Relaxed))
-    {
+    if env.saturated.as_ref().is_some_and(|s| s.is_saturated()) {
         env.node_conns.fetch_sub(1, Ordering::SeqCst);
         return Err(Reject {
             error: PusherError::server_over_capacity(),
@@ -3156,8 +3149,25 @@ enum ShedBand {
     Pressure,
     /// 95–100%: skip any subscriber whose out-queue is non-trivially backed up.
     Severe,
-    /// ≥ 100%: drop the broadcast for this worker entirely; set saturated.
+    /// ≥ 100%: drop the broadcast for this worker entirely.
     Saturated,
+}
+
+/// The band this worker's `inflight_bytes` must fall back into before its
+/// budget-pressure bit is released — deliberately BELOW the band that sets it,
+/// so the node's saturation signal cannot flap at the 100% boundary.
+const BUDGET_PRESSURE_RELEASE_BAND: ShedBand = ShedBand::Normal;
+
+/// Raise this worker's budget-pressure bit while it is over budget; drop it only
+/// once it has fallen back to [`BUDGET_PRESSURE_RELEASE_BAND`]. Only the owning
+/// worker calls this, so no other worker can release a pressure this one is
+/// still under.
+fn update_budget_pressure(bit: &AtomicBool, inflight: u64, budget: u64) {
+    match shed_band(inflight, budget) {
+        ShedBand::Saturated => bit.store(true, Ordering::Relaxed),
+        BUDGET_PRESSURE_RELEASE_BAND => bit.store(false, Ordering::Relaxed),
+        _ => {}
+    }
 }
 
 fn shed_band(inflight: u64, budget: u64) -> ShedBand {
@@ -3229,8 +3239,9 @@ impl ConnIndex for slab::Slab<Entry> {
 ///
 /// For each message: classify the current [`ShedBand`] from `inflight_bytes /
 /// effective_budget`; in `Saturated` (≥100%) the whole broadcast is dropped and
-/// the sink flagged; otherwise, for each subscriber (skipping `except`), the
-/// already-WS-framed frame for THAT subscriber's negotiated protocol version
+/// `budget_saturated` — the caller's OWN bit — is raised; otherwise, for each
+/// subscriber (skipping `except`), the already-WS-framed frame for THAT
+/// subscriber's negotiated protocol version
 /// (U3: the message carries one frame per active version) is `queue`d (a
 /// `Bytes` refcount bump — never re-encoded) UNLESS the band says to skip a
 /// backed-up subscriber. `inflight_bytes` is kept live across the drain (each
@@ -3254,7 +3265,7 @@ pub fn drain_broadcast_inbox<C: ConnIndex>(
     effective_budget: u64,
     inflight_bytes: &mut u64,
     drophead_total: &mut u64,
-    saturated: Option<&Arc<AtomicBool>>,
+    budget_saturated: Option<&AtomicBool>,
     now_ns: u64,
     touched: &mut HashSet<usize>,
     to_close: &HashSet<usize>,
@@ -3297,10 +3308,8 @@ pub fn drain_broadcast_inbox<C: ConnIndex>(
             // broadcast — the budget is never blown past by a single large channel.
             let band = shed_band(*inflight_bytes, effective_budget);
             if band == ShedBand::Saturated {
-                // ≥100%: never enqueue past the budget. Flag saturation so the
-                // publish-admission path 503s; skip enqueueing this subscriber.
-                if let Some(sat) = saturated {
-                    sat.store(true, Ordering::Relaxed);
+                if let Some(bit) = budget_saturated {
+                    bit.store(true, Ordering::Relaxed);
                 }
                 continue;
             }
@@ -3383,7 +3392,7 @@ fn drain_broadcasts(
     inflight_bytes: &mut u64,
     codel_total: &mut u64,
     drophead_total: &mut u64,
-    saturated: Option<&Arc<AtomicBool>>,
+    budget_saturated: Option<&AtomicBool>,
     now_ns: u64,
     conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
     app_registry: &Arc<AppRegistry>,
@@ -3404,7 +3413,7 @@ fn drain_broadcasts(
         effective_budget,
         inflight_bytes,
         drophead_total,
-        saturated,
+        budget_saturated,
         now_ns,
         &mut touched,
         &to_close,
@@ -3460,6 +3469,7 @@ fn drain_broadcasts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::fanout::{BroadcastMsg, SaturationFlag, WorkerSlot};
     use futures_util::{SinkExt, StreamExt};
     use std::sync::atomic::AtomicBool;
     use tokio_tungstenite::tungstenite::Message;
@@ -4019,5 +4029,209 @@ mod tests {
             client.read_exact(&mut got).expect("read flushed frame");
             assert_eq!(&got[..], &expect[..], "subscriber's own version frame");
         }
+    }
+
+    // ---- Issue #48: the two saturation producers have separate lifetimes ------
+
+    /// One fixture worker: the sink slot it OWNS (carrying its budget bit), the
+    /// hand-off inbox it drains, and `subs` subscribers on one channel that
+    /// never read — so everything queued onto them stays queued.
+    struct FixtureWorker {
+        slot: Arc<WorkerSlot>,
+        rx: std::sync::mpsc::Receiver<BroadcastMsg>,
+        conns: FixtureConns,
+        local_subs: LocalSubs,
+        app: Arc<str>,
+        channel: Arc<str>,
+        inflight: u64,
+        _clients: Vec<std::net::TcpStream>,
+    }
+
+    impl FixtureWorker {
+        fn new(listener: &std::net::TcpListener, subs: usize) -> Self {
+            let mut conns = FixtureConns {
+                slab: slab::Slab::new(),
+            };
+            let mut clients = Vec::with_capacity(subs);
+            let mut subscribers: HashMap<SocketId, (usize, u8)> = HashMap::new();
+            for _ in 0..subs {
+                let (conn, client) = fixture_conn(listener);
+                let token = conns.slab.insert(conn);
+                subscribers.insert(SocketId::generate(), (token, 7));
+                clients.push(client);
+            }
+            let app: Arc<str> = Arc::from("app");
+            let channel: Arc<str> = Arc::from("budget-chan");
+            let mut local_subs: LocalSubs = HashMap::new();
+            local_subs.insert((app.clone(), channel.clone()), subscribers);
+            let (tx, rx) = std::sync::mpsc::sync_channel(8);
+            Self {
+                slot: Arc::new(WorkerSlot {
+                    tx,
+                    waker: std::sync::OnceLock::new(),
+                    dropped: AtomicU64::new(0),
+                    budget_saturated: AtomicBool::new(false),
+                }),
+                rx,
+                conns,
+                local_subs,
+                app,
+                channel,
+                inflight: 0,
+                _clients: clients,
+            }
+        }
+
+        /// Hand this worker one broadcast, returning the framed byte length —
+        /// exactly what ONE subscriber's enqueue adds to `inflight`.
+        fn publish(&self) -> u64 {
+            let frames = crate::transport::fanout::frames_for(
+                &[7],
+                &ServerEvent::ChannelEvent {
+                    channel: self.channel.to_string(),
+                    event: "flood".to_string(),
+                    data: serde_json::json!({"pad": "0123456789abcdef"}),
+                    user_id: None,
+                },
+            );
+            let len = frames[0].1.len() as u64;
+            self.slot
+                .tx
+                .send(BroadcastMsg {
+                    app: self.app.clone(),
+                    channel: self.channel.clone(),
+                    frames,
+                    except: None,
+                })
+                .unwrap();
+            len
+        }
+
+        /// One worker-loop pass: drain the inbox to empty, then run the SAME
+        /// post-drain flag maintenance the real loop runs.
+        fn loop_pass(&mut self, flag: &SaturationFlag, budget: u64) {
+            let mut touched: HashSet<usize> = HashSet::new();
+            let mut drophead: u64 = 0;
+            drain_broadcast_inbox(
+                &self.rx,
+                &self.local_subs,
+                &mut self.conns,
+                budget,
+                &mut self.inflight,
+                &mut drophead,
+                Some(&self.slot.budget_saturated),
+                1,
+                &mut touched,
+                &HashSet::new(),
+            );
+            flag.clear_inbox_full();
+            update_budget_pressure(&self.slot.budget_saturated, self.inflight, budget);
+        }
+    }
+
+    fn flag_over(slots: Vec<Arc<WorkerSlot>>) -> SaturationFlag {
+        let flag = SaturationFlag::default();
+        flag.bind_workers(Arc::new(slots));
+        flag
+    }
+
+    /// Issue #48: a worker that blows its byte budget mid-fan-out must still
+    /// read as saturated to an ADMISSION-PATH consumer AFTER the drain returns.
+    /// The pre-fix code set the shared bit inside the drain and stored `false`
+    /// over it on the very next statement, so no consumer could ever observe it.
+    #[test]
+    fn budget_saturation_is_observable_after_the_drain_returns() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut w = FixtureWorker::new(&listener, 3);
+        let flag = flag_over(vec![w.slot.clone()]);
+
+        // One frame's worth of budget: the first subscriber's enqueue puts the
+        // worker AT 100%, so the rest of the fan-out classifies `Saturated`.
+        let budget = w.publish();
+        w.loop_pass(&flag, budget);
+
+        assert!(
+            w.inflight >= budget,
+            "the fan-out must have blown the budget"
+        );
+        assert!(
+            flag.is_saturated(),
+            "budget pressure must survive the drain that observed it"
+        );
+    }
+
+    /// Issue #48, the cross-worker stomp: the flag is node-wide, so a SECOND
+    /// worker completing a trivially-empty drain used to clear what the first
+    /// had just set. Each worker now owns its own bit.
+    #[test]
+    fn an_idle_workers_drain_cannot_clear_another_workers_pressure() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut busy = FixtureWorker::new(&listener, 3);
+        let mut idle = FixtureWorker::new(&listener, 0);
+        let flag = flag_over(vec![busy.slot.clone(), idle.slot.clone()]);
+
+        let budget = busy.publish();
+        busy.loop_pass(&flag, budget);
+        assert!(flag.is_saturated());
+
+        // The idle worker's loop pass: empty inbox, zero inflight, nothing owed.
+        idle.loop_pass(&flag, budget);
+        assert_eq!(idle.inflight, 0);
+        assert!(
+            flag.is_saturated(),
+            "an idle worker's drain must not clear another worker's budget pressure"
+        );
+    }
+
+    /// Producer 1 is unchanged: a publisher's full hand-off raises the
+    /// inbox-full half, and a drain to empty releases it.
+    #[test]
+    fn inbox_full_still_clears_once_the_inbox_drains_empty() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut w = FixtureWorker::new(&listener, 1);
+        let flag = flag_over(vec![w.slot.clone()]);
+
+        flag.set_inbox_full();
+        assert!(flag.is_saturated());
+
+        // A budget nothing here can reach keeps producer 2 out of the verdict.
+        w.publish();
+        w.loop_pass(&flag, 64 << 20);
+        assert!(
+            !flag.is_saturated(),
+            "a drain to empty must release the inbox-full half"
+        );
+    }
+
+    /// Hysteresis: the bit is raised at the `Saturated` boundary and released
+    /// only back in [`BUDGET_PRESSURE_RELEASE_BAND`]. The band between the two
+    /// neither sets nor clears, so the signal cannot flap at either edge.
+    #[test]
+    fn budget_pressure_holds_between_the_set_and_release_bands() {
+        const BUDGET: u64 = 1_000;
+        let bit = AtomicBool::new(false);
+        let raised = || bit.load(Ordering::Relaxed);
+
+        update_budget_pressure(&bit, 799, BUDGET);
+        assert!(!raised(), "below the release band: stays down");
+
+        // Climbing through the hold band does NOT raise it — only ≥100% does.
+        for inflight in [800, 949, 950, 999] {
+            update_budget_pressure(&bit, inflight, BUDGET);
+            assert!(!raised(), "{inflight} is under budget; must not raise");
+        }
+        update_budget_pressure(&bit, BUDGET, BUDGET);
+        assert!(raised(), "at 100% the budget bit is raised");
+
+        // Falling back through the same band does NOT release it.
+        for inflight in [999, 950, 900, 800] {
+            update_budget_pressure(&bit, inflight, BUDGET);
+            assert!(
+                raised(),
+                "{inflight} is inside the hold band; must not release"
+            );
+        }
+        update_budget_pressure(&bit, 799, BUDGET);
+        assert!(!raised(), "back under the release band: released");
     }
 }

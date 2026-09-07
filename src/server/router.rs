@@ -29,7 +29,7 @@ pub struct AppState {
     /// Both production paths in `main.rs` (standalone local and clustered
     /// redis+percore) pass `Some(local.saturation_flag())`; `None` appears only
     /// in tests. Do not wire a production `AppState` without the flag.
-    pub saturated: Option<Arc<AtomicBool>>,
+    pub saturated: Option<crate::transport::fanout::SaturationFlag>,
     /// C2b graceful-shutdown draining flag. Set to `true` by the C2a two-phase
     /// shutdown sequence in `main.rs`. The `/ready` handler returns 503 while draining
     /// so load balancers stop routing new connections before we close existing ones.
@@ -50,9 +50,7 @@ impl AppState {
     /// saturation flag wired (`saturated == None`) this is always `false`, so the
     /// REST 503 gate and the WS client-event drop are no-ops.
     pub fn is_saturated(&self) -> bool {
-        self.saturated
-            .as_ref()
-            .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+        self.saturated.as_ref().is_some_and(|s| s.is_saturated())
     }
 }
 
