@@ -675,10 +675,9 @@ impl RedisAdapter {
 /// identical to the inline code these were extracted from — they are the single source of
 /// truth that both callers now share.
 impl RedisAdapter {
-    /// Attach this node to a channel's `msg` pub/sub key — the node-local 0→1 subscriber
-    /// edge. The node-local subscription has already succeeded when this runs, so a Redis
-    /// SUBSCRIBE failure costs only cross-node delivery for this channel on this node:
-    /// logged loudly, never fatal, and repaired by the membership reconciler's next tick.
+    /// Attach this node to a channel's `msg` pub/sub key — the node-local 0→1 edge. The
+    /// node-local subscription has already succeeded, so a failure costs only cross-node
+    /// delivery on this node: logged, never fatal, repaired by the reconciler's next tick.
     #[doc(hidden)]
     pub async fn cluster_sub_channel(&self, app: &str, channel: &str) {
         let msg_key = self.keys.msg(app, channel);
@@ -732,9 +731,8 @@ impl RedisAdapter {
     }
 
     /// The membership half of [`cluster_subscribe`](RedisAdapter::cluster_subscribe),
-    /// without the pub/sub lifecycle: a caller that must take the node's 0→1 pub/sub edge
-    /// on its own schedule (the bridge's presence path, whose admission verdict lands
-    /// between the two) drives the two halves separately.
+    /// without the pub/sub lifecycle — for a caller whose admission verdict lands between
+    /// the two (the bridge's presence path) and so must schedule the edge itself.
     #[doc(hidden)]
     pub async fn cluster_membership_join(
         &self,
@@ -849,12 +847,10 @@ impl RedisAdapter {
     }
 
     /// Cluster half of a presence join: the atomic cap decision + PRESENCE_JOIN refcount +
-    /// cluster roster read, all in one round trip's worth of Redis-serialized script.
-    /// Returns `Ok(Some((first_for_user, cluster_roster)))` when admitted and `Ok(None)`
-    /// when `max_members` rejected it — in which case NOTHING was written, so a caller
-    /// that reports the rejection leaves the cluster count exactly as it found it.
-    /// `max_members: None` is uncapped. Propagates the Redis error (the caller keeps its
-    /// node-local join on `Err`, as the inline path did).
+    /// cluster roster read. `Ok(None)` means `max_members` rejected it, having written
+    /// NOTHING — so a caller that reports the rejection leaves the cluster count exactly
+    /// as it found it. `None` is uncapped. Propagates the Redis error (the caller keeps
+    /// its node-local join on `Err`, as the inline path did).
     #[doc(hidden)]
     pub async fn cluster_presence_join(
         &self,

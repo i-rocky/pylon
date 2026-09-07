@@ -158,10 +158,8 @@ return {1, roster}
 /// step. Split across a probe and a later write, two nodes admitting concurrently both
 /// read room and both commit.
 ///
-/// Returns `-1` when the cap rejected the join — nothing was written — and otherwise the
-/// user's new refcount (`1` means first_for_user → emit member_added). A negative
-/// `ARGV[4]` means uncapped.
-///
+/// Returns `-1` when the cap rejected the join — nothing was written — else the user's new
+/// refcount (`1` means first_for_user → emit member_added). Negative `ARGV[4]` = uncapped.
 /// KEYS\[1\]=presusers KEYS\[2\]=presinfo KEYS\[3\]=presmembers
 /// ARGV\[1\]=user_id ARGV\[2\]=user_info ARGV\[3\]=member_token ARGV\[4\]=max_members
 const PRESENCE_JOIN_LUA: &str = r#"
@@ -315,8 +313,7 @@ pub struct Scripts {
     /// iff THIS call's SREM removed the chans entry, in which case it also drained
     /// the presence side-tables and each returned user is owed a `member_removed`.
     pub vacate: Script,
-    /// Decides the cluster-wide presence cap and, on admission, records the join:
-    /// returns `-1` for a capped-out join, else the user's new connection refcount.
+    /// Decides the cluster-wide presence cap and, on admission, records the join.
     pub presence_join: Script,
     /// Records a presence leave and returns the user's remaining connection refcount.
     pub presence_leave: Script,

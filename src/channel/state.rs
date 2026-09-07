@@ -64,9 +64,8 @@ pub struct ChannelState {
     /// `PresencePayload` per join. A generation is everything the encoded bytes
     /// depend on, so it ends on a change to the user SET *or* to any user's
     /// `user_info`; a second connection of an existing user changes neither and
-    /// keeps sharing the cached `Arc`, which is what makes this one encode per
-    /// generation rather than per join. Same OnceLock/take-on-mutation
-    /// memoization pattern as `snapshot` (R20).
+    /// keeps sharing the `Arc`. Same OnceLock/take-on-mutation memoization
+    /// pattern as `snapshot` (R20).
     roster_frame: OnceLock<Arc<str>>,
 }
 
@@ -139,10 +138,9 @@ impl ChannelState {
     }
 
     /// Point a user's roster entry back at its oldest SURVIVING connection's `user_info`.
-    /// The entry mirrors one connection's value, so when that connection departs the
-    /// entry must follow, or the roster keeps advertising metadata no live connection
-    /// ever presented. A changed value ends the roster generation just as a changed user
-    /// set does — the cached frame is bytes, and these bytes moved.
+    /// The entry mirrors one connection's value, so when that connection departs the entry
+    /// must follow, or the roster advertises metadata no live connection ever presented.
+    /// A changed value ends the roster generation just as a changed user set does.
     fn reseat_user_info(&mut self, user_id: &str, oldest: SocketId) {
         let Some(info) = self
             .subscribers
@@ -751,9 +749,8 @@ mod tests {
     }
 
     /// The roster's `user_info` for a user always belongs to a LIVE connection of that
-    /// user — the oldest one. Its departure re-seats the entry on the next-oldest instead
-    /// of pinning metadata no live connection ever presented, and because the encoded
-    /// bytes moved, the memoised roster frame must be invalidated with them.
+    /// user — the oldest. Its departure re-seats the entry on the next-oldest, and the
+    /// memoised roster frame must be invalidated with it or the bytes go stale.
     #[test]
     fn roster_reseats_user_info_when_the_oldest_connection_leaves() {
         let ch = "presence-reseat";
@@ -805,9 +802,8 @@ mod tests {
         assert_eq!(s.user_count(), None);
     }
 
-    /// Three connections of one user: the roster follows the JOIN order, so it shows the
-    /// oldest survivor's info at every step — never the newest, and never a departed
-    /// connection's.
+    /// Three connections of one user: the roster follows JOIN order, showing the oldest
+    /// survivor at every step — never the newest, never a departed connection's.
     #[test]
     fn roster_follows_join_order_across_successive_departures() {
         let ch = "presence-order";
@@ -838,7 +834,7 @@ mod tests {
     }
 
     /// A departure that leaves the roster bytes unchanged must NOT invalidate the cached
-    /// frame — the memoisation stays as tight as the generation it tracks.
+    /// frame — the memoisation stays exactly as tight as the generation it tracks.
     #[test]
     fn identical_user_info_survivor_keeps_the_cached_roster_frame() {
         let ch = "presence-same";
