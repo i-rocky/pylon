@@ -71,7 +71,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use mio::net::TcpStream as MioTcpStream;
 use pylon::channel::registry::Registry;
 use pylon::connection::handle::{ConnectionHandle, Mailbox};
@@ -84,6 +84,7 @@ use pylon::transport::fanout::{
 };
 use pylon::transport::worker::{drain_broadcast_inbox, ConnIndex, LocalSubs};
 use slab::Slab;
+use std::hint::black_box;
 
 /// Subscriber scales mandated by the plan.
 const SCALES: [usize; 3] = [1_000, 10_000, 100_000];

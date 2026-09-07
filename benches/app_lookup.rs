@@ -18,12 +18,11 @@
 //! group reports time *per lookup* via `Throughput::Elements`, amortising the
 //! one `block_on` per batch so the numbers reflect the lookup itself.
 
+use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use pylon::app::cache::{CacheConfig, CachingAppManager};
 use pylon::app::static_file::StaticFileAppManager;
 use pylon::app::{App, AppLookup, AppLookupError, AppManager};

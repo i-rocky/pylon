@@ -4,9 +4,10 @@
 //! a fat `ChannelEvent` (whose clone already heap-allocates its strings, so the
 //! Box is marginal) and a tiny `Pong` (zero-alloc bare, so the Box is pure new cost).
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use pylon::protocol::event::ServerEvent;
 use serde_json::json;
+use std::hint::black_box;
 use tokio::sync::mpsc;
 
 fn fat() -> ServerEvent {

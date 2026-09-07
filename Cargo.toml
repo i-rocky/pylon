@@ -99,7 +99,7 @@ rcgen = "0.14"
 # Enables paused-time control (`start_paused`, `tokio::time::advance`) in tests.
 tokio = { version = "1", features = ["test-util"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
-criterion = "0.5"
+criterion = "0.8"
 futures-util = "0.3"
 # Used by transport::conn tests to shrink SO_SNDBUF and force partial writes.
 socket2 = "0.6.5"
