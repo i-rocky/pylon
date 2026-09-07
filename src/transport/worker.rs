@@ -191,7 +191,7 @@ pub struct DispatchEnv {
     /// connection handler suppresses its node-local emits. `false` ⇒ the
     /// not-yet-clustered percore path keeps the node-local handler emits.
     pub clustered: bool,
-    /// Task 4.2 (finding D2): the node's cluster bridge handle, for CLUSTER-WIDE
+    /// The node's cluster bridge handle, for CLUSTER-WIDE
     /// per-app capacity admission. `Some` only on a clustered node (the same
     /// wiring that sets [`clustered`](DispatchEnv::clustered) = `true`); `None` ⇒
     /// no cluster admission — the per-app `capacity` check below stays purely
@@ -619,7 +619,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
         ),
     };
 
-    // Task 4.2 (D2): the cluster bridge handle for the close-side capacity
+    // The cluster bridge handle for the close-side capacity
     // release. `None` for echo workers and non-clustered dispatch workers.
     let cluster: Option<crate::cluster::bridge::ClusterHandle> = match &cfg.mode {
         Mode::Dispatch(env) => env.cluster.clone(),

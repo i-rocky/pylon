@@ -60,7 +60,7 @@ impl Default for ClusterMetrics {
 const CMD_CHANNEL_CAPACITY: usize = 8192;
 
 /// How long [`ClusterHandle::admit_app`] blocks the calling worker for the
-/// bridge's capacity verdict before failing open (Task 4.2). The verdict is one
+/// bridge's capacity verdict before failing open. The verdict is one
 /// Redis round trip on the bridge's drain loop; a healthy bridge answers in
 /// single-digit milliseconds. The bound exists for the DEGRADED case: a worker
 /// must never block indefinitely on a stalled bridge — after it elapses the
@@ -194,7 +194,7 @@ pub enum ClusterCmd {
         socket_id: SocketId,
         no_longer_watched: Vec<String>,
     },
-    /// Cluster-wide per-app capacity ADMISSION (Task 4.2 / finding D2): run
+    /// Cluster-wide per-app capacity ADMISSION: run
     /// `ADMIT_APP_LUA` on the bridge's RedisAdapter and hand the verdict back
     /// over `reply`. Unlike the fire-and-forget commands, this one is
     /// REQUEST-RESPONSE: the calling worker blocks (bounded by
@@ -538,7 +538,7 @@ impl ClusterHandle {
         }
     }
 
-    /// Cluster-wide per-app capacity ADMISSION (Task 4.2 / finding D2). Unlike the
+    /// Cluster-wide per-app capacity ADMISSION. Unlike the
     /// fire-and-forget commands, this one needs the bridge's VERDICT before the
     /// caller may proceed, so it sends the command and then blocks — bounded by
     /// [`ADMIT_REPLY_TIMEOUT`] — for the reply:
@@ -709,7 +709,7 @@ impl Drop for ClusterBridge {
 /// bridge hands it to the adapter's node heartbeat, which uses it to RE-SEED this
 /// node's `nodeconns` capacity hash after a Redis outage longer than the hash's TTL
 /// backstop — without the re-seed, pre-outage capacity units would drift in the
-/// cluster totals forever (Task 4.2 fix).
+/// cluster totals forever.
 pub fn start(
     cfg: &ServerConfig,
     local: Arc<LocalAdapter>,

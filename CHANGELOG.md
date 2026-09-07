@@ -134,6 +134,22 @@ pre-1.0 and versions track `Cargo.toml`.
   effect and produces no warning.
 
 ### Fixed
+- **The sweeper's user-binding reap can no longer wipe a live binding and report an
+  online user as offline.** `reap_user` was a five-round-trip read-modify-write —
+  the un-fixed twin of the channel-member reap already made atomic. Its `HLEN` guard
+  closed the window between the `HDEL` and the guard itself, but not the one between
+  the guard and the `DEL` that followed: a signin landing there had its fresh binding
+  deleted, was dropped out of `users(app)` — where nothing re-adds it, since the
+  heartbeat only re-`HSET`s the binding — and had a `WatchOffline` published for it,
+  stamped with the DEAD node's id so no live node self-dedups it. Watchlist clients
+  saw a user go online and immediately offline while they were connected and signed
+  in, `is_user_online` answered `false` for up to a heartbeat, and that user became
+  invisible to every later sweep, so a genuine crash of the node holding them would
+  never fire `WatchOffline` at all. The reap is now one `USER_REAP_LUA` CAS, which
+  Redis serialises against the signin script: the offline edge belongs to whichever
+  caller's `SREM` actually removed the `users(app)` entry, exactly as the channel
+  vacate and member reap already decide theirs, so a concurrent signout that
+  de-indexed the user first also leaves the reap silent.
 - **A connection whose cluster capacity admission failed open no longer steals a
   sibling connection's unit when it closes.** `admit_app` returning `None` — a
   bridge channel that was full or closed, a verdict that timed out, or a Redis

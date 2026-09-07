@@ -219,6 +219,50 @@ local left = redis.call('HINCRBY', KEYS[1], user_id, -1)
 return {user_id, left, 0}
 "#;
 
+/// USER_REAP CAS script (the sweeper's stale-binding reap), the user twin of
+/// [`REAP_MEMBER_LUA`]. HDELs every binding whose `expireAt` is in the past (an
+/// unparseable stamp counts as stale — no live node can ever re-stamp it to a valid
+/// future value) and, when that leaves the user with none, DELs the hash and
+/// de-indexes them. `won == 1` iff THIS call's `SREM` removed the `users` entry: the
+/// single cluster-wide `WatchOffline` emission right, so a concurrent signout that
+/// already de-indexed the user leaves this reap silent.
+///
+/// Decision and writes are one script, so a signin landing anywhere near it is
+/// serialised either wholly before (this call then sees a fresh binding and
+/// declines) or wholly after (it re-establishes the user behind a reap that won).
+/// Split across round trips, the decision could be made before the signin and the
+/// `DEL` + `SREM` land after it — wiping a live binding, dropping an online user out
+/// of `users(app)` for good, and publishing an offline for them.
+///
+/// Returns `{won, dead_node}` — `dead_node` is the first stale token's node prefix
+/// (the publisher stamped on the `WatchOffline` so no live node self-dedups it), or
+/// `''` when the hash had already TTL-lapsed while still indexed.
+///
+/// `KEYS[1]` = usr hash, `KEYS[2]` = users set.
+/// `ARGV[1]` = now_ms, `ARGV[2]` = user_id.
+const USER_REAP_LUA: &str = r#"
+local now = tonumber(ARGV[1])
+local bindings = redis.call('HGETALL', KEYS[1])
+local dead_node = ''
+local fresh = 0
+for i = 1, #bindings, 2 do
+  local expire_at = tonumber(bindings[i + 1])
+  if expire_at ~= nil and expire_at >= now then
+    fresh = fresh + 1
+  else
+    if dead_node == '' then
+      local node = string.match(bindings[i], '^([^:]+):')
+      if node then dead_node = node end
+    end
+    redis.call('HDEL', KEYS[1], bindings[i])
+  end
+end
+if fresh > 0 then return {0, ''} end
+redis.call('DEL', KEYS[1])
+if redis.call('SREM', KEYS[2], ARGV[2]) == 0 then return {0, ''} end
+return {1, dead_node}
+"#;
+
 /// USER_SIGNOUT. Removes this connection's binding token and — on the cluster 1→0
 /// user edge — deletes the now-empty hash and de-indexes the user. Returns the
 /// remaining `HLEN` (authoritative cluster-wide connection count).
@@ -232,7 +276,7 @@ if conn <= 0 then redis.call('DEL', KEYS[1]); redis.call('SREM', KEYS[2], ARGV[2
 return conn
 "#;
 
-/// APP ADMIT (Task 4.2 / finding D2): the cluster-wide per-app capacity gate.
+/// APP ADMIT: the cluster-wide per-app capacity gate.
 /// Atomically checks the CLUSTER count (`appconns`) against the app's capacity
 /// and, when there is room, takes one unit there AND on the admitting node's
 /// own per-app hash (which also re-arms that hash's TTL backstop). Returns `1`
@@ -357,6 +401,10 @@ pub struct Scripts {
     /// `won == 1` iff THIS call took the user's refcount to exactly 0 and owns
     /// the single `member_removed` emission right.
     pub reap_member: Script,
+    /// The sweeper's atomic user-binding reap: returns `{won, dead_node}` — `won == 1`
+    /// iff THIS call de-indexed the user and owns the single `WatchOffline` emission
+    /// right.
+    pub user_reap: Script,
     /// Records a user signout and returns the user's remaining cluster connection count.
     pub user_signout: Script,
     /// Cluster-wide per-app capacity gate: returns 1 when admitted (unit taken
@@ -382,6 +430,7 @@ impl Scripts {
             presence_join: Script::from_lua(PRESENCE_JOIN_LUA),
             presence_leave: Script::from_lua(PRESENCE_LEAVE_LUA),
             reap_member: Script::from_lua(REAP_MEMBER_LUA),
+            user_reap: Script::from_lua(USER_REAP_LUA),
             user_signout: Script::from_lua(USER_SIGNOUT_LUA),
             admit_app: Script::from_lua(ADMIT_APP_LUA),
             release_app: Script::from_lua(RELEASE_APP_LUA),
@@ -415,6 +464,8 @@ mod tests {
         let s = Scripts::new();
         assert_ne!(s.membership_join.sha1(), s.user_signout.sha1());
         assert_ne!(s.user_signout.sha1(), s.unsubscribe.sha1());
+        assert_ne!(s.user_reap.sha1(), s.user_signout.sha1());
+        assert_ne!(s.user_reap.sha1(), s.reap_member.sha1());
     }
 
     #[test]
