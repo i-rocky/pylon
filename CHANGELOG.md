@@ -98,6 +98,44 @@ pre-1.0 and versions track `Cargo.toml`.
   sending a non-conforming `socket_id` and relying on the previous `200`**:
   that call now returns `400 "Invalid socket id"` — audit callers before
   upgrading.
+- **An empty `channel_data` on a presence subscribe no longer signs as a
+  private-channel token** — `channel_signature` collapsed `Some("")` onto the
+  private signing string, so such a subscribe verified against a token signed
+  without channel data and was kept out only by `parse_channel_data("")` failing
+  afterwards. The join was already refused either way; the wire effect is that
+  the `pusher:subscription_error` for this (malformed) request now reads
+  "Invalid signature" rather than "Invalid channel_data", both still
+  `AuthError`/401 and non-fatal.
+- **A REST request carrying two query keys that differ only by case is now
+  rejected with `401 "Invalid query: two parameters differ only by case"`** —
+  the signing string lowercases every key, so `Info` and `info` collapsed into
+  one entry with the survivor decided by `HashMap` iteration order. The
+  signature was therefore not a function of the request: the same signed URL
+  could verify on one attempt and 401 on the next. No bypass was possible (every
+  field the handlers act on is read by exact case), but a legitimately signed
+  request could fail intermittently. Requests without such a collision — every
+  request an official SDK builds — are byte-for-byte unaffected.
+- **An app `key` containing `:` is now rejected at validation instead of
+  silently breaking every websocket auth** — the channel-auth and
+  `pusher:signin` tokens are `<key>:<signature>` and both verifiers split at the
+  first colon, so a key like `team:web` made every private and presence
+  subscribe answer "Auth key mismatch" and every `pusher:signin` close the
+  connection with 4009, permanently. REST was unaffected (it reads `auth_key` as
+  its own query parameter), so the failure looked like a client-library bug. It
+  failed closed, so nothing was exposed. `App::validate` now rejects such a key,
+  naming the reason; as with the other credential checks this runs at load for
+  the static-file manager and per-lookup for the SQL and Mongo backends. **This
+  is breaking for any deployment whose app key contains a colon: the server now
+  refuses to load it** — rotate the key before upgrading.
+- **REST `socket_id` validation now caps length at 24 bytes instead of 64**,
+  closing the 25–64 byte band that passed validation and was then silently
+  truncated. A `SocketId` stores 24 bytes inline and `SocketId::from_raw`
+  truncates rather than failing, so a signed trigger carrying a well-formed but
+  over-long `socket_id` matched no connection: the exclusion did nothing and the
+  call still answered `200`. The bound is now derived from `SocketId::CAPACITY`
+  so the two cannot drift apart again. Every id pylon issues is at most 21 bytes
+  (two 10-digit halves and a dot), so no conforming caller is affected; a caller
+  sending a longer id now gets `400 "Invalid socket id"`.
 - Per-core worker broadcast index consolidated to the single-map layout: each
   `local_subs` channel entry now carries its subscribers' `(slab token,
   negotiated protocol version)` directly (`(app, channel) → {socket_id →

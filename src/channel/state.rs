@@ -72,6 +72,10 @@ pub struct ChannelState {
 impl ChannelState {
     /// Add a subscriber. Returns `Some(PresenceJoin)` for presence channels.
     ///
+    /// Idempotent per socket: a re-add REPLACES the socket's previous membership,
+    /// so the ws layer's duplicate-subscribe guard is an optimisation rather than
+    /// what keeps the roster consistent.
+    ///
     /// `channel` is the registry key's channel (this state IS that key's
     /// value; the sole production caller passes its own key): it is baked
     /// verbatim into the cached `subscription_succeeded` frame the join
@@ -83,6 +87,7 @@ impl ChannelState {
         member: Option<PresenceMember>,
     ) -> Option<PresenceJoin> {
         let socket_id = handle.socket_id;
+        let _ = self.remove(&socket_id);
         let join = member.as_ref().map(|m| {
             let u = self
                 .users
@@ -400,6 +405,56 @@ mod tests {
         assert!(s.user_count().is_none());
         assert!(s.remove(&sid).is_none());
         assert!(s.is_empty());
+    }
+
+    /// `add` is idempotent per socket: a second `add` for a socket already in
+    /// the channel REPLACES its membership. Without that the roster keeps the
+    /// socket's earlier user forever — `remove` only ever clears the membership
+    /// the last `add` recorded — and nothing below the ws layer prevents it.
+    #[test]
+    fn re_adding_a_socket_replaces_its_presence_membership() {
+        let mut s = ChannelState::default();
+        let h = handle();
+        let sid = h.socket_id;
+        let h_again = ConnectionHandle {
+            socket_id: sid,
+            mailbox: h.mailbox.clone(),
+        };
+
+        s.add("presence-x", h, Some(member("first")));
+        s.add("presence-x", h_again, Some(member("second")));
+
+        assert_eq!(s.subscription_count(), 1);
+        assert_eq!(s.user_count(), Some(1), "the first user must not linger");
+
+        let leave = s.remove(&sid).expect("presence member");
+        assert_eq!(leave.user_id, "second");
+        assert!(leave.last_for_user);
+        assert_eq!(s.user_count(), None, "no roster entry may survive");
+    }
+
+    /// A duplicate `add` of the same socket and user leaves exactly the state a
+    /// single `add` produced, join outcome included.
+    #[test]
+    fn re_adding_a_socket_unchanged_is_a_no_op() {
+        let mut s = ChannelState::default();
+        let h = handle();
+        let sid = h.socket_id;
+        let h_again = ConnectionHandle {
+            socket_id: sid,
+            mailbox: h.mailbox.clone(),
+        };
+
+        let first = s.add("presence-x", h, Some(member("u1"))).unwrap();
+        let again = s.add("presence-x", h_again, Some(member("u1"))).unwrap();
+
+        assert!(again.first_for_user);
+        assert_eq!(
+            roster_json(&again.roster_frame),
+            roster_json(&first.roster_frame)
+        );
+        assert_eq!(s.subscription_count(), 1);
+        assert_eq!(s.user_count(), Some(1));
     }
 
     #[test]

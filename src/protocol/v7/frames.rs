@@ -1,4 +1,7 @@
-//! v7 wire (de)serialization. Every `data` is double-encoded EXCEPT pusher:error.
+//! v7 wire (de)serialization. `data` has no uniform encoding — a double-encoded
+//! JSON string on some frames, an inline object on others, absent on
+//! `pusher:cache_miss` — so each arm pins its own hosted-Pusher shape, and a new
+//! variant's must be looked up there rather than inferred from a rule.
 
 use crate::protocol::codec::DecodeError;
 use crate::protocol::command::ClientCommand;

@@ -1381,13 +1381,13 @@ async fn rest_trigger_valid_channel_name_is_200() {
     assert_eq!(resp.status(), 200, "valid channel name must still be 200");
 }
 
-#[tokio::test]
-async fn rest_body_too_large_is_413() {
-    let addr = spawn().await;
+/// A trigger body just over the REST body cap.
+///
+/// The overshoot is deliberately small. The limit fires at body extraction, so the
+/// server answers 413 and closes while a large body is still being written, and the
+/// client sees a connection reset instead of the status.
+fn oversize_trigger_body() -> String {
     const BODY_CAP: usize = 10 * 10_000 + 64 * 1024;
-    // Overshoot by a little, not a lot: the limit fires at body extraction and the
-    // server answers 413 and closes, so a large body is still being written when
-    // that close lands and the client sees a reset instead of the status.
     const OVERSHOOT: usize = 1024;
     let envelope = json!({"name": "e", "data": "", "channels": ["c"]})
         .to_string()
@@ -1395,6 +1395,13 @@ async fn rest_body_too_large_is_413() {
     let big = "x".repeat(BODY_CAP + OVERSHOOT - envelope);
     let body = json!({"name": "e", "data": big, "channels": ["c"]}).to_string();
     assert!(body.len() > BODY_CAP, "body must exceed the cap under test");
+    body
+}
+
+#[tokio::test]
+async fn rest_body_too_large_is_413() {
+    let addr = spawn().await;
+    let body = oversize_trigger_body();
     let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/apps/app1/events?{q}"))
@@ -1490,6 +1497,37 @@ async fn rest_trigger_invalid_socket_id_is_400() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400, "malformed socket_id must be 400");
+}
+
+/// POST /events with a `socket_id` that is well-formed but longer than a
+/// `SocketId` holds → 400. Accepting it would truncate the id, match no
+/// connection, and silently exclude nobody while still answering 200.
+#[tokio::test]
+async fn rest_trigger_over_long_socket_id_is_400() {
+    let addr = spawn().await;
+    let socket_id = format!(
+        "{}.2",
+        "1".repeat(pylon::protocol::socket_id::SocketId::CAPACITY)
+    );
+    let body = json!({
+        "name": "ev",
+        "data": "{}",
+        "channel": "room",
+        "socket_id": socket_id
+    })
+    .to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "a socket_id longer than SocketId::CAPACITY must be 400, not truncated"
+    );
 }
 
 /// POST /events with a well-formed `socket_id` → 200 (regression guard).
@@ -1653,9 +1691,7 @@ async fn rest_error_body_413_event_data_is_json() {
 #[tokio::test]
 async fn rest_error_body_413_body_limit_is_json() {
     let addr = spawn().await;
-    // Default limits → body cap = 10*10000 + 64KiB ≈ 161.7KiB; exceed it.
-    let big = "x".repeat(200 * 1024);
-    let body = json!({"name": "e", "data": big, "channels": ["c"]}).to_string();
+    let body = oversize_trigger_body();
     let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/apps/app1/events?{q}"))
