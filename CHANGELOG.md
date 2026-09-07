@@ -170,6 +170,13 @@ pre-1.0 and versions track `Cargo.toml`.
   latter has no successor (retries are bounded by `PYLON_WEBHOOK_RETRY_BUDGET_MS`,
   total time rather than attempt count). Setting either variable now has no
   effect and produces no warning.
+- **`transport::conn::ConnState::Closing` removed** — the variant was never
+  assigned anywhere in the crate, so the two `Open | Closing` dispatch arms
+  that matched it were reachable only through `Open`. The transport closes a
+  connection by queueing its Close frame, flushing once and tearing down, with
+  no intermediate draining state; the variant described a lifecycle step that
+  does not exist. Library consumers matching on `ConnState` exhaustively need
+  to drop the arm.
 
 ### Fixed
 - **A clustered node no longer goes deaf to a channel it still has subscribers
