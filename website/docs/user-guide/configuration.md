@@ -11,6 +11,14 @@ Pylon uses two layers of configuration:
 
 All variables are optional. Unset variables fall back to the defaults shown below.
 
+!!! warning "Malformed values fail startup"
+    A numeric `PYLON_*` variable that IS set but cannot be parsed into its expected type (for
+    example `PYLON_PORT=abc`, or `PYLON_MAX_CONNECTIONS=100_000` — Rust's `_` literal separator,
+    invalid for parsing) is a **startup error**, not a silent fallback to the default: pylon logs
+    the offending variable, its value, and the expected type at `error`, then exits non-zero.
+    Boolean (`0`/`false`/`off`) and plain-string variables are unaffected — only the numeric knobs
+    are parsed this strictly.
+
 !!! note "Auto-tuned defaults"
     Several defaults self-tune to the host at startup: `PYLON_WORKERS` defaults to the number
     of available CPU cores, and the memory budget is derived from the cgroup/host effective

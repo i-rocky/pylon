@@ -32,6 +32,16 @@ pre-1.0 and versions track `Cargo.toml`.
   for reviewed exceptions (empty today).
 
 ### Changed
+- **Breaking:** every numeric `PYLON_*` environment variable now fails startup
+  loudly instead of silently keeping its default when set to a value that
+  fails to parse — `PYLON_PORT=abc` and `PYLON_MAX_CONNECTIONS=100_000` (the
+  latter valid Rust literal syntax, invalid for `parse`) previously booted on
+  the default with no indication anything was wrong; both now log the
+  variable name, the offending value, and the expected type at `error` and
+  exit non-zero. Unset variables are unaffected (default applies, as before);
+  boolean (`0`/`false`/`off`) and plain-string variables are unaffected (they
+  cannot fail to parse). Anyone currently running with a typo'd numeric
+  `PYLON_*` value will need to fix it before the server will start.
 - Per-core worker broadcast index consolidated to the single-map layout: each
   `local_subs` channel entry now carries its subscribers' `(slab token,
   negotiated protocol version)` directly (`(app, channel) → {socket_id →
