@@ -107,7 +107,7 @@ channels.
 {
   "event": "pusher_internal:subscription_succeeded",
   "channel": "my-channel",
-  "data": ""
+  "data": "{}"
 }
 ```
 
@@ -304,9 +304,10 @@ The per-core broadcast sink already builds one finished WebSocket frame per
 called with `wire::ACTIVE_VERSIONS` from the broadcast path in
 [`src/adapter/local.rs`](https://github.com/i-rocky/pylon/blob/master/src/adapter/local.rs)),
 and each worker's drain delivers every subscriber the frame for ITS
-negotiated version: `sid_to_token` (in `src/transport/worker.rs`) carries
-`(slab token, negotiated version)` — stamped at reconcile from the session's
-negotiated codec — and the drain picks the matching slot (single-version
+negotiated version: `LocalSubs` (in `src/transport/worker.rs`) maps
+`(app, channel)` to `{socket_id -> (slab token, negotiated version)}` — stamped
+at reconcile from the session's negotiated codec — so the drain resolves both
+from the subscriber iteration itself and picks the matching slot (single-version
 fast path when `frames.len() == 1`). `ServerEvent::Raw` stays version-agnostic
 and shares ONE buffer across slots (the no-copy property; pinned by
 pointer identity in the fanout tests). With a real vN this all lights up

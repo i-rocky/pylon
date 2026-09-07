@@ -36,9 +36,29 @@ cargo build --release # optimised build → target/release/pylon
     fails. On a machine that's missing one of them — say, no MongoDB —
     `cargo test` dies at `mongo_app_manager`'s 30-second connection timeout,
     and every binary Cargo would have run after it (`percore*`,
-    `postgres_app_manager`, `redis_*`, `rest`, `signin`, `tls`, `watchlist`,
+    `mysql_app_manager`, `postgres_app_manager`, `redis_*`, `rest`, `signin`, `tls`, `watchlist`,
     `webhooks`) never runs at all — including the ones that need no
     infrastructure. Use the commands below instead of a bare `cargo test`.
+
+!!! warning "Do not add `--all-targets` to `cargo test`"
+    `cargo test --all-targets -- --test-threads=1` **fails**, and not because
+    anything is broken. `--all-targets` pulls in the four criterion benches
+    (`fanout`, `fanout_sink`, `mailbox`, `app_lookup`), which are
+    `harness = false` and parse their own arguments — criterion rejects
+    `--test-threads` with `error: unexpected argument found` and the run dies
+    after every real test has already passed.
+
+    `--all-targets` belongs on `cargo clippy`, where the repo and CI both use
+    it, not on `cargo test`. A bare `cargo test` is safe (the bench targets are
+    `test = false`, so they are never built or run). If you want everything
+    *except* benches under a single-threaded harness, name the target kinds
+    explicitly:
+
+    ```bash
+    cargo test --locked --lib --bins --tests -- --test-threads=1
+    ```
+
+    Benches are exercised separately with `cargo bench`.
 
 ### Tests that need no infrastructure
 

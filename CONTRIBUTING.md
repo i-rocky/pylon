@@ -5,7 +5,9 @@ changes.
 
 ## Development setup
 
-A recent stable Rust toolchain is required.
+The toolchain is pinned by `rust-toolchain.toml`, including the `rustfmt` and `clippy` components.
+rustup honours it automatically in this directory, so the commands below use the pinned toolchain
+without any extra setup.
 
 ```sh
 cargo build              # debug build
@@ -25,7 +27,7 @@ cargo run --release
 cargo test               # full suite — requires Redis, MySQL, Postgres, and Mongo (see below)
 ```
 
-`cargo test` builds and runs every test binary in the workspace, and several of them fail loudly
+`cargo test` builds and runs every test binary in this package, and several of them fail loudly
 if their service isn't reachable. Cargo stops the whole run at the first binary that fails, so on
 a machine missing a service, everything ordered after it never runs either — including binaries
 that need no infrastructure at all. If you don't have all four services below running locally, run
@@ -64,7 +66,7 @@ schema, and isolates its rows with a UUID prefix, so it's safe to point at a sha
 ## Before you open a pull request
 
 - **Format:** `cargo fmt --all`
-- **Lint:** `cargo clippy --all-targets -- -D warnings` AND
+- **Lint:** `cargo clippy --all-targets --locked -- -D warnings` AND
   `cargo clippy --locked --lib --bins -- -D warnings` (the tree is kept warning-clean under both —
   a dev-dependency self-reference enables the `test-hooks` feature whenever test targets are in the
   build graph, so `--all-targets` alone can't see warnings that only appear in the default-features
