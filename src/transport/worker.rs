@@ -3332,22 +3332,14 @@ pub fn drain_broadcast_inbox<C: ConnIndex>(
         let Some(subs) = local_subs.get(&(app, channel)) else {
             continue; // no local subscribers for this channel on this worker
         };
-        // U3: per-version fan-out. `frames` carries one finished WS frame per
-        // active protocol version, keyed by version byte. Version→slot
-        // mapping, and why it is cheap today: the SINGLE-version fast path is
-        // resolved ONCE PER MESSAGE here — `frames` is always built by
-        // looping `wire::ACTIVE_VERSIONS` (a 1-element slice today), so
-        // `fast` is `Some(&frames[0].1)` and the per-subscriber loop below
-        // costs exactly what the 6.3 single-frame shape cost: one nullable-
-        // pointer `Option` check (perfectly predicted, no scan, no
-        // allocation) — the subscriber's version byte rides the SAME
-        // iteration that yields its slab token (the entry's absorbed
-        // `(token, version)` value), so no lookup at all. Only when a second
-        // protocol version goes active does the multi-version arm below
-        // start scanning (a first-match walk of the ≤2-element vec, falling
-        // back to the first frame so an unknown version byte never DROPS a
-        // broadcast).
-        let fast: Option<&Bytes> = (frames.len() == 1).then(|| &frames[0].1);
+        // `frames` carries one finished WS frame per active protocol version,
+        // keyed by version byte. Resolving the single-version shape once per
+        // message keeps the per-subscriber cost at one `Option` check; the
+        // scan below only starts once a second version goes live.
+        let Some((_, first_frame)) = frames.first() else {
+            continue; // nothing encoded for this message
+        };
+        let fast: Option<&Bytes> = (frames.len() == 1).then_some(first_frame);
         for (sid, &(token, version)) in subs.iter() {
             // Reclassify PER SUBSCRIBER: the band tightens as `inflight_bytes`
             // grows within this drain, so once the worker crosses 100% mid-fan-out
@@ -3363,11 +3355,6 @@ pub fn drain_broadcast_inbox<C: ConnIndex>(
             if except.as_ref() == Some(sid) {
                 continue; // sender exclusion
             }
-            // F12 single-layout: the iteration itself yields BOTH the slab
-            // token and the subscriber's negotiated version (the entry value
-            // absorbed from the old standalone `socket_id → (token, version)`
-            // map) — the per-subscriber probe lookup is GONE, which is the
-            // point of the layout: one hash walk per subscriber total.
             if to_close.contains(&token) {
                 continue;
             }
@@ -3379,16 +3366,15 @@ pub fn drain_broadcast_inbox<C: ConnIndex>(
             if should_skip(band, conn.out_bytes(), conn.high_water()) {
                 continue;
             }
-            // The frame for THIS subscriber's negotiated version: the hoisted
-            // fast frame when one version is active (see `fast` above), else
-            // the first-match slot for the version byte.
+            // An unrecognised version byte falls back to the first frame
+            // rather than dropping the broadcast.
             let frame: &Bytes = match fast {
                 Some(f) => f,
                 None => frames
                     .iter()
                     .find(|(v, _)| *v == version)
                     .map(|(_, b)| b)
-                    .unwrap_or(&frames[0].1),
+                    .unwrap_or(first_frame),
             };
             // SP10: the per-connection queue is byte-bounded drop-head — it never
             // rejects. A slow consumer simply loses its OLDEST queued frame(s)
@@ -4099,6 +4085,93 @@ mod tests {
             client.read_exact(&mut got).expect("read flushed frame");
             assert_eq!(&got[..], &expect[..], "subscriber's own version frame");
         }
+    }
+
+    /// A `BroadcastMsg` carrying no frames is skipped, not indexed into.
+    /// `frames_for` returns an empty vec for an empty version list, and both
+    /// it and the drain are public seams, so an empty `frames` must not take
+    /// the whole core's connection set down with it.
+    ///
+    /// A second, normal message on the SAME channel and subscriber follows it
+    /// through the same drain: its delivery is what proves the empty message
+    /// really did reach a live, deliverable subscriber rather than being
+    /// skipped by an unwired fixture.
+    #[test]
+    fn drain_skips_a_broadcast_with_no_frames() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (conn, mut client) = fixture_conn(&listener);
+
+        let mut conns = FixtureConns {
+            slab: slab::Slab::new(),
+        };
+        let token = conns.slab.insert(conn);
+
+        let app: Arc<str> = Arc::from("app");
+        let channel: Arc<str> = Arc::from("room-1");
+        let mut local_subs: LocalSubs = HashMap::new();
+        let mut subs: HashMap<SocketId, (usize, u8)> = HashMap::new();
+        subs.insert(SocketId::generate(), (token, 7));
+        local_subs.insert((app.clone(), channel.clone()), subs);
+
+        let event = ServerEvent::ChannelEvent {
+            channel: "room-1".to_string(),
+            event: "client-message".to_string(),
+            data: serde_json::json!({"msg": "after the empty one"}),
+            user_id: None,
+        };
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        tx.send(crate::transport::fanout::BroadcastMsg {
+            app: app.clone(),
+            channel: channel.clone(),
+            frames: Vec::new(),
+            except: None,
+        })
+        .unwrap();
+        tx.send(crate::transport::fanout::BroadcastMsg {
+            app,
+            channel,
+            frames: crate::transport::fanout::frames_for(&[7], &event),
+            except: None,
+        })
+        .unwrap();
+        drop(tx);
+
+        let mut touched: HashSet<usize> = HashSet::new();
+        let mut inflight: u64 = 0;
+        let mut outbound: u64 = 0;
+        let mut drophead: u64 = 0;
+        drain_broadcast_inbox(
+            &rx,
+            &local_subs,
+            &mut conns,
+            64 << 20,
+            &mut inflight,
+            &mut outbound,
+            &mut drophead,
+            None,
+            1,
+            &mut touched,
+            &HashSet::new(),
+        );
+
+        assert_eq!(touched, HashSet::from([token]), "only the framed message");
+        let expect = expected_frame(7, &event);
+        assert_eq!(
+            inflight,
+            expect.len() as u64,
+            "the empty message queued nothing"
+        );
+
+        let conn = conns.slab.get_mut(token).unwrap();
+        assert_eq!(conn.flush(1), WriteStatus::Drained, "loopback flush");
+        let mut got = vec![0u8; expect.len()];
+        use std::io::Read as _;
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client.read_exact(&mut got).expect("read flushed frame");
+        assert_eq!(&got[..], &expect[..], "exactly the one framed broadcast");
     }
 
     // ---- Issue #48: the two saturation producers have separate lifetimes ------
