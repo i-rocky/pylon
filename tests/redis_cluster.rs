@@ -17,6 +17,7 @@ use pylon::connection::handle::ConnectionHandle;
 use pylon::protocol::event::ServerEvent;
 use pylon::protocol::socket_id::SocketId;
 use pylon::server::config::ServerConfig;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -126,21 +127,21 @@ async fn smoke_connectivity() {
 
     // Publish from the pool side. `Pool` itself is not a `PubsubInterface`;
     // pub/sub commands go through a pooled `Client` (`pool.next()`).
-    // PUBLISH returns the number of subscribers the SERVER delivered to —
-    // pinning it (>= 1) turns a server-side loss (subscription gone, e.g. a
-    // subscriber reconnect between the SUBSCRIBE confirmation and the PUBLISH)
-    // into a loud, diagnosable failure instead of a silent recv timeout.
+    // PUBLISH returns the number of subscribers the SERVER delivered to, and
+    // that count is authoritative and immediate — Redis pub/sub does not
+    // buffer for late subscribers, so a copy dispatched to zero connections
+    // is gone for good, not merely slow. A zero here is the SAME
+    // single-copy-loss class `recover_lost_copy` below tolerates on a
+    // recv-side timeout (subscription gone, e.g. a subscriber reconnect
+    // between the SUBSCRIBE confirmation and the PUBLISH); it's just
+    // observed at publish time rather than recv time, and gets the same
+    // recovery instead of a bare, unrecoverable assert.
     let first_count: i64 = clients
         .pool
         .next()
         .publish(channel.clone(), payload.clone())
         .await
         .expect("PUBLISH must succeed");
-    assert!(
-        first_count >= 1,
-        "PUBLISH delivered to {first_count} subscribers — the server-side subscription \
-         was gone at publish time (subscriber reconnect?)"
-    );
 
     // Receive, event-bound on arrival (`broadcast::recv` is cancel-safe: a
     // dropped pending recv consumes nothing), with a hard PER-COPY bound so a
@@ -156,62 +157,27 @@ async fn smoke_connectivity() {
     // wall-clock settle window that a bigger deadline fixes: two of those
     // classes only ever DELIVER LATE, the blip class NEVER delivers.
     //
-    // Redis pub/sub is best-effort by contract — a subscriber reconnected at
-    // publish time legitimately misses the copy. The smoke's purpose is "the
-    // round trip works", so on a per-copy timeout we re-verify the
-    // subscription server-side (PUBSUB NUMSUB — the observable, event-based
-    // gate the de-flake program established), re-publish ONE second copy with
-    // the SAME payload (whichever copy lands, the assert below holds), and
-    // only fail if BOTH are lost. A genuinely broken stream still fails loud;
-    // a single environmental loss no longer fails a healthy runner.
-    let msg = match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
-        Ok(Ok(msg)) => msg,
-        Ok(Err(e)) => panic!("broadcast receiver must yield a message: {e:?}"),
-        Err(_) => {
-            // First copy did not arrive within its bound. Gate the retry on
-            // the server-side subscription being attached (covers a blip
-            // whose resubscribe is still in flight), bounded and loud.
-            let attached = tokio::time::timeout(
-                Duration::from_secs(2),
-                poll_numsub_at_least(&clients, &channel, 1),
-            )
-            .await
-            .unwrap_or(false);
-            assert!(
-                attached,
-                "first copy lost and the server reports no subscriber on {channel} \
-                 (tracked: {:?}) — pub/sub round trip is broken, not slow",
-                clients.sub.tracked_channels()
-            );
-
-            eprintln!(
-                "smoke_connectivity: first publish not received within 5s \
-                 (server had {first_count} subscriber(s) at publish time) — \
-                 re-publishing one retry copy"
-            );
-            let retry_count: i64 = clients
-                .pool
-                .next()
-                .publish(channel.clone(), payload.clone())
-                .await
-                .expect("retry PUBLISH must succeed");
-            assert!(
-                retry_count >= 1,
-                "retry PUBLISH delivered to {retry_count} subscribers"
-            );
-
-            // Wait for EITHER copy, then assert below (same payload/channel).
-            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
-                Ok(Ok(msg)) => msg,
-                Ok(Err(e)) => panic!("broadcast receiver must yield a message: {e:?}"),
-                Err(_) => panic!(
-                    "neither of two PUBLISHes (each confirmed delivered to >=1 \
-                     subscriber server-side) arrived within 5s per copy on {channel} \
-                     (tracked: {:?}) — the subscriber stream is broken",
-                    clients.sub.tracked_channels()
-                ),
-            }
+    // A second flake (issue #23) put the same loss class on the OTHER side of
+    // the round trip: `subscribe().await` resolved `Ok` and the very next
+    // PUBLISH still reported zero subscribers server-side. `subscribe()`
+    // resolving means the server acknowledged the SUBSCRIBE command, not that
+    // every later subscriber-count read (this PUBLISH's return value
+    // included) has already caught up — so a zero first-publish count isn't
+    // a different failure mode, it's the identical class caught one step
+    // earlier. Both faces route through the same `recover_lost_copy`: gate on
+    // the observable server state (PUBSUB NUMSUB) and re-publish ONE second
+    // copy with the SAME payload, only failing loud if that gate itself says
+    // the subscriber is genuinely gone. Redis pub/sub is best-effort by
+    // contract; the smoke's purpose is "the round trip works", which one
+    // retry preserves without masking real breakage.
+    let msg = if first_count >= 1 {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Ok(msg)) => msg,
+            Ok(Err(e)) => panic!("broadcast receiver must yield a message: {e:?}"),
+            Err(_) => recover_lost_copy(&clients, &channel, &payload, &mut rx, first_count).await,
         }
+    } else {
+        recover_lost_copy(&clients, &channel, &payload, &mut rx, first_count).await
     };
 
     assert_eq!(msg.channel.to_string(), channel);
@@ -226,25 +192,147 @@ async fn smoke_connectivity() {
     let _ = clients.pool.quit().await;
 }
 
-/// Poll Redis `PUBSUB NUMSUB <channel>` (via the command pool) until the server
-/// reports at least `want` subscribers attached to the pub/sub channel. The
-/// observable "the SUBSCRIBE really is live server-side" — used to gate a
-/// re-publish after a lost copy so the retry can never race a still-in-flight
-/// resubscribe. Only ever resolves `true`; the caller's timeout supplies the
-/// `false`. Never panics.
-async fn poll_numsub_at_least(clients: &RedisClients, channel: &str, want: i64) -> bool {
+/// Recover from a lost first pub/sub copy in `smoke_connectivity` — shared by
+/// its two faces of the same single-copy-loss class: a PUBLISH that reported
+/// zero subscribers, and a copy that reported >=1 subscriber but never
+/// arrived within its recv bound. Gates the retry on the server's own
+/// observable state (`PUBSUB NUMSUB`, via `require_numsub_at_least`) rather
+/// than a bare retry loop, re-publishes ONE second copy with the SAME
+/// payload, and waits for it (or a still-arriving first copy — `recv` is
+/// cancel-safe, so neither can fall between recvs). Fails loud — never masks
+/// a genuinely broken stream — if the gate itself finds no subscriber, or if
+/// neither copy arrives within its bound.
+async fn recover_lost_copy(
+    clients: &RedisClients,
+    channel: &str,
+    payload: &str,
+    rx: &mut tokio::sync::broadcast::Receiver<fred::types::Message>,
+    first_count: i64,
+) -> fred::types::Message {
+    require_numsub_at_least(
+        clients.pool.next(),
+        channel,
+        1,
+        Duration::from_secs(2),
+        &format!(
+            "first copy lost (PUBLISH reported {first_count} subscriber(s) at publish time); \
+             tracked: {:?}",
+            clients.sub.tracked_channels()
+        ),
+    )
+    .await;
+
+    eprintln!(
+        "smoke_connectivity: first publish not delivered (PUBLISH reported {first_count} \
+         subscriber(s) at publish time) — re-publishing one retry copy"
+    );
+    let retry_count: i64 = clients
+        .pool
+        .next()
+        .publish(channel.to_string(), payload.to_string())
+        .await
+        .expect("retry PUBLISH must succeed");
+    assert!(
+        retry_count >= 1,
+        "retry PUBLISH delivered to {retry_count} subscribers"
+    );
+
+    // Wait for EITHER copy, then the caller's assert holds (same
+    // payload/channel on both).
+    match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+        Ok(Ok(msg)) => msg,
+        Ok(Err(e)) => panic!("broadcast receiver must yield a message: {e:?}"),
+        Err(_) => panic!(
+            "neither the first publish nor a retry (confirmed delivered to >=1 subscriber \
+             server-side) arrived within 5s per copy on {channel} (tracked: {:?}) — the \
+             subscriber stream is broken",
+            clients.sub.tracked_channels()
+        ),
+    }
+}
+
+/// Poll Redis `PUBSUB NUMSUB <channel>` until the server reports at least
+/// `want` subscribers attached to the pub/sub channel. The observable "the
+/// SUBSCRIBE really is live server-side" — used to gate a re-publish, or an
+/// upcoming publish a probe needs to see, after a completed `subscribe()`
+/// that doesn't yet guarantee delivery.
+///
+/// `client` must NOT itself hold any active subscription: RESP2 forbids
+/// ordinary commands — `PUBSUB NUMSUB` included — on a connection that is in
+/// subscribe context (confirmed against a live server: Redis rejects it
+/// outright with "only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT /
+/// RESET are allowed in this context"), so a `SubscriberClient` can never
+/// poll its OWN attachment this way. Pass a plain command client instead — a
+/// command-pool `Client` works, and so does a second, unsubscribed
+/// connection built solely for this check.
+///
+/// `last_seen` is stamped with every count this function reads (including
+/// ones below `want`), so a caller whose OUTER timeout cancels this loop
+/// mid-poll can still report the last count it actually observed — this
+/// function only ever returns on success, so that's the one channel a
+/// canceling caller has to that history.
+///
+/// Only ever resolves `true`; the caller's timeout supplies the `false`.
+/// Never panics.
+async fn poll_numsub_at_least<C: PubsubInterface>(
+    client: &C,
+    channel: &str,
+    want: i64,
+    last_seen: &AtomicI64,
+) -> bool {
     loop {
-        let counts: std::collections::HashMap<String, i64> = clients
-            .pool
-            .next()
-            .pubsub_numsub(channel)
-            .await
-            .unwrap_or_default();
-        if counts.get(channel).copied().unwrap_or(0) >= want {
+        let counts: std::collections::HashMap<String, i64> =
+            client.pubsub_numsub(channel).await.unwrap_or_default();
+        let count = counts.get(channel).copied().unwrap_or(0);
+        last_seen.store(count, Ordering::Relaxed);
+        if count >= want {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// Bounded wait for the server to confirm `>= want` subscribers on `channel`
+/// (via [`poll_numsub_at_least`]), panicking with `context` folded into the
+/// message if the server never confirms within `bound`. This is the single
+/// readiness/recovery gate every call site needing "is the subscription
+/// really live server-side" shares: a completed `subscribe()` resolving only
+/// means the server acknowledged the command, not that every code path that
+/// later consults subscriber state (a PUBLISH's delivery count, another
+/// client's own NUMSUB read) has caught up — only the server's own NUMSUB
+/// count settles that. Do not re-derive this bound-and-assert shape at a new
+/// call site; route it through here instead.
+///
+/// `client` carries the same constraint as [`poll_numsub_at_least`]: it must
+/// not itself be the subscribed connection whose attachment you're checking.
+///
+/// On timeout the panic states both `want` and the last NUMSUB count this
+/// call actually observed, so a future reader of a failed run can tell "saw
+/// 0, nothing ever attached" from "saw want-1, one subscriber short" without
+/// re-running anything.
+async fn require_numsub_at_least<C: PubsubInterface>(
+    client: &C,
+    channel: &str,
+    want: i64,
+    bound: Duration,
+    context: &str,
+) {
+    let last_seen = AtomicI64::new(-1);
+    let attached = tokio::time::timeout(
+        bound,
+        poll_numsub_at_least(client, channel, want, &last_seen),
+    )
+    .await
+    .unwrap_or(false);
+    let observed = match last_seen.load(Ordering::Relaxed) {
+        -1 => "no NUMSUB read completed in time".to_string(),
+        n => format!("last saw {n}"),
+    };
+    assert!(
+        attached,
+        "server never reported >= {want} subscriber(s) on {channel} within {bound:?} \
+         ({observed}) — the pub/sub round trip is broken, not slow ({context})"
+    );
 }
 
 /// B1: the per-(app,channel) Redis-subscription lifecycle. A node's SubscriberClient
@@ -1337,9 +1425,15 @@ async fn send_to_user_feeds_the_same_encoded_bytes_to_local_and_publish_halves()
         let (_sid, handle, mut rx) = recording_handle();
         adapter.signin_user(TEST_APP, "u-half", handle).await;
 
-        // A raw probe subscriber sniffs the published envelope bytes (fred's
-        // `subscribe` future resolves on the server's confirmation, so the
-        // sniffed publish cannot race the subscription).
+        // A raw probe subscriber sniffs the published envelope bytes. A
+        // completed `subscribe()` only means the server acknowledged the
+        // SUBSCRIBE command — NOT that the server's own subscriber-count
+        // bookkeeping (what the very next PUBLISH's delivery depends on) has
+        // caught up. That false "subscribe cannot race the publish" assumption
+        // is exactly the issue #23 flake class (see `poll_numsub_at_least` /
+        // `require_numsub_at_least` above, shared with `smoke_connectivity`
+        // and the envelope-compat test): gate on the observable state (PUBSUB
+        // NUMSUB) before trusting the probe to see the first publish below.
         let probe = fred::prelude::Builder::from_config(
             fred::prelude::Config::from_url(test_redis_url().as_str()).unwrap(),
         )
@@ -1352,6 +1446,32 @@ async fn send_to_user_feeds_the_same_encoded_bytes_to_local_and_publish_halves()
             .subscribe(usermsg.clone())
             .await
             .expect("probe SUBSCRIBE");
+        // A plain command client for the NUMSUB readiness gate — NOT `probe`
+        // itself: RESP2 forbids ordinary commands (PUBSUB included) on a
+        // connection that has active subscriptions, so the gate needs its own
+        // connection to ask "is `probe` attached?" from the outside.
+        let numsub = fred::prelude::Builder::from_config(
+            fred::prelude::Config::from_url(test_redis_url().as_str()).unwrap(),
+        )
+        .build()
+        .unwrap();
+        numsub.init().await.expect("numsub client must connect");
+        // want=2, not 1: `adapter.signin_user` above already SUBSCRIBEd its OWN
+        // `SubscriberClient` to this exact `usermsg` channel (the node-local
+        // 0->1 edge — see redis/mod.rs), so NUMSUB is never 0 here even before
+        // the probe catches up. Gating on >=1 would pass on the adapter's own
+        // subscriber alone and let the publish below race the probe's — the
+        // same flake this whole gate exists to close, just one subscriber
+        // short of catching it. Only >=2 (adapter + probe) is the observable
+        // fact that the probe itself is attached.
+        require_numsub_at_least(
+            &numsub,
+            &usermsg,
+            2,
+            Duration::from_secs(2),
+            "probe readiness before the first send_to_user publish",
+        )
+        .await;
 
         // Typed event → ONE encode shared by both halves.
         let event = ServerEvent::ChannelEvent {
@@ -1404,6 +1524,7 @@ async fn send_to_user_feeds_the_same_encoded_bytes_to_local_and_publish_halves()
         );
 
         let _ = probe.quit().await;
+        let _ = numsub.quit().await;
     })
     .await
     .expect("send_to_user encode-once pin must not hang (Redis up?)");
@@ -1839,12 +1960,35 @@ async fn cluster_envelope_compat_knob_shapes_the_wire_and_relay_still_works() {
         .unwrap();
         probe.init().await.expect("probe must connect");
         let mut probe_rx = probe.message_rx();
-        // fred's `subscribe` future resolves on the server's confirmation, so
-        // the first sniffed publish cannot race the subscription.
+        // A plain command client for the NUMSUB readiness gate below — NOT
+        // `probe` itself: RESP2 forbids ordinary commands (PUBSUB included)
+        // on a connection that has active subscriptions, so the gate needs
+        // its own connection to ask "is `probe` attached?" from the outside.
+        let numsub = fred::prelude::Builder::from_config(
+            fred::prelude::Config::from_url(test_redis_url().as_str()).unwrap(),
+        )
+        .build()
+        .unwrap();
+        numsub.init().await.expect("numsub client must connect");
         probe
             .subscribe(msg_on.clone())
             .await
             .expect("probe SUBSCRIBE");
+        // A completed `subscribe()` only means the server acknowledged the
+        // SUBSCRIBE command — not that the server's own subscriber-count
+        // bookkeeping (what the very next broadcast's delivery depends on)
+        // has caught up. That's the same single-copy-loss class
+        // `smoke_connectivity` hits from the PUBLISH side of the round trip;
+        // gate on the observable state (PUBSUB NUMSUB) before trusting the
+        // probe to see the first broadcast.
+        require_numsub_at_least(
+            &numsub,
+            &msg_on,
+            1,
+            Duration::from_secs(2),
+            "probe readiness before the compat=on broadcast",
+        )
+        .await;
 
         adapter_on
             .broadcast(
@@ -1905,6 +2049,22 @@ async fn cluster_envelope_compat_knob_shapes_the_wire_and_relay_still_works() {
             .subscribe(usermsg_off.clone())
             .await
             .expect("probe SUBSCRIBE");
+        // want=2, not 1: `adapter_b.subscribe` above already SUBSCRIBEd its OWN
+        // `SubscriberClient` to this exact `msg_off` channel (the node-local
+        // 0->1 edge — see the B1 lifecycle test), so NUMSUB is never 0 here
+        // even before the probe catches up. Gating on >=1 would pass on
+        // adapter_b's own subscriber alone and let the broadcast below race
+        // the probe's SUBSCRIBE — the same flake this gate exists to close,
+        // just one subscriber short of catching it. Only >=2 (adapter_b +
+        // probe) is the observable fact that the probe itself is attached.
+        require_numsub_at_least(
+            &numsub,
+            &msg_off,
+            2,
+            Duration::from_secs(2),
+            "probe readiness before the compat=off broadcast",
+        )
+        .await;
 
         // A (compat=off) broadcasts: the bus envelope must omit `event`.
         adapter_a
@@ -1938,6 +2098,24 @@ async fn cluster_envelope_compat_knob_shapes_the_wire_and_relay_still_works() {
 
         // A (compat=off) sends to u1: the UserSend envelope also omits `event`,
         // and B still delivers the frame to its local u1 connection.
+        //
+        // want=2, not 1: `adapter_b.signin_user` above already SUBSCRIBEd its
+        // OWN `SubscriberClient` to this exact `usermsg_off` channel (the same
+        // node-local 0->1 edge `send_to_user_feeds_the_same_encoded_bytes_...`
+        // relies on), so NUMSUB is never 0 here even before the probe catches
+        // up. Gating on >=1 would pass on adapter_b's own subscriber alone and
+        // prove only "someone is subscribed" — already true before this gate
+        // ever ran — letting the send below race the probe's SUBSCRIBE. Only
+        // >=2 (adapter_b + probe) is the observable fact that the probe itself
+        // is attached.
+        require_numsub_at_least(
+            &numsub,
+            &usermsg_off,
+            2,
+            Duration::from_secs(2),
+            "probe readiness before the compat=off user send",
+        )
+        .await;
         adapter_a
             .send_to_user(
                 TEST_APP,
@@ -1968,6 +2146,7 @@ async fn cluster_envelope_compat_knob_shapes_the_wire_and_relay_still_works() {
             .await;
         adapter_b.signout_user(TEST_APP, "u1", &user_sock).await;
         let _ = probe.quit().await;
+        let _ = numsub.quit().await;
     })
     .await
     .expect("compat knob test must not hang (Redis up?)");
