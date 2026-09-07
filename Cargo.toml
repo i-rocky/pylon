@@ -76,7 +76,7 @@ dhat = { version = "0.3", optional = true }
 # SO_REUSEPORT/SO_REUSEADDR listener sockets — one per per-core worker so the
 # kernel load-balances accepts across worker threads (SP9 multi-worker). The
 # `all` feature unlocks `set_reuse_port` (gated `cfg(all(feature="all", unix))`).
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6.5", features = ["all"] }
 # Pin each per-core worker thread to a CPU (SP9 multi-worker core affinity).
 core_affinity = "0.8"
 # Parallelize the per-subscriber broadcast enqueue across a work-stealing pool
@@ -102,7 +102,7 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 criterion = "0.5"
 futures-util = "0.3"
 # Used by transport::conn tests to shrink SO_SNDBUF and force partial writes.
-socket2 = "0.5"
+socket2 = "0.6.5"
 # Temp files for SqlAppManager tests (avoids in-memory SQLite pool isolation issue)
 tempfile = "3"
 
