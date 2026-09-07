@@ -2070,6 +2070,37 @@ async fn rest_request_with_forty_headers_gets_a_real_response() {
     );
 }
 
+/// #18 review fix: hyper's own h1 parser defaults to 100 header slots
+/// (`DEFAULT_MAX_HEADERS`), independent of this transport's `MAX_HEADERS` (128).
+/// Before the `hyper_util` auto builder in `rest.rs` was told to match
+/// `MAX_HEADERS`, a REST request landing in the 101-128 field band cleared the
+/// transport's own `read_head` (so `HeadResult::Rest`, handed off to hyper) but
+/// then blew hyper's lower ceiling on the way into axum — hyper answers that
+/// itself with a bodiless 431, built inside the h1 layer before axum's router
+/// (and R10's JSON error shape) ever runs. A ~110-header REST request must
+/// clear BOTH ceilings and come back with a normal response, proving the gap
+/// between the transport's limit and hyper's default is closed.
+#[tokio::test]
+async fn rest_request_with_110_headers_gets_a_real_response() {
+    let addr = spawn().await;
+    let body =
+        json!({"name":"my-event","data":"{\"hi\":1}","channels":["public-room"]}).to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let mut req = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body);
+    for i in 0..110 {
+        req = req.header(format!("x-pad-{i}"), "v");
+    }
+    let resp = req.send().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "a 110-header REST request (past hyper's own default 100-header ceiling) \
+         must still be answered, not hyper's own bodiless 431"
+    );
+}
+
 /// #18 on the WS plane: the same 32-field ceiling killed `GET /app/{key}`
 /// upgrades — 32 headers got the 101, 33 got a silent close. A 40-header
 /// upgrade must still complete the handshake and establish the session.

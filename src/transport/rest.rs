@@ -576,8 +576,21 @@ async fn serve_one(
     let tokio_stream = tokio::net::TcpStream::from_std(fd_stream)?;
 
     let service = hyper_util::service::TowerToHyperService::new(router);
-    let builder =
+    let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    // Match hyper's own h1 header-count ceiling to the transport's `MAX_HEADERS`
+    // (#18). hyper's h1 parser defaults to 100 header slots regardless of what
+    // `read_head` accepted upstream; unset, a REST request in the 101-128 field
+    // band would clear the transport's own parser (so `HeadResult::Rest`, handed
+    // off here) and then blow hyper's lower ceiling on the way into axum. hyper
+    // answers that itself — a bodiless 431 built inside the h1 layer before this
+    // service (and R10's "every REST error is JSON" bar) ever runs, so no
+    // fallback in `router.rs` can reshape it. Keeping the two ceilings equal
+    // means the REST plane's `431` always goes through `RestError`'s JSON shape,
+    // never hyper's raw one, for every field count this transport itself allows.
+    builder
+        .http1()
+        .max_headers(crate::transport::handshake::MAX_HEADERS);
 
     match tls {
         None => {
