@@ -1815,7 +1815,33 @@ fn handle_handshake(
                 Action::Close
             }
         }
-        HeadResult::Bad(_) => Action::Close,
+        // More header fields than the parser can address — a proxy chain that
+        // stacked `X-Forwarded-*`/`CF-*`/tracing headers past
+        // `handshake::MAX_HEADERS`. The head is well-formed, so answer it
+        // instead of dropping it: RFC 6585 §5's 431 in the Pusher JSON error
+        // shape (R10), queued → flushed → closed, the same three steps the
+        // 4001/4005/4007 pre-session rejects take with their WS frames. A
+        // client that gets no status line at all cannot tell this apart from a
+        // network fault, which is exactly the report this came in as.
+        HeadResult::TooManyHeaders => {
+            tracing::debug!(
+                limit = handshake::MAX_HEADERS,
+                head_bytes = entry.inbuf.len(),
+                "rejecting request head with too many header fields (431)"
+            );
+            let response = handshake::header_fields_too_large_response().into_boxed_slice();
+            // Drop-head queue never rejects; the 431 always enqueues.
+            let _ = entry.conn.queue(Bytes::from(response), now_ns);
+            let _ = flush_and_arm(poll, entry, now_ns);
+            Action::Close
+        }
+        // Genuinely malformed (or over the G3 size cap): nothing to answer
+        // with, but say why at `debug` so an operator can attribute the close
+        // rather than reading it as a transport fault.
+        HeadResult::Bad(reason) => {
+            tracing::debug!(reason, "closing connection with a bad request head");
+            Action::Close
+        }
     }
 }
 

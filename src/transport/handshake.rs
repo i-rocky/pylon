@@ -22,6 +22,23 @@ use sha1::{Digest, Sha1};
 /// RFC 6455 §1.3 magic GUID appended to `Sec-WebSocket-Key` before hashing.
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
+/// Number of header slots [`read_head`] parses into. A head carrying more
+/// fields than this is [`HeadResult::TooManyHeaders`].
+///
+/// This is a PARSER bound, not the memory guard. The head's total SIZE is
+/// bounded independently by `max_head_bytes` (G3, default 16384) and checked
+/// before parsing, so the slot count buys nothing on the slowloris front — it
+/// only decides how many *fields* the parser can address at once, at
+/// `size_of::<httparse::Header>()` (32 bytes on 64-bit) of stack each.
+///
+/// The previous 32 was reachable by ordinary traffic: a browser WS upgrade
+/// already sends 10–14 fields, and a CDN or reverse-proxy chain then appends
+/// `X-Forwarded-*`, `CF-*`, `Via`, `Forwarded`, tracing headers and per-request
+/// cookies on top. 128 clears any realistic chain for ~4 KiB of stack, paid on
+/// the handshake path only (once per readable event while the head is
+/// incomplete, never again once the session is open).
+pub const MAX_HEADERS: usize = 128;
+
 /// Result of reading an HTTP request head from a connection's initial bytes.
 #[derive(Debug, PartialEq)]
 pub enum HeadResult {
@@ -34,6 +51,13 @@ pub enum HeadResult {
     /// The head is not yet fully received (no CRLFCRLF terminator yet). Read
     /// more.
     NeedMore,
+    /// The head carries more than [`MAX_HEADERS`] fields. Kept distinct from
+    /// [`HeadResult::Bad`] because it is ANSWERABLE: the head is well-formed,
+    /// there is simply more of it than the parser can address, so the worker
+    /// replies `431 Request Header Fields Too Large`
+    /// ([`header_fields_too_large_response`]) and closes instead of dropping
+    /// the connection with no response at all.
+    TooManyHeaders,
     /// Malformed / unsupported request.
     Bad(&'static str),
 }
@@ -70,12 +94,17 @@ pub fn read_head(buf: &[u8], max_head_bytes: usize) -> HeadResult {
             return HeadResult::Bad("request head too large");
         }
     }
-    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut req = httparse::Request::new(&mut headers);
 
     let consumed = match req.parse(buf) {
         Ok(httparse::Status::Complete(n)) => n,
         Ok(httparse::Status::Partial) => return HeadResult::NeedMore,
+        // Running out of slots says nothing about the head's syntax — httparse
+        // reports it the moment field `MAX_HEADERS + 1` appears, complete head
+        // or not. Surface it separately so the caller can answer 431 rather
+        // than treat an over-long-but-valid head as garbage.
+        Err(httparse::Error::TooManyHeaders) => return HeadResult::TooManyHeaders,
         Err(_) => return HeadResult::Bad("malformed http request"),
     };
 
@@ -196,6 +225,37 @@ pub fn accept_response(ws_key: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// The RFC 6585 §5 `431 Request Header Fields Too Large` response for a head
+/// that overran [`MAX_HEADERS`].
+///
+/// Built here, in bytes, rather than by the axum plane: the REST handoff works
+/// by REPLAYING the consumed head to the control plane, and a head we could not
+/// finish parsing has nothing to replay — the answer has to come from the
+/// worker or not at all. The body is the same Pusher error shape
+/// (`{"error":...,"status":...}`) every other REST error renders (R10), so an
+/// official SDK parses this exactly as it parses a 413 or a 404. `Connection:
+/// close` states what the worker then does: the head is unusable, so there is
+/// no framing left to keep the socket on.
+///
+/// The same response answers an oversized WS upgrade: at the point the parse
+/// gives up there is no way to tell a WS handshake from a REST call, and an
+/// HTTP error is what a WS client's opening handshake is specified to accept in
+/// place of the 101 (RFC 6455 §4.1) — far better than the bare FIN it used to
+/// get.
+pub fn header_fields_too_large_response() -> Vec<u8> {
+    let body = crate::http::error::error_body("Request header fields too large", 431);
+    format!(
+        "HTTP/1.1 431 Request Header Fields Too Large\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {len}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        len = body.len()
+    )
+    .into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +338,114 @@ mod tests {
             read_head(&buf, 1024),
             HeadResult::Bad("request head too large")
         );
+    }
+
+    /// Build a `GET /metrics` head carrying `n` distinct `X-Pad-{i}` header
+    /// fields on top of the mandatory `Host`, terminated by CRLFCRLF.
+    fn head_with_headers(n: usize) -> Vec<u8> {
+        let mut buf = b"GET /metrics HTTP/1.1\r\nHost: x\r\n".to_vec();
+        for i in 0..n {
+            buf.extend_from_slice(format!("X-Pad-{i}: v\r\n").as_bytes());
+        }
+        buf.extend_from_slice(b"\r\n");
+        buf
+    }
+
+    /// A head with 33 fields — one past the old 32-slot ceiling, which a CDN or
+    /// proxy chain clears without being remotely abusive — parses normally
+    /// instead of being closed as malformed.
+    #[test]
+    fn head_past_the_old_thirty_two_slot_ceiling_parses() {
+        let req = head_with_headers(33);
+        assert_eq!(
+            read_head(&req, DEFAULT_TEST_HEAD_CAP),
+            HeadResult::Rest {
+                consumed: req.len()
+            }
+        );
+    }
+
+    /// The boundary itself: exactly [`MAX_HEADERS`] fields still parses, and one
+    /// more is `TooManyHeaders` — NOT `NeedMore` (the head is complete) and NOT
+    /// the generic `Bad` (its syntax is fine), so the worker can answer 431
+    /// rather than close silently.
+    #[test]
+    fn over_max_headers_is_its_own_variant() {
+        // `Host` occupies one slot, so `MAX_HEADERS - 1` pads fill the array.
+        let at_limit = head_with_headers(MAX_HEADERS - 1);
+        assert_eq!(
+            read_head(&at_limit, DEFAULT_TEST_HEAD_CAP),
+            HeadResult::Rest {
+                consumed: at_limit.len()
+            }
+        );
+        let over = head_with_headers(MAX_HEADERS);
+        assert_eq!(
+            read_head(&over, DEFAULT_TEST_HEAD_CAP),
+            HeadResult::TooManyHeaders
+        );
+    }
+
+    /// An over-limit WS upgrade reports the same variant as an over-limit REST
+    /// head: once the slots run out there is nothing left to tell them apart,
+    /// and both get the 431 rather than a bare FIN.
+    #[test]
+    fn over_max_headers_on_a_ws_upgrade_is_too_many_headers() {
+        let mut req = b"GET /app/app-key HTTP/1.1\r\n\
+            Host: example.com\r\n\
+            Upgrade: websocket\r\n\
+            Connection: Upgrade\r\n\
+            Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+            Sec-WebSocket-Version: 13\r\n"
+            .to_vec();
+        for i in 0..MAX_HEADERS {
+            req.extend_from_slice(format!("X-Pad-{i}: v\r\n").as_bytes());
+        }
+        req.extend_from_slice(b"\r\n");
+        assert_eq!(
+            read_head(&req, DEFAULT_TEST_HEAD_CAP),
+            HeadResult::TooManyHeaders
+        );
+    }
+
+    /// G3 still wins over the header count: an over-limit head that is ALSO
+    /// past the size cap is `Bad("request head too large")`, because the cap is
+    /// checked before the parse. The answerable 431 must not become a way to
+    /// make the server write to a slowloris.
+    #[test]
+    fn the_size_cap_is_checked_before_the_header_count() {
+        let over = head_with_headers(MAX_HEADERS);
+        assert_eq!(
+            read_head(&over, 64),
+            HeadResult::Bad("request head too large")
+        );
+    }
+
+    /// The 431 is a complete, parseable HTTP response carrying the same Pusher
+    /// JSON error shape (R10) as every other REST error.
+    #[test]
+    fn header_fields_too_large_response_shape() {
+        let resp = header_fields_too_large_response();
+        let text = std::str::from_utf8(&resp).unwrap();
+        assert!(
+            text.starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"),
+            "bad start line:\n{text}"
+        );
+        assert!(
+            text.contains("Content-Type: application/json\r\n"),
+            "missing JSON content type:\n{text}"
+        );
+        let body = text
+            .split_once("\r\n\r\n")
+            .expect("blank-line terminator")
+            .1;
+        assert!(
+            text.contains(&format!("Content-Length: {}\r\n", body.len())),
+            "content-length does not match the body:\n{text}"
+        );
+        let json: serde_json::Value = serde_json::from_str(body).expect("body is JSON");
+        assert_eq!(json["status"], 431);
+        assert_eq!(json["error"], "Request header fields too large");
     }
 
     /// 1. RFC 6455 §1.3 canonical accept Known-Answer-Test.

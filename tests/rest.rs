@@ -2043,3 +2043,104 @@ async fn rest_wrong_method_on_valid_path_is_405() {
         r#"{"error":"Method not allowed","status":405}"#
     );
 }
+
+/// #18: a request head is no longer limited to 32 header fields. A browser
+/// already sends 10-14, and a CDN or reverse-proxy chain stacks `X-Forwarded-*`,
+/// `CF-*`, `Via`, `Forwarded`, tracing headers and cookies on top, so 40 is
+/// ordinary traffic — it used to be closed at the TCP level with ZERO bytes
+/// returned, indistinguishable from a network fault. It must reach the router
+/// and come back with a real HTTP response.
+#[tokio::test]
+async fn rest_request_with_forty_headers_gets_a_real_response() {
+    let addr = spawn().await;
+    let body =
+        json!({"name":"my-event","data":"{\"hi\":1}","channels":["public-room"]}).to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let mut req = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body);
+    for i in 0..40 {
+        req = req.header(format!("x-pad-{i}"), "v");
+    }
+    let resp = req.send().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "a 40-header REST request must be answered, not dropped at the TCP level"
+    );
+}
+
+/// #18 on the WS plane: the same 32-field ceiling killed `GET /app/{key}`
+/// upgrades — 32 headers got the 101, 33 got a silent close. A 40-header
+/// upgrade must still complete the handshake and establish the session.
+#[tokio::test]
+async fn ws_upgrade_with_forty_headers_completes_the_101() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::header::{HeaderName, HeaderValue};
+
+    let addr = spawn().await;
+    // `into_client_request` supplies the mandatory upgrade set (Host,
+    // Connection, Upgrade, Sec-WebSocket-Key, Sec-WebSocket-Version); the pads
+    // stand in for what a proxy chain would prepend.
+    let mut request = format!("ws://{addr}/app/app-key?protocol=7")
+        .into_client_request()
+        .unwrap();
+    for i in 0..40 {
+        request.headers_mut().insert(
+            HeaderName::try_from(format!("x-pad-{i}")).unwrap(),
+            HeaderValue::from_static("v"),
+        );
+    }
+    let (mut ws, response) = tokio_tungstenite::connect_async(request).await.unwrap();
+    assert_eq!(response.status(), 101);
+    let frame = next_json(&mut ws).await;
+    assert_eq!(frame["event"], "pusher:connection_established");
+}
+
+/// #18: past the parser's slot count the head is genuinely unusable — but it is
+/// now ANSWERED rather than dropped. Both planes get RFC 6585 §5's `431 Request
+/// Header Fields Too Large` in the Pusher JSON error shape (R10), so a client
+/// can tell "you sent too many headers" apart from "the connection broke".
+///
+/// The pads keep the head far inside the 16 KiB `max_head_bytes` cap, so this
+/// exercises the field COUNT, not the G3 size guard (which still closes without
+/// a response, by design — a slowloris earns no write).
+#[tokio::test]
+async fn head_over_the_header_limit_is_answered_with_json_431() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::header::{HeaderName, HeaderValue};
+
+    let addr = spawn().await;
+
+    let mut req = reqwest::Client::new().get(format!("http://{addr}/health"));
+    for i in 0..160 {
+        req = req.header(format!("x-pad-{i}"), "v");
+    }
+    let resp = req.send().await.unwrap();
+    assert_eq!(resp.status(), 431);
+    assert_eq!(
+        resp.text().await.unwrap(),
+        r#"{"error":"Request header fields too large","status":431}"#,
+        "the 431 must carry the same JSON error shape as every other REST error"
+    );
+
+    // The WS plane answers identically: once the slots run out there is nothing
+    // left to tell an upgrade from a REST call, and RFC 6455 §4.1 lets the
+    // opening handshake fail with an HTTP status instead of the 101.
+    let mut request = format!("ws://{addr}/app/app-key?protocol=7")
+        .into_client_request()
+        .unwrap();
+    for i in 0..160 {
+        request.headers_mut().insert(
+            HeaderName::try_from(format!("x-pad-{i}")).unwrap(),
+            HeaderValue::from_static("v"),
+        );
+    }
+    match tokio_tungstenite::connect_async(request).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            assert_eq!(resp.status(), 431);
+        }
+        Err(e) => panic!("an over-limit upgrade must fail with an HTTP 431, got: {e}"),
+        Ok(_) => panic!("an over-limit upgrade must not complete the 101"),
+    }
+}
