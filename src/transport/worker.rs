@@ -669,29 +669,25 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 //    SO_REUSEPORT listener from the poll. The broadcast/mailbox
                 //    waker registration stays so we keep flushing.
                 let _ = poll.registry().deregister(&mut listener);
-                // 2. Queue a `pusher:error` 4200 text frame + WS Close(4200) on
-                //    every open connection. pusher-js reads code 4200 as "reconnect
-                //    immediately" → the LB routes the client to a surviving node on
-                //    a rolling restart (vs code 1001 which triggers backoff).
-                //    Collect keys first to avoid aliasing `conns` while iterating.
+                // 2. Tell every connection to reconnect elsewhere. Keys first,
+                //    to avoid aliasing `conns` while iterating.
                 let keys: Vec<usize> = conns.iter().map(|(k, _)| k).collect();
                 for k in keys {
-                    queue_shutdown_error(&mut conns, k, now_ns);
-                    send_close_4200(&poll, &mut conns, k, now_ns);
-                    // INCREMENTAL INFLIGHT: mirror the 4201 path (lines ~668-674).
-                    // The Close frame may not flush synchronously (backpressured
-                    // client). Without this fold, `inflight_bytes` stays 0 and the
-                    // drain's `inflight_bytes == 0` exit fires immediately, dropping
-                    // the still-queued Close frame. After this fold, inflight_bytes
-                    // is exact: the exit only fires when all Close frames are truly
-                    // flushed, and the debug_assert_eq holds on a non-idle drain.
-                    fold_delta(&mut conns, k, &mut inflight_bytes);
-                    // G8: fold this connection's drop counters too — the queued
-                    // 4200 frames may have evicted older frames (drop-head) and
-                    // the flush may have CoDel-dropped stale ones. Uniform with
-                    // every other queue/flush site.
-                    fold_codel(&mut conns, k, &mut codel_dropped_total);
-                    fold_drophead(&mut conns, k, &mut drophead_dropped_total);
+                    drain_close_connection(
+                        &poll,
+                        &mut conns,
+                        k,
+                        now_ns,
+                        &mut local_subs,
+                        &mut wheel,
+                        &mut inflight_bytes,
+                        &mut codel_dropped_total,
+                        &mut drophead_dropped_total,
+                        &conn_counts,
+                        &app_registry,
+                        &node_conns,
+                        &cluster,
+                    );
                 }
                 tracing::info!(
                     worker = cfg.worker_id,
@@ -728,21 +724,14 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 );
                 return Ok(());
             }
-            // else: fall through — the rest of the loop polls writable events and
-            // flushes the queued Close frames + any pending out-bytes. The
-            // Close-queue flush armed WRITABLE on every still-backpressured
-            // connection, so the poll wakes on the next drain event (or the
-            // 50ms idle tick, whichever comes first). We re-check
-            // inflight_bytes/deadline each iteration.
+            // Otherwise fall through and let the loop flush the queued Close
+            // frames: every still-backpressured connection has WRITABLE armed,
+            // so the poll wakes as soon as one drains.
         }
 
-        // Debug-only cross-check: the incrementally-maintained `inflight_bytes`
-        // must equal the true sum of every connection's accounted bytes (its
-        // out-queue plus its reassembly buffer). Any missed delta site (a
-        // `queue`/`flush`/drop/fragment change that didn't fold, or a `remove`
-        // that didn't subtract) makes this panic in tests — the SP10 overload
-        // flood (queue + drop-head + CoDel + send all firing) is the hardest
-        // case. Free in release (compiles out under `#[cfg(debug_assertions)]`).
+        // Debug-only cross-check: any missed delta site — a queue/flush/drop
+        // that didn't fold, or a teardown that didn't subtract — shows up here
+        // rather than as a slow drift in the overload signal.
         debug_assert_eq!(
             inflight_bytes,
             conns
@@ -1336,10 +1325,14 @@ fn queue_close_frame(entry: &mut Entry, code: u16, reason: &str, now_ns: u64) {
 }
 
 /// Send a WebSocket Close frame with the given `code` and `reason` text —
-/// queue it and flush so it actually reaches the peer — then let the caller
-/// handle the connection (either `remove` it immediately or wait for flush).
-/// The single generalized Close-reply helper; [`send_close_4200`] and
-/// [`send_close_4201`] are thin callers.
+/// queue it and flush so it actually reaches the peer — and report what the
+/// flush wants done with the connection. The single generalized Close-reply
+/// helper; [`send_close_4200`] and [`send_close_4201`] are thin callers.
+///
+/// A caller that is not already tearing the connection down MUST honour an
+/// [`Action::Close`]: `flush_and_arm` returns it without arming WRITABLE, so
+/// leaving the connection in the slab strands its queued bytes behind a poll
+/// that will never wake for them.
 fn send_close_reply(
     poll: &Poll,
     conns: &mut slab::Slab<Entry>,
@@ -1347,13 +1340,12 @@ fn send_close_reply(
     code: u16,
     reason: &str,
     now_ns: u64,
-) {
+) -> Action {
     let Some(entry) = conns.get_mut(key) else {
-        return;
+        return Action::Close;
     };
     queue_close_frame(entry, code, reason, now_ns);
-    // Flush so the Close frame actually reaches the peer before we deregister.
-    let _ = flush_and_arm(poll, entry, now_ns);
+    flush_and_arm(poll, entry, now_ns)
 }
 
 /// SP11 §4: send a WebSocket Close frame with code `4201` (pong-timeout) with the
@@ -1373,8 +1365,7 @@ fn send_close_4201(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_n
 /// "reconnect immediately") with the canonical shutdown reason text.
 /// pusher-js reads 4200 and reconnects to the LB immediately — this minimises
 /// client disruption on a rolling restart compared to the 1001 generic-gone-away.
-/// The caller is responsible for the subsequent `fold_delta` + eventual `remove`.
-fn send_close_4200(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) {
+fn send_close_4200(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) -> Action {
     send_close_reply(
         poll,
         conns,
@@ -1382,7 +1373,7 @@ fn send_close_4200(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_n
         4200,
         "Server is shutting down; please reconnect",
         now_ns,
-    );
+    )
 }
 
 /// Max connection lifetime (Pusher parity, default 24h): send a WebSocket Close
@@ -1485,6 +1476,55 @@ fn queue_shutdown_error(conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) 
     let _ = entry.conn.queue(out.freeze(), now_ns);
     // No explicit flush here: the caller queues the Close frame next, and
     // `send_close` calls `flush_and_arm` which flushes both frames together.
+}
+
+/// C2a drain, one connection: queue the `pusher:error` 4200 + WS Close(4200),
+/// flush them, and fold this connection's counters into the worker totals. The
+/// Close frame often will not flush synchronously (a backpressured client), so
+/// the folded bytes are what makes the drain's `inflight_bytes == 0` exit wait
+/// for them.
+///
+/// A peer that is already write-dead — very common on a rolling restart, where
+/// the LB drains clients while the node is stopping — can never receive those
+/// frames: the flush reports [`Action::Close`] and arms no WRITABLE interest.
+/// Such a connection is removed here rather than left holding queued bytes that
+/// nothing will ever send, which would pin `inflight_bytes` above zero for the
+/// whole grace window (and trip the loop-top interest invariant in debug builds).
+#[allow(clippy::too_many_arguments)]
+fn drain_close_connection(
+    poll: &Poll,
+    conns: &mut slab::Slab<Entry>,
+    key: usize,
+    now_ns: u64,
+    local_subs: &mut LocalSubs,
+    wheel: &mut TimerWheel,
+    inflight_bytes: &mut u64,
+    codel_total: &mut u64,
+    drophead_total: &mut u64,
+    conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
+    app_registry: &Arc<AppRegistry>,
+    node_conns: &Arc<AtomicUsize>,
+    cluster: &Option<crate::cluster::bridge::ClusterHandle>,
+) {
+    queue_shutdown_error(conns, key, now_ns);
+    let action = send_close_4200(poll, conns, key, now_ns);
+    fold_delta(conns, key, inflight_bytes);
+    fold_codel(conns, key, codel_total);
+    fold_drophead(conns, key, drophead_total);
+    if action == Action::Close {
+        remove(
+            poll,
+            conns,
+            key,
+            local_subs,
+            wheel,
+            inflight_bytes,
+            conn_counts,
+            app_registry,
+            node_conns,
+            cluster,
+        );
+    }
 }
 
 /// Outcome of handling a connection event: keep it, close it, or hand it off to
@@ -4405,5 +4445,126 @@ mod tests {
         }
         update_budget_pressure(&bit, 799, BUDGET);
         assert!(!raised(), "back under the release band: released");
+    }
+
+    // ---- teardown paths keep `inflight_bytes` exact --------------------------
+
+    /// The worker-total bundle every teardown path has to keep in step.
+    struct Totals {
+        inflight: u64,
+        codel: u64,
+        drophead: u64,
+        local_subs: LocalSubs,
+        wheel: TimerWheel,
+        conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>>,
+        app_registry: Arc<crate::adapter::app_registry::AppRegistry>,
+        node_conns: Arc<AtomicUsize>,
+    }
+
+    impl Totals {
+        fn new() -> Self {
+            Totals {
+                inflight: 0,
+                codel: 0,
+                drophead: 0,
+                local_subs: HashMap::new(),
+                wheel: TimerWheel::new(),
+                conn_counts: Arc::new(DashMap::new()),
+                app_registry: Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+                node_conns: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    /// One `Open` connection over `stream`, in a slab and registered with
+    /// `poll` exactly as `accept_ready` leaves it.
+    fn slab_with_conn(poll: &Poll, stream: mio::net::TcpStream) -> (slab::Slab<Entry>, usize) {
+        let mut conns: slab::Slab<Entry> = slab::Slab::new();
+        let key = conns.insert(Entry {
+            conn: Connection::new(stream, 1 << 20),
+            inbuf: BytesMut::new(),
+            token: Token(0),
+            session: None,
+            fragment: None,
+            pending_establish: None,
+        });
+        let entry = &mut conns[key];
+        entry.token = Token(key);
+        entry.conn.state = ConnState::Open;
+        poll.registry()
+            .register(entry.conn.stream_mut(), Token(key), Interest::READABLE)
+            .unwrap();
+        (conns, key)
+    }
+
+    /// An accepted loopback socket whose peer has gone away with an RST, held
+    /// until writes on it genuinely fail — the rolling-restart shape, where the
+    /// LB drops clients while the node is being stopped.
+    fn write_dead_stream() -> mio::net::TcpStream {
+        use std::io::Write as _;
+        use std::os::fd::OwnedFd;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        accepted.set_nonblocking(true).unwrap();
+        // Data the client never reads, plus a zero linger, makes its close an
+        // RST rather than a FIN.
+        (&accepted).write_all(b"unread").unwrap();
+        socket2::SockRef::from(&client)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(client);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while (&accepted)
+            .write(b"probe")
+            .err()
+            .is_none_or(|e| e.kind() == ErrorKind::WouldBlock)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the peer's RST never landed"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        mio::net::TcpStream::from(OwnedFd::from(accepted))
+    }
+
+    /// Issue #61: the drain must honour the `Close` its flush reports. A peer
+    /// that has already RST'd can never receive the 4200 frames, and the flush
+    /// arms no WRITABLE interest for them — so leaving it in the slab pins
+    /// `inflight_bytes` above zero, the drain's fast exit can never fire, and
+    /// shutdown burns the whole grace window on every restart where one peer
+    /// has gone away.
+    #[test]
+    fn drain_removes_a_connection_whose_close_frames_can_never_flush() {
+        let poll = Poll::new().unwrap();
+        let (mut conns, key) = slab_with_conn(&poll, write_dead_stream());
+        let mut t = Totals::new();
+
+        drain_close_connection(
+            &poll,
+            &mut conns,
+            key,
+            0,
+            &mut t.local_subs,
+            &mut t.wheel,
+            &mut t.inflight,
+            &mut t.codel,
+            &mut t.drophead,
+            &t.conn_counts,
+            &t.app_registry,
+            &t.node_conns,
+            &None,
+        );
+
+        assert!(
+            conns.is_empty(),
+            "a write-dead peer is torn down, not left holding unsendable frames"
+        );
+        assert_eq!(
+            t.inflight, 0,
+            "its queued 4200 frames leave the worker total with it"
+        );
     }
 }

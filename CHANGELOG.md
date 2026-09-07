@@ -165,6 +165,16 @@ pre-1.0 and versions track `Cargo.toml`.
   the per-connection subscription cap are unaffected), with the presence roster
   read from the same source the original ack used — cluster-wide on a clustered
   node, node-local otherwise.
+- **Shutdown no longer waits out the full `shutdown_grace_ms` when a peer has
+  already gone away.** The drain queued its `pusher:error` 4200 + Close(4200)
+  and discarded the flush's verdict, so a connection whose peer had RST'd —
+  routine on a rolling restart, where the load balancer drains clients while
+  the node is stopping — was left in the slab with those frames queued and no
+  WRITABLE interest armed. `inflight_bytes` could then never reach zero, so the
+  drain's "everything flushed, exit now" path stopped applying and every
+  restart paid the whole grace window (10 s by default); debug builds panicked
+  on the queued-bytes-imply-armed invariant instead. Such a connection is now
+  torn down as soon as the flush reports it unwritable.
 - **A TLS connection no longer under-reports up to 60 KiB of unsent data to the
   byte budget.** The out-queue released a frame the moment rustls accepted the
   plaintext, not when the bytes reached the socket, so a backpressured TLS
