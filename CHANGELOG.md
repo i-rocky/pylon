@@ -162,6 +162,18 @@ pre-1.0 and versions track `Cargo.toml`.
   pins); the Redis adapter's cluster-roster overwrite still re-encodes fresh
   cluster truth per join (it replaces the frame in the join outcome, not the
   node-local cache).
+- **The pinned Rust toolchain moves from 1.96.0 to 1.98.1**, and the minimum
+  supported Rust version rises with it — sqlx 0.9 alone requires 1.94.0.
+  Building from source needs a toolchain at least that new; `rust-toolchain.toml`
+  installs the right one automatically under rustup.
+- **Outbound webhook HTTPS now verifies against the operating system's
+  certificate store instead of a compiled-in Mozilla root bundle** — reqwest
+  0.13 replaced the bundled-roots option with the platform verifier. A host or
+  container whose trust store is empty can no longer deliver to an HTTPS
+  endpoint; the shipped image already installs `ca-certificates`. Custom
+  internal CAs now work by trusting them at the OS level, with no rebuild.
+  Webhook TLS also runs on the same `ring` crypto provider as pylon's own
+  listener rather than pulling a second backend into the process.
 
 ### Removed
 - **`PYLON_WEBHOOK_RETRY_BASE_MS` and `PYLON_WEBHOOK_MAX_RETRIES` removed** —
