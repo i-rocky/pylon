@@ -641,6 +641,113 @@ async fn overload_publish_returns_503_then_200_after() {
     result.expect("503-admission test did not complete within the wall");
 }
 
+/// Scrape `/metrics` for `pylon_saturation_flag`. Every scrape is itself a
+/// connection the worker accepts, hands off and closes — i.e. it forces the very
+/// loop passes whose broadcast drain used to clear the flag.
+async fn saturation_flag(port: u16, client: &reqwest::Client) -> Option<u64> {
+    let body = client
+        .get(format!("http://127.0.0.1:{port}/metrics"))
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    body.lines()
+        .find(|l| l.starts_with("pylon_saturation_flag "))
+        .and_then(|l| l.split_whitespace().last())
+        .and_then(|v| v.parse().ok())
+}
+
+/// Issue #48 — the saturation signal must OUTLIVE the drains that follow it.
+/// With the flood stopped, a worker still holding out-queues over its byte
+/// budget keeps reporting saturated and keeps 503ing publishes, however many
+/// times it drains its (now empty) broadcast inbox. It recovers only when the
+/// pressure itself goes — here, when the backed-up subscribers disconnect and
+/// their queued bytes are reclaimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overload_budget_saturation_outlives_the_worker_drain() {
+    let _guard = HARNESS_LOCK.lock().await;
+    const BUDGET: u64 = 256 << 10;
+    // One worker, so every subscriber shares the one budget that their out-queue
+    // caps together sum to twice over.
+    let config = ServerConfig {
+        workers: 1,
+        memory_budget_bytes: BUDGET,
+        expected_conns_per_worker: 2,
+        perconn_queue_min_bytes: 128 << 10,
+        perconn_queue_max_bytes: 128 << 10,
+        max_event_payload_bytes: 1 << 20,
+        ..base_config(free_port())
+    };
+    const N_BACKED_UP: usize = 8;
+
+    let result = tokio::time::timeout(WALL, async {
+        let h = spawn_with(config).await;
+        let channel = "outlive-chan";
+
+        let mut subs: Vec<Ws> = Vec::with_capacity(N_BACKED_UP);
+        for _ in 0..N_BACKED_UP {
+            let mut ws = connect(h.port).await;
+            let est = next_json(&mut ws).await;
+            assert_eq!(est["event"], "pusher:connection_established");
+            subscribe_public(&mut ws, channel).await;
+            subs.push(ws);
+        }
+
+        let client = reqwest::Client::new();
+        let big = "y".repeat(64 << 10);
+        let flood_until = Instant::now() + FLOOD;
+        while Instant::now() < flood_until {
+            let _ = publish(h.port, &client, channel, &big).await;
+        }
+
+        // Nothing is publishing any more and nobody is reading, so the pressure
+        // is unchanged — but each scrape below drives worker loop passes whose
+        // drain finds an EMPTY inbox, the exact passes that used to clear it.
+        let mut flag = None;
+        for _ in 0..10 {
+            flag = saturation_flag(h.port, &client).await;
+        }
+        let inflight = pylon::transport::percore_total_inflight_bytes();
+        assert!(
+            inflight * 100 >= BUDGET * 80,
+            "fixture precondition: the worker must still be over its budget \
+             ({inflight} of {BUDGET} bytes)"
+        );
+        assert_eq!(
+            flag,
+            Some(1),
+            "budget pressure must survive the drains that follow it"
+        );
+        assert_eq!(
+            publish(h.port, &client, channel, "{\"probe\":1}").await,
+            503,
+            "a worker still over its byte budget must keep rejecting publishes"
+        );
+
+        // Release the pressure: the backed-up subscribers leave, so `remove`
+        // reclaims their queued bytes and the worker falls back under the band.
+        drop(subs);
+        let mut recovered = false;
+        for _ in 0..40 {
+            if publish(h.port, &client, "post-drop-chan", "{\"ok\":1}").await == 200 {
+                recovered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            recovered,
+            "saturation must release once the backlog is gone"
+        );
+
+        drop(h);
+    })
+    .await;
+    result.expect("saturation-lifetime test did not complete within the wall");
+}
+
 /// Phase 2 gate: under the flood, the total bytes queued across all workers must
 /// never exceed the configured memory budget. With a small explicit budget
 /// (`PYLON_MEMORY_BUDGET_BYTES`), flood publishes to many never-reading

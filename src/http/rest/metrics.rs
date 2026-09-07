@@ -322,7 +322,7 @@ pub async fn get_metrics(
         );
     }
 
-    let saturation = state.saturated.as_ref().map(|s| s.load(Ordering::Relaxed));
+    let saturation = state.saturated.as_ref().map(|s| s.is_saturated());
     let percore = percore_metrics_snapshot();
 
     // Phase-2 B2: webhook metrics + queue depth. The depth is the spec formula

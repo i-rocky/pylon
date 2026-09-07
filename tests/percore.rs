@@ -518,7 +518,7 @@ async fn disconnect_cleans_up_subscription() {
 
 /// Spawn a dispatch worker with a manually-controlled `saturated` flag. Returns
 /// the harness AND the flag so the test can flip it.
-async fn spawn_with_saturation_flag() -> (Harness, Arc<AtomicBool>) {
+async fn spawn_with_saturation_flag() -> (Harness, pylon::transport::fanout::SaturationFlag) {
     const APPS_UNLIMITED: &str = r#"[
         {"name":"Test","id":"app","key":"app-key","secret":"app-secret",
          "capacity":0,"client_messages_enabled":true,"subscription_count_enabled":false}
@@ -531,7 +531,7 @@ async fn spawn_with_saturation_flag() -> (Harness, Arc<AtomicBool>) {
         registry,
         app_registry.clone(),
     ));
-    let sat_flag = Arc::new(AtomicBool::new(false));
+    let sat_flag = pylon::transport::fanout::SaturationFlag::default();
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
     let node_conns = Arc::new(AtomicUsize::new(0));
     let env = Arc::new(DispatchEnv {
@@ -612,7 +612,7 @@ async fn saturated_accept_gate_rejects_4100_and_releases_counter() {
     let (h, sat_flag) = spawn_with_saturation_flag().await;
 
     // ── Saturated: new connection must be rejected with 4100. ──────────────
-    sat_flag.store(true, Ordering::SeqCst);
+    sat_flag.set_inbox_full();
     let mut ws1 = try_connect(h.port).await;
     let close_code = wait_close_code(&mut ws1).await;
     assert_eq!(
@@ -622,7 +622,7 @@ async fn saturated_accept_gate_rejects_4100_and_releases_counter() {
     );
 
     // ── Not saturated: clear the flag — a new connection must succeed. ──────
-    sat_flag.store(false, Ordering::SeqCst);
+    sat_flag.clear_inbox_full();
     // Give the worker a moment to process the previous close so the node counter
     // is back to 0 before the next connect (the reject path should have already
     // decremented it, but a small sleep confirms).

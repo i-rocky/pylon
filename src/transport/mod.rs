@@ -392,19 +392,20 @@ pub fn run_percore(
                 tx,
                 waker: std::sync::OnceLock::new(),
                 dropped: AtomicU64::new(0),
+                budget_saturated: AtomicBool::new(false),
             }));
             receivers.push(rx);
         }
         // Retain slot arcs for the metrics registry before moving them into wirings.
         worker_slots_for_metrics.extend(slots.iter().cloned());
-        // Sink-shared saturation flag: set by the publisher on a full hand-off
-        // OR by a worker that hit ≥100% of its byte budget, cleared by each
-        // worker after it drains its inbox to empty. Sourced from the
-        // `LocalAdapter` so the REST `AppState`'s 503 admission check (which holds
-        // a clone via `saturation_flag()`) observes the SAME bit.
+        // Sourced from the `LocalAdapter` so the REST `AppState`'s 503 admission
+        // check (which holds a clone via `saturation_flag()`) observes the SAME
+        // state, including every worker's own budget bit.
         let saturated = local.saturation_flag();
+        let workers = Arc::new(slots.clone());
+        saturated.bind_workers(workers.clone());
         let sink = BroadcastSink {
-            workers: Arc::new(slots.clone()),
+            workers,
             saturated: saturated.clone(),
         };
         // Install BEFORE spawning workers so the very first broadcast routes here.

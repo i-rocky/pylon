@@ -28,7 +28,7 @@ pub struct ConnectionContext {
     /// (mirroring the rate-limit drop) instead of broadcasting — the WS analogue
     /// of the REST 503. `None` when no concrete local adapter backs the sink (the
     /// redis+percore fallback) or in tests, so the drop never fires.
-    pub saturated: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub saturated: Option<crate::transport::fanout::SaturationFlag>,
     /// SP11: whether this connection runs on the clustered percore path. When `true`
     /// the cluster `ClusterBridge` owns the single cluster-wide channel-edge emits — the
     /// clustered `subscription_count` broadcast, `channel_occupied`, and
@@ -62,9 +62,7 @@ impl ConnectionContext {
     /// Whether the percore broadcast pipeline is currently saturated (SP10).
     /// `false` when no flag is wired (off-percore).
     pub(in crate::ws) fn is_saturated(&self) -> bool {
-        self.saturated
-            .as_ref()
-            .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+        self.saturated.as_ref().is_some_and(|s| s.is_saturated())
     }
 
     pub(crate) fn handle(&self) -> ConnectionHandle {
