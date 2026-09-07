@@ -42,8 +42,6 @@ pub fn user_signature(secret: &str, socket_id: &str, user_data: &str) -> String 
 
 /// Channel auth signature. Private channels sign `"<socket_id>:<channel>"`;
 /// presence channels append ":<channel_data>" (the exact JSON string the client sent).
-/// An empty `channel_data` (`Some("")`) is treated as no channel data — it signs
-/// the private-channel string `"<socket_id>:<channel>"`.
 pub fn channel_signature(
     secret: &str,
     socket_id: &str,
@@ -51,8 +49,8 @@ pub fn channel_signature(
     channel_data: Option<&str>,
 ) -> String {
     let msg = match channel_data {
-        Some(cd) if !cd.is_empty() => format!("{socket_id}:{channel}:{cd}"),
-        _ => format!("{socket_id}:{channel}"),
+        Some(cd) => format!("{socket_id}:{channel}:{cd}"),
+        None => format!("{socket_id}:{channel}"),
     };
     hmac_sha256_hex(secret, &msg)
 }
@@ -98,11 +96,15 @@ mod tests {
         );
     }
 
+    /// A presence subscribe carrying an empty `channel_data` must NOT verify
+    /// against a token signed the private way. Collapsing the two made the
+    /// authentication decision depend on `parse_channel_data("")` failing
+    /// afterwards rather than on the signature itself.
     #[test]
-    fn empty_channel_data_signs_as_private() {
-        assert_eq!(
-            channel_signature("secret", "123.456", "private-foo", Some("")),
-            channel_signature("secret", "123.456", "private-foo", None)
+    fn empty_channel_data_does_not_sign_as_private() {
+        assert_ne!(
+            channel_signature("secret", "123.456", "presence-foo", Some("")),
+            channel_signature("secret", "123.456", "presence-foo", None)
         );
     }
 
