@@ -98,6 +98,15 @@ pre-1.0 and versions track `Cargo.toml`.
   sending a non-conforming `socket_id` and relying on the previous `200`**:
   that call now returns `400 "Invalid socket id"` — audit callers before
   upgrading.
+- **REST `socket_id` validation now caps length at 24 bytes instead of 64**,
+  closing the 25–64 byte band that passed validation and was then silently
+  truncated. A `SocketId` stores 24 bytes inline and `SocketId::from_raw`
+  truncates rather than failing, so a signed trigger carrying a well-formed but
+  over-long `socket_id` matched no connection: the exclusion did nothing and the
+  call still answered `200`. The bound is now derived from `SocketId::CAPACITY`
+  so the two cannot drift apart again. Every id pylon issues is at most 21 bytes
+  (two 10-digit halves and a dot), so no conforming caller is affected; a caller
+  sending a longer id now gets `400 "Invalid socket id"`.
 - Per-core worker broadcast index consolidated to the single-map layout: each
   `local_subs` channel entry now carries its subscribers' `(slab token,
   negotiated protocol version)` directly (`(app, channel) → {socket_id →

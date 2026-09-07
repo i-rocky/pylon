@@ -5,11 +5,15 @@ use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SocketId {
-    buf: [u8; 24],
+    buf: [u8; Self::CAPACITY],
     len: u8,
 }
 
 impl SocketId {
+    /// Longest `socket_id` a `SocketId` can hold; [`Self::from_raw`] truncates
+    /// past it, so anything client-supplied must be length-checked first.
+    pub const CAPACITY: usize = 24;
+
     /// Each half is drawn from `[1, 10^10)` — large enough to be unguessable.
     pub fn generate() -> Self {
         let mut rng = rand::thread_rng();
@@ -25,8 +29,8 @@ impl SocketId {
     /// Build a `SocketId` from a client-supplied string (e.g. a REST `socket_id`).
     pub fn from_raw(raw: impl AsRef<str>) -> Self {
         let s = raw.as_ref().as_bytes();
-        let n = s.len().min(24);
-        let mut buf = [0u8; 24];
+        let n = s.len().min(Self::CAPACITY);
+        let mut buf = [0u8; Self::CAPACITY];
         buf[..n].copy_from_slice(&s[..n]);
         Self { buf, len: n as u8 }
     }
