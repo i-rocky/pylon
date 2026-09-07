@@ -84,7 +84,7 @@ impl RedisClients {
 /// (the authoritative cluster-wide subscription count).
 ///
 /// `KEYS[1]` = occ hash, `KEYS[2]` = chans set.
-/// `ARGV[1]` = member_token, `ARGV[2]` = expire_at_ms, `ARGV[3]` = ttl_secs,
+/// `ARGV[1]` = member_token, `ARGV[2]` = expire_at_ms, `ARGV[3]` = key_ttl_secs,
 /// `ARGV[4]` = channel.
 const SUBSCRIBE_LUA: &str = r#"
 redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
@@ -116,24 +116,29 @@ end
 return {count, won}
 "#;
 
-/// VACATE CAS script (the sweeper's orphan reclaim). Atomically decides AND
-/// performs the vacate: if the occ hash holds no members (or is already gone),
-/// DEL it and `SREM` the channel from the `chans` index, returning `1` — the
-/// single cluster-wide `channel_vacated` emission right — ONLY if THIS call's
-/// SREM actually removed the entry. Returns `0` when a member (re-)appeared, or
-/// when another writer (the last-unsubscribe's [`UNSUBSCRIBE_LUA`]) already
-/// removed the entry and therefore already owns the emission. Together the two
-/// scripts guarantee exactly one `channel_vacated` per vacancy in every
-/// interleaving.
+/// VACATE CAS script (the sweeper's orphan reclaim). With the occ hash empty (or
+/// already gone) it DELs the hash and `SREM`s the channel from the `chans` index;
+/// the caller whose SREM actually removed the entry owns the single cluster-wide
+/// `channel_vacated`. A member that (re-)appeared, or an entry another writer
+/// (the last-unsubscribe's [`UNSUBSCRIBE_LUA`]) already removed, yields `won == 0`.
 ///
-/// `KEYS[1]` = occ hash, `KEYS[2]` = chans set.
-/// `ARGV[1]` = channel.
+/// That same winner DRAINS the channel's presence side-tables in the same script,
+/// returning every user still on the roster — each owed one `member_removed`.
+/// `chans` is the only index without a TTL, so the SREM that de-indexes the channel
+/// is the last instant anything can still reach those hashes; doing both under one
+/// script is what stops them outliving the membership they describe, and keeps the
+/// drain on the single winner rather than every racing sweeper.
+///
+/// `KEYS[1]` = occ hash, `KEYS[2]` = chans set, `KEYS[3]` = presusers,
+/// `KEYS[4]` = presinfo, `KEYS[5]` = presmembers. `ARGV[1]` = channel.
+/// Returns `{won, drained_user_ids}`; a non-presence channel drains empty.
 const VACATE_LUA: &str = r#"
-if redis.call('HLEN', KEYS[1]) == 0 then
-  redis.call('DEL', KEYS[1])
-  return redis.call('SREM', KEYS[2], ARGV[1])
-end
-return 0
+if redis.call('HLEN', KEYS[1]) ~= 0 then return {0, {}} end
+redis.call('DEL', KEYS[1])
+if redis.call('SREM', KEYS[2], ARGV[1]) == 0 then return {0, {}} end
+local roster = redis.call('HKEYS', KEYS[3])
+redis.call('DEL', KEYS[3], KEYS[4], KEYS[5])
+return {1, roster}
 "#;
 
 /// PRESENCE_JOIN. Records this connection's member, bumps the user's cluster-wide
@@ -160,28 +165,17 @@ if conn <= 0 then redis.call('HDEL', KEYS[1], ARGV[1]); redis.call('HDEL', KEYS[
 return conn
 "#;
 
-/// REAP_MEMBER CAS script (the sweeper's stale-connection reap — F-6, the member
-/// analog of [`VACATE_LUA`]'s R8 rule: the `member_removed` emission right belongs
-/// to whichever caller's atomic op takes the user's refcount to exactly 0).
-/// Atomically: resolve the stale `member_token` to its `user_id`; read the user's
-/// connection refcount; then EITHER — if this reap brings the count to EXACTLY 0 —
-/// HDEL the member AND de-index the user from `presusers` + `presinfo`, returning
-/// `won == 1` (this caller owns the single cluster-wide `member_removed`), OR
-/// simply apply the decrement (`HINCRBY -1`) and return `won == 0`.
+/// REAP_MEMBER CAS script (the sweeper's stale-connection reap). Resolves the stale
+/// `member_token` to its user and either takes that user's refcount to EXACTLY 0 —
+/// de-indexing it from `presusers` + `presinfo` and returning `won == 1`, the single
+/// cluster-wide `member_removed` emission right — or applies a plain decrement and
+/// returns `won == 0`. A token already gone, or a refcount already at/below 0, is
+/// still garbage-collected but never re-emits: that edge was taken and announced by
+/// another writer. Redis serializes scripts, so exactly one of this and the live
+/// [`PRESENCE_LEAVE_LUA`] can observe the 1→0 edge — and after a reap win the racing
+/// live leave sees −1, not 0.
 ///
-/// Absent verdicts (both `won == 0`, silent — another writer already owns or has
-/// already spent the emission right): the token is gone from `presmembers`
-/// (the live [`PRESENCE_LEAVE_LUA`] already ran), or the user's refcount field is
-/// gone/≤0 while a stale token lingered (the →0 edge was already taken and
-/// emitted; the ghost token is still reaped, just without a second emission).
-/// Together with the live path this guarantees exactly one `member_removed` per
-/// user-removal edge in every interleaving: Redis serializes scripts, so exactly
-/// one of the two racing writers can observe the 1→0 edge. The live path needs no
-/// change — after a reap win HDELs the refcount field, the racing
-/// `PRESENCE_LEAVE_LUA` returns −1 (not 0), and the bridge emits only on `== 0`.
-///
-/// Returns `{user_id, remaining, won}` (`user_id` is `''` on the absent verdict;
-/// `remaining` is the post-reap refcount).
+/// Returns `{user_id, remaining, won}` (`user_id` is `''` when the token was absent).
 /// KEYS\[1\]=presusers KEYS\[2\]=presinfo KEYS\[3\]=presmembers
 /// ARGV\[1\]=member_token
 const REAP_MEMBER_LUA: &str = r#"
@@ -306,8 +300,9 @@ pub struct Scripts {
     pub subscribe: Script,
     /// Removes a member and returns `{remaining cluster-wide count, vacate-CAS won}`.
     pub unsubscribe: Script,
-    /// The sweeper's atomic vacate: returns 1 iff THIS call won the
-    /// `channel_vacated` emission right (its SREM removed the chans entry).
+    /// The sweeper's atomic vacate: returns `{won, drained_user_ids}` — `won == 1`
+    /// iff THIS call's SREM removed the chans entry, in which case it also drained
+    /// the presence side-tables and each returned user is owed a `member_removed`.
     pub vacate: Script,
     /// Records a presence join and returns the user's new connection refcount.
     pub presence_join: Script,

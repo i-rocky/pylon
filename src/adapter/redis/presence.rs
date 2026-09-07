@@ -110,26 +110,12 @@ pub(super) async fn user_count(
 }
 
 /// Sweeper crash-time reap of ONE stale presence member token — the atomic CAS
-/// (F-6, the member analog of the vacate CAS `VACATE_LUA` in `client.rs`). One
+/// (the member analog of the vacate CAS `VACATE_LUA` in `client.rs`). One
 /// `REAP_MEMBER_LUA` invocation resolves the token to its user, decrements the
 /// user's cluster refcount (or removes the user on the 1→0 edge), and returns the
 /// CAS verdict: `won == 1` iff THIS call took the refcount to EXACTLY 0 — the
-/// single cluster-wide `member_removed` emission right. The emit below gates on
-/// `won`; a racing live `leave` (the atomic `PRESENCE_LEAVE_LUA`) is the only
-/// other contender, and Redis serializes the two scripts, so exactly one of them
-/// can ever observe the 1→0 edge — no duplicate `member_removed` in any
-/// interleaving (the pre-CAS HGET→HDEL→HINCRBY sequence could double-decrement
-/// and emit on `<= 0` while the live path emitted on `== 0`).
-///
-/// On `won` the broadcast half is the same as before: `member_removed` broadcast
-/// cross-node via the channel's msg pub/sub plus a webhook. Best-effort: logs +
-/// returns on any Redis error, never panics. The broadcast envelope's `node_id` is
-/// the DEAD node (the token prefix) so every LIVE node — including this sweeper's —
-/// delivers it. `compat` is the cluster-wide `PYLON_CLUSTER_ENVELOPE_COMPAT`
-/// setting: with compat off the member_removed envelope omits the legacy `event`
-/// member (frame_b64 is the sole carrier — legal only on a fleet whose every node
-/// ships the knob; v0.3.0 alone does not qualify, its receivers drop compat-off
-/// envelopes silently).
+/// single cluster-wide `member_removed` emission right. Best-effort: logs +
+/// returns on any Redis error, never panics.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn reap_member(
     scripts: &Scripts,
@@ -162,37 +148,82 @@ pub(super) async fn reap_member(
         }
     };
     if won != 1 {
-        // The token was already gone (the live PRESENCE_LEAVE ran), or the user's
-        // refcount was >1 (this was a plain decrement), or the →0 edge was already
-        // taken and emitted by another writer. Either way another caller owns or
-        // has spent the emission right: stay silent. (On the absent verdicts the
-        // script has still reaped the stale token itself — no ghost entry.)
         return;
     }
-    let dead_node = token
-        .split_once(':')
-        .map(|(n, _)| n.to_string())
-        .unwrap_or_default();
-    // The sweeper's compensating `member_removed` is one frame shared
-    // cluster-wide; it encodes at `ACTIVE_VERSIONS[0]` (the cluster
-    // envelope stays single-version until a v8 relay format exists).
+    let dead_node = token.split_once(':').map(|(n, _)| n).unwrap_or_default();
+    emit_member_removed(
+        pool, keys, app, channel, &user_id, dead_node, sharded, compat, webhooks,
+    )
+    .await;
+}
+
+/// Announce the users a won `VACATE_LUA` drained from the roster of a channel that
+/// has just become unreachable — the compensating `member_removed` for members whose
+/// node died holding them, which no live leave and no per-token reap can still emit.
+/// Emitted before the caller's `channel_vacated`, preserving the documented order.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn emit_drained_members(
+    pool: &Pool,
+    keys: &Keys,
+    app: &str,
+    channel: &str,
+    users: &[String],
+    sharded: bool,
+    compat: bool,
+    webhooks: &WebhookHandle,
+) {
+    for user_id in users {
+        emit_member_removed(
+            pool,
+            keys,
+            app,
+            channel,
+            user_id,
+            NO_ORIGIN_NODE,
+            sharded,
+            compat,
+            webhooks,
+        )
+        .await;
+    }
+}
+
+/// Envelope publisher for an emission that belongs to no surviving node. Node ids are
+/// UUIDs, so no live node's receive loop can mistake this for its own echo and drop it.
+const NO_ORIGIN_NODE: &str = "";
+
+/// Broadcast one `member_removed` cluster-wide on the channel's msg pub/sub, plus its
+/// webhook. `origin_node` is the node the departed member belonged to (the sweeper is
+/// never it), so every LIVE node — including the sweeper's own — delivers the frame.
+/// `compat` is the cluster-wide `PYLON_CLUSTER_ENVELOPE_COMPAT` setting: with compat
+/// off the envelope omits the legacy `event` member and `frame_b64` is the sole
+/// carrier. One frame is shared cluster-wide, so it encodes at `ACTIVE_VERSIONS[0]`.
+#[allow(clippy::too_many_arguments)]
+async fn emit_member_removed(
+    pool: &Pool,
+    keys: &Keys,
+    app: &str,
+    channel: &str,
+    user_id: &str,
+    origin_node: &str,
+    sharded: bool,
+    compat: bool,
+    webhooks: &WebhookHandle,
+) {
     let frame = crate::protocol::wire::encode(
         crate::protocol::wire::ACTIVE_VERSIONS[0],
         &ServerEvent::MemberRemoved {
             channel: channel.to_string(),
-            user_id: user_id.clone(),
+            user_id: user_id.to_string(),
         },
     );
     let env = Envelope {
-        node_id: dead_node,
+        node_id: origin_node.to_string(),
         app: app.to_string(),
         kind: EnvelopeKind::Broadcast,
         channel: channel.to_string(),
         event: Value::String(frame.clone()),
         except: None,
-        // Additive (F16): raw frame bytes as base64 alongside the legacy
-        // `event` JSON string (see `Envelope::frame_b64`). F-1: with the
-        // compat knob off the envelope drops the `event` member instead.
         frame_b64: Some(Envelope::encode_frame_b64(&frame)),
     };
     if let Ok(payload) = String::from_utf8(env.encode_with(compat)) {
@@ -205,7 +236,7 @@ pub(super) async fn reap_member(
     webhooks.enqueue(WebhookEvent::MemberRemoved {
         app: app.to_string(),
         channel: channel.to_string(),
-        user_id,
+        user_id: user_id.to_string(),
     });
 }
 

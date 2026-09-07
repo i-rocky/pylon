@@ -120,6 +120,33 @@ pre-1.0 and versions track `Cargo.toml`.
   effect and produces no warning.
 
 ### Fixed
+- **A node dying while it held the last members of a presence channel no longer
+  leaks its roster into Redis forever, and no longer skips their
+  `member_removed`.** The three presence side-tables (`presusers`, `presinfo`,
+  `presmembers`) had no TTL and no vacate-time cleanup: their only reclaim path
+  ran off the member tokens in the channel's `occ` hash, whose whole-key TTL
+  expired at the same instant those tokens went stale. A sweep that arrived
+  after that found an empty `occ`, reaped nothing, and fired `channel_vacated`
+  with **zero** preceding `member_removed` — leaving the departed users in the
+  cluster roster permanently. The leak then compounded: every later join of such
+  a user on that channel incremented the ghost refcount instead of crossing the
+  0→1 edge, silently suppressing both its `member_added` and, later, its
+  `member_removed`, and the state was unrecoverable without a manual `DEL`.
+  Three changes close it, together making the side-tables strictly unable to
+  outlive the membership they describe. (1) The `occ` hash's whole-key TTL is now
+  a genuine backstop rather than a second deadline — it outlives the per-member
+  `expireAt` stamps it carries by `4 × sweep_interval + 5` seconds, so a crashed
+  node's tokens survive to be resolved and reaped one by one through the existing
+  exactly-once `member_removed` CAS. (2) The sweeper's vacate now also DRAINS the
+  presence side-tables, in the same atomic script that de-indexes the channel from
+  `chans` (the one structure with no TTL, and therefore the last point at which
+  the roster is still reachable): the single SREM winner emits one
+  `member_removed` per surviving user *before* its `channel_vacated`, then deletes
+  all three hashes. (3) A presence leave now writes Redis before the membership
+  half de-indexes the channel, so that index brackets the state it describes and a
+  crash between the two calls can never strand a roster nothing enumerates. No
+  configuration changes; the non-crash path still fires exactly one
+  `member_removed` followed by one `channel_vacated`, as before.
 - **HTTP request heads with more than 32 header fields are now accepted (up
   to 128), and a head that still overruns the limit is answered instead of
   the connection closing silently** — `read_head` parsed into a fixed

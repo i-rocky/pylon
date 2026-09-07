@@ -7,13 +7,24 @@
 //! at a time holds a short-lived Redis lease (`{prefix}:sweeplock`), scans every
 //! occupied channel, HDELs members whose `expireAt < now`, and — when that empties a
 //! channel — vacates it via the atomic VACATE_LUA CAS (DEL the occ hash + de-index
-//! the channel + decide the emission right in ONE script) and fires
-//! `channel_vacated` only when this pass won the CAS (through the dispatcher's
-//! grace + cluster re-check, so a re-subscribe within the grace window suppresses
-//! the webhook). The CAS is what keeps the sweeper and a concurrent
+//! the channel + drain the presence side-tables + decide the emission right in ONE
+//! script) and fires `channel_vacated` only when this pass won the CAS (through the
+//! dispatcher's grace + cluster re-check, so a re-subscribe within the grace window
+//! suppresses the webhook). The CAS is what keeps the sweeper and a concurrent
 //! last-unsubscribe (UNSUBSCRIBE_LUA) from BOTH firing `channel_vacated` for one
 //! vacancy: the emission right belongs to whichever caller's SREM actually removed
 //! the `chans` entry, and Redis serializes scripts — exactly one winner.
+//!
+//! Presence rosters have two lines of defence, because a presence member outlives
+//! its `occ` token in two different ways. While ANY member of the channel is live,
+//! the occ hash's whole-key TTL backstop (sized to OUTLIVE the per-member `expireAt`
+//! stamps it carries — [`RedisConfig::occ_ttl_secs`]) keeps a crashed node's stale
+//! tokens visible, so the per-token reap above resolves each to its user and emits
+//! the exact `member_removed`. When nobody is left, the occ hash can lapse entirely
+//! with its tokens; the roster the vacate drains is then the only remaining record
+//! of who was in the channel, and the members it names are emitted here.
+//!
+//! [`RedisConfig::occ_ttl_secs`]: crate::adapter::redis::RedisConfig::occ_ttl_secs
 //!
 //! Every Redis error is logged and skipped; one failure must never abort the whole
 //! sweep. Nothing here panics or unwraps.
@@ -121,14 +132,11 @@ pub(crate) async fn sweep_once(
                 })
                 .collect();
 
-            // Presence side-table reap: for a presence channel, each stale token's user
-            // loses a connection via the atomic REAP_MEMBER_LUA CAS; the →0 user edge
-            // (won == 1) is the ONLY branch that emits member_removed (cross-node +
-            // webhook) — the emission right belongs to whichever caller's atomic op
-            // took the refcount to 0, so a racing live PRESENCE_LEAVE and this reap
-            // can never BOTH fire it. Per-token via the user refcount, so
-            // multi-connection users and users still live on another node are
-            // handled correctly.
+            // Presence side-table reap: each stale token's user loses a connection via
+            // the atomic REAP_MEMBER_LUA CAS; only the →0 user edge (won == 1) emits
+            // member_removed, so a racing live PRESENCE_LEAVE and this reap can never
+            // both fire it. Per-token via the user refcount, so multi-connection users
+            // and users still live on another node are handled correctly.
             if super::presence::is_presence(&channel) {
                 for token in &stale {
                     super::presence::reap_member(
@@ -166,37 +174,48 @@ pub(crate) async fn sweep_once(
                 continue;
             }
 
-            // Vacate via the atomic VACATE_LUA CAS: "if HLEN occ == 0 → DEL occ +
-            // SREM chans; return whether THIS call's SREM removed the entry". The
-            // whole vacate DECISION+action is one script, so unlike the old
-            // HLEN→DEL→SREM round-trips it cannot straddle a concurrent
-            // last-unsubscribe's atomic UNSUBSCRIBE_LUA and see a chans-indexed
-            // channel whose occ is already gone (which double-fired
-            // channel_vacated). The webhook fires ONLY when this pass won the CAS
-            // (`won == 1`): if the last-unsubscribe already removed the chans entry,
-            // IT owns the single cluster-wide emission and this pass stays silent
-            // (Redis serializes scripts — exactly one winner in every interleaving).
-            let won: i64 = match scripts
+            // Vacate via the atomic VACATE_LUA CAS. The whole vacate DECISION+action is
+            // one script, so unlike the old HLEN→DEL→SREM round-trips it cannot straddle
+            // a concurrent last-unsubscribe's UNSUBSCRIBE_LUA and see a chans-indexed
+            // channel whose occ is already gone (which double-fired channel_vacated).
+            // The winner also gets the presence roster the script drained — every user
+            // whose node died holding it, owed one member_removed BEFORE the vacate.
+            let (won, drained): (i64, Vec<String>) = match scripts
                 .vacate
-                .evalsha_with_reload::<i64, _, _>(
+                .evalsha_with_reload::<(i64, Vec<String>), _, _>(
                     pool.next(),
-                    vec![occ, keys.chans(&app)],
+                    vec![
+                        occ,
+                        keys.chans(&app),
+                        keys.presusers(&app, &channel),
+                        keys.presinfo(&app, &channel),
+                        keys.presmembers(&app, &channel),
+                    ],
                     vec![channel.clone()],
                 )
                 .await
             {
-                Ok(w) => w,
+                Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(error = %e, app, channel, "sweeper: VACATE cas failed; skipping channel");
                     continue;
                 }
             };
             if won != 1 {
-                // A member (re-)appeared, or another writer already vacated and
-                // already owns the emission right. Either way: no webhook here.
                 continue;
             }
 
+            super::presence::emit_drained_members(
+                pool,
+                keys,
+                &app,
+                &channel,
+                &drained,
+                sharded,
+                envelope_compat,
+                webhooks,
+            )
+            .await;
             webhooks.enqueue(WebhookEvent::ChannelVacated {
                 app: app.clone(),
                 channel: channel.clone(),

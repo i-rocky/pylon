@@ -45,29 +45,28 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 /// Membership TTL heartbeat loop. Every `interval_secs`, re-stamp each LOCAL
-/// member's `expireAt` in its channel's occupancy hash and bump that hash's
-/// whole-key TTL, so a live node never lets its members expire. A dead node simply
-/// stops ticking — its entries go stale and the per-key `EXPIRE` reaps them.
+/// member's `expireAt` (`ttl_secs` ahead) in its channel's occupancy hash and re-arm
+/// that hash's whole-key backstop (`occ_ttl_secs`, deliberately LONGER — see
+/// [`RedisConfig::occ_ttl_secs`]), so a live node never lets its members expire. A
+/// dead node simply stops ticking — its entries go stale and the sweeper reaps them.
 ///
 /// F11 batching: ONE pipeline per tick carries every refresh. Members are grouped
 /// per channel hash into a single multi-field `HSET` (all of this node's member
 /// tokens → the tick's shared `expireAt`), followed immediately by that hash's
 /// whole-key `EXPIRE` re-arm; the user `usr(app,user)` hashes get the same
-/// treatment in the SAME pipeline. Redis-side state per tick is identical to the
-/// previous per-member pipelines: every command is an idempotent re-seed (field
+/// treatment in the SAME pipeline. Every command is an idempotent re-seed (field
 /// writes overwrite in place, `EXPIRE` re-arms idempotently, and per key the
-/// `EXPIRE` still follows its `HSET` in command order). A Redis error now fails
-/// the whole tick's batch rather than one member — the loop retries the FULL
-/// idempotent batch next tick, and the TTL (`membership_ttl_secs`, default 60s)
-/// spans multiple ticks (`presence_heartbeat_secs`, default 25s), so the re-seed
-/// semantics are unchanged. It is logged and skipped, never fatal — the loop runs
-/// for the adapter's lifetime.
+/// `EXPIRE` still follows its `HSET` in command order), so a Redis error fails the
+/// tick's whole batch and the loop simply retries it next tick — the stamp horizon
+/// (`membership_ttl_secs`, default 60s) spans multiple ticks
+/// (`presence_heartbeat_secs`, default 25s). Logged and skipped, never fatal.
 async fn heartbeat_loop(
     local: Arc<LocalAdapter>,
     pool: Pool,
     keys: keys::Keys,
     node_id: String,
     ttl_secs: u64,
+    occ_ttl_secs: u64,
     interval_secs: u64,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
@@ -96,7 +95,8 @@ async fn heartbeat_loop(
                     })
                     .collect();
                 pipe.hset::<(), _, _>(&occ, fields).await?;
-                pipe.expire::<(), _>(&occ, ttl_secs as i64, None).await?;
+                pipe.expire::<(), _>(&occ, occ_ttl_secs as i64, None)
+                    .await?;
             }
 
             // Re-stamp this node's own user bindings (the `usr(app,user)` HASH),
@@ -316,6 +316,19 @@ impl RedisConfig {
     pub(crate) fn node_conns_ttl_secs(&self) -> u64 {
         4 * self.node_heartbeat_secs.max(1) + 4 * self.sweep_interval_secs.max(1) + 5
     }
+
+    /// TTL (secs) of a channel's `occ` hash. The per-member `expireAt` stamps inside
+    /// it are the staleness signal; this whole-key TTL is only the backstop for a
+    /// hash no live node re-arms, so it MUST outlive those stamps — a hash that
+    /// lapsed at its members' own deadline would take a crashed node's tokens with
+    /// it, and with them the sweeper's only way to resolve each token to the presence
+    /// user it must emit `member_removed` for. Sizing: once a stamp falls into the
+    /// past the sweeper still needs the lease a dead holder may hold
+    /// (`max(3 × sweep, 5s)`) plus a tick to act, so the backstop adds
+    /// `4 × sweep + 5` to the stamp horizon.
+    pub(crate) fn occ_ttl_secs(&self) -> u64 {
+        self.membership_ttl_secs + 4 * self.sweep_interval_secs.max(1) + 5
+    }
 }
 
 /// Cross-node adapter backed by Redis. Broadcasts deliver locally and fan out over
@@ -436,9 +449,19 @@ impl RedisAdapter {
         let hb_keys = keys.clone();
         let hb_node = node_id.clone();
         let hb_ttl = redis_cfg.membership_ttl_secs;
+        let hb_occ_ttl = redis_cfg.occ_ttl_secs();
         let hb_interval = redis_cfg.presence_heartbeat_secs;
         let heartbeat_handle = tokio::spawn(async move {
-            heartbeat_loop(hb_local, hb_pool, hb_keys, hb_node, hb_ttl, hb_interval).await
+            heartbeat_loop(
+                hb_local,
+                hb_pool,
+                hb_keys,
+                hb_node,
+                hb_ttl,
+                hb_occ_ttl,
+                hb_interval,
+            )
+            .await
         });
 
         // Spawn the node-liveness heartbeat. It advertises this node as alive every
@@ -623,7 +646,7 @@ impl RedisAdapter {
         let argv = vec![
             token,
             (now_ms() + ttl_secs * 1000).to_string(),
-            ttl_secs.to_string(),
+            self.cfg.occ_ttl_secs().to_string(),
             channel.to_string(),
         ];
         let mut count = 0usize;
@@ -1228,6 +1251,23 @@ impl Adapter for RedisAdapter {
         // must read the node-local count captured here.
         let node_last = out.subscription_count == 0;
 
+        // Presence BEFORE the membership half, so the `chans` index entry — the only
+        // handle the sweeper has on this channel's presence side-tables, and the one
+        // structure with no TTL — outlives them: a crash between the two calls then
+        // leaves reachable state the sweeper's vacate can still drain, never a roster
+        // nothing enumerates. Overwrites last_for_user with the cluster refcount edge.
+        if let Some(leave) = out.presence.as_mut() {
+            match self
+                .cluster_presence_leave(app, channel, &leave.user_id, socket_id)
+                .await
+            {
+                Ok(last_for_user) => leave.last_for_user = last_for_user,
+                Err(e) => {
+                    tracing::warn!(error = %e, app, channel, "redis presence leave failed; keeping node-local last_for_user");
+                }
+            }
+        }
+
         // Cluster half: the node-local msg-channel unsubscribe-on-last + UNSUBSCRIBE_LUA
         // authoritative remaining count + vacate-CAS verdict. `(0, false)` is produced
         // both on Redis error AND when the sweeper's VACATE_LUA already won the chans
@@ -1239,19 +1279,6 @@ impl Adapter for RedisAdapter {
         if count > 0 || vacated {
             out.subscription_count = count;
             out.vacated = vacated;
-        }
-
-        // Presence: overwrite last_for_user with the cluster refcount edge.
-        if let Some(leave) = out.presence.as_mut() {
-            match self
-                .cluster_presence_leave(app, channel, &leave.user_id, socket_id)
-                .await
-            {
-                Ok(last_for_user) => leave.last_for_user = last_for_user,
-                Err(e) => {
-                    tracing::warn!(error = %e, app, channel, "redis presence leave failed; keeping node-local last_for_user");
-                }
-            }
         }
 
         out

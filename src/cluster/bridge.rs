@@ -1166,15 +1166,15 @@ async fn handle_cmd(
             socket_id,
             node_last,
         } => {
-            // Membership half: authoritative remaining cluster `(count, vacated)` + the
-            // node-local msg-channel unsubscribe-on-last. Presence channels do NOT emit
-            // `subscription_count` (P4), so the count is ignored — only `vacated` matters.
-            let (_count, vacated) = adapter
-                .cluster_unsubscribe(&app, &channel, &socket_id, node_last)
-                .await;
-            // Presence half: the cluster-wide `last_for_user` refcount edge. On a Redis
-            // error degrade to `false` (log) so a blip never emits a spurious
-            // cross-node `member_removed`.
+            // Presence half FIRST: the cluster-wide `last_for_user` refcount edge. It
+            // must precede the membership half below, whose 1→0 edge de-indexes the
+            // channel from `chans` — the only handle the sweeper has on this channel's
+            // presence side-tables, and the one structure with no TTL. Removing the
+            // roster entry first keeps that index bracketing the state it describes, so
+            // a crash between the two calls leaves something the sweeper's vacate can
+            // still drain rather than a roster nothing enumerates. On a Redis error
+            // degrade to `false` (log) so a blip never emits a spurious cross-node
+            // `member_removed`.
             let last_for_user = match adapter
                 .cluster_presence_leave(&app, &channel, &user_id, &socket_id)
                 .await
@@ -1189,6 +1189,12 @@ async fn handle_cmd(
                     false
                 }
             };
+            // Membership half: authoritative remaining cluster `(count, vacated)` + the
+            // node-local msg-channel unsubscribe-on-last. Presence channels do NOT emit
+            // `subscription_count` (P4), so the count is ignored — only `vacated` matters.
+            let (_count, vacated) = adapter
+                .cluster_unsubscribe(&app, &channel, &socket_id, node_last)
+                .await;
             let a = match apps.by_id(&app).await {
                 Ok(crate::app::AppLookup::Found(a)) => a,
                 // App vanished or was disabled mid-flight: drop the edge.
