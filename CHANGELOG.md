@@ -134,6 +134,20 @@ pre-1.0 and versions track `Cargo.toml`.
   effect and produces no warning.
 
 ### Fixed
+- **A partially-received WebSocket frame is now billed to its connection, so
+  the bytes a peer pins by trickling a large frame are visible to the byte
+  budget** (security-relevant). The per-connection read buffer holds a frame's
+  bytes until the frame completes, and its only bound is the per-frame
+  `max_payload` — whose 1 MiB floor an operator cannot lower. Those bytes were
+  counted nowhere: `inflight_bytes` and everything now built on it (the REST
+  `503` admission path, the `client-*` ingress drop, the graduated shed bands
+  and the PSI backstop) read green while real memory climbed, so a peer opening
+  N connections, sending a large frame header on each and then trickling the
+  payload could pin memory outside the budget and the shedding machinery could
+  not react. The buffer is now billed to the connection alongside its queued
+  out-frames and its message-reassembly buffer, and released as soon as the
+  frame completes. No configuration changes; the per-frame ceiling itself is
+  unchanged.
 - **A presence roster no longer advertises the `user_info` of a connection that
   has already left.** `ChannelState` keeps one `user_info` per distinct presence
   user, seeded by that user's first connection; `remove` only decremented the
