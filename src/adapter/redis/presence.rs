@@ -41,6 +41,7 @@ pub(super) async fn join(
                 keys.presusers(app, channel),
                 keys.presinfo(app, channel),
                 keys.presmembers(app, channel),
+                keys.presseats(app, channel),
             ],
             vec![member.user_id.clone(), info, token, cap.to_string()],
         )
@@ -73,6 +74,7 @@ pub(super) async fn leave(
                 keys.presusers(app, channel),
                 keys.presinfo(app, channel),
                 keys.presmembers(app, channel),
+                keys.presseats(app, channel),
             ],
             vec![user_id.to_string(), token],
         )
@@ -142,6 +144,7 @@ pub(super) async fn reap_member(
                 keys.presusers(app, channel),
                 keys.presinfo(app, channel),
                 keys.presmembers(app, channel),
+                keys.presseats(app, channel),
             ],
             vec![token.to_string()],
         )

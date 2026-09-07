@@ -179,15 +179,54 @@ return {count, won}
 /// drain on the single winner rather than every racing sweeper.
 ///
 /// `KEYS[1]` = occ hash, `KEYS[2]` = chans set, `KEYS[3]` = presusers,
-/// `KEYS[4]` = presinfo, `KEYS[5]` = presmembers. `ARGV[1]` = channel.
+/// `KEYS[4]` = presinfo, `KEYS[5]` = presmembers, `KEYS[6]` = presseats.
+/// `ARGV[1]` = channel.
 /// Returns `{won, drained_user_ids}`; a non-presence channel drains empty.
 const VACATE_LUA: &str = r#"
 if redis.call('HLEN', KEYS[1]) ~= 0 then return {0, {}} end
 redis.call('DEL', KEYS[1])
 if redis.call('SREM', KEYS[2], ARGV[1]) == 0 then return {0, {}} end
 local roster = redis.call('HKEYS', KEYS[3])
-redis.call('DEL', KEYS[3], KEYS[4], KEYS[5])
+redis.call('DEL', KEYS[3], KEYS[4], KEYS[5], KEYS[6])
 return {1, roster}
+"#;
+
+/// Re-seat helper, prepended to the two scripts that retire ONE presence connection
+/// of a user who may still have others: the live [`PRESENCE_LEAVE_LUA`] and the
+/// sweeper's [`REAP_MEMBER_LUA`]. It points `presinfo[user]` at the `user_info` of
+/// that user's OLDEST connection still in `presmembers` — the cluster twin of
+/// `ChannelState::reseat_user_info`, so a clustered roster advertises exactly what
+/// a single-node one does instead of the first writer's value forever.
+///
+/// Liveness comes from `presmembers`, never from `presseats`: a seat whose token has
+/// gone is dropped rather than seated, which is also how a seat left behind by a
+/// writer that predates `presseats` is collected. A user with no seat recorded at all
+/// keeps whatever `presinfo` already holds — the pre-`presseats` behaviour, and what
+/// a mixed fleet degrades to for as long as the oldest connection belongs to a node
+/// that records no seats.
+///
+/// It runs inside the caller's script, so choosing the survivor and installing it are
+/// one indivisible step against every racing join, leave and reap — the same reason
+/// the cap and vacate verdicts live in their scripts.
+const RESEAT_LUA: &str = r#"
+local function reseat(members, info, seats, user)
+  local packed = redis.call('HGET', seats, user)
+  if not packed then return end
+  local live, seat = {}, nil
+  for token, presented in string.gmatch(packed, '([^\n]*)\n([^\n]*)\n') do
+    if redis.call('HEXISTS', members, token) == 1 then
+      live[#live + 1] = token
+      live[#live + 1] = presented
+      seat = seat or presented
+    end
+  end
+  if seat == nil then
+    redis.call('HDEL', seats, user)
+  else
+    redis.call('HSET', seats, user, table.concat(live, '\n') .. '\n')
+    redis.call('HSET', info, user, seat)
+  end
+end
 "#;
 
 /// PRESENCE_JOIN. Decides the cluster-wide distinct-user cap and, when the join is
@@ -201,7 +240,10 @@ return {1, roster}
 ///
 /// Returns `-1` when the cap rejected the join — nothing was written — else the user's new
 /// refcount (`1` means first_for_user → emit member_added). Negative `ARGV[4]` = uncapped.
-/// KEYS\[1\]=presusers KEYS\[2\]=presinfo KEYS\[3\]=presmembers
+///
+/// The seat appended to `presseats` is what lets a later leave re-seat the roster
+/// ([`RESEAT_LUA`]); Redis serializes scripts, so append order IS cluster join order.
+/// KEYS\[1\]=presusers KEYS\[2\]=presinfo KEYS\[3\]=presmembers KEYS\[4\]=presseats
 /// ARGV\[1\]=user_id ARGV\[2\]=user_info ARGV\[3\]=member_token ARGV\[4\]=max_members
 const PRESENCE_JOIN_LUA: &str = r#"
 local cap = tonumber(ARGV[4])
@@ -211,20 +253,29 @@ if cap >= 0
   return -1
 end
 redis.call('HSET', KEYS[3], ARGV[3], ARGV[1])
+local seats = redis.call('HGET', KEYS[4], ARGV[1]) or ''
+redis.call('HSET', KEYS[4], ARGV[1], seats .. ARGV[3] .. '\n' .. ARGV[2] .. '\n')
 local conn = redis.call('HINCRBY', KEYS[1], ARGV[1], 1)
 if conn == 1 then redis.call('HSET', KEYS[2], ARGV[1], ARGV[2]) end
 return conn
 "#;
 
 /// PRESENCE_LEAVE. Drops this connection's member and decrements the user's refcount;
-/// on the →0 user edge removes the user from presusers + presinfo. Returns the
+/// on the →0 user edge removes the user from presusers + presinfo + presseats, and
+/// otherwise re-seats the survivors' roster entry ([`RESEAT_LUA`]). Returns the
 /// remaining refcount (== 0 means last_for_user → emit member_removed).
-/// KEYS\[1\]=presusers KEYS\[2\]=presinfo KEYS\[3\]=presmembers
+/// KEYS\[1\]=presusers KEYS\[2\]=presinfo KEYS\[3\]=presmembers KEYS\[4\]=presseats
 /// ARGV\[1\]=user_id ARGV\[2\]=member_token
 const PRESENCE_LEAVE_LUA: &str = r#"
 redis.call('HDEL', KEYS[3], ARGV[2])
 local conn = redis.call('HINCRBY', KEYS[1], ARGV[1], -1)
-if conn <= 0 then redis.call('HDEL', KEYS[1], ARGV[1]); redis.call('HDEL', KEYS[2], ARGV[1]) end
+if conn <= 0 then
+  redis.call('HDEL', KEYS[1], ARGV[1])
+  redis.call('HDEL', KEYS[2], ARGV[1])
+  redis.call('HDEL', KEYS[4], ARGV[1])
+else
+  reseat(KEYS[3], KEYS[2], KEYS[4], ARGV[1])
+end
 return conn
 "#;
 
@@ -239,24 +290,22 @@ return conn
 /// live leave sees −1, not 0.
 ///
 /// Returns `{user_id, remaining, won}` (`user_id` is `''` when the token was absent).
-/// KEYS\[1\]=presusers KEYS\[2\]=presinfo KEYS\[3\]=presmembers
+/// KEYS\[1\]=presusers KEYS\[2\]=presinfo KEYS\[3\]=presmembers KEYS\[4\]=presseats
 /// ARGV\[1\]=member_token
 const REAP_MEMBER_LUA: &str = r#"
 local user_id = redis.call('HGET', KEYS[3], ARGV[1])
 if not user_id then return {'', 0, 0} end
 redis.call('HDEL', KEYS[3], ARGV[1])
 local conn = tonumber(redis.call('HGET', KEYS[1], user_id) or '0') or 0
-if conn == 1 then
+if conn <= 1 then
+  local won = conn == 1 and 1 or 0
   redis.call('HDEL', KEYS[1], user_id)
   redis.call('HDEL', KEYS[2], user_id)
-  return {user_id, 0, 1}
-end
-if conn <= 0 then
-  redis.call('HDEL', KEYS[1], user_id)
-  redis.call('HDEL', KEYS[2], user_id)
-  return {user_id, 0, 0}
+  redis.call('HDEL', KEYS[4], user_id)
+  return {user_id, 0, won}
 end
 local left = redis.call('HINCRBY', KEYS[1], user_id, -1)
+reseat(KEYS[3], KEYS[2], KEYS[4], user_id)
 return {user_id, left, 0}
 "#;
 
@@ -469,8 +518,8 @@ impl Scripts {
             unsubscribe: Script::from_lua(UNSUBSCRIBE_LUA),
             vacate: Script::from_lua(VACATE_LUA),
             presence_join: Script::from_lua(PRESENCE_JOIN_LUA),
-            presence_leave: Script::from_lua(PRESENCE_LEAVE_LUA),
-            reap_member: Script::from_lua(REAP_MEMBER_LUA),
+            presence_leave: Script::from_lua(format!("{RESEAT_LUA}{PRESENCE_LEAVE_LUA}")),
+            reap_member: Script::from_lua(format!("{RESEAT_LUA}{REAP_MEMBER_LUA}")),
             user_reap: Script::from_lua(USER_REAP_LUA),
             user_signout: Script::from_lua(USER_SIGNOUT_LUA),
             admit_app: Script::from_lua(ADMIT_APP_LUA),
@@ -498,6 +547,22 @@ mod tests {
         assert_ne!(s.membership_join.sha1(), s.presence_join.sha1());
         assert_ne!(s.reap_member.sha1(), s.presence_leave.sha1());
         assert_ne!(s.reap_member.sha1(), s.vacate.sha1());
+    }
+
+    /// `presseats` packs a seat as two newline-terminated lines, so neither half may
+    /// contain one. A `member_token` is a UUID and a dotted integer pair; a `user_info`
+    /// is whatever `serde_json` produced, which escapes every control character —
+    /// including the newline a client can put inside a string.
+    #[test]
+    fn a_seat_never_contains_the_line_separator_it_is_packed_with() {
+        let token = super::super::keys::member_token(
+            &uuid::Uuid::new_v4().to_string(),
+            crate::protocol::socket_id::SocketId::generate().as_str(),
+        );
+        assert!(!token.contains('\n'), "token was {token}");
+        let info = serde_json::to_string(&serde_json::json!({"bio": "two\nlines"}))
+            .expect("user_info must serialize");
+        assert!(!info.contains('\n'), "user_info was {info}");
     }
 
     #[test]
