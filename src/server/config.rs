@@ -63,6 +63,11 @@ pub struct ServerConfig {
     pub strict_protocol: bool,
     pub apps_path: String,
     pub max_presence_members: usize,
+    /// Maximum event payload size in bytes. Hosted Pusher's docs say "smaller
+    /// than 10kB" and the archived OpenAPI spec pins `maxLength: 10000` —
+    /// decimal kilobytes, not KiB. `PYLON_MAX_EVENT_PAYLOAD_BYTES` (default
+    /// 10000): a payload of 10,001-10,240 bytes previously passed pylon and
+    /// got a 413 from hosted, breaking migration out of pylon.
     pub max_event_payload_bytes: usize,
     pub max_channels_per_publish: usize,
     pub rest_auth_window_secs: u64,
@@ -93,6 +98,14 @@ pub struct ServerConfig {
     /// (`1`/`true` to enable) — for operators whose webhook receivers live on
     /// internal networks.
     pub webhook_allow_private_targets: bool,
+    /// Maximum channel name length in bytes. Pusher's own sources disagree:
+    /// the live channels doc quotes 164, while both actively-maintained
+    /// official server SDKs (`pusher-http-node`, `pusher-http-go`) validate
+    /// client-side at 200. Pylon matches the SDKs — a live library is a
+    /// stronger signal of real traffic than a doc page of unknown age, and
+    /// the failure direction that matters for a compatible server is not
+    /// rejecting a name a current SDK already sends. `PYLON_MAX_CHANNEL_NAME_LENGTH`
+    /// (default 200) reverts to the published doc value for operators who want it.
     pub max_channel_name_length: usize,
     pub max_event_name_length: usize,
     pub max_client_events_per_second: u32,
@@ -253,7 +266,7 @@ impl Default for ServerConfig {
             strict_protocol: false,
             apps_path: "apps.json".into(),
             max_presence_members: 100,
-            max_event_payload_bytes: 10_240,
+            max_event_payload_bytes: 10_000,
             max_channels_per_publish: 100,
             rest_auth_window_secs: 600,
             max_batch_events: 10,
@@ -266,7 +279,7 @@ impl Default for ServerConfig {
             webhook_retry_budget_ms: 300000,
             webhook_max_concurrency: 100,
             webhook_allow_private_targets: false,
-            max_channel_name_length: 164,
+            max_channel_name_length: 200,
             max_event_name_length: 200,
             max_client_events_per_second: 10,
             max_presence_user_id_length: 128,
@@ -657,13 +670,13 @@ mod tests {
         assert_eq!(c.handshake_timeout_ms, 10_000);
         assert!(!c.strict_protocol);
         assert_eq!(c.max_presence_members, 100);
-        assert_eq!(c.max_event_payload_bytes, 10_240);
+        assert_eq!(c.max_event_payload_bytes, 10_000);
         assert_eq!(c.max_channels_per_publish, 100);
         assert_eq!(c.rest_auth_window_secs, 600);
         assert_eq!(c.max_batch_events, 10);
         assert_eq!(c.cache_ttl_secs, 1800);
         assert_eq!(c.max_watchlist_size, 100);
-        assert_eq!(c.max_channel_name_length, 164);
+        assert_eq!(c.max_channel_name_length, 200);
         assert_eq!(c.max_event_name_length, 200);
         assert_eq!(c.max_client_events_per_second, 10);
         assert_eq!(c.max_presence_user_id_length, 128);

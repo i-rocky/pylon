@@ -4,7 +4,8 @@ Pylon supports all Pusher Channels v7 channel types. The channel name determines
 prefix (or absence of one) tells Pylon what authentication and behaviour to apply.
 
 Channel names may contain letters, digits, and the characters `_`, `-`, `=`, `@`, `,`, `.`, `;`.
-The maximum length is 164 bytes.
+The maximum length is 200 bytes — see [`PYLON_MAX_CHANNEL_NAME_LENGTH`](configuration.md) for
+why 200 rather than the 164 the pusher.com docs quote.
 
 ---
 

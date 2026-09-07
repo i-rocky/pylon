@@ -504,7 +504,7 @@ async fn client_event_oversize_payload_returns_4301() {
     .await;
     let _ = rx.try_recv().map(|b| *b); // drain subscription_succeeded
 
-    // Build a payload that exceeds the default max_event_payload_bytes (10 KiB = 10240 bytes).
+    // Build a payload that exceeds the default max_event_payload_bytes (10 KB = 10000 bytes).
     let big_data = serde_json::json!({ "x": "a".repeat(11_000) });
     c.dispatch(ClientCommand::ClientEvent {
         event: "client-x".into(),
@@ -1434,7 +1434,7 @@ async fn cache_channel_miss_emits_cache_miss_webhook() {
 
 #[tokio::test]
 async fn subscribe_over_length_channel_name_errors_4009() {
-    let long_name = "a".repeat(165); // > default max of 164
+    let long_name = "a".repeat(201); // > default max of 200
     let (mut c, mut rx) = ctx(app(false));
     c.dispatch(ClientCommand::Subscribe {
         channel: long_name.clone(),

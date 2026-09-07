@@ -646,12 +646,12 @@ async fn ping_between_fragments_is_answered_before_message_completes() {
 }
 
 /// P1 cap rule: the assembled message is capped at `max_event_payload_bytes`
-/// (default 10 KiB) per message. An oversize assembled message is dropped and
+/// (default 10 KB) per message. An oversize assembled message is dropped and
 /// the accumulator reset WITHOUT closing the connection — the follow-up
 /// well-formed fragmented message below must still reassemble and dispatch.
 #[tokio::test]
 async fn oversize_assembled_message_is_dropped_and_connection_stays_usable() {
-    let addr = spawn(ServerConfig::default()).await; // max_event_payload_bytes = 10_240
+    let addr = spawn(ServerConfig::default()).await; // max_event_payload_bytes = 10_000
     let mut ws = connect(addr, "?protocol=7").await;
     let _ = established_socket_id(&mut ws).await;
 

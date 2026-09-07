@@ -5,7 +5,7 @@ SDK (which handles auth for you) or by making raw signed HTTP requests.
 
 Pylon imposes these limits on every trigger call:
 
-- **Event payload:** 10 240 bytes (10 KiB) maximum.
+- **Event payload:** 10,000 bytes (10 KB) maximum.
 - **Channels per publish:** up to 100 channels in a single `POST /apps/{app_id}/events` call.
 - **Batch size:** up to 10 events in a single `POST /apps/{app_id}/batch_events` call.
 

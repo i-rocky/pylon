@@ -214,7 +214,12 @@ impl ConnectionContext {
             // additionally requiring the operator's per-endpoint opt-in. Verified
             // against https://pusher.com/docs/channels/server_api/webhooks/
             // (2026-08-30): "Channels will send a subscription_count webhook
-            // whenever a new client subscribes or unsubscribes to a channel".
+            // whenever a new client subscribes or unsubscribes to a channel";
+            // above 100 subscribers hosted throttles this to once per 5s of
+            // activity. Pylon fires on every edge regardless of channel size —
+            // deliberately: it is strictly more timely, never stale, and adding
+            // a coalescing timer only to reproduce hosted's rate limit is not
+            // worth the per-channel timer state it would need.
             // `count > 0` mirrors the cluster bridge's count-broadcast guard so
             // both paths behave identically — the vacate edge's signal is
             // `channel_vacated`, never a zero-count event (the local broadcast

@@ -910,7 +910,8 @@ async fn handle_cmd(
                 // client subscribes or unsubscribes to a channel". The `count > 0` /
                 // enabled / non-presence gates are inherited from the broadcast above;
                 // `has_subscription_count_webhooks` is the operator's per-endpoint
-                // `event_types` opt-in.
+                // `event_types` opt-in. No 5s coalescing above 100 subscribers —
+                // see the rationale on `ConnectionContext::maybe_emit_count`.
                 if a.has_subscription_count_webhooks {
                     if let Some(wh) = webhooks.get() {
                         wh.enqueue(WebhookEvent::SubscriptionCount {

@@ -737,7 +737,7 @@ const SCENARIOS = {
         outcomes.name_limit = 'server-4301';
       }
 
-      // Oversized payload: 11,000-char string > 10 KiB budget.
+      // Oversized payload: 11,000-char string > 10 KB budget.
       const bigPayload = 'x'.repeat(11000);
       let payloadThrown = null;
       try {

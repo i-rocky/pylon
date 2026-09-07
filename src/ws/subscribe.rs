@@ -447,7 +447,7 @@ impl ConnectionContext {
         //    → 4301 KEPT (deliberate, undocumented class); message is soketi parity
         //    ("Event name is too long. Maximum allowed size is ${max}.").
         //
-        // 3. Oversized payload (> max_event_payload_bytes, default 10 KiB):
+        // 3. Oversized payload (> max_event_payload_bytes, default 10 KB):
         //    No code/message documented for the WS path (the REST API page documents
         //    a 413 HTTP error, which does not apply to in-band pusher:error frames).
         //    → 4301 KEPT (deliberate, undocumented class); message is Pylon's own,

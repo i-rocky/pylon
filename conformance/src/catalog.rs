@@ -93,7 +93,7 @@ pub const CATALOG: &[Scenario] = &[
         id: "C-EVENT-LIMITS",
         plane: Plane::Client,
         sdk: "pusher-js",
-        summary: "oversized name (>200) and payload (>10 KiB)",
+        summary: "oversized name (>200) and payload (>10 KB)",
         budget_ms: 20000,
     },
     Scenario {
