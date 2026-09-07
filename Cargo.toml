@@ -38,7 +38,7 @@ slab = "0.4"
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "service", "http1", "http2"] }
 # RFC 6455 Sec-WebSocket-Accept = base64(sha1(key + GUID)).
 sha1 = "0.10"
-base64 = "0.22"
+base64 = "0.23.1"
 # JSON
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
