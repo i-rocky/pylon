@@ -42,6 +42,48 @@ pre-1.0 and versions track `Cargo.toml`.
   default applies, as before), as are boolean (`0`/`false`/`off`) and
   plain-string variables, which cannot fail to parse. Anyone running with a
   typo'd numeric `PYLON_*` value must fix it before the server will start.
+- **App credentials are now validated, and app loading now aborts on a bad
+  entry instead of serving it** — `App::validate()` previously checked only
+  the webhook array, so an app with an empty or whitespace-only `id`, `key`,
+  or `secret` loaded with no warning and authenticated normally.
+  HMAC-SHA256 accepts a zero-length key, and an app's `key` is public by
+  design (it ships in browser bundles), so a blank `secret` let anyone
+  holding the key forge REST signatures, channel-auth tokens, and
+  `pusher:signin` for that app. `validate()` now rejects a blank `id`,
+  `key`, or `secret`, and the static-file loader additionally rejects a
+  duplicate `id` or `key` across the loaded app set, naming the offending
+  value — `StaticFileAppManager::resolve` is a linear scan, so a duplicate
+  key previously let the first-loaded entry win silently, attaching clients
+  of the second app to the wrong secret, capacity, and webhook set (the SQL
+  and Mongo schemas already enforce uniqueness on those columns, so the
+  duplicate check is static-file-only). **This is breaking for any
+  deployment whose `apps.json` currently carries a blank credential or a
+  duplicate `id`/`key`: the server now refuses to start rather than loading
+  it** — fix the offending entries before upgrading. `validate()` also runs
+  per-lookup, not just at load: the SQL and Mongo backends call it from
+  every `by_id`/`by_key` fetch, so a stored row with a blank field now fails
+  every lookup against it as `AppLookupError::Decode`, which the REST auth
+  path renders as `503 "app store temporarily unavailable"` (logged as
+  `"app lookup failed (transient)"`) rather than the disabled/not-found
+  response that row would otherwise produce. That's correct — it fails
+  closed — but it points an operator at their database rather than the
+  offending row, so check for blank credentials there too before upgrading.
+- **REST `POST /events` and `/batch_events` now reject a malformed
+  `socket_id` with `400`** — hosted Pusher's HTTP API validates `socket_id`
+  server-side against `\A\d+\.\d+\z` (two non-empty runs of ASCII digits
+  joined by exactly one dot, matching `pusher-http-node`'s client-side
+  `validateSocketId`), and every other trigger field on this endpoint
+  already enforced Pusher's documented rules — `socket_id` was the one gap:
+  pylon fed it straight into `SocketId::from_raw`, which truncates rather
+  than validating, so any string was accepted and excluded nothing from
+  delivery. Validation runs on the query-merged trigger body (so the R9
+  query-string fallback path can't bypass it) and, for `/batch_events`,
+  against every item before any `deliver()` call runs — one bad `socket_id`
+  in a batch now rejects the whole batch rather than partially delivering
+  the earlier items. **This is breaking for any integration that has been
+  sending a non-conforming `socket_id` and relying on the previous `200`**:
+  that call now returns `400 "Invalid socket id"` — audit callers before
+  upgrading.
 - Per-core worker broadcast index consolidated to the single-map layout: each
   `local_subs` channel entry now carries its subscribers' `(slab token,
   negotiated protocol version)` directly (`(app, channel) → {socket_id →
@@ -78,6 +120,63 @@ pre-1.0 and versions track `Cargo.toml`.
   effect and produces no warning.
 
 ### Fixed
+- **HTTP request heads with more than 32 header fields are now accepted (up
+  to 128), and a head that still overruns the limit is answered instead of
+  the connection closing silently** — `read_head` parsed into a fixed
+  32-slot array, so httparse's 33rd header field folded into a generic
+  malformed-request error that the worker mapped straight to a silent
+  close (no status line, no log). 32 was reachable by ordinary traffic — a
+  browser's WS upgrade already carries 10-14 fields before a CDN or
+  reverse-proxy chain appends `X-Forwarded-*`, `CF-*`, `Via`, `Forwarded`,
+  tracing headers, and per-request cookies — so the failure looked, from
+  the client, indistinguishable from a network fault. The slot count is now
+  a named `MAX_HEADERS = 128`; the real memory guard, `PYLON_MAX_HEAD_BYTES`
+  (bounding the head's total size, checked before parsing), is unchanged, so
+  raising the slot count costs stack, not slowloris resistance. A head that
+  still overruns 128 fields now gets `431 Request Header Fields Too Large`
+  in the same Pusher JSON error shape every other REST error uses, on both
+  the REST plane and a WS upgrade's opening handshake (RFC 6455 §4.1 permits
+  an HTTP error status in place of the 101). hyper's own h1 layer
+  separately capped REST requests at its own default of 100 header fields,
+  independent of and lower than this transport's limit, so a request in the
+  101-128 field band cleared `read_head` but then hit a bare, non-JSON 431
+  built inside hyper before axum's router ever ran — the REST listener's h1
+  builder now sets `max_headers` to the same `MAX_HEADERS` constant so the
+  two ceilings agree.
+- **Per-app Prometheus gauges (`pylon_connections`, `pylon_channels_occupied`,
+  `pylon_subscriptions`) no longer vanish from `/metrics` when a configured
+  app goes idle** — the per-app section was built purely from the live
+  `conn_counts` map, which the worker prunes back to nothing the moment an
+  app's connection count returns to zero; no series meant no evaluation, so
+  a `pylon_connections{app="x"} == 0` alert rule silently stopped firing
+  exactly when the app went dark. `AppManager` gained a `known_app_ids()`
+  method (`Some` for the static-file store, whose full app set is fixed at
+  startup and bounded in memory; `None`, unchanged, for the SQL/Mongo
+  backends, whose id space is unbounded) that `/metrics` now uses to seed
+  the per-app map at zero before overlaying live counts, so a
+  configured-but-idle static app keeps reporting `0` — HELP/TYPE lines
+  included — instead of disappearing. SQL/Mongo-backed stores are
+  unaffected: a series there still only appears once an app has had a
+  tracked connection and drops again at zero, so alert rules against those
+  backends still need an `absent()`-aware condition, not a bare `== 0`
+  comparison.
+- **Small hosts now keep a real memory budget instead of it saturating to
+  zero** — `memory_budget` subtracted a reserve of `max(1.5 GiB, 7%)` from
+  the effective envelope; any envelope at or below 1.5 GiB saturated the
+  reserve to the whole envelope, zeroing the budget. A budget of `0` is
+  read downstream as "unconfigured": `shed_band` pins to `Normal`
+  (disabling the REST 503 admission gate, the WS client-event ingress drop,
+  and the subscribe-time memory-pressure gate), and
+  `resolved_max_connections` treats it as an unlimited connection ceiling —
+  so the smaller the host, the less overload protection it got, exactly
+  backwards from what a memory-constrained box needs. A 1 GiB container
+  limit is an entirely ordinary deployment. The reserve is now capped at
+  half the effective envelope — `min(max(1.5 GiB, 7%), 50%)` — so a host at
+  or below the ~3 GiB crossover keeps a real, proportionate, non-zero
+  budget; hosts above the crossover are arithmetically unaffected (verified
+  at 4 GiB and 256 GiB). A startup `warn` now fires, naming the disabled
+  controls, whenever the resolved budget is still `0` — a genuinely
+  unconfigured envelope stays possible, but is no longer silent.
 - Conformance harness hardening batch: the pusher-js runner's `fire()`
   helper now bounds its `--fire-stdin` child (8s timeout, SIGTERM kill
   signal) — the last unbounded child wait in the runner; the run's scratch
@@ -109,12 +208,13 @@ pre-1.0 and versions track `Cargo.toml`.
   its `== 0` gate stays silent).
 
 ### Security
-- Webhook SSRF classifier: NAT64 (`64:ff9b::/96`) and class-E reserved
-  (`240.0.0.0/4`) targets are now classified as private. A NAT64 gateway
-  translates the embedded IPv4 into interior address space, so both public and
-  private embedded v4s are refused; class E has no legitimate webhook
-  receivers. `PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS=1` still relaxes the whole
-  address classification.
+- Webhook SSRF classifier: NAT64 (`64:ff9b::/96`), 6to4 (`2002::/16`), and
+  class-E reserved (`240.0.0.0/4`) targets are now classified as private. A
+  NAT64 gateway and a 6to4 relay both translate the embedded IPv4 address
+  into interior address space, so both public and private embedded v4s are
+  refused for either prefix; class E has no legitimate webhook receivers.
+  `PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS=1` still relaxes the whole address
+  classification.
 - Dependency advisories (lockfile-only bumps; no `Cargo.toml` changes):
   `anyhow` 1.0.102→1.0.103 (RUSTSEC-2026-0190), `crossbeam-epoch`
   0.9.18→0.9.20 (RUSTSEC-2026-0204), `event-listener` 5.4.1→5.4.2
