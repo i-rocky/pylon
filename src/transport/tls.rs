@@ -187,7 +187,7 @@ mod tests {
 
         let mut key_file = File::create(&key_path).expect("create temp key file");
         key_file
-            .write_all(cert.key_pair.serialize_pem().as_bytes())
+            .write_all(cert.signing_key.serialize_pem().as_bytes())
             .expect("write key PEM");
 
         (cert_path, key_path)
@@ -295,19 +295,18 @@ mod tests {
         path
     }
 
-    /// Generate a CA cert + a server cert signed by that CA using rcgen 0.13.
+    /// Generate a CA cert + a server cert signed by that CA.
     /// Returns `(ca_cert_pem, server_cert_pem, server_key_pem)`.
     fn generate_ca_and_server_cert() -> (String, String, String) {
-        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 
         // CA key + cert
         let ca_key = KeyPair::generate().expect("rcgen: CA key");
         let mut ca_params =
             CertificateParams::new(vec!["pylon-test-ca".to_string()]).expect("rcgen: CA params");
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let ca_cert = ca_params
-            .self_signed(&ca_key)
-            .expect("rcgen: CA self-signed cert");
+        let ca =
+            CertifiedIssuer::self_signed(ca_params, ca_key).expect("rcgen: CA self-signed cert");
 
         // Server leaf key + cert signed by CA
         let server_key = KeyPair::generate().expect("rcgen: server key");
@@ -315,10 +314,10 @@ mod tests {
             CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
                 .expect("rcgen: server params");
         let server_cert = server_params
-            .signed_by(&server_key, &ca_cert, &ca_key)
+            .signed_by(&server_key, &ca)
             .expect("rcgen: server cert signed by CA");
 
-        (ca_cert.pem(), server_cert.pem(), server_key.serialize_pem())
+        (ca.pem(), server_cert.pem(), server_key.serialize_pem())
     }
 
     // ── mTLS tests ────────────────────────────────────────────────────────────

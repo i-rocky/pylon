@@ -635,7 +635,7 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
             .expect("rcgen: generate self-signed cert");
-        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
         let server_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert.cert.der().clone()], key)

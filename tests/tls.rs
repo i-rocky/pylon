@@ -50,7 +50,7 @@ fn gen_cert() -> (Vec<u8>, PathBuf, PathBuf) {
     let key_path = dir.join(format!("pylon-tls-test-key-{pid}-{n}.pem"));
 
     std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
 
     let cert_der = cert.cert.der().to_vec();
     (cert_der, cert_path, key_path)

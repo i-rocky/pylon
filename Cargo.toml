@@ -95,7 +95,7 @@ mongodb = { version = "3", default-features = false, features = ["rustls-tls", "
 # debug accessors like `percore_total_inflight_bytes`.
 pylon = { path = ".", features = ["test-hooks"] }
 # Self-signed cert generation for the TLS integration tests (never in production).
-rcgen = "0.13"
+rcgen = "0.14"
 # Enables paused-time control (`start_paused`, `tokio::time::advance`) in tests.
 tokio = { version = "1", features = ["test-util"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
