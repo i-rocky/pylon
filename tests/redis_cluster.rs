@@ -12,11 +12,15 @@ use fred::prelude::*;
 use pylon::adapter::redis::keys::Keys;
 use pylon::adapter::redis::{client::RedisClients, client::Scripts, RedisAdapter};
 use pylon::adapter::Adapter;
+use pylon::app::static_file::StaticFileAppManager;
+use pylon::app::AppManager;
 use pylon::channel::cache::CachedEvent;
 use pylon::connection::handle::ConnectionHandle;
 use pylon::protocol::event::ServerEvent;
 use pylon::protocol::socket_id::SocketId;
 use pylon::server::config::ServerConfig;
+use pylon::webhook::dispatcher::SystemClock;
+use pylon::webhook::transport::{RecordingTransport, WebhookTransport};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -678,6 +682,49 @@ async fn membership_heartbeat_keeps_member_alive_past_ttl() {
     .expect("heartbeat test must not hang (Redis up?)");
 }
 
+/// Issue #49: the occ hash's whole-key TTL is a BACKSTOP, not a second deadline. It
+/// must OUTLIVE the per-member `expireAt` stamps it carries — a hash that lapsed at
+/// its own members' deadline would take a crashed node's tokens with it at the very
+/// instant they went stale, leaving the sweeper nothing to resolve to the presence
+/// user it owes a `member_removed`. Both writers of that TTL (the subscribe script and
+/// the heartbeat's re-arm) must honour it, so the remaining TTL is checked after each.
+#[tokio::test]
+async fn occ_key_ttl_outlives_its_member_stamps() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let prefix = random_prefix();
+        let stamp_ttl_secs = 2;
+        let adapter = connect_adapter_with_prefix_ttl(&prefix, stamp_ttl_secs, 1).await;
+        let clients = RedisClients::connect(&test_redis_url(), 2)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let occ = Keys::new(&prefix).occ(TEST_APP, "public-room");
+
+        let (_sock, handle) = fake_handle();
+        adapter
+            .subscribe(TEST_APP, "public-room", handle, None)
+            .await;
+
+        let after_subscribe: i64 = clients.pool.next().ttl(&occ).await.expect("ttl occ");
+        assert!(
+            after_subscribe > stamp_ttl_secs as i64,
+            "the subscribe script must arm a backstop longer than the {stamp_ttl_secs}s stamp horizon (got {after_subscribe}s)"
+        );
+
+        // Past the stamp horizon: the heartbeat has re-armed the key at least twice,
+        // and its re-arm must use the same backstop rather than the stamp horizon.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let after_heartbeat: i64 = clients.pool.next().ttl(&occ).await.expect("ttl occ");
+        assert!(
+            after_heartbeat > stamp_ttl_secs as i64,
+            "the heartbeat re-arm must keep the backstop longer than the {stamp_ttl_secs}s stamp horizon (got {after_heartbeat}s)"
+        );
+
+        let _ = clients.pool.quit().await;
+    })
+    .await
+    .expect("occ TTL backstop test must not hang (Redis up?)");
+}
+
 /// Current wall-clock millis since the Unix epoch (mirrors the adapter's internal
 /// `now_ms`; the sweeper test seam takes `now` so the test drives time deterministically).
 fn now_ms() -> u64 {
@@ -1278,6 +1325,166 @@ async fn sweeper_emits_member_removed_for_crashed_presence_member() {
     })
     .await
     .expect("sweeper member_removed test must not hang (Redis up?)");
+}
+
+/// A real webhook dispatcher backed by a `RecordingTransport`, so a sweep's
+/// `webhooks.enqueue(...)` is batched and signed exactly as in production but captured
+/// in memory. `vacated_grace_ms` is 0, so `member_removed` / `channel_vacated` deliver
+/// inline in enqueue order rather than through the debounced grace path.
+fn recording_webhooks() -> (pylon::webhook::WebhookHandle, RecordingTransport) {
+    let apps: Arc<dyn AppManager> = Arc::new(
+        StaticFileAppManager::from_json(
+            r#"[{"name":"Test","id":"app1","key":"app1-key","secret":"app1-secret",
+             "webhooks":[{"url":"http://127.0.0.1:1/pusher/webhooks",
+                          "event_types":["member_removed","channel_vacated"]}]}]"#,
+        )
+        .expect("apps json must parse"),
+    );
+    let transport = RecordingTransport::new();
+    let recorded = transport.clone();
+    let handle = pylon::webhook::spawn(
+        apps,
+        move |_metrics| {
+            Ok::<_, std::convert::Infallible>(Arc::new(recorded) as Arc<dyn WebhookTransport>)
+        },
+        Arc::new(SystemClock),
+        10,
+        1024,
+        0,
+        None,
+    )
+    .expect("recording transport factory is infallible");
+    (handle, transport)
+}
+
+/// The webhook event names recorded by a `RecordingTransport`, in delivery order,
+/// paired with each event's `user_id` when it carries one.
+async fn recorded_events(transport: &RecordingTransport) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    for d in transport.recorded().await {
+        let v: serde_json::Value =
+            serde_json::from_str(&d.body).expect("webhook body must be JSON");
+        for e in v["events"].as_array().into_iter().flatten() {
+            out.push((
+                e["name"].as_str().unwrap_or_default().to_string(),
+                e.get("user_id")
+                    .and_then(|u| u.as_str())
+                    .map(str::to_string),
+            ));
+        }
+    }
+    out
+}
+
+/// Poll `transport` until it has recorded at least `want` events or the deadline
+/// elapses — the dispatcher's batch window is asynchronous, so a bare read races it.
+async fn await_recorded(
+    transport: &RecordingTransport,
+    want: usize,
+    timeout: Duration,
+) -> Vec<(String, Option<String>)> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let events = recorded_events(transport).await;
+        if events.len() >= want || tokio::time::Instant::now() >= deadline {
+            return events;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Issue #49: a node dying while it holds the LAST presence members of a channel. Its
+/// `occ` entries go stale AND — with no other live node re-arming the hash — the whole
+/// `occ` key eventually lapses with them, taking the member tokens the per-token reap
+/// needs. The roster is then reachable only through the un-expiring `chans` index, and
+/// the sweep's vacate must drain it: exactly one `member_removed` for u1, BEFORE
+/// `channel_vacated`, with the three presence hashes gone. Proving the corruption is
+/// really cleared, u1's next join on that channel must again report `first_for_user`.
+///
+/// The `occ` key's own lapse is applied directly (a raw `DEL` standing in for the
+/// whole-key backstop firing) rather than slept through: the backstop is deliberately
+/// sized to outlive the member stamps by several sweep intervals, which is exactly the
+/// wait this test must not take.
+///
+/// (RED before the fix: the sweep finds an empty `occ`, reaps nothing, vacates, and
+/// leaves `presusers`/`presinfo`/`presmembers` in Redis forever — zero `member_removed`,
+/// a `channel_vacated` with no preceding member removal, and a u1 whose every later join
+/// is silently suppressed.)
+#[tokio::test]
+async fn sweeper_drains_presence_roster_of_channel_orphaned_by_dead_node() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let prefix = random_prefix();
+        let channel = "presence-lonely";
+        let adapter_a = connect_adapter_with_prefix_ttl(&prefix, 2, 1).await;
+        let adapter_b = connect_adapter_with_prefix_ttl(&prefix, 2, 1).await;
+
+        // u1 on A is the channel's ONLY member cluster-wide.
+        let (_s1, h1, m1) = presence_handle("u1", serde_json::json!({"name": "Ann"}));
+        adapter_a.subscribe(TEST_APP, channel, h1, Some(m1)).await;
+        let before = adapter_b.presence_members(TEST_APP, channel).await;
+        assert_eq!(before.len(), 1, "u1 must be the only cluster roster entry");
+
+        // Crash A (drop aborts its heartbeats), then apply the occ hash's whole-key
+        // lapse: no live node holds this channel, so nothing would re-arm it.
+        drop(adapter_a);
+        let clients = RedisClients::connect(&test_redis_url(), 2)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let keys = Keys::new(&prefix);
+        let _: () = clients
+            .pool
+            .next()
+            .del(keys.occ(TEST_APP, channel))
+            .await
+            .expect("raw DEL occ must succeed");
+
+        // B sweeps: no tokens to reap, so the vacate is the only thing that can still
+        // find u1 — and it must announce the removal before vacating the channel.
+        let (webhooks, transport) = recording_webhooks();
+        let (acquired, _reaped, vacated) = adapter_b.sweep_now(&webhooks, now_ms()).await;
+        assert!(acquired, "B must acquire the sweep lease");
+        assert!(
+            vacated.contains(&(TEST_APP.to_string(), channel.to_string())),
+            "the orphaned presence channel must be vacated: {vacated:?}"
+        );
+
+        let events = await_recorded(&transport, 2, Duration::from_secs(3)).await;
+        assert_eq!(
+            events,
+            vec![
+                ("member_removed".to_string(), Some("u1".to_string())),
+                ("channel_vacated".to_string(), None),
+            ],
+            "the sweep must fire exactly one member_removed for u1 and then channel_vacated"
+        );
+
+        // The roster is clean: no ghost in presinfo, no ghost refcount in presusers.
+        let after = adapter_b.presence_members(TEST_APP, channel).await;
+        assert!(
+            after.is_empty(),
+            "the cluster roster must be empty: {after:?}"
+        );
+        let summary = adapter_b.channel(TEST_APP, channel).await;
+        assert_eq!(
+            summary.user_count,
+            Some(0),
+            "the cluster user_count must be 0 (got {:?})",
+            summary.user_count
+        );
+
+        // The compounding half: u1's next join must be a genuine first_for_user again,
+        // not a duplicate suppressed by a leaked refcount.
+        let (_s2, h2, m2) = presence_handle("u1", serde_json::json!({"name": "Ann"}));
+        let out = adapter_b.subscribe(TEST_APP, channel, h2, Some(m2)).await;
+        assert!(
+            out.presence.expect("presence join outcome").first_for_user,
+            "u1 rejoining a drained channel must report first_for_user"
+        );
+
+        let _ = clients.pool.quit().await;
+    })
+    .await
+    .expect("presence-drain sweep test must not hang (Redis up?)");
 }
 
 /// A2: user online/offline is a SINGLE cluster-wide edge, not per-node. The FIRST
@@ -2308,19 +2515,26 @@ async fn purge_app_closes_connections_and_removes_from_redis_apps_set() {
 // winner each — deterministic where the full-system straddle is not.
 // ---------------------------------------------------------------------------
 
-/// Run the sweeper's VACATE_LUA for `channel`; returns `won` (1 iff THIS call's
-/// SREM removed the channel from the `chans` index).
+/// Run the sweeper's VACATE_LUA for `channel`; returns `(won, drained_user_ids)`
+/// (`won == 1` iff THIS call's SREM removed the channel from the `chans` index, in
+/// which case the ids are the presence roster it drained).
 async fn run_vacate(
     scripts: &Scripts,
     pool: &fred::clients::Pool,
     keys: &Keys,
     channel: &str,
-) -> i64 {
+) -> (i64, Vec<String>) {
     scripts
         .vacate
-        .evalsha_with_reload::<i64, _, _>(
+        .evalsha_with_reload::<(i64, Vec<String>), _, _>(
             pool.next(),
-            vec![keys.occ(TEST_APP, channel), keys.chans(TEST_APP)],
+            vec![
+                keys.occ(TEST_APP, channel),
+                keys.chans(TEST_APP),
+                keys.presusers(TEST_APP, channel),
+                keys.presinfo(TEST_APP, channel),
+                keys.presmembers(TEST_APP, channel),
+            ],
             vec![channel.to_string()],
         )
         .await
@@ -2392,10 +2606,14 @@ async fn vacate_cas_unsubscribe_first_sweep_silent() {
         );
 
         // The sweeper's later orphan reclaim finds the chans entry gone → silent.
-        let won = run_vacate(&scripts, &clients.pool, &keys, &channel).await;
+        let (won, drained) = run_vacate(&scripts, &clients.pool, &keys, &channel).await;
         assert_eq!(
             won, 0,
             "the sweeper must NOT win after the unsubscribe already vacated"
+        );
+        assert!(
+            drained.is_empty(),
+            "a losing vacate must drain nothing: {drained:?}"
         );
 
         // And the Redis state is fully reclaimed either way.
@@ -2444,7 +2662,7 @@ async fn vacate_cas_sweep_first_unsubscribe_silent() {
 
         // The sweeper's atomic vacate: occ empty/gone → DEL (no-op) → SREM
         // removes the entry → the sweeper WINS the emission right.
-        let won = run_vacate(&scripts, &clients.pool, &keys, &channel).await;
+        let (won, _drained) = run_vacate(&scripts, &clients.pool, &keys, &channel).await;
         assert_eq!(
             won, 1,
             "the sweeper must WIN the vacate emission right in the straddle"
@@ -2461,6 +2679,59 @@ async fn vacate_cas_sweep_first_unsubscribe_silent() {
     })
     .await
     .expect("vacate CAS ordering-2 test must not hang (Redis up?)");
+}
+
+/// Issue #49 — the winning vacate DRAINS the presence side-tables. Seed exactly what
+/// a node death leaves behind once the `occ` hash lapses with the whole-key backstop
+/// that carried its member tokens: `chans` still indexes the channel, `occ` is gone,
+/// and `presusers` / `presinfo` / `presmembers` still hold u1. `chans` is the only
+/// structure with no TTL, so this vacate is the last moment anything can reach that
+/// roster — it must hand u1 back (one owed `member_removed`) and leave the three
+/// hashes empty. The racing second vacate wins nothing and drains nothing, so the
+/// emission cannot double-fire.
+///
+/// (RED before the fix: the vacate SREMs `chans` and returns, so u1 stays in all three
+/// hashes forever — `member_removed` never fires, and every later join of u1 on this
+/// channel is silently suppressed by the ghost refcount.)
+#[tokio::test]
+async fn vacate_drains_presence_roster_left_by_a_dead_node() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let scripts = Scripts::new();
+        let clients = RedisClients::connect(&test_redis_url(), 2)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let channel = format!("presence-orphan-{}", Uuid::new_v4());
+
+        seed_presence_user(&clients, &keys, &channel, "u1", &["deadnode:s1"], 1).await;
+        let _: () = clients
+            .pool
+            .next()
+            .sadd(keys.chans(TEST_APP), channel.clone())
+            .await
+            .expect("sadd chans");
+
+        let (won, drained) = run_vacate(&scripts, &clients.pool, &keys, &channel).await;
+        assert_eq!(won, 1, "the orphaned channel's vacate must win");
+        assert_eq!(
+            drained,
+            vec!["u1".to_string()],
+            "the winning vacate must drain the surviving roster (got {drained:?})"
+        );
+        assert_presence_fully_reclaimed(&clients, &keys, &channel).await;
+
+        // A racing second sweeper finds the chans entry gone: no win, no second drain,
+        // so the drained user can never be announced twice.
+        let (won, drained) = run_vacate(&scripts, &clients.pool, &keys, &channel).await;
+        assert_eq!(
+            (won, drained),
+            (0, Vec::new()),
+            "a losing vacate must neither win nor drain"
+        );
+    })
+    .await
+    .expect("vacate presence-drain test must not hang (Redis up?)");
 }
 
 // ---------------------------------------------------------------------------
