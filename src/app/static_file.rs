@@ -1,4 +1,5 @@
 use super::{App, AppLookup, AppLookupError, AppManager};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -10,9 +11,22 @@ impl StaticFileAppManager {
     pub fn from_json(raw: &str) -> anyhow::Result<Self> {
         let parsed: Vec<App> = serde_json::from_str(raw)?;
         let mut apps: Vec<Arc<App>> = Vec::with_capacity(parsed.len());
+        // Static-file-only: the WS establish path resolves apps by key via a
+        // linear scan, so a duplicate key would silently attach clients to
+        // whichever entry loaded first (wrong secret, capacity, webhooks).
+        // The SQL/Mongo backends carry UNIQUE/PRIMARY KEY on these columns, so
+        // this check has no equivalent there.
+        let mut seen_ids: HashSet<String> = HashSet::with_capacity(parsed.len());
+        let mut seen_keys: HashSet<String> = HashSet::with_capacity(parsed.len());
         for mut app in parsed {
             app.recompute_has_flags();
             app.validate().map_err(|e| anyhow::anyhow!(e))?;
+            if !seen_ids.insert(app.id.clone()) {
+                return Err(anyhow::anyhow!("duplicate app id '{}'", app.id));
+            }
+            if !seen_keys.insert(app.key.clone()) {
+                return Err(anyhow::anyhow!("duplicate app key '{}'", app.key));
+            }
             apps.push(Arc::new(app));
         }
         Ok(Self { apps })
@@ -107,6 +121,49 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("unknown event_type 'nope'"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_duplicate_key_across_apps() {
+        let raw = r#"[
+            {"name":"A","id":"a","key":"dup-key","secret":"s"},
+            {"name":"B","id":"b","key":"dup-key","secret":"s"}
+        ]"#;
+        let err = StaticFileAppManager::from_json(raw)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate app key 'dup-key'"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_duplicate_id_across_apps() {
+        let raw = r#"[
+            {"name":"A","id":"dup-id","key":"k1","secret":"s"},
+            {"name":"B","id":"dup-id","key":"k2","secret":"s"}
+        ]"#;
+        let err = StaticFileAppManager::from_json(raw)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate app id 'dup-id'"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn two_distinct_apps_both_load() {
+        let raw = r#"[
+            {"name":"A","id":"a","key":"a-key","secret":"s"},
+            {"name":"B","id":"b","key":"b-key","secret":"s"}
+        ]"#;
+        let m = StaticFileAppManager::from_json(raw).unwrap();
+        assert!(matches!(m.by_id("a").await.unwrap(), AppLookup::Found(_)));
+        assert!(matches!(m.by_id("b").await.unwrap(), AppLookup::Found(_)));
+        assert!(matches!(
+            m.by_key("a-key").await.unwrap(),
+            AppLookup::Found(_)
+        ));
+        assert!(matches!(
+            m.by_key("b-key").await.unwrap(),
+            AppLookup::Found(_)
+        ));
     }
 
     #[tokio::test]

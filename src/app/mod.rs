@@ -91,9 +91,21 @@ impl App {
         self.has_subscription_count_webhooks = any("subscription_count");
     }
 
-    /// Fail-fast load validation (spec §6): non-empty `event_types`, every entry
-    /// one of the seven, non-empty `url`.
+    /// Fail-fast load validation (spec §6): non-empty (and non-whitespace) `id`,
+    /// `key` and `secret` — a blank secret is a zero-length HMAC-SHA256 key, and
+    /// since the key ships in browser bundles by design, that lets anyone holding
+    /// it forge REST signatures, channel-auth tokens and `pusher:signin`; plus
+    /// non-empty `event_types`, every entry one of the seven, non-empty `url`.
     pub fn validate(&self) -> Result<(), String> {
+        if self.id.trim().is_empty() {
+            return Err(format!("app '{}': id is empty", self.id));
+        }
+        if self.key.trim().is_empty() {
+            return Err(format!("app '{}': key is empty", self.id));
+        }
+        if self.secret.trim().is_empty() {
+            return Err(format!("app '{}': secret is empty", self.id));
+        }
         for (i, w) in self.webhooks.iter().enumerate() {
             if w.url.trim().is_empty() {
                 return Err(format!("app '{}' webhook[{i}]: url is empty", self.id));
@@ -207,6 +219,42 @@ mod tests {
         assert!(!a.has_channel_occupied_webhooks);
         assert!(!a.has_client_event_webhooks);
         assert!(a.validate().is_ok());
+    }
+
+    #[test]
+    fn empty_secret_fails_validation() {
+        let a = parse(serde_json::json!({
+            "name": "t", "id": "app", "key": "k", "secret": ""
+        }));
+        let err = a.validate().unwrap_err();
+        assert!(err.contains("secret is empty"), "got: {err}");
+    }
+
+    #[test]
+    fn whitespace_only_secret_fails_validation() {
+        let a = parse(serde_json::json!({
+            "name": "t", "id": "app", "key": "k", "secret": "   "
+        }));
+        let err = a.validate().unwrap_err();
+        assert!(err.contains("secret is empty"), "got: {err}");
+    }
+
+    #[test]
+    fn empty_key_fails_validation() {
+        let a = parse(serde_json::json!({
+            "name": "t", "id": "app", "key": "", "secret": "s"
+        }));
+        let err = a.validate().unwrap_err();
+        assert!(err.contains("key is empty"), "got: {err}");
+    }
+
+    #[test]
+    fn empty_id_fails_validation() {
+        let a = parse(serde_json::json!({
+            "name": "t", "id": "", "key": "k", "secret": "s"
+        }));
+        let err = a.validate().unwrap_err();
+        assert!(err.contains("id is empty"), "got: {err}");
     }
 
     #[test]
