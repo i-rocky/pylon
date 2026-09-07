@@ -741,14 +741,10 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
             "incremental inflight_bytes drifted from the true accounted_bytes sum",
         );
 
-        // G1 invariant: any connection with queued out-bytes MUST hold WRITABLE
-        // interest in the poll registry. This is what makes the idle 50ms poll
-        // safe for a backpressured connection — the kernel wakes the loop with
-        // a writable event the moment the socket drains, so queued bytes can
-        // never be stranded behind a sleeping poll. Every queue site flushes
-        // via `flush_and_arm` before control returns to the loop top, arming
-        // WRITABLE on `WouldBlock`, so this holds by construction; a violation
-        // means a queue path forgot to arm.
+        // G1 invariant: queued out-bytes MUST come with WRITABLE interest, or
+        // the idle 50ms poll can sleep on a backlog nothing will wake it for.
+        // Every queue site goes through `flush_and_arm` before control returns
+        // here, so a violation means one of them let an unarmed connection live.
         debug_assert!(
             conns
                 .iter()
@@ -1197,9 +1193,6 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                     }
                     Due::Close4201(key) => {
                         send_close_4201(&poll, &mut conns, key, now_ns);
-                        // INCREMENTAL INFLIGHT: the 4201 close frame was queued +
-                        // flushed; fold the net delta before `remove` subtracts any
-                        // bytes still queued on the connection being torn down.
                         fold_delta(&mut conns, key, &mut inflight_bytes);
                         fold_codel(&mut conns, key, &mut codel_dropped_total);
                         fold_drophead(&mut conns, key, &mut drophead_dropped_total);
@@ -1218,16 +1211,11 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         work = true;
                     }
                     Due::Close4202(key) => {
-                        // Max connection lifetime reached: emit the in-band
-                        // `pusher:error` 4202 first, then the WS Close 4202
-                        // (same belt-and-suspenders convention as the drain
-                        // path's 4200), and tear the connection down through
-                        // the normal `remove` close path.
+                        // Max connection lifetime reached: the in-band
+                        // `pusher:error` 4202 first, then the WS Close 4202 —
+                        // the drain path's belt-and-suspenders convention.
                         queue_lifetime_error(&mut conns, key, now_ns);
                         send_close_4202(&poll, &mut conns, key, now_ns);
-                        // INCREMENTAL INFLIGHT: mirror the 4201 arm — fold the
-                        // queued/flushed delta before `remove` subtracts the
-                        // connection's still-queued bytes.
                         fold_delta(&mut conns, key, &mut inflight_bytes);
                         fold_codel(&mut conns, key, &mut codel_dropped_total);
                         fold_drophead(&mut conns, key, &mut drophead_dropped_total);
@@ -1443,23 +1431,14 @@ fn queue_lifetime_error(conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) 
 }
 
 /// C2a drain: queue a `pusher:error` 4200 text frame onto `key`'s out-queue
-/// BEFORE the Close frame. This is the belt-and-suspenders convention from
-/// Soketi (which does `ws.end(4200)` after sending the `pusher:error` event).
-/// The frame payload matches the Pusher v7 wire format for connection-level
-/// errors: `{"event":"pusher:error","data":{"code":4200,"message":"…"}}`.
-///
-/// If the connection no longer exists or has no session this is a no-op: the
-/// Close frame alone (code 4200 in the WS Close payload) is sufficient for
-/// pusher-js to recognise the reconnect-immediately signal.
+/// BEFORE the Close frame — Soketi's belt-and-suspenders convention (it does
+/// `ws.end(4200)` after sending the `pusher:error` event). A no-op for a
+/// connection that no longer exists; the Close frame's own 4200 is already
+/// enough for pusher-js to reconnect immediately.
 fn queue_shutdown_error(conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) {
     let Some(entry) = conns.get_mut(key) else {
         return;
     };
-    // Build the pusher:error 4200 text frame. Use the session codec when
-    // present (so encoding is consistent with every other server event),
-    // fall back to the same raw-JSON form used by `queue_reject` when no
-    // codec has been negotiated yet (connection still handshaking).
-    // F6/6.4: the session arm uses the append seam (`encode_into`).
     let mut text = String::new();
     match entry.session.as_ref() {
         Some(session) => session.codec.encode_into(
@@ -1470,9 +1449,8 @@ fn queue_shutdown_error(conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) 
             &mut text,
         ),
         None => {
-            // No codec yet (connection in handshaking state): hand-build the
-            // raw JSON that the v7 codec would have produced. The data field is
-            // a plain JSON object (not double-encoded) — matching `queue_reject`.
+            // Still handshaking, so no codec has been negotiated: hand-build
+            // what the v7 one would have produced, matching `queue_reject`.
             text.push_str(
                 &serde_json::json!({
                     "event": "pusher:error",
@@ -2847,11 +2825,12 @@ fn handle_writable(
 ///
 /// * [`WriteStatus::Drained`] → re-arm `READABLE`-only (drop `WRITABLE`).
 /// * [`WriteStatus::WouldBlock`] → add `WRITABLE` so we get a writable event.
-/// * [`WriteStatus::Closed`] → close.
+/// * [`WriteStatus::Closed`] → close, with no interest re-registered: the
+///   caller must tear the connection down, not leave it holding a backlog.
 ///
-/// The tracked `writable_armed` mirror on the [`Connection`] is updated after
-/// every successful re-registration so the loop-top debug invariant ("queued
-/// bytes ⇒ WRITABLE armed") can verify the arm really happened.
+/// The `writable_armed` mirror is updated after every successful
+/// re-registration, so the loop-top invariant can verify the arm really
+/// happened.
 fn flush_and_arm(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action {
     // Read the token before the mutable stream borrow below.
     let token = entry.token;
@@ -2918,21 +2897,18 @@ fn arm_handshake_interest(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action
 
 /// Transfer a plain-HTTP connection to the tokio/axum REST plane (SP9 §3.4).
 ///
-/// Order matters: deregister the stream from this `Poll` and remove the slab
-/// entry BEFORE moving the fd out of mio, so mio's registry/slab no longer
-/// reference it. Then [`crate::transport::rest::mio_to_std`] transfers fd ownership into a
-/// `std::net::TcpStream` (the single audited `unsafe` site), and the connection
-/// plus its already-read `prefix` bytes are sent to the handoff channel. The
-/// stream stays non-blocking (inherited from mio), which is what tokio wants.
-///
-/// On a missing handoff sender, or a closed channel, the connection is simply
-/// dropped (closed). A pre-handshake REST connection never has a [`Session`], so
-/// no on-close hook / counter decrement is needed.
+/// Order matters: deregister the stream and remove the slab entry BEFORE
+/// [`crate::transport::rest::mio_to_std`] moves the fd out of mio (the single
+/// audited `unsafe` site), so nothing still references it. The connection plus
+/// its already-read `prefix` bytes then go to the handoff channel; with no
+/// sender, or a closed channel, dropping the entry closes the socket. A
+/// pre-handshake REST connection never has a [`Session`], so there is no
+/// on-close hook or counter to unwind.
 ///
 /// Like [`remove`], this subtracts whatever the connection still holds from the
 /// worker total. The shutdown drain queues its 4200 frames onto `Handshaking`
 /// entries too, so a REST head arriving mid-drain reaches here with a non-empty
-/// queue — and bytes not subtracted here are a permanent phantom floor under
+/// queue — and bytes not subtracted are a permanent phantom floor under
 /// `inflight_bytes` for the life of the worker.
 fn handoff_rest(
     poll: &Poll,
@@ -2977,13 +2953,10 @@ fn handoff_rest(
     }
 }
 
-/// INCREMENTAL INFLIGHT accounting: fold connection `key`'s accumulated
-/// `out_bytes` delta into the worker's running `inflight_bytes`, bringing the
-/// counter back in step with that connection's queued bytes after a touch
-/// (`handle_readable`/`handle_writable`/`queue_ping`/…). A no-op (delta 0) when
-/// the connection didn't change or no longer exists. `wrapping_add` because the
-/// delta is signed: a net send/drop folds a negative delta. O(1) — this is what
-/// replaces the per-iteration O(connections) re-sum.
+/// Fold connection `key`'s accumulated accounting delta into the worker's
+/// running `inflight_bytes`, bringing the counter back in step after a touch.
+/// `wrapping_add` because the delta is signed: a net send or drop folds a
+/// negative one. O(1) — this is what replaces a per-iteration re-sum.
 fn fold_delta(conns: &mut slab::Slab<Entry>, key: usize, inflight_bytes: &mut u64) {
     if let Some(entry) = conns.get_mut(key) {
         let delta = entry.conn.take_inflight_delta();
@@ -2993,10 +2966,8 @@ fn fold_delta(conns: &mut slab::Slab<Entry>, key: usize, inflight_bytes: &mut u6
     }
 }
 
-/// B1: drain this connection's per-frame CoDel drop accumulator into the
-/// worker-level total. Called alongside `fold_delta` at every flush site so
-/// the shared `codel_dropped_slot` reflects actual drops with zero per-frame
-/// cost on the normal (no-drop) path.
+/// B1: drain this connection's CoDel drop accumulator into the worker-level
+/// total, alongside [`fold_delta`] at every flush site.
 fn fold_codel(conns: &mut slab::Slab<Entry>, key: usize, codel_total: &mut u64) {
     if let Some(entry) = conns.get_mut(key) {
         let dropped = entry.conn.take_codel_dropped();
@@ -3007,12 +2978,9 @@ fn fold_codel(conns: &mut slab::Slab<Entry>, key: usize, codel_total: &mut u64) 
 }
 
 /// G8: drain this connection's drop-head eviction accumulator into the
-/// worker-level total. Called at exactly the same sites as [`fold_codel`] so
-/// the shared `drophead_dropped_slot` (→ `pylon_drophead_dropped_total`)
-/// reflects actual evictions with zero per-frame cost on the normal path.
-/// Folding is UNIFORM (Keep and pre-teardown sites alike): an eviction right
-/// before a close would otherwise die with the slab entry, silently losing the
-/// count — the exact unobservability this counter exists to close.
+/// worker-level total, at exactly the same sites as [`fold_codel`] —
+/// pre-teardown ones included, or an eviction right before a close would die
+/// with the slab entry and lose the count.
 fn fold_drophead(conns: &mut slab::Slab<Entry>, key: usize, drophead_total: &mut u64) {
     if let Some(entry) = conns.get_mut(key) {
         let dropped = entry.conn.take_drophead_dropped();
@@ -3048,11 +3016,9 @@ fn remove(
     // connection on the same token never inherits a stale timer.
     wheel.remove(key);
     if let Some(mut entry) = conns.try_remove(key) {
-        // INCREMENTAL INFLIGHT: a removed connection's still-held bytes leave the
-        // worker total. Fold its outstanding delta up to date, then subtract its
-        // current `accounted_bytes` so the running counter doesn't leak upward
-        // over the worker's lifetime. (After the fold the connection's
-        // contribution is exactly `accounted_bytes`, so subtracting it zeroes it.)
+        // Bring this connection's contribution up to date, then subtract it:
+        // after the fold that contribution is exactly `accounted_bytes`, so the
+        // pair zeroes it and the worker total cannot leak upward.
         *inflight_bytes = inflight_bytes
             .wrapping_add(entry.conn.take_inflight_delta() as u64)
             .wrapping_sub(entry.conn.accounted_bytes() as u64);
