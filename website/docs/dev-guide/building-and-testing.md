@@ -59,8 +59,7 @@ cargo test --locked --lib \
 ### Full suite (all services)
 
 Running everything — the clustered/Redis suites and the per-backend
-AppManager suites included — requires all four services below, on the ports
-and env vars the suites already default to:
+AppManager suites included — requires all four services below:
 
 | Service | Port | Env var |
 |---|---|---|
@@ -72,10 +71,17 @@ and env vars the suites already default to:
 [`deploy/docker/docker-compose.test.yml`](https://github.com/i-rocky/pylon/blob/master/deploy/docker/docker-compose.test.yml)
 brings up all four on those ports: `docker compose -f deploy/docker/docker-compose.test.yml up -d`.
 
-With those running and reachable, pass `--no-fail-fast` so one missing or
+With those running and reachable, export the env vars above explicitly —
+not every suite's compiled-in default agrees with the table, so don't rely
+on defaults for the full run — and pass `--no-fail-fast` so one missing or
 misbehaving backend doesn't hide the results of the others:
 
 ```bash
+export PYLON_TEST_REDIS_URL=redis://127.0.0.1:6390
+export PYLON_TEST_MYSQL_URL=mysql://root:pylon@127.0.0.1:3307/pylon_test
+export PYLON_TEST_POSTGRES_URL=postgres://postgres:pylon@127.0.0.1:5433/pylon_test
+export PYLON_TEST_MONGO_URL=mongodb://127.0.0.1:27018/pylon_test
+
 cargo test --locked --no-fail-fast -- --test-threads=1
 ```
 
