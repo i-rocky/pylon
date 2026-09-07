@@ -43,7 +43,9 @@ pre-1.0 and versions track `Cargo.toml`.
   bytes** — hosted Pusher's docs say "smaller than 10kB" (decimal, not KiB) and
   the archived OpenAPI spec pins `maxLength: 10000`; the old 10,240 (10 KiB) let
   a 10,001-10,240 byte payload pass pylon and then 413 on hosted, breaking
-  migration out of pylon. Still overridable via `PYLON_MAX_EVENT_PAYLOAD_BYTES`.
+  migration out of pylon. Note this tightens an existing default: a payload
+  between 10,001 and 10,240 bytes that pylon accepted before now gets a 413.
+  Set `PYLON_MAX_EVENT_PAYLOAD_BYTES=10240` to keep the previous behaviour.
 - **Malformed numeric `PYLON_*` values now fail startup instead of silently
   keeping the default** — every numeric environment variable is rejected when it
   is set to a value that fails to parse. `PYLON_PORT=abc` and
