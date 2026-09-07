@@ -1398,9 +1398,15 @@ async fn send_to_user_feeds_the_same_encoded_bytes_to_local_and_publish_halves()
         let (_sid, handle, mut rx) = recording_handle();
         adapter.signin_user(TEST_APP, "u-half", handle).await;
 
-        // A raw probe subscriber sniffs the published envelope bytes (fred's
-        // `subscribe` future resolves on the server's confirmation, so the
-        // sniffed publish cannot race the subscription).
+        // A raw probe subscriber sniffs the published envelope bytes. A
+        // completed `subscribe()` only means the server acknowledged the
+        // SUBSCRIBE command — NOT that the server's own subscriber-count
+        // bookkeeping (what the very next PUBLISH's delivery depends on) has
+        // caught up. That false "subscribe cannot race the publish" assumption
+        // is exactly the issue #23 flake class (see `poll_numsub_at_least` /
+        // `require_numsub_at_least` above, shared with `smoke_connectivity`
+        // and the envelope-compat test): gate on the observable state (PUBSUB
+        // NUMSUB) before trusting the probe to see the first publish below.
         let probe = fred::prelude::Builder::from_config(
             fred::prelude::Config::from_url(test_redis_url().as_str()).unwrap(),
         )
@@ -1413,6 +1419,32 @@ async fn send_to_user_feeds_the_same_encoded_bytes_to_local_and_publish_halves()
             .subscribe(usermsg.clone())
             .await
             .expect("probe SUBSCRIBE");
+        // A plain command client for the NUMSUB readiness gate — NOT `probe`
+        // itself: RESP2 forbids ordinary commands (PUBSUB included) on a
+        // connection that has active subscriptions, so the gate needs its own
+        // connection to ask "is `probe` attached?" from the outside.
+        let numsub = fred::prelude::Builder::from_config(
+            fred::prelude::Config::from_url(test_redis_url().as_str()).unwrap(),
+        )
+        .build()
+        .unwrap();
+        numsub.init().await.expect("numsub client must connect");
+        // want=2, not 1: `adapter.signin_user` above already SUBSCRIBEd its OWN
+        // `SubscriberClient` to this exact `usermsg` channel (the node-local
+        // 0->1 edge — see redis/mod.rs), so NUMSUB is never 0 here even before
+        // the probe catches up. Gating on >=1 would pass on the adapter's own
+        // subscriber alone and let the publish below race the probe's — the
+        // same flake this whole gate exists to close, just one subscriber
+        // short of catching it. Only >=2 (adapter + probe) is the observable
+        // fact that the probe itself is attached.
+        require_numsub_at_least(
+            &numsub,
+            &usermsg,
+            2,
+            Duration::from_secs(2),
+            "probe readiness before the first send_to_user publish",
+        )
+        .await;
 
         // Typed event → ONE encode shared by both halves.
         let event = ServerEvent::ChannelEvent {
@@ -1465,6 +1497,7 @@ async fn send_to_user_feeds_the_same_encoded_bytes_to_local_and_publish_halves()
         );
 
         let _ = probe.quit().await;
+        let _ = numsub.quit().await;
     })
     .await
     .expect("send_to_user encode-once pin must not hang (Redis up?)");
