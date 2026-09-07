@@ -1456,6 +1456,94 @@ async fn rest_batch_event_name_over_200_is_400() {
     );
 }
 
+// ── socket_id parity tests — REST trigger endpoints reject malformed ids ────
+//
+// Hosted Pusher's HTTP API validates `socket_id` server-side and rejects a
+// malformed value with 400; `pusher-http-node`'s `validateSocketId` enforces
+// the same shape client-side: `\A\d+\.\d+\z`. Pylon previously fed the raw
+// string straight into `SocketId::from_raw`, so any string was accepted and
+// excluded nothing (issue #24).
+
+/// POST /events with a malformed `socket_id` → 400.
+#[tokio::test]
+async fn rest_trigger_invalid_socket_id_is_400() {
+    let addr = spawn().await;
+    let body = json!({
+        "name": "ev",
+        "data": "{}",
+        "channel": "room",
+        "socket_id": "not-a-socket-id"
+    })
+    .to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "malformed socket_id must be 400");
+}
+
+/// POST /events with a well-formed `socket_id` → 200 (regression guard).
+#[tokio::test]
+async fn rest_trigger_valid_socket_id_is_200() {
+    let addr = spawn().await;
+    let body = json!({
+        "name": "ev",
+        "data": "{}",
+        "channel": "room",
+        "socket_id": "123.456"
+    })
+    .to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "well-formed socket_id must still be 200"
+    );
+}
+
+/// POST /batch_events with one item carrying a bad `socket_id` → 400, and the
+/// OTHER (valid) item in the same batch must NOT be delivered — a batch is
+/// all-or-nothing, matching the existing per-item validations above.
+#[tokio::test]
+async fn rest_batch_events_bad_socket_id_rejects_whole_batch() {
+    let addr = spawn().await;
+    let mut ws = connect_ws(addr).await;
+    let _ = next_json(&mut ws).await; // established
+    subscribe_public(&mut ws, "room-a").await;
+
+    let body = json!({"batch":[
+        {"name":"ev-a","data":"1","channel":"room-a"},
+        {"name":"ev-b","data":"2","channel":"room-b","socket_id":"bad-id"}
+    ]})
+    .to_string();
+    let q = signed_query("POST", "/apps/app1/batch_events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/batch_events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "batch with a bad socket_id must be 400");
+
+    // The first item must NOT have been delivered — validation runs before
+    // any deliver() call, so a bad later item rejects the whole batch.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), next_json(&mut ws))
+            .await
+            .is_err(),
+        "no batch item should be delivered when any item fails validation"
+    );
+}
+
 // ── R2 parity tests — REST errors render JSON bodies {error, status} ────────
 
 /// Assert an error response carries the Pusher-style JSON error body: the body
