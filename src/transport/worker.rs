@@ -3550,14 +3550,27 @@ mod tests {
         (shutdown, handle)
     }
 
-    /// F3 (Nagle): `accept_ready` must disable Nagle on every accepted
-    /// socket. The server-side socket isn't reachable through a client
-    /// connection (the client only sees its own half), and a loopback
-    /// ping/pong latency assertion is probabilistic — macOS loopback rarely
-    /// exhibits the Nagle+delayed-ACK stall the fix targets — so this asserts
-    /// the option observably on the accepted stream itself, driven through
-    /// the real accept path (no `run` loop needed: one pending connection,
-    /// then inspect the slab entry's stream).
+    /// Block until the listener signals the readiness `run` only ever calls
+    /// [`accept_ready`] under: a peer sitting in the accept queue, rather than
+    /// a `connect` that has merely returned on the client's side.
+    fn await_listener_readable(poll: &mut Poll) {
+        let mut events = Events::with_capacity(4);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            poll.poll(&mut events, Some(Duration::from_millis(50)))
+                .unwrap();
+            if events.iter().any(|e| e.token() == LISTENER) {
+                return;
+            }
+        }
+        panic!("listener never reported a pending connection");
+    }
+
+    /// F3 (Nagle): `accept_ready` must disable Nagle on every accepted socket.
+    /// The server-side socket isn't reachable through a client connection (the
+    /// client only sees its own half), and a loopback ping/pong latency
+    /// assertion is probabilistic, so this asserts the option observably on the
+    /// accepted stream itself, driven through the real accept path.
     #[test]
     fn accept_ready_sets_nodelay_on_accepted_socket() {
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3568,10 +3581,13 @@ mod tests {
         let addr = std_listener.local_addr().unwrap();
         let mut listener = TcpListener::from_std(std_listener);
 
-        // A pending client connection for accept_ready to drain.
+        let mut poll = Poll::new().unwrap();
+        poll.registry()
+            .register(&mut listener, LISTENER, Interest::READABLE)
+            .unwrap();
         let _client = std::net::TcpStream::connect(addr).unwrap();
+        await_listener_readable(&mut poll);
 
-        let poll = Poll::new().unwrap();
         let mut conns = slab::Slab::new();
         let mut wheel = TimerWheel::new();
         let cfg = echo_worker_config(addr);
