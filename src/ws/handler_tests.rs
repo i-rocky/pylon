@@ -2704,3 +2704,169 @@ mod capability_gates {
         assert!(matches!(rx.try_recv().map(|b| *b), Ok(ServerEvent::Pong)));
     }
 }
+
+/// A presence subscribe must leave the connection able to unsubscribe itself,
+/// whatever the adapter reports back. `on_close` walks `subscribed`, so a socket
+/// the adapter registered but the connection never recorded would stay in the
+/// channel registry for the life of the process.
+mod presence_tracking_is_independent_of_the_presence_outcome {
+    use super::*;
+    use crate::adapter::Adapter;
+    use crate::channel::cache::CachedEvent;
+    use crate::channel::outcome::{ChannelSummary, SubscribeOutcome, UnsubscribeOutcome};
+    use crate::connection::handle::{ConnectionHandle, Mailbox};
+    use crate::presence::member::PresenceMember;
+    use crate::user::{UserJoinOutcome, UserLeaveOutcome};
+    use async_trait::async_trait;
+    use std::time::Duration;
+
+    /// A `LocalAdapter` that blanks the `PresenceJoin` a presence subscribe
+    /// returns while still committing the subscription — the one-line adapter
+    /// change the connection must survive.
+    struct PresencelessAdapter(Arc<LocalAdapter>);
+
+    #[async_trait]
+    impl Adapter for PresencelessAdapter {
+        async fn subscribe(
+            &self,
+            app: &str,
+            channel: &str,
+            handle: ConnectionHandle,
+            member: Option<PresenceMember>,
+        ) -> SubscribeOutcome {
+            let mut out = self.0.subscribe(app, channel, handle, member).await;
+            out.presence = None;
+            out
+        }
+        async fn unsubscribe(
+            &self,
+            app: &str,
+            channel: &str,
+            socket_id: &SocketId,
+        ) -> UnsubscribeOutcome {
+            self.0.unsubscribe(app, channel, socket_id).await
+        }
+        async fn broadcast(
+            &self,
+            app: &str,
+            channel: &str,
+            event: ServerEvent,
+            except: Option<SocketId>,
+        ) {
+            self.0.broadcast(app, channel, event, except).await
+        }
+        async fn channels(&self, app: &str, prefix: Option<&str>) -> Vec<ChannelSummary> {
+            self.0.channels(app, prefix).await
+        }
+        async fn channel(&self, app: &str, channel: &str) -> ChannelSummary {
+            self.0.channel(app, channel).await
+        }
+        async fn presence_members(&self, app: &str, channel: &str) -> Vec<PresenceMember> {
+            self.0.presence_members(app, channel).await
+        }
+        async fn resend_presence_ack(&self, app: &str, channel: &str, mailbox: Mailbox) {
+            self.0.resend_presence_ack(app, channel, mailbox).await
+        }
+        async fn cache_set(&self, app: &str, channel: &str, event: CachedEvent, ttl: Duration) {
+            self.0.cache_set(app, channel, event, ttl).await
+        }
+        async fn cache_get(&self, app: &str, channel: &str) -> Option<CachedEvent> {
+            self.0.cache_get(app, channel).await
+        }
+        async fn signin_user(
+            &self,
+            app: &str,
+            user_id: &str,
+            handle: ConnectionHandle,
+        ) -> UserJoinOutcome {
+            self.0.signin_user(app, user_id, handle).await
+        }
+        async fn signout_user(
+            &self,
+            app: &str,
+            user_id: &str,
+            socket_id: &SocketId,
+        ) -> UserLeaveOutcome {
+            self.0.signout_user(app, user_id, socket_id).await
+        }
+        async fn is_user_online(&self, app: &str, user_id: &str) -> bool {
+            self.0.is_user_online(app, user_id).await
+        }
+        async fn send_to_user(&self, app: &str, user_id: &str, event: ServerEvent) {
+            self.0.send_to_user(app, user_id, event).await
+        }
+        async fn terminate_user(&self, app: &str, user_id: &str) -> Vec<SocketId> {
+            self.0.terminate_user(app, user_id).await
+        }
+        async fn purge_app(&self, app_id: &str) -> Vec<SocketId> {
+            self.0.purge_app(app_id).await
+        }
+        async fn watch(
+            &self,
+            app: &str,
+            handle: ConnectionHandle,
+            watched: Vec<String>,
+        ) -> Vec<String> {
+            self.0.watch(app, handle, watched).await
+        }
+        async fn unwatch(&self, app: &str, socket_id: &SocketId) {
+            self.0.unwatch(app, socket_id).await
+        }
+        async fn watchers_of(&self, app: &str, user_id: &str) -> Vec<ConnectionHandle> {
+            self.0.watchers_of(app, user_id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn on_close_unsubscribes_a_presence_join_with_no_presence_outcome() {
+        let (tx, _rx) = mpsc::channel(1024);
+        let local = Arc::new(LocalAdapter::new(
+            Arc::new(Registry::new()),
+            Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+        ));
+        let mut c = ConnectionContext {
+            app: Arc::new(app(false)),
+            socket_id: SocketId::generate(),
+            self_tx: tx,
+            adapter: Arc::new(PresencelessAdapter(local.clone())),
+            limits: crate::server::config::ServerConfig::default().limits(),
+            subscribed: HashSet::new(),
+            user: None,
+            webhooks: crate::webhook::WebhookHandle::null(),
+            presence_membership: std::collections::HashMap::new(),
+            saturated: None,
+            clustered: false,
+            mailbox_notify: None,
+            mailbox_dropped: None,
+            client_event_rate: crate::ws::rate::RateWindow::new(0),
+            capabilities: Capabilities::v7(),
+        };
+
+        let sid = c.socket_id.as_str().to_string();
+        let cd = serde_json::json!({"user_id":"u1"}).to_string();
+        let sig = crate::auth::signature::channel_signature("s", &sid, "presence-x", Some(&cd));
+        c.dispatch(ClientCommand::Subscribe {
+            channel: "presence-x".into(),
+            auth: Some(format!("k:{sig}")),
+            channel_data: Some(cd),
+        })
+        .await;
+
+        assert_eq!(
+            local.channel("app", "presence-x").await.subscription_count,
+            1,
+            "the adapter committed the subscription"
+        );
+        assert!(
+            c.subscribed.contains("presence-x"),
+            "the connection must record a subscription the adapter committed"
+        );
+
+        c.on_close().await;
+        assert_eq!(
+            local.channel("app", "presence-x").await.subscription_count,
+            0,
+            "on_close must leave no ghost subscriber behind"
+        );
+    }
+}

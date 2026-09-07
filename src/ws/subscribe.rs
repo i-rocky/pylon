@@ -300,20 +300,20 @@ impl ConnectionContext {
                         );
                     }
                 }
+                let member_user_id = member.user_id.clone();
                 let out = self
                     .adapter
                     .subscribe(&self.app.id, &channel, self.handle(), Some(member))
                     .await;
                 let occupied = out.occupied;
+                // Recorded before the presence outcome is inspected: the adapter has
+                // committed the subscription and `on_close` unsubscribes only what
+                // `subscribed` holds. UNGUARDED in cluster mode — the worker still
+                // indexes the connection for delivery + client_event.user_id.
+                self.subscribed.insert(channel.clone());
+                self.presence_membership
+                    .insert(channel.clone(), member_user_id);
                 if let Some(join) = out.presence {
-                    self.subscribed.insert(channel.clone());
-                    // Record this socket's presence member id so a later
-                    // `client_event` on this channel can attach `user_id`. Clone
-                    // before the `first_for_user` block moves `join.member.user_id`.
-                    // UNGUARDED in cluster mode: the worker must still index the
-                    // connection locally (for delivery + client_event.user_id).
-                    self.presence_membership
-                        .insert(channel.clone(), join.member.user_id.clone());
                     // Clustered: the bridge sends `subscription_succeeded` with the
                     // CLUSTER-wide roster (straight to this connection's mailbox) and
                     // fires the single cluster-wide `member_added` + its webhook. The
