@@ -319,15 +319,21 @@ pub struct Connection {
     /// strand a backpressured connection's out-queue: with WRITABLE armed the
     /// kernel wakes the loop the moment the socket drains.
     writable_armed: bool,
-    /// Signed accumulator of every change to `out_bytes` since the last
-    /// [`take_inflight_delta`](Self::take_inflight_delta), so the worker can
-    /// maintain its `inflight_bytes` total incrementally (O(work), not
+    /// Bytes held by the worker's inbound reassembly buffer for this connection
+    /// (RFC 6455 §5.4), maintained by
+    /// [`set_reassembly_bytes`](Self::set_reassembly_bytes). Counted alongside
+    /// `out_bytes` in [`accounted_bytes`](Self::accounted_bytes) so memory a peer
+    /// pins mid-message is visible to the worker's `inflight_bytes` total.
+    reassembly_bytes: usize,
+    /// Signed accumulator of every change to [`accounted_bytes`](Self::accounted_bytes)
+    /// since the last [`take_inflight_delta`](Self::take_inflight_delta), so the
+    /// worker can maintain its `inflight_bytes` total incrementally (O(work), not
     /// O(connections)) instead of re-summing every connection each loop. Every
-    /// mutation site that changes `out_bytes` — the `queue` enqueue/drop-head
-    /// eviction, the `flush` send, and the CoDel staleness drop — folds the exact
+    /// mutation site — the `queue` enqueue/drop-head eviction, the `flush` send,
+    /// the CoDel staleness drop, and `set_reassembly_bytes` — folds the exact
     /// signed delta in here. Bounded by the queue cap (≤ a few MiB), so `i64`
     /// never overflows. Invariant: across any sequence of operations the SUM of
-    /// the deltas taken equals the net change in `out_bytes`.
+    /// the deltas taken equals the net change in `accounted_bytes`.
     inflight_delta: i64,
 }
 
@@ -350,6 +356,7 @@ impl Connection {
             writev_batch: Vec::new(),
             tls_batch: Vec::new(),
             writable_armed: false,
+            reassembly_bytes: 0,
             inflight_delta: 0,
         }
     }
@@ -372,6 +379,7 @@ impl Connection {
             writev_batch: Vec::new(),
             tls_batch: Vec::new(),
             writable_armed: false,
+            reassembly_bytes: 0,
             inflight_delta: 0,
         }
     }
@@ -891,21 +899,42 @@ impl Connection {
         self.out_bytes
     }
 
-    /// Take and reset this connection's accumulated `out_bytes` delta since the
-    /// last call, for the worker's INCREMENTAL inflight accounting (replaces the
-    /// O(connections) re-sum every loop iteration with an O(work) fold).
+    /// Bytes this connection's inbound RFC 6455 §5.4 reassembly buffer currently
+    /// holds.
+    pub fn reassembly_bytes(&self) -> usize {
+        self.reassembly_bytes
+    }
+
+    /// Resize this connection's reassembly-buffer accounting to `bytes`, folding
+    /// the change into the inflight delta. The worker calls this at every site
+    /// that grows, drops or completes the buffer, so a peer that pins memory by
+    /// opening a message and never finishing it is billed for it.
+    pub fn set_reassembly_bytes(&mut self, bytes: usize) {
+        self.inflight_delta += bytes as i64 - self.reassembly_bytes as i64;
+        self.reassembly_bytes = bytes;
+    }
+
+    /// Every byte this connection contributes to the worker's `inflight_bytes`:
+    /// the queued out-frames plus the inbound reassembly buffer.
+    pub fn accounted_bytes(&self) -> usize {
+        self.out_bytes + self.reassembly_bytes
+    }
+
+    /// Take and reset this connection's accumulated [`accounted_bytes`](Self::accounted_bytes)
+    /// delta since the last call, for the worker's INCREMENTAL inflight accounting
+    /// (replaces the O(connections) re-sum every loop iteration with an O(work) fold).
     ///
-    /// Every mutation site that changes `out_bytes` — `queue` (enqueue +
-    /// drop-head eviction), `flush` (send), and the CoDel staleness drop — folds
-    /// its exact signed delta into the accumulator. So the value returned here is
-    /// precisely the net change in `out_bytes` over the operations since the
+    /// Every mutation site — `queue` (enqueue + drop-head eviction), `flush`
+    /// (send), the CoDel staleness drop, and `set_reassembly_bytes` — folds its
+    /// exact signed delta into the accumulator. So the value returned here is
+    /// precisely the net change in `accounted_bytes` over the operations since the
     /// previous take. The worker adds it to its running `inflight_bytes` after
-    /// every site that touches this connection's out-queue; the sum of all deltas
-    /// ever taken equals the connection's current `out_bytes`. Resets to `0`.
+    /// every site that touches this connection; the sum of all deltas ever taken
+    /// equals the connection's current `accounted_bytes`. Resets to `0`.
     ///
-    /// A connection being `remove`d must have its delta taken (or its `out_bytes`
-    /// subtracted) before it is dropped, so its still-queued bytes are removed
-    /// from the worker total and the counter cannot leak upward.
+    /// A connection being `remove`d must have its delta taken (and its
+    /// `accounted_bytes` subtracted) before it is dropped, so the bytes it still
+    /// holds are removed from the worker total and the counter cannot leak upward.
     pub fn take_inflight_delta(&mut self) -> i64 {
         std::mem::take(&mut self.inflight_delta)
     }

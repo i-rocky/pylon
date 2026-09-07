@@ -703,6 +703,130 @@ async fn oversize_assembled_message_is_dropped_and_connection_stays_usable() {
     assert_eq!(frame["channel"], "after-cap");
 }
 
+/// Issue #58: the FIRST fragment is bounded by `max_event_payload_bytes` too.
+/// A peer that opens a message far over the cap and never completes it used to
+/// pin the whole payload on the connection, unseen by the byte budget; the
+/// message is now dropped on the opening frame and nothing is buffered. The
+/// connection is fully usable throughout.
+#[tokio::test]
+async fn oversize_first_fragment_is_dropped_and_connection_stays_usable() {
+    let addr = spawn(ServerConfig::default()).await; // max_event_payload_bytes = 10_240
+    let mut ws = connect(addr, "?protocol=7").await;
+    let _ = established_socket_id(&mut ws).await;
+
+    // One opening fragment of 512 KiB — 50x the per-message cap, and under the
+    // 1 MiB per-frame ceiling that was its only bound before.
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(vec![b'x'; 512 * 1024], WsOpCode::Data(WsData::Text), false),
+    )
+    .await;
+
+    // The message is still open as far as the peer is concerned, and the
+    // connection answers control frames (RFC 6455 §5.5.2) — proof it was not
+    // closed and the drop was silent.
+    ws.send(Message::Ping(b"unfinished".to_vec()))
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        .await
+        .expect("a frame within 5s")
+        .expect("stream open");
+    match first {
+        Ok(Message::Pong(p)) => assert_eq!(p.as_slice(), b"unfinished"),
+        other => panic!("expected a Pong on the still-open connection, got {other:?}"),
+    }
+
+    // Completing the dropped message is silent, not a stray Continuation.
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(
+            vec![b'y'; 64 * 1024],
+            WsOpCode::Data(WsData::Continue),
+            true,
+        ),
+    )
+    .await;
+    if let Some(v) = try_next_json_short(&mut ws).await {
+        panic!("oversize fragmented message must be dropped silently, got {v}");
+    }
+
+    // A well-formed fragmented message still reassembles and dispatches.
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(
+            b"{\"event\":\"pusher:sub".to_vec(),
+            WsOpCode::Data(WsData::Text),
+            false,
+        ),
+    )
+    .await;
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(
+            b"scribe\",\"data\":{\"channel\":\"after-pin\"}}".to_vec(),
+            WsOpCode::Data(WsData::Continue),
+            true,
+        ),
+    )
+    .await;
+    let frame = next_event_named(&mut ws, "pusher_internal:subscription_succeeded").await;
+    assert_eq!(frame["channel"], "after-pin");
+}
+
+/// Issue #60: the fragmented and unfragmented paths must agree. An oversize
+/// unfragmented TEXT frame leaves the connection open; so must an oversize
+/// fragmented one — including the fragments that arrive AFTER the overflow,
+/// which used to trip the stray-Continuation guard and close with 1002.
+#[tokio::test]
+async fn oversize_text_leaves_the_connection_open_fragmented_or_not() {
+    let addr = spawn(ServerConfig::default()).await; // max_event_payload_bytes = 10_240
+    let mut ws = connect(addr, "?protocol=7").await;
+    let _ = established_socket_id(&mut ws).await;
+
+    // Unfragmented: one 16 KiB TEXT frame, over the per-message cap.
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(vec![b'u'; 16 * 1024], WsOpCode::Data(WsData::Text), true),
+    )
+    .await;
+    send_json(&mut ws, json!({ "event": "pusher:ping", "data": {} })).await;
+    assert_eq!(
+        next_json(&mut ws).await["event"],
+        "pusher:pong",
+        "an oversize unfragmented TEXT frame must not close the connection"
+    );
+
+    // Fragmented, the #60 trigger: 8000 + 8000 overflows on the second
+    // fragment, and a third fragment follows the drop.
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(vec![b'f'; 8_000], WsOpCode::Data(WsData::Text), false),
+    )
+    .await;
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(vec![b'g'; 8_000], WsOpCode::Data(WsData::Continue), false),
+    )
+    .await;
+    send_raw_frame(
+        &mut ws,
+        WsFrame::message(vec![b'h'; 100], WsOpCode::Data(WsData::Continue), true),
+    )
+    .await;
+    if let Some(v) = try_next_json_short(&mut ws).await {
+        panic!("oversize fragmented message must be dropped silently, got {v}");
+    }
+
+    // Same outcome as the unfragmented path: still connected, still serving.
+    send_json(&mut ws, json!({ "event": "pusher:ping", "data": {} })).await;
+    assert_eq!(
+        next_json(&mut ws).await["event"],
+        "pusher:pong",
+        "an oversize fragmented TEXT message must not close the connection either"
+    );
+}
+
 /// P1 / RFC 6455 §5.4: a new Text data frame arriving while a fragmented
 /// message is open is a protocol violation — the server must fail the
 /// connection with a WebSocket Close carrying code 1002 (protocol error), and
