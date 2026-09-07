@@ -24,7 +24,7 @@ use pylon::protocol::event::ServerEvent;
 use pylon::server::config::ServerConfig;
 use pylon::transport::worker::{run, DispatchEnv, Mode, WorkerConfig};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -46,6 +46,10 @@ struct Harness {
     /// Shared adapter — retained so tests can call `adapter.broadcast()` to push
     /// events to subscribed connections and exercise the inflight-bytes path.
     adapter: Arc<dyn Adapter>,
+    /// The worker's own incrementally-maintained queued-byte total, mirrored
+    /// into this slot once per loop iteration. Tests gate on it rather than
+    /// sleeping and hoping the backpressure they need actually formed.
+    worker_queued_bytes: Arc<AtomicU64>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -106,6 +110,8 @@ async fn spawn_with_grace(grace_ms: u64) -> Harness {
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let shutdown = Arc::new(AtomicBool::new(false));
     let sd = shutdown.clone();
+    let worker_queued_bytes = Arc::new(AtomicU64::new(0));
+    let queued_slot = worker_queued_bytes.clone();
     let handle = std::thread::spawn(move || {
         run(
             WorkerConfig {
@@ -120,7 +126,7 @@ async fn spawn_with_grace(grace_ms: u64) -> Harness {
                 worker_id: 0,
                 broadcast: None,
                 per_worker_budget: 0,
-                inflight_slot: None,
+                inflight_slot: Some(queued_slot),
                 accepted_slot: None,
                 codel_dropped_slot: None,
                 drophead_dropped_slot: None,
@@ -142,6 +148,7 @@ async fn spawn_with_grace(grace_ms: u64) -> Harness {
         shutdown,
         conn_counts,
         adapter: adapter_for_harness,
+        worker_queued_bytes,
         handle: Some(handle),
     }
 }
@@ -156,6 +163,65 @@ async fn connect(port: u16) -> Ws {
     .expect("connect within 5s")
     .expect("ws handshake");
     ws
+}
+
+/// Connect a WS client whose socket receive buffer is pinned small BEFORE the
+/// TCP connect, so the kernel never autosizes the window upward. Left alone,
+/// `net.inet.tcp.doautorcvbuf` grows a loopback receive buffer into the
+/// megabytes and swallows a whole flood, leaving the server nothing queued to
+/// be backpressured on. Same `SO_RCVBUF` lever `transport::conn`'s TLS tests
+/// pull to force partial writes: the accepted end's `SO_SNDBUF` is out of a
+/// test process's reach (that accept happens inside the worker), but the
+/// client end it dials from is not.
+async fn connect_with_pinned_recv_buffer(port: u16, recv_buffer: usize) -> Ws {
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let sock = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .unwrap();
+    sock.set_recv_buffer_size(recv_buffer).unwrap();
+    sock.connect(&addr.into()).unwrap();
+    let std_stream = std::net::TcpStream::from(sock);
+    std_stream.set_nonblocking(true).unwrap();
+    let stream = tokio::net::TcpStream::from_std(std_stream).unwrap();
+    let (ws, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::client_async(
+            format!("ws://127.0.0.1:{port}/app/app-key?protocol=7"),
+            tokio_tungstenite::MaybeTlsStream::Plain(stream),
+        ),
+    )
+    .await
+    .expect("connect within 5s")
+    .expect("ws handshake");
+    ws
+}
+
+/// Poll the worker's mirrored queued-byte total until `accept` holds, returning
+/// the value that satisfied it. Panics naming `expected` and the last and peak
+/// values seen if `budget` runs out: a drain test that proceeds on an
+/// unverified backlog is not exercising the drain's wait at all.
+async fn await_queued_bytes(
+    slot: &AtomicU64,
+    expected: &str,
+    budget: Duration,
+    accept: impl Fn(u64) -> bool,
+) -> u64 {
+    let deadline = std::time::Instant::now() + budget;
+    let mut peak = 0u64;
+    loop {
+        let queued = slot.load(Ordering::Relaxed);
+        peak = peak.max(queued);
+        if accept(queued) {
+            return queued;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("never observed {expected} within {budget:?} (last: {queued}, peak: {peak})");
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
 }
 
 /// Read messages from `ws` until we receive the `pusher:connection_established`
@@ -370,10 +436,11 @@ async fn graceful_drain_sends_pusher_error_4200_and_close_4200() {
 /// `conn.flush()` returns `WouldBlock` and the frames accumulate in `out_bytes`,
 /// making `inflight_bytes > 0`. Shutdown is then triggered.
 ///
-/// Determinism note: we flood enough data (≥ 1 MB) that the kernel's per-socket
-/// receive buffer (typically 64–128 KB) fills up and backpressure is virtually
-/// guaranteed. A small delay between subscribe and flood ensures the subscription
-/// frame is drained first, so only the broadcast frames cause the WouldBlock.
+/// This test asserts only that the drain completes cleanly, because a client
+/// that merely stops reading does NOT reliably backpressure: the kernel
+/// autosizes its receive buffer into the megabytes and can absorb the whole
+/// flood. `graceful_drain_delays_for_backpressured_outbound_bytes` pins that
+/// buffer shut to make the backlog real, and is the test that asserts on it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn graceful_drain_with_backpressured_client() {
     let _lock = HARNESS_LOCK.lock().await;
@@ -538,45 +605,82 @@ async fn graceful_drain_ignores_a_partial_inbound_frame() {
 /// that: it asserts the connection survives shortly after shutdown (a real
 /// delay happened), then relieves the backpressure and requires the client
 /// actually receive Close(4200) before `conn_counts` returns to 0.
+///
+/// The backpressure is manufactured, not hoped for. A client that merely stops
+/// reading is not enough: the kernel autosizes its receive buffer into the
+/// megabytes and absorbs the entire flood, and even when a backlog does form,
+/// CoDel collapses it to the freshest frame on the drain's own flush — which
+/// then fits in the window that is still open, so `outbound_bytes` reaches 0
+/// and the drain exits inside the observation window. Pinning the client's
+/// receive buffer shut wedges the connection instead: with a zero window not
+/// even the Close frame can leave, so the backlog cannot evaporate. Shutdown
+/// is then withheld until the worker's own counter confirms the wedge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn graceful_drain_delays_for_backpressured_outbound_bytes() {
     let _lock = HARNESS_LOCK.lock().await;
 
     const GRACE_MS: u64 = 4_000;
+    const WEDGE_RECV_BUFFER: usize = 4 * 1024;
+    const MIN_WEDGED_BYTES: u64 = 256 * 1024;
+    const FLOOD_EVENTS: usize = 8_000;
+
     let h = spawn_with_grace(GRACE_MS).await;
 
-    let mut ws = connect(h.port).await;
+    let mut ws = connect_with_pinned_recv_buffer(h.port, WEDGE_RECV_BUFFER).await;
     wait_established(&mut ws).await;
     subscribe(&mut ws, "flood-channel").await;
 
-    // Give the worker a moment to drain the subscription_succeeded frame so
-    // only the flood below contributes to the out-queue.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Start from a quiet out-queue and send nothing further from this side, so
+    // every byte the gate below counts is one the flood queued outbound.
+    await_queued_bytes(
+        &h.worker_queued_bytes,
+        "an idle out-queue before the flood",
+        Duration::from_secs(5),
+        |queued| queued == 0,
+    )
+    .await;
 
-    // Stop reading from the socket entirely: the client's TCP receive buffer
-    // fills up once the flood starts, so the server's flush() blocks and
-    // frames pile up in `out_bytes` — genuine queued outbound bytes.
-    const N_FLOOD: usize = 1_000;
-    let pad = "x".repeat(1024);
-    let adapter = h.adapter.clone();
-    tokio::spawn(async move {
-        for i in 0..N_FLOOD {
-            adapter
-                .broadcast(
-                    APP_ID,
-                    "flood-channel",
-                    ServerEvent::ChannelEvent {
-                        channel: "flood-channel".to_string(),
-                        event: "flood".to_string(),
-                        data: serde_json::json!({ "i": i, "pad": pad }),
-                        user_id: None,
-                    },
-                    None,
-                )
-                .await;
+    // Stop reading from the socket entirely from here on: the pinned receive
+    // buffer fills within a few frames, the window shuts, and the server's
+    // flush can no longer place a single byte.
+    let flood = tokio::spawn({
+        let adapter = h.adapter.clone();
+        async move {
+            let pad = "x".repeat(1024);
+            for i in 0..FLOOD_EVENTS {
+                adapter
+                    .broadcast(
+                        APP_ID,
+                        "flood-channel",
+                        ServerEvent::ChannelEvent {
+                            channel: "flood-channel".to_string(),
+                            event: "flood".to_string(),
+                            data: serde_json::json!({ "i": i, "pad": pad }),
+                            user_id: None,
+                        },
+                        None,
+                    )
+                    .await;
+                // Let the worker move its mailbox into the out-queue: an
+                // unyielding flood just overruns the bounded mailbox, and
+                // frames dropped there never become queued outbound bytes.
+                tokio::task::yield_now().await;
+            }
         }
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let wedged = await_queued_bytes(
+        &h.worker_queued_bytes,
+        &format!("a wedged outbound backlog of at least {MIN_WEDGED_BYTES} bytes"),
+        Duration::from_secs(15),
+        |queued| queued >= MIN_WEDGED_BYTES,
+    )
+    .await;
+
+    // Freeze the queue before signalling: what the drain has to flush is now
+    // exactly what the gate above measured.
+    flood.abort();
+    let _ = flood.await;
 
     h.shutdown.store(true, Ordering::SeqCst);
 
@@ -591,9 +695,9 @@ async fn graceful_drain_delays_for_backpressured_outbound_bytes() {
         .unwrap_or(0);
     assert_eq!(
         count, 1,
-        "a connection with genuinely queued outbound bytes must still be \
-         present shortly after shutdown — the drain must wait for it, not \
-         exit unconditionally"
+        "a connection with {wedged} queued outbound bytes and a shut receive \
+         window must still be present shortly after shutdown — the drain must \
+         wait for it, not exit unconditionally"
     );
 
     // Now relieve the backpressure: drain the client's socket as fast as
