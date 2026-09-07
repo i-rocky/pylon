@@ -60,8 +60,8 @@ pre-1.0 and versions track `Cargo.toml`.
   node-local cache).
 
 ### Removed
-- **BREAKING:** `PYLON_WEBHOOK_RETRY_BASE_MS` and `PYLON_WEBHOOK_MAX_RETRIES`,
-  deprecated in the v0.3.0 line, are gone — their one-release grace window has
+- **`PYLON_WEBHOOK_RETRY_BASE_MS` and `PYLON_WEBHOOK_MAX_RETRIES` removed** —
+  deprecated in the v0.3.0 line, their one-release grace window has now
   elapsed. Use `PYLON_WEBHOOK_BACKOFF_BASE_MS` in place of the former; the
   latter has no successor (retries are bounded by `PYLON_WEBHOOK_RETRY_BUDGET_MS`,
   total time rather than attempt count). Setting either variable now has no
