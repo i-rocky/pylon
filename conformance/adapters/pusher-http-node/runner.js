@@ -55,9 +55,16 @@
 //
 //   node runner.js --version    Print the SDK's package version.
 //   node runner.js --list       Print implemented scenario ids, one per line.
+//
+// Occupied-server fixtures: the query scenarios (S-CHANNELS/S-CHANNEL/S-USERS)
+// establish the client state they assert on through the sibling pusher-js
+// runner's `--hold` mode, so each observes a server IT populated instead of
+// whatever an earlier scenario left behind — no query scenario depends on
+// another's leftovers or on catalog order.
 
 const fs = require('fs');
 const path = require('path');
+const { spawn } = require('child_process');
 
 // The SDK: `module.exports` IS the Pusher class (no named export).
 const Pusher = require('pusher');
@@ -170,6 +177,76 @@ const assertOk = (cond, msg) => {
 };
 
 // ---------------------------------------------------------------------------
+// Occupied-server fixture: a real client connection, established through the
+// official CLIENT SDK (the sibling pusher-js runner's `--hold` mode), holding
+// the channels a server-plane scenario is about to query. The spec rides the
+// child's STDIN and closing that STDIN is the release signal, so neither a
+// thrown scenario nor a dead parent can leak a held connection.
+// ---------------------------------------------------------------------------
+
+const JS_ADAPTER_DIR = path.join(__dirname, '..', 'pusher-js');
+const HOLD_READY_TIMEOUT_MS = 8000;
+const HOLD_RELEASE_TIMEOUT_MS = 4000;
+
+const holdChannels = (spec) =>
+  new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      ['runner.js', '--hold', '--env', '--', arg('--env')],
+      { cwd: JS_ADAPTER_DIR, stdio: ['pipe', 'pipe', 'inherit'] }
+    );
+    const exited = new Promise((res) => child.on('exit', res));
+    let settled = false;
+    const abandon = (why) => {
+      if (settled) return;
+      settled = true;
+      child.kill('SIGKILL');
+      reject(new Error(why));
+    };
+    const release = async () => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      child.stdin.end();
+      const killer = setTimeout(() => child.kill('SIGKILL'), HOLD_RELEASE_TIMEOUT_MS);
+      await exited;
+      clearTimeout(killer);
+    };
+
+    const readyTimer = setTimeout(
+      () => abandon(`hold not ready within ${HOLD_READY_TIMEOUT_MS}ms: ${spec.channels}`),
+      HOLD_READY_TIMEOUT_MS
+    );
+    child.on('error', (e) => {
+      clearTimeout(readyTimer);
+      abandon(`hold spawn failed: ${(e && e.message) || String(e)}`);
+    });
+    child.on('exit', (code, signal) => {
+      clearTimeout(readyTimer);
+      abandon(`hold exited before it was ready (code ${code}, signal ${signal})`);
+    });
+    child.stdin.on('error', () => {});
+    child.stdout.setEncoding('utf8');
+    let buffered = '';
+    child.stdout.on('data', (chunk) => {
+      if (settled) return;
+      buffered += chunk;
+      const newline = buffered.indexOf('\n');
+      if (newline < 0) return;
+      clearTimeout(readyTimer);
+      const line = buffered.slice(0, newline);
+      let ready;
+      try {
+        ready = JSON.parse(line);
+      } catch (e) {
+        return abandon(`hold ready line is not JSON: ${line.slice(0, 120)}`);
+      }
+      settled = true;
+      log('holding', (ready.held || []).join(', '));
+      resolve({ held: ready.held || [], release });
+    });
+    child.stdin.write(JSON.stringify(spec) + '\n');
+  });
+
+// ---------------------------------------------------------------------------
 // Scenarios (verdict: pass | fail | skip).
 // ---------------------------------------------------------------------------
 
@@ -194,60 +271,167 @@ const SCENARIOS = {
     return { batches: '<10x10-ok>' };
   },
 
-  // Both shapes are valid observations: `{"channels":{}}` in a server-only
-  // scoped run (triggering does not occupy channels) vs occupied channels in
-  // a full run where the client plane subscribed first (catalog order puts
-  // every C-*/U-*/E-* before S-*).
+  // The index must distinguish occupied from unoccupied: the two channels this
+  // scenario holds are named in the response with their real attribute values,
+  // and a never-subscribed sibling name is absent. An implementation returning
+  // an unconditionally empty (or unconditionally full) index fails both ways.
   'S-CHANNELS': async () => {
-    const p = client();
-    const r = await p.get({ path: '/channels', params: { filter_by_prefix: 'cf-' } });
-    assertOk(r.status === 200, `status ${r.status}`);
-    const body = await r.json();
-    const ids = Object.keys((body && body.channels) || {});
-    // info-attribute leg: user_count is only legal filtered to presence-.
-    const r2 = await p.get({
-      path: '/channels',
-      params: { filter_by_prefix: 'presence-cf-', info: 'user_count' },
+    const held = await holdChannels({
+      user_id: 'u-s-channels',
+      channels: ['cf-s-channels', 'presence-cf-s-channels'],
     });
-    assertOk(r2.status === 200, `attrs status ${r2.status}`);
-    const body2 = await r2.json();
-    const presenceIds = Object.keys((body2 && body2.channels) || {});
-    return {
-      status: '200',
-      channel_count: ids.length,
-      channel_keys: ids.map(() => '<name>'),
-      presence_attrs_status: '200',
-      presence_channel_count: presenceIds.length,
-    };
-  },
-
-  'S-CHANNEL': async () => {
-    const r = await client().get({ path: '/channels/cf-test-channel' });
-    assertOk(r.status === 200, `status ${r.status}`);
-    const body = await r.json();
-    assertOk(body && body.occupied !== undefined, 'occupied field present');
-    return { occupied: Boolean(body.occupied) };
-  },
-
-  // Query the presence channel C-PRES-SUB occupies (`presence-cf-pres`), so a
-  // full run observes the 200/users shape. Both shapes stay valid: 200 with a
-  // users array (occupied, or empty-but-present before Task 8 lands), 400 when
-  // the server refuses the query (unoccupied).
-  'S-USERS': async () => {
-    let status;
-    let users = null;
     try {
-      const r = await client().get({ path: '/channels/presence-cf-pres/users' });
-      status = r.status;
+      const p = client();
+      const r = await p.get({
+        path: '/channels',
+        params: { filter_by_prefix: 'cf-', info: 'subscription_count' },
+      });
+      assertOk(r.status === 200, `status ${r.status}`);
+      const listed = (await r.json()).channels || {};
+      const names = Object.keys(listed).join(',') || 'none';
+      const occupied = listed['cf-s-channels'];
+      assertOk(occupied !== undefined, `held channel missing from the index (listed: ${names})`);
+      assertOk(
+        occupied.subscription_count === 1,
+        `held channel subscription_count: ${JSON.stringify(occupied)}`
+      );
+      assertOk(
+        listed['cf-s-channels-never-subscribed'] === undefined,
+        `a never-subscribed channel is listed in the index (listed: ${names})`
+      );
+
+      // user_count is only legal filtered to presence-.
+      const r2 = await p.get({
+        path: '/channels',
+        params: { filter_by_prefix: 'presence-cf-', info: 'user_count' },
+      });
+      assertOk(r2.status === 200, `attrs status ${r2.status}`);
+      const presence = (await r2.json()).channels || {};
+      const roster = presence['presence-cf-s-channels'];
+      assertOk(
+        roster !== undefined,
+        `held presence channel missing from the index (listed: ${Object.keys(presence).join(',') || 'none'})`
+      );
+      assertOk(roster.user_count === 1, `held presence channel user_count: ${JSON.stringify(roster)}`);
+
+      return {
+        status: '200',
+        held_channel_listed: true,
+        held_channel_subscription_count: 1,
+        never_subscribed_channel_listed: false,
+        presence_attrs_status: '200',
+        held_presence_channel_listed: true,
+        held_presence_user_count: 1,
+      };
+    } finally {
+      await held.release();
+    }
+  },
+
+  // occupied must track reality in BOTH directions — true for the channel this
+  // scenario holds, false for a never-subscribed one — and the cache attribute
+  // must read back the event this scenario published (null when nothing was).
+  'S-CHANNEL': async () => {
+    const held = await holdChannels({ channels: ['cf-s-channel'] });
+    try {
+      const p = client();
+      const r = await p.get({
+        path: '/channels/cf-s-channel',
+        params: { info: 'subscription_count' },
+      });
+      assertOk(r.status === 200, `status ${r.status}`);
       const body = await r.json();
-      users = Array.isArray(body && body.users) ? body.users.map(() => '<id>') : null;
-    } catch (e) {
-      status = statusOf(e); // RequestError carries the HTTP status
+      assertOk(body.occupied === true, `held channel not occupied: ${JSON.stringify(body)}`);
+      assertOk(
+        body.subscription_count === 1,
+        `held channel subscription_count: ${JSON.stringify(body)}`
+      );
+
+      const vacantResp = await p.get({ path: '/channels/cf-s-channel-never-subscribed' });
+      assertOk(vacantResp.status === 200, `never-subscribed status ${vacantResp.status}`);
+      const vacant = await vacantResp.json();
+      assertOk(
+        vacant.occupied === false,
+        `never-subscribed channel reports occupied: ${JSON.stringify(vacant)}`
+      );
+
+      const payload = { v: 'cf-s-channel-cached' };
+      const cacheTrigger = await p.trigger('cache-cf-s-channel', 'cached-event', payload);
+      assertOk(cacheTrigger.status === 200, `cache trigger status ${cacheTrigger.status}`);
+      const cacheResp = await p.get({
+        path: '/channels/cache-cf-s-channel',
+        params: { info: 'cache' },
+      });
+      assertOk(cacheResp.status === 200, `cache attr status ${cacheResp.status}`);
+      const cache = (await cacheResp.json()).cache;
+      assertOk(cache !== null && typeof cache === 'object', `cache attr: ${JSON.stringify(cache)}`);
+      assertOk(
+        cache.data === JSON.stringify(payload),
+        `cached data is not the published payload: ${JSON.stringify(cache.data)}`
+      );
+      assertOk(
+        typeof cache.ttl === 'number' && cache.ttl > 0,
+        `cache ttl: ${JSON.stringify(cache.ttl)}`
+      );
+
+      const emptyResp = await p.get({
+        path: '/channels/cache-cf-s-channel-never-published',
+        params: { info: 'cache' },
+      });
+      assertOk(emptyResp.status === 200, `empty cache attr status ${emptyResp.status}`);
+      const empty = (await emptyResp.json()).cache;
+      assertOk(empty === null, `never-published cache attr is not null: ${JSON.stringify(empty)}`);
+
+      return {
+        occupied: true,
+        subscription_count: 1,
+        never_subscribed_occupied: false,
+        cache_attr: '<data+ttl>',
+        never_published_cache_attr: null,
+      };
+    } finally {
+      await held.release();
     }
-    if (status !== 200 && status !== 400) {
-      throw new Error(`users status ${status}`);
+  },
+
+  // The roster must name the member this scenario put there, and an unoccupied
+  // presence channel must answer with an EMPTY roster — not the same roster,
+  // and not an error.
+  'S-USERS': async () => {
+    const held = await holdChannels({
+      user_id: 'u-s-users',
+      channels: ['presence-cf-s-users'],
+    });
+    try {
+      const p = client();
+      const r = await p.get({ path: '/channels/presence-cf-s-users/users' });
+      assertOk(r.status === 200, `status ${r.status}`);
+      const users = (await r.json()).users;
+      assertOk(Array.isArray(users), `users is not an array: ${JSON.stringify(users)}`);
+      const ids = users.map((u) => u && u.id);
+      assertOk(
+        ids.length === 1 && ids[0] === 'u-s-users',
+        `roster does not name the held member: ${JSON.stringify(users)}`
+      );
+
+      const emptyResp = await p.get({
+        path: '/channels/presence-cf-s-users-never-subscribed/users',
+      });
+      assertOk(emptyResp.status === 200, `unoccupied roster status ${emptyResp.status}`);
+      const emptyUsers = (await emptyResp.json()).users;
+      assertOk(
+        Array.isArray(emptyUsers) && emptyUsers.length === 0,
+        `unoccupied presence roster is not empty: ${JSON.stringify(emptyUsers)}`
+      );
+
+      return {
+        status: '200',
+        users: ['u-s-users'],
+        unoccupied_roster: [],
+      };
+    } finally {
+      await held.release();
     }
-    return { status: String(status), users: users === null ? '<opaque>' : users };
   },
 
   // Self-test of the signing mode: private + presence channelData + user auth.

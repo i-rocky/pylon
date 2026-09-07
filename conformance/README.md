@@ -29,6 +29,22 @@ re-implement pylon's bugs and call them conformant. Delegating to the SDKs
 means the harness is blind to implementation details and honest about
 interoperability.
 
+## No scenario reads another scenario's leftovers
+
+Every scenario establishes the state it asserts on. The server-plane query
+scenarios (`S-CHANNELS`, `S-CHANNEL`, `S-USERS`) hold their own client
+connection for the duration — through the official *client*
+SDK, via the pusher-js runner's `--hold` mode (spec on stdin, the channels
+released when that stdin closes, so a dead parent cannot leak a connection) —
+and then assert real values: a named channel present in the index with its
+real `subscription_count`/`user_count`, `occupied` true for the held channel
+and false for a never-subscribed one, the known `user_id` in the presence
+roster, the cached payload read back through the `cache` attribute.
+
+
+Verdicts therefore do not depend on catalog order, and a `--scenario`-scoped
+run of any one of them is as meaningful as a full run.
+
 ## Prerequisites
 
 - **Node ≥ 18** on PATH (the adapters are Node runners; the exact engine
