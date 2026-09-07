@@ -2,9 +2,9 @@
 //!
 //! Holds the command pool (one [`Pool`] of `pool_size` connections) used for all
 //! ordinary commands + PUBLISH, and a dedicated [`SubscriberClient`] for the
-//! pub/sub side. The subscriber's resubscribe task ([`SubscriberClient::manage_subscriptions`])
-//! is kept alive by storing its [`JoinHandle`] — dropping it would stop the
-//! automatic re-subscribe on reconnect.
+//! pub/sub side, plus the task that re-subscribes it after a reconnect. That task's
+//! [`JoinHandle`] is kept alive — dropping it would leave the node deaf to every
+//! cross-node channel after the next reconnect.
 
 use fred::clients::{Pool, SubscriberClient};
 use fred::error::Error as FredError;
@@ -55,7 +55,6 @@ impl RedisClients {
     /// spawns the subscriber's resubscribe-on-reconnect task.
     pub async fn connect(redis_url: &str, pool_size: u32) -> anyhow::Result<RedisClients> {
         let config = Config::from_url(redis_url)?;
-        // `max_attempts = 0` means retry forever; min 100ms, max 30s, base 2.
         let policy = ReconnectPolicy::new_exponential(0, 100, 30_000, 2);
 
         let mut builder = Builder::from_config(config);
@@ -67,14 +66,56 @@ impl RedisClients {
         pool.init().await?;
         sub.init().await?;
 
-        // Keep the resubscribe task handle so it isn't dropped (which would stop it).
-        let sub_manager = sub.manage_subscriptions();
+        let sub_manager = tokio::spawn(resubscribe_on_reconnect(sub.clone()));
 
         Ok(RedisClients {
             pool,
             sub,
             sub_manager,
         })
+    }
+}
+
+/// Re-issue every subscription the client tracks after each reconnect, ONE key at a
+/// time, logging and continuing past a failure.
+///
+/// fred's own [`SubscriberClient::manage_subscriptions`] cannot do this job. Its
+/// `resubscribe_all` opens by replaying the tracked ordinary-channel and pattern sets
+/// verbatim — and under `PYLON_REDIS_SHARDED_PUBSUB` both are empty by construction,
+/// since pylon then subscribes exclusively with `SSUBSCRIBE`. fred still builds and
+/// writes those two commands, so Redis answers a zero-argument `SUBSCRIBE` and
+/// `PSUBSCRIBE` with errors. Neither command is response-tracked (fred resolves them
+/// locally and buffers nothing), while the `SSUBSCRIBE`s that follow are, so a stray
+/// error frame is handed to an in-flight shard resubscribe and the `?` abandons every
+/// remaining hash-slot group. The node comes back subscribed to a fraction of its
+/// keys — no `msg`, no `usermsg`, no `watch` for the rest — while it keeps publishing
+/// normally and its `redis_connected` gauge reads healthy.
+async fn resubscribe_on_reconnect(sub: SubscriberClient) {
+    let mut reconnects = sub.reconnect_rx();
+    loop {
+        // A lagged receiver missed reconnect events, which is all the more reason to
+        // re-assert the subscriptions; only a closed channel ends the task.
+        if let Err(tokio::sync::broadcast::error::RecvError::Closed) = reconnects.recv().await {
+            return;
+        }
+        for channel in sub.tracked_channels() {
+            log_resubscribe(sub.subscribe(channel.clone()).await, &channel);
+        }
+        for pattern in sub.tracked_patterns() {
+            log_resubscribe(sub.psubscribe(pattern.clone()).await, &pattern);
+        }
+        for channel in sub.tracked_shard_channels() {
+            log_resubscribe(sub.ssubscribe(channel.clone()).await, &channel);
+        }
+    }
+}
+
+fn log_resubscribe(result: Result<(), FredError>, channel: &str) {
+    if let Err(e) = result {
+        tracing::warn!(
+            error = %e, channel,
+            "failed to re-subscribe a Redis pub/sub channel after a reconnect"
+        );
     }
 }
 

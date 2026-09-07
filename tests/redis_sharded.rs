@@ -9,7 +9,9 @@
 //! are genuinely SHARDED — visible to `PUBSUB SHARDCHANNELS` on the server and
 //! invisible to `PUBSUB CHANNELS` — while SPUBLISH-driven cross-node delivery
 //! keeps working (broadcast, per-user send, watchlist). With the flag OFF the
-//! ordinary pub/sub path is untouched.
+//! ordinary pub/sub path is untouched. Both modes must also come back WHOLE from a
+//! dropped subscriber connection, which is checked by killing that one connection
+//! (`CLIENT KILL ID`) and reading the server's own subscription index back.
 
 use fred::prelude::*;
 use pylon::adapter::redis::client::RedisClients;
@@ -128,6 +130,21 @@ async fn await_channel(clients: &RedisClients, channel: &str, timeout: Duration)
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if channels_contain(clients, channel).await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Poll the ORDINARY channel index until `channel` disappears (the flag-off twin
+/// of [`await_shardchannel_gone`]).
+async fn await_channel_gone(clients: &RedisClients, channel: &str, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !channels_contain(clients, channel).await {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -419,4 +436,115 @@ async fn flag_off_keeps_ordinary_pubsub() {
     })
     .await
     .expect("flag-off ordinary pubsub test must not hang (Redis up?)");
+}
+
+/// `CLIENT` as a raw command — pylon does not build fred with the `i-client`
+/// feature, so the test reaches `CLIENT ID` / `CLIENT KILL` through `custom`.
+fn client_command() -> fred::types::CustomCommand {
+    fred::types::CustomCommand::new_static("CLIENT", fred::types::ClusterHash::FirstKey, false)
+}
+
+/// Subscribe to six run-unique `msg` keys (each its own hash slot), kill the
+/// subscriber connection, and return once the server has seen it go — leaving the
+/// keys for the caller to check the reconnect restored.
+async fn subscribe_six_then_kill(
+    clients: &RedisClients,
+    probe: &RedisClients,
+    keys: &Keys,
+    sharded: bool,
+) -> Vec<String> {
+    // RESP2 forbids ordinary commands once a connection enters subscriber context,
+    // so read its CLIENT ID before the first subscribe.
+    let sub_id: i64 = clients
+        .sub
+        .custom(client_command(), vec!["ID"])
+        .await
+        .expect("CLIENT ID must work before the connection subscribes");
+
+    let channels: Vec<String> = (0..6)
+        .map(|_| keys.msg(TEST_APP, &format!("reconnect-{}", Uuid::new_v4())))
+        .collect();
+    for channel in &channels {
+        let subscribed = if sharded {
+            clients.sub.ssubscribe(channel.clone()).await
+        } else {
+            clients.sub.subscribe(channel.clone()).await
+        };
+        subscribed.expect("subscribe must succeed");
+        let live = if sharded {
+            await_shardchannel(probe, channel, Duration::from_secs(5)).await
+        } else {
+            await_channel(probe, channel, Duration::from_secs(5)).await
+        };
+        assert!(
+            live,
+            "the subscription must be live before the connection is killed"
+        );
+    }
+
+    let killed: i64 = probe
+        .pool
+        .next()
+        .custom(client_command(), vec!["KILL", "ID", &sub_id.to_string()])
+        .await
+        .expect("CLIENT KILL must succeed");
+    assert_eq!(killed, 1, "CLIENT KILL must close exactly the subscriber");
+    let gone = if sharded {
+        await_shardchannel_gone(probe, &channels[0], Duration::from_secs(5)).await
+    } else {
+        await_channel_gone(probe, &channels[0], Duration::from_secs(5)).await
+    };
+    assert!(gone, "the killed connection must drop its subscriptions");
+    channels
+}
+
+/// Reconnect repair: after the subscriber connection drops, EVERY sharded
+/// subscription this node held must be live again server-side — not just the first
+/// hash-slot group fred's own `resubscribe_all` gets to before the stray error from
+/// its zero-argument `SUBSCRIBE` aborts the rest.
+#[tokio::test]
+async fn sharded_subscriptions_restored_after_subscriber_reconnect() {
+    tokio::time::timeout(Duration::from_secs(40), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let probe = probe_clients().await;
+        let clients = RedisClients::connect(&test_redis_url(), 1)
+            .await
+            .expect("fred clients must connect to the test Redis");
+
+        let channels = subscribe_six_then_kill(&clients, &probe, &keys, true).await;
+        for channel in &channels {
+            assert!(
+                await_shardchannel(&probe, channel, Duration::from_secs(20)).await,
+                "every shard subscription must be restored after the subscriber reconnects; \
+                 {channel} was not"
+            );
+        }
+    })
+    .await
+    .expect("sharded reconnect test must not hang (Redis up?)");
+}
+
+/// The flag-off twin: ordinary subscriptions come back the same way.
+#[tokio::test]
+async fn ordinary_subscriptions_restored_after_subscriber_reconnect() {
+    tokio::time::timeout(Duration::from_secs(40), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let probe = probe_clients().await;
+        let clients = RedisClients::connect(&test_redis_url(), 1)
+            .await
+            .expect("fred clients must connect to the test Redis");
+
+        let channels = subscribe_six_then_kill(&clients, &probe, &keys, false).await;
+        for channel in &channels {
+            assert!(
+                await_channel(&probe, channel, Duration::from_secs(20)).await,
+                "every ordinary subscription must be restored after the subscriber \
+                 reconnects; {channel} was not"
+            );
+        }
+    })
+    .await
+    .expect("ordinary reconnect test must not hang (Redis up?)");
 }

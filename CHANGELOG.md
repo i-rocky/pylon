@@ -134,6 +134,22 @@ pre-1.0 and versions track `Cargo.toml`.
   effect and produces no warning.
 
 ### Fixed
+- **Under `PYLON_REDIS_SHARDED_PUBSUB`, a node no longer comes back from a Redis
+  reconnect subscribed to only a fraction of its channels.** Pylon subscribes
+  exclusively with `SSUBSCRIBE` in that mode, so fred's ordinary-channel and pattern
+  sets are empty by construction — but its `resubscribe_all` replayed them anyway,
+  writing a zero-argument `SUBSCRIBE` and `PSUBSCRIBE` that Redis answers with
+  errors. Neither command is response-tracked while the `SSUBSCRIBE`s that follow
+  are, so a stray error frame was handed to an in-flight shard resubscribe and the
+  batch was abandoned at the first hash-slot group — every later group (one per
+  channel, since pylon's keys are hash-tagged) never re-issued. That node silently
+  stopped delivering cross-node broadcasts, user sends, terminates and watchlist
+  transitions for those channels, while it kept publishing normally, other nodes saw
+  it as healthy, and its own `redis_connected` gauge stayed `true`. The membership
+  reconciler does not cover this: it diffs against fred's tracked sets, which still
+  list every channel after the aborted resubscribe. Pylon now owns the reconnect
+  repair and re-issues each tracked channel, pattern and shard channel one at a
+  time, logging and continuing past a failure instead of abandoning the rest.
 - **The sweeper's user-binding reap can no longer wipe a live binding and report an
   online user as offline.** `reap_user` was a five-round-trip read-modify-write —
   the un-fixed twin of the channel-member reap already made atomic. Its `HLEN` guard
