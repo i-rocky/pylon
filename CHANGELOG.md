@@ -98,6 +98,15 @@ pre-1.0 and versions track `Cargo.toml`.
   sending a non-conforming `socket_id` and relying on the previous `200`**:
   that call now returns `400 "Invalid socket id"` — audit callers before
   upgrading.
+- **A REST request carrying two query keys that differ only by case is now
+  rejected with `401 "Invalid query: two parameters differ only by case"`** —
+  the signing string lowercases every key, so `Info` and `info` collapsed into
+  one entry with the survivor decided by `HashMap` iteration order. The
+  signature was therefore not a function of the request: the same signed URL
+  could verify on one attempt and 401 on the next. No bypass was possible (every
+  field the handlers act on is read by exact case), but a legitimately signed
+  request could fail intermittently. Requests without such a collision — every
+  request an official SDK builds — are byte-for-byte unaffected.
 - **An app `key` containing `:` is now rejected at validation instead of
   silently breaking every websocket auth** — the channel-auth and
   `pusher:signin` tokens are `<key>:<signature>` and both verifiers split at the

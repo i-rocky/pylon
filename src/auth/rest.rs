@@ -19,6 +19,10 @@ pub enum RestAuthError {
     BadBodyMd5,
     #[error("invalid auth_signature")]
     BadSignature,
+    /// Two query keys differ only by case, so the lowercased signing string
+    /// cannot be derived from the request.
+    #[error("query keys differ only by case")]
+    CaseCollidingParams,
 }
 
 /// The GENERIC 401 message for auth failures that must stay
@@ -52,6 +56,9 @@ impl RestAuthError {
             RestAuthError::BadBodyMd5 => "Invalid body_md5".into(),
             RestAuthError::BadSignature => {
                 "Invalid signature: Expected HMAC SHA256 hex digest".into()
+            }
+            RestAuthError::CaseCollidingParams => {
+                "Invalid query: two parameters differ only by case".into()
             }
         }
     }
@@ -111,11 +118,17 @@ pub fn verify(
         }
     }
     let signature = get("auth_signature").ok_or(RestAuthError::MissingParam)?;
-    let signed: BTreeMap<String, String> = params
-        .iter()
-        .map(|(k, v)| (k.to_lowercase(), v.clone()))
-        .filter(|(k, _)| k != "auth_signature")
-        .collect();
+    // The signing string lowercases every key, so two raw keys that differ only
+    // by case would collapse into one entry with the survivor picked by
+    // `HashMap` iteration order — the signature would not be a function of the
+    // request. Reject instead of signing one of two possible strings.
+    let mut signed: BTreeMap<String, String> = BTreeMap::new();
+    for (k, v) in params {
+        if signed.insert(k.to_lowercase(), v.clone()).is_some() {
+            return Err(RestAuthError::CaseCollidingParams);
+        }
+    }
+    signed.remove("auth_signature");
     let expected = hmac_sha256_hex(app_secret, &signing_string(method, path, &signed));
     if constant_time_eq(signature, &expected) {
         Ok(())
@@ -429,6 +442,10 @@ mod tests {
             RestAuthError::BadSignature.message(600),
             "Invalid signature: Expected HMAC SHA256 hex digest"
         );
+        assert_eq!(
+            RestAuthError::CaseCollidingParams.message(600),
+            "Invalid query: two parameters differ only by case"
+        );
     }
 
     /// The timestamp message carries the CONFIGURED window, so a deployment
@@ -443,6 +460,32 @@ mod tests {
 
     /// No two variants may collapse onto one message (that collapse is the bug
     /// this mapping fixes).
+    /// Two raw keys that lowercase to the same string make the signing string
+    /// depend on `HashMap` iteration order, so an otherwise valid request would
+    /// verify or 401 at random. Reject it outright, whichever case came first.
+    #[test]
+    fn rejects_query_keys_that_differ_only_by_case() {
+        for (a, b) in [("info", "Info"), ("Info", "info")] {
+            let mut p = signed_params("secret", "GET", "/apps/1/channels", 1000, b"");
+            p.insert(a.into(), "1".into());
+            p.insert(b.into(), "2".into());
+            assert_eq!(
+                verify(
+                    "app-key",
+                    "secret",
+                    "GET",
+                    "/apps/1/channels",
+                    &p,
+                    b"",
+                    1000,
+                    600
+                ),
+                Err(RestAuthError::CaseCollidingParams),
+                "{a}/{b} must be rejected, not signed nondeterministically"
+            );
+        }
+    }
+
     #[test]
     fn messages_are_pairwise_distinct() {
         let all = [
@@ -452,6 +495,7 @@ mod tests {
             RestAuthError::Expired,
             RestAuthError::BadBodyMd5,
             RestAuthError::BadSignature,
+            RestAuthError::CaseCollidingParams,
         ]
         .map(|e| e.message(600));
         let unique: std::collections::HashSet<&str> = all.iter().map(String::as_str).collect();
