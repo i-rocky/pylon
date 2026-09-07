@@ -209,7 +209,7 @@ async fn next_text(ws: &mut Ws) -> String {
         .expect("recv: timeout")
         .expect("recv: stream ended")
         .expect("recv: frame error");
-    msg.into_text().expect("expected text frame")
+    msg.into_text().expect("expected text frame").to_string()
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────────
@@ -256,7 +256,7 @@ async fn wss_subscribe_and_receive_broadcast() {
 
     // 2. Subscribe to a channel.
     let sub = json!({"event":"pusher:subscribe","data":{"channel":CHANNEL}});
-    ws.send(Message::Text(sub.to_string())).await.unwrap();
+    ws.send(Message::text(sub.to_string())).await.unwrap();
 
     let text = next_text(&mut ws).await;
     let v: Value = serde_json::from_str(&text).unwrap();
@@ -368,7 +368,7 @@ async fn rest_publish_over_native_tls() {
 
     // Subscribe to the test channel.
     let sub = json!({"event":"pusher:subscribe","data":{"channel":CHANNEL}});
-    ws.send(Message::Text(sub.to_string())).await.unwrap();
+    ws.send(Message::text(sub.to_string())).await.unwrap();
 
     let text = next_text(&mut ws).await;
     let v: Value = serde_json::from_str(&text).unwrap();
@@ -589,7 +589,7 @@ async fn rest_large_response_over_native_tls() {
         for j in i..end {
             let ch = format!("{base}-{j:04}"); // 106 chars
             let sub = json!({"event": "pusher:subscribe", "data": {"channel": ch}});
-            ws.send(Message::Text(sub.to_string()))
+            ws.send(Message::text(sub.to_string()))
                 .await
                 .expect("subscribe send");
         }

@@ -265,7 +265,7 @@ pub async fn run_client(
     } else {
         None
     };
-    ws.send(Message::Text(subscribe_frame(
+    ws.send(Message::text(subscribe_frame(
         &cfg.channel,
         auth.as_deref(),
         None,
@@ -284,7 +284,7 @@ pub async fn run_client(
                                 Counters::inc(&counters.subscribed);
                             }
                             "pusher:ping" => {
-                                ws.send(Message::Text(pong_frame())).await.ok();
+                                ws.send(Message::text(pong_frame())).await.ok();
                             }
                             _ => {
                                 if let Some(data) = f.data.as_deref() {

@@ -19,7 +19,7 @@ path = "src/bin/ceiling.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "process"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.30"
 url = "2"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }

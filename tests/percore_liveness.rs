@@ -211,7 +211,7 @@ async fn responsive_connection_stays_alive() {
                     let v: Value = serde_json::from_str(&t).unwrap();
                     if v["event"] == "pusher:ping" {
                         // Answer like a real client → inbound activity → stay alive.
-                        ws.send(Message::Text(
+                        ws.send(Message::text(
                             r#"{"event":"pusher:pong","data":{}}"#.to_string(),
                         ))
                         .await
@@ -239,7 +239,7 @@ async fn responsive_connection_stays_alive() {
 
     // Confirm the socket is still usable: a pusher:ping we send is answered with
     // a pusher:pong, proving the connection is live (not half-closed).
-    ws.send(Message::Text(
+    ws.send(Message::text(
         r#"{"event":"pusher:ping","data":{}}"#.to_string(),
     ))
     .await

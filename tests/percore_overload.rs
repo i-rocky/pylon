@@ -202,7 +202,7 @@ async fn next_json(ws: &mut Ws) -> Value {
 /// Subscribe `ws` to a PUBLIC channel (no auth) and drain its
 /// `subscription_succeeded`.
 async fn subscribe_public(ws: &mut Ws, channel: &str) {
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({
             "event": "pusher:subscribe",
             "data": { "channel": channel }
@@ -909,7 +909,7 @@ async fn backpressured_connection_does_not_spin_and_backlog_survives() {
         let mut slow = connect_plain(h.port).await;
         let est = next_json_raw(&mut slow).await;
         assert_eq!(est["event"], "pusher:connection_established");
-        slow.send(Message::Text(
+        slow.send(Message::text(
             json!({
                 "event": "pusher:subscribe",
                 "data": { "channel": channel }

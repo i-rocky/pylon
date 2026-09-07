@@ -575,7 +575,7 @@ pub async fn try_next_json_short(ws: &mut Ws) -> Option<Value> {
 }
 
 pub async fn send_json(ws: &mut Ws, v: Value) {
-    ws.send(Message::Text(v.to_string())).await.unwrap();
+    ws.send(Message::text(v.to_string())).await.unwrap();
 }
 
 /// `connection_established`'s `data` is a JSON-encoded STRING; extract socket_id.

@@ -233,7 +233,7 @@ async fn occupied_webhook_is_posted_and_signature_validates() {
     assert_eq!(est["event"], "pusher:connection_established");
 
     // Subscribe to a public channel → 0→1 → channel_occupied webhook.
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({ "event": "pusher:subscribe", "data": { "channel": "my-channel" } }).to_string(),
     ))
     .await
@@ -277,7 +277,7 @@ async fn non_2xx_receiver_is_retried() {
     assert_eq!(est["event"], "pusher:connection_established");
 
     // Subscribe → channel_occupied webhook fires against the 404 receiver.
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({ "event": "pusher:subscribe", "data": { "channel": "retry-room" } }).to_string(),
     ))
     .await
@@ -323,7 +323,7 @@ async fn metrics_reflect_a_driven_webhook() {
     assert_eq!(est["event"], "pusher:connection_established");
 
     // Subscribe to a public channel → 0→1 → channel_occupied webhook fires.
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({ "event": "pusher:subscribe", "data": { "channel": "metrics-room" } }).to_string(),
     ))
     .await
@@ -424,7 +424,7 @@ async fn subscription_count_webhook_carries_counts_across_sub_and_unsub() {
     );
 
     for ws in [&mut ws1, &mut ws2] {
-        ws.send(Message::Text(
+        ws.send(Message::text(
             json!({ "event": "pusher:subscribe", "data": { "channel": "count-room" } }).to_string(),
         ))
         .await
@@ -437,7 +437,7 @@ async fn subscription_count_webhook_carries_counts_across_sub_and_unsub() {
         );
     }
     // Unsubscribe ws2 only → the count goes 2 → 1 (ws1 stays subscribed).
-    ws2.send(Message::Text(
+    ws2.send(Message::text(
         json!({ "event": "pusher:unsubscribe", "data": { "channel": "count-room" } }).to_string(),
     ))
     .await
@@ -540,7 +540,7 @@ async fn subscription_count_webhook_absent_without_event_type() {
     );
 
     for ws in [&mut ws1, &mut ws2] {
-        ws.send(Message::Text(
+        ws.send(Message::text(
             json!({ "event": "pusher:subscribe", "data": { "channel": "neg-room" } }).to_string(),
         ))
         .await
@@ -552,7 +552,7 @@ async fn subscription_count_webhook_absent_without_event_type() {
             "pusher_internal:subscription_succeeded"
         );
     }
-    ws2.send(Message::Text(
+    ws2.send(Message::text(
         json!({ "event": "pusher:unsubscribe", "data": { "channel": "neg-room" } }).to_string(),
     ))
     .await
@@ -612,7 +612,7 @@ async fn subscription_count_webhook_absent_without_feature_toggle() {
     );
 
     for ws in [&mut ws1, &mut ws2] {
-        ws.send(Message::Text(
+        ws.send(Message::text(
             json!({ "event": "pusher:subscribe", "data": { "channel": "neg2-room" } }).to_string(),
         ))
         .await
@@ -624,7 +624,7 @@ async fn subscription_count_webhook_absent_without_feature_toggle() {
             "pusher_internal:subscription_succeeded"
         );
     }
-    ws2.send(Message::Text(
+    ws2.send(Message::text(
         json!({ "event": "pusher:unsubscribe", "data": { "channel": "neg2-room" } }).to_string(),
     ))
     .await
@@ -802,7 +802,7 @@ async fn subscribe_presence(ws: &mut Ws, socket_id: &str, channel: &str, user_id
         "app-key:{}",
         channel_signature(SECRET, socket_id, channel, Some(&channel_data))
     );
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({"event":"pusher:subscribe","data":{
             "channel": channel, "auth": token, "channel_data": channel_data
         }})
@@ -816,7 +816,7 @@ async fn subscribe_presence(ws: &mut Ws, socket_id: &str, channel: &str, user_id
 
 /// Unsubscribe `ws` from `channel` (fire-and-forget: no server ack frame).
 async fn unsubscribe(ws: &mut Ws, channel: &str) {
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({ "event": "pusher:unsubscribe", "data": { "channel": channel } }).to_string(),
     ))
     .await

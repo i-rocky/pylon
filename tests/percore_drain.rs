@@ -244,7 +244,7 @@ async fn wait_established(ws: &mut Ws) -> String {
 
 /// Send a subscribe command and drain until we see the `pusher_internal:subscription_succeeded`.
 async fn subscribe(ws: &mut Ws, channel: &str) {
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({"event": "pusher:subscribe", "data": {"channel": channel}}).to_string(),
     ))
     .await

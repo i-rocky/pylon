@@ -170,7 +170,7 @@ async fn next_json(ws: &mut Ws) -> Value {
 }
 
 async fn send_json(ws: &mut Ws, v: Value) {
-    ws.send(Message::Text(v.to_string())).await.unwrap();
+    ws.send(Message::text(v.to_string())).await.unwrap();
 }
 
 /// Read the `connection_established` frame and return this connection's socket_id.

@@ -168,7 +168,7 @@ async fn metrics_per_app_gauges_reflect_subscription() {
     let _ = next_json(&mut ws).await; // connection_established
 
     // Subscribe to a channel.
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({"event":"pusher:subscribe","data":{"channel":"public-metrics-room"}}).to_string(),
     ))
     .await

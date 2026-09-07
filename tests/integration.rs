@@ -428,9 +428,7 @@ async fn malformed_frame_silently_dropped_connection_stays_alive() {
     let _ = established_socket_id(&mut ws).await; // consume connection_established
 
     // Send a garbage text frame that cannot be decoded as a valid Pusher command.
-    ws.send(Message::Text("not json at all".into()))
-        .await
-        .unwrap();
+    ws.send(Message::text("not json at all")).await.unwrap();
 
     // Give the server a brief window to (incorrectly) emit a pusher:error frame.
     // If it does, we catch it here and fail the test.
@@ -618,7 +616,7 @@ async fn ping_between_fragments_is_answered_before_message_completes() {
         ),
     )
     .await;
-    ws.send(Message::Ping(b"mid-fragment".to_vec()))
+    ws.send(Message::Ping(b"mid-fragment".as_slice().into()))
         .await
         .unwrap();
     send_raw_frame(
@@ -638,7 +636,7 @@ async fn ping_between_fragments_is_answered_before_message_completes() {
         .expect("a frame within 5s")
         .expect("stream open");
     match first {
-        Ok(Message::Pong(p)) => assert_eq!(p.as_slice(), b"mid-fragment"),
+        Ok(Message::Pong(p)) => assert_eq!(&p[..], b"mid-fragment".as_slice()),
         other => panic!("expected Pong before the message completes, got {other:?}"),
     }
     let frame = next_event_named(&mut ws, "pusher_internal:subscription_succeeded").await;
@@ -725,7 +723,7 @@ async fn oversize_first_fragment_is_dropped_and_connection_stays_usable() {
     // The message is still open as far as the peer is concerned, and the
     // connection answers control frames (RFC 6455 §5.5.2) — proof it was not
     // closed and the drop was silent.
-    ws.send(Message::Ping(b"unfinished".to_vec()))
+    ws.send(Message::Ping(b"unfinished".as_slice().into()))
         .await
         .unwrap();
     let first = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
@@ -733,7 +731,7 @@ async fn oversize_first_fragment_is_dropped_and_connection_stays_usable() {
         .expect("a frame within 5s")
         .expect("stream open");
     match first {
-        Ok(Message::Pong(p)) => assert_eq!(p.as_slice(), b"unfinished"),
+        Ok(Message::Pong(p)) => assert_eq!(&p[..], b"unfinished".as_slice()),
         other => panic!("expected a Pong on the still-open connection, got {other:?}"),
     }
 

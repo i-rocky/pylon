@@ -218,7 +218,7 @@ async fn sharded_broadcast_reaches_all_workers_and_excludes_sender() {
     for _ in 0..N_SUBS {
         let mut ws = connect(h.port).await;
         let sid = established_socket_id(&mut ws).await;
-        ws.send(Message::Text(
+        ws.send(Message::text(
             json!({
                 "event": "pusher:subscribe",
                 "data": { "channel": channel, "auth": auth_token(&sid, channel) }
@@ -257,7 +257,7 @@ async fn sharded_broadcast_reaches_all_workers_and_excludes_sender() {
         assert_eq!(frame["data"], "{\"hi\":1}", "subscriber {i} wrong data");
         // Exactly once: no second copy should be queued. A ping round-trip proves
         // the next frame is the pong, not a duplicate delivery.
-        ws.send(Message::Text(
+        ws.send(Message::text(
             json!({"event":"pusher:ping","data":{}}).to_string(),
         ))
         .await
@@ -273,7 +273,7 @@ async fn sharded_broadcast_reaches_all_workers_and_excludes_sender() {
     // subs[0] emits; subs[1..] must receive; subs[0] must NOT (its next frame is
     // a pong, proving no self-echo).
     subs[0]
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "event": "client-foo",
                 "channel": channel,
@@ -296,7 +296,7 @@ async fn sharded_broadcast_reaches_all_workers_and_excludes_sender() {
 
     // The sender gets a pong, never its own client-foo echo.
     subs[0]
-        .send(Message::Text(
+        .send(Message::text(
             json!({"event":"pusher:ping","data":{}}).to_string(),
         ))
         .await

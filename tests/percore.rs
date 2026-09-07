@@ -198,7 +198,7 @@ async fn next_event_named(ws: &mut Ws, event: &str) -> Value {
 }
 
 async fn send_json(ws: &mut Ws, v: Value) {
-    ws.send(Message::Text(v.to_string())).await.unwrap();
+    ws.send(Message::text(v.to_string())).await.unwrap();
 }
 
 async fn established_socket_id(ws: &mut Ws) -> String {
@@ -770,7 +770,7 @@ async fn max_conn_lifetime_closes_4202_even_when_active() {
         for _ in 0..25 {
             // 25 × 200ms = 5s of activity; breaks early once the server closes.
             if sink
-                .send(Message::Text(
+                .send(Message::text(
                     r#"{"event":"pusher:ping","data":{}}"#.to_string(),
                 ))
                 .await
