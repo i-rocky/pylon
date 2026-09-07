@@ -561,6 +561,11 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     // every connection begins with a 0 out-queue, so the counter is exact from the
     // first iteration without an initial O(N) sum.
     let mut inflight_bytes: u64 = 0;
+    // Same incremental mechanism as `inflight_bytes`, scoped to queued
+    // out-frames + unflushed TLS plaintext only. The shutdown drain reads
+    // this instead — inbound buffers in `inflight_bytes` never reach zero
+    // once a peer stops sending.
+    let mut outbound_bytes: u64 = 0;
     // B1: worker-local accumulator for CoDel drops; mirrored into `codel_dropped_slot`.
     let mut codel_dropped_total: u64 = 0;
     // G8: worker-local accumulator for drop-head evictions; mirrored into
@@ -681,6 +686,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         &mut local_subs,
                         &mut wheel,
                         &mut inflight_bytes,
+                        &mut outbound_bytes,
                         &mut codel_dropped_total,
                         &mut drophead_dropped_total,
                         &conn_counts,
@@ -695,10 +701,14 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                     "percore worker draining"
                 );
             }
-            // Decide whether the drain is complete: all bytes flushed, deadline
-            // expired, or grace_ms == 0 (immediate mode).
+            // Decide whether the drain is complete: every connection has
+            // nothing left to send, the deadline expired, or grace_ms == 0
+            // (immediate mode). Deliberately reads `outbound_bytes`, not
+            // `inflight_bytes` — a connection mid-frame or mid-message pins the
+            // latter above zero forever once the peer stops sending, which
+            // would otherwise burn the whole grace window every time.
             let expired = drain_deadline.is_none_or(|d| Instant::now() >= d);
-            if inflight_bytes == 0 || expired {
+            if outbound_bytes == 0 || expired {
                 // 3. Final cleanup: run on_close hooks, decrement conn_counts,
                 //    deindex channels, deregister sockets — so per-app counters and
                 //    presence/channel state return to 0.
@@ -711,6 +721,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         &mut local_subs,
                         &mut wheel,
                         &mut inflight_bytes,
+                        &mut outbound_bytes,
                         &conn_counts,
                         &app_registry,
                         &node_conns,
@@ -739,6 +750,14 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 .map(|(_, e)| e.conn.accounted_bytes() as u64)
                 .sum::<u64>(),
             "incremental inflight_bytes drifted from the true accounted_bytes sum",
+        );
+        debug_assert_eq!(
+            outbound_bytes,
+            conns
+                .iter()
+                .map(|(_, e)| e.conn.outbound_bytes() as u64)
+                .sum::<u64>(),
+            "incremental outbound_bytes drifted from the true outbound_bytes sum",
         );
 
         // G1 invariant: queued out-bytes MUST come with WRITABLE interest, or
@@ -876,6 +895,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             &mut local_subs,
                             &mut wheel,
                             &mut inflight_bytes,
+                            &mut outbound_bytes,
                             &conn_counts,
                             &app_registry,
                             &node_conns,
@@ -920,6 +940,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                     &mut local_subs,
                                     &mut wheel,
                                     &mut inflight_bytes,
+                                    &mut outbound_bytes,
                                     &conn_counts,
                                     &app_registry,
                                     &node_conns,
@@ -940,6 +961,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                     &cfg,
                                     prefix,
                                     &mut inflight_bytes,
+                                    &mut outbound_bytes,
                                 );
                                 continue;
                             }
@@ -948,7 +970,12 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                 // replies (handshake 101 / established / dispatched
                                 // frames / pong) and flushed; fold this connection's
                                 // net delta into the running total.
-                                fold_delta(&mut conns, key, &mut inflight_bytes);
+                                fold_delta(
+                                    &mut conns,
+                                    key,
+                                    &mut inflight_bytes,
+                                    &mut outbound_bytes,
+                                );
                                 fold_codel(&mut conns, key, &mut codel_dropped_total);
                                 fold_drophead(&mut conns, key, &mut drophead_dropped_total);
                                 // A subscribe/unsubscribe in this readable batch
@@ -980,7 +1007,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         // INCREMENTAL INFLIGHT: the flush sent bytes out; fold the
                         // (negative) delta before any close/handoff so the count
                         // is exact.
-                        fold_delta(&mut conns, key, &mut inflight_bytes);
+                        fold_delta(&mut conns, key, &mut inflight_bytes, &mut outbound_bytes);
                         fold_codel(&mut conns, key, &mut codel_dropped_total);
                         fold_drophead(&mut conns, key, &mut drophead_dropped_total);
                         match action {
@@ -992,6 +1019,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                     &mut local_subs,
                                     &mut wheel,
                                     &mut inflight_bytes,
+                                    &mut outbound_bytes,
                                     &conn_counts,
                                     &app_registry,
                                     &node_conns,
@@ -1011,6 +1039,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                     &cfg,
                                     prefix,
                                     &mut inflight_bytes,
+                                    &mut outbound_bytes,
                                 );
                             }
                             Action::Keep => {
@@ -1045,6 +1074,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 &mut wheel,
                 effective_budget,
                 &mut inflight_bytes,
+                &mut outbound_bytes,
                 &mut codel_dropped_total,
                 &mut drophead_dropped_total,
                 Some(&wiring.slot.budget_saturated),
@@ -1094,6 +1124,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 &mut local_subs,
                 &mut wheel,
                 &mut inflight_bytes,
+                &mut outbound_bytes,
                 &mut codel_dropped_total,
                 &mut drophead_dropped_total,
                 now_ns,
@@ -1120,6 +1151,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                     &mut local_subs,
                     &mut wheel,
                     &mut inflight_bytes,
+                    &mut outbound_bytes,
                     &mut codel_dropped_total,
                     &mut drophead_dropped_total,
                     now_ns,
@@ -1150,7 +1182,12 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                 // INCREMENTAL INFLIGHT: the ping was queued +
                                 // flushed; fold this connection's net delta
                                 // into the total.
-                                fold_delta(&mut conns, key, &mut inflight_bytes);
+                                fold_delta(
+                                    &mut conns,
+                                    key,
+                                    &mut inflight_bytes,
+                                    &mut outbound_bytes,
+                                );
                                 if action == Action::Close {
                                     // The ping flush failed (dead peer or a
                                     // failed re-registration): reap the
@@ -1167,6 +1204,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                         &mut local_subs,
                                         &mut wheel,
                                         &mut inflight_bytes,
+                                        &mut outbound_bytes,
                                         &conn_counts,
                                         &app_registry,
                                         &node_conns,
@@ -1193,7 +1231,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                     }
                     Due::Close4201(key) => {
                         send_close_4201(&poll, &mut conns, key, now_ns);
-                        fold_delta(&mut conns, key, &mut inflight_bytes);
+                        fold_delta(&mut conns, key, &mut inflight_bytes, &mut outbound_bytes);
                         fold_codel(&mut conns, key, &mut codel_dropped_total);
                         fold_drophead(&mut conns, key, &mut drophead_dropped_total);
                         remove(
@@ -1203,6 +1241,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             &mut local_subs,
                             &mut wheel,
                             &mut inflight_bytes,
+                            &mut outbound_bytes,
                             &conn_counts,
                             &app_registry,
                             &node_conns,
@@ -1216,7 +1255,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         // the drain path's belt-and-suspenders convention.
                         queue_lifetime_error(&mut conns, key, now_ns);
                         send_close_4202(&poll, &mut conns, key, now_ns);
-                        fold_delta(&mut conns, key, &mut inflight_bytes);
+                        fold_delta(&mut conns, key, &mut inflight_bytes, &mut outbound_bytes);
                         fold_codel(&mut conns, key, &mut codel_dropped_total);
                         fold_drophead(&mut conns, key, &mut drophead_dropped_total);
                         remove(
@@ -1226,6 +1265,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             &mut local_subs,
                             &mut wheel,
                             &mut inflight_bytes,
+                            &mut outbound_bytes,
                             &conn_counts,
                             &app_registry,
                             &node_conns,
@@ -1256,6 +1296,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                                 &mut local_subs,
                                 &mut wheel,
                                 &mut inflight_bytes,
+                                &mut outbound_bytes,
                                 &conn_counts,
                                 &app_registry,
                                 &node_conns,
@@ -1470,14 +1511,14 @@ fn queue_shutdown_error(conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) 
 /// C2a drain, one connection: queue the `pusher:error` 4200 + WS Close(4200),
 /// flush them, and fold this connection's counters into the worker totals. The
 /// Close frame often will not flush synchronously (a backpressured client), so
-/// the folded bytes are what makes the drain's `inflight_bytes == 0` exit wait
+/// the folded bytes are what makes the drain's `outbound_bytes == 0` exit wait
 /// for them.
 ///
 /// A peer that is already write-dead — very common on a rolling restart, where
 /// the LB drains clients while the node is stopping — can never receive those
 /// frames: the flush reports [`Action::Close`] and arms no WRITABLE interest.
 /// Such a connection is removed here rather than left holding queued bytes that
-/// nothing will ever send, which would pin `inflight_bytes` above zero for the
+/// nothing will ever send, which would pin `outbound_bytes` above zero for the
 /// whole grace window (and trip the loop-top interest invariant in debug builds).
 #[allow(clippy::too_many_arguments)]
 fn drain_close_connection(
@@ -1488,6 +1529,7 @@ fn drain_close_connection(
     local_subs: &mut LocalSubs,
     wheel: &mut TimerWheel,
     inflight_bytes: &mut u64,
+    outbound_bytes: &mut u64,
     codel_total: &mut u64,
     drophead_total: &mut u64,
     conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
@@ -1497,7 +1539,7 @@ fn drain_close_connection(
 ) {
     queue_shutdown_error(conns, key, now_ns);
     let action = send_close_4200(poll, conns, key, now_ns);
-    fold_delta(conns, key, inflight_bytes);
+    fold_delta(conns, key, inflight_bytes, outbound_bytes);
     fold_codel(conns, key, codel_total);
     fold_drophead(conns, key, drophead_total);
     if action == Action::Close {
@@ -1508,6 +1550,7 @@ fn drain_close_connection(
             local_subs,
             wheel,
             inflight_bytes,
+            outbound_bytes,
             conn_counts,
             app_registry,
             node_conns,
@@ -2504,6 +2547,7 @@ fn drain_dirty_sessions(
     local_subs: &mut LocalSubs,
     wheel: &mut TimerWheel,
     inflight_bytes: &mut u64,
+    outbound_bytes: &mut u64,
     codel_total: &mut u64,
     drophead_total: &mut u64,
     now_ns: u64,
@@ -2541,7 +2585,7 @@ fn drain_dirty_sessions(
         // fold this connection's net delta (queued minus sent/dropped) into the
         // running total whether or not it closes (a closing conn's REMAINING
         // queued bytes are then subtracted by `remove`).
-        fold_delta(conns, key, inflight_bytes);
+        fold_delta(conns, key, inflight_bytes, outbound_bytes);
         fold_codel(conns, key, codel_total);
         fold_drophead(conns, key, drophead_total);
         if result.action == Action::Close {
@@ -2552,6 +2596,7 @@ fn drain_dirty_sessions(
                 local_subs,
                 wheel,
                 inflight_bytes,
+                outbound_bytes,
                 conn_counts,
                 app_registry,
                 node_conns,
@@ -2603,6 +2648,7 @@ fn drain_resolved(
     local_subs: &mut LocalSubs,
     wheel: &mut TimerWheel,
     inflight_bytes: &mut u64,
+    outbound_bytes: &mut u64,
     codel_total: &mut u64,
     drophead_total: &mut u64,
     now_ns: u64,
@@ -2677,7 +2723,7 @@ fn drain_resolved(
                     flush_and_arm(poll, entry, now_ns)
                 };
                 // INCREMENTAL INFLIGHT: the established frame was queued + flushed.
-                fold_delta(conns, token, inflight_bytes);
+                fold_delta(conns, token, inflight_bytes, outbound_bytes);
                 fold_codel(conns, token, codel_total);
                 fold_drophead(conns, token, drophead_total);
                 wrote_any = true;
@@ -2689,6 +2735,7 @@ fn drain_resolved(
                         local_subs,
                         wheel,
                         inflight_bytes,
+                        outbound_bytes,
                         conn_counts,
                         app_registry,
                         node_conns,
@@ -2722,7 +2769,7 @@ fn drain_resolved(
                 }
                 // INCREMENTAL INFLIGHT: fold the reject frames before `remove`
                 // subtracts the connection's still-queued bytes.
-                fold_delta(conns, token, inflight_bytes);
+                fold_delta(conns, token, inflight_bytes, outbound_bytes);
                 fold_codel(conns, token, codel_total);
                 fold_drophead(conns, token, drophead_total);
                 wrote_any = true;
@@ -2733,6 +2780,7 @@ fn drain_resolved(
                     local_subs,
                     wheel,
                     inflight_bytes,
+                    outbound_bytes,
                     conn_counts,
                     app_registry,
                     node_conns,
@@ -2873,10 +2921,10 @@ fn arm_handshake_interest(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action
 /// on-close hook or counter to unwind.
 ///
 /// Like [`remove`], this subtracts whatever the connection still holds from the
-/// worker total. The shutdown drain queues its 4200 frames onto `Handshaking`
+/// worker totals. The shutdown drain queues its 4200 frames onto `Handshaking`
 /// entries too, so a REST head arriving mid-drain reaches here with a non-empty
 /// queue — and bytes not subtracted are a permanent phantom floor under
-/// `inflight_bytes` for the life of the worker.
+/// `inflight_bytes`/`outbound_bytes` for the life of the worker.
 fn handoff_rest(
     poll: &Poll,
     conns: &mut slab::Slab<Entry>,
@@ -2884,6 +2932,7 @@ fn handoff_rest(
     cfg: &WorkerConfig,
     prefix: Vec<u8>,
     inflight_bytes: &mut u64,
+    outbound_bytes: &mut u64,
 ) {
     let Some(mut entry) = conns.try_remove(key) else {
         return;
@@ -2891,6 +2940,9 @@ fn handoff_rest(
     *inflight_bytes = inflight_bytes
         .wrapping_add(entry.conn.take_inflight_delta() as u64)
         .wrapping_sub(entry.conn.accounted_bytes() as u64);
+    *outbound_bytes = outbound_bytes
+        .wrapping_add(entry.conn.take_outbound_delta() as u64)
+        .wrapping_sub(entry.conn.outbound_bytes() as u64);
     let _ = poll.registry().deregister(entry.conn.stream_mut());
 
     let Some(tx) = cfg.rest_handoff.as_ref() else {
@@ -2920,15 +2972,25 @@ fn handoff_rest(
     }
 }
 
-/// Fold connection `key`'s accumulated accounting delta into the worker's
-/// running `inflight_bytes`, bringing the counter back in step after a touch.
-/// `wrapping_add` because the delta is signed: a net send or drop folds a
-/// negative one. O(1) — this is what replaces a per-iteration re-sum.
-fn fold_delta(conns: &mut slab::Slab<Entry>, key: usize, inflight_bytes: &mut u64) {
+/// Fold connection `key`'s accumulated accounting deltas into the worker's
+/// running `inflight_bytes` and `outbound_bytes`, bringing both counters back
+/// in step after a touch. `wrapping_add` because the deltas are signed: a net
+/// send or drop folds a negative one. O(1) — this is what replaces a
+/// per-iteration re-sum.
+fn fold_delta(
+    conns: &mut slab::Slab<Entry>,
+    key: usize,
+    inflight_bytes: &mut u64,
+    outbound_bytes: &mut u64,
+) {
     if let Some(entry) = conns.get_mut(key) {
         let delta = entry.conn.take_inflight_delta();
         if delta != 0 {
             *inflight_bytes = inflight_bytes.wrapping_add(delta as u64);
+        }
+        let out_delta = entry.conn.take_outbound_delta();
+        if out_delta != 0 {
+            *outbound_bytes = outbound_bytes.wrapping_add(out_delta as u64);
         }
     }
 }
@@ -2973,6 +3035,7 @@ fn remove(
     local_subs: &mut LocalSubs,
     wheel: &mut TimerWheel,
     inflight_bytes: &mut u64,
+    outbound_bytes: &mut u64,
     conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
     app_registry: &Arc<AppRegistry>,
     node_conns: &Arc<AtomicUsize>,
@@ -2984,11 +3047,14 @@ fn remove(
     wheel.remove(key);
     if let Some(mut entry) = conns.try_remove(key) {
         // Bring this connection's contribution up to date, then subtract it:
-        // after the fold that contribution is exactly `accounted_bytes`, so the
-        // pair zeroes it and the worker total cannot leak upward.
+        // after the fold each contribution is exactly its own accounted total,
+        // so the pair zeroes it and neither worker total can leak upward.
         *inflight_bytes = inflight_bytes
             .wrapping_add(entry.conn.take_inflight_delta() as u64)
             .wrapping_sub(entry.conn.accounted_bytes() as u64);
+        *outbound_bytes = outbound_bytes
+            .wrapping_add(entry.conn.take_outbound_delta() as u64)
+            .wrapping_sub(entry.conn.outbound_bytes() as u64);
         entry.conn.send_close_notify();
         if let Some(mut session) = entry.session.take() {
             deindex_connection(&session, local_subs);
@@ -3245,6 +3311,7 @@ pub fn drain_broadcast_inbox<C: ConnIndex>(
     conns: &mut C,
     effective_budget: u64,
     inflight_bytes: &mut u64,
+    outbound_bytes: &mut u64,
     drophead_total: &mut u64,
     budget_saturated: Option<&AtomicBool>,
     now_ns: u64,
@@ -3334,6 +3401,7 @@ pub fn drain_broadcast_inbox<C: ConnIndex>(
             // (taken below) composes correctly without double-counting.
             let _dropped = conn.queue(frame.clone(), now_ns);
             *inflight_bytes = inflight_bytes.wrapping_add(conn.take_inflight_delta() as u64);
+            *outbound_bytes = outbound_bytes.wrapping_add(conn.take_outbound_delta() as u64);
             // G8: the enqueue may have evicted older frames (drop-head) — fold
             // the per-connection accumulator into the worker total NOW rather
             // than deferring to the post-drain flush fold, so the counter is
@@ -3371,6 +3439,7 @@ fn drain_broadcasts(
     wheel: &mut TimerWheel,
     effective_budget: u64,
     inflight_bytes: &mut u64,
+    outbound_bytes: &mut u64,
     codel_total: &mut u64,
     drophead_total: &mut u64,
     budget_saturated: Option<&AtomicBool>,
@@ -3393,6 +3462,7 @@ fn drain_broadcasts(
         conns,
         effective_budget,
         inflight_bytes,
+        outbound_bytes,
         drophead_total,
         budget_saturated,
         now_ns,
@@ -3412,6 +3482,7 @@ fn drain_broadcasts(
             // INCREMENTAL INFLIGHT: the flush sent bytes out (negative delta); fold
             // it into the running total so it reflects the post-send queue depth.
             *inflight_bytes = inflight_bytes.wrapping_add(entry.conn.take_inflight_delta() as u64);
+            *outbound_bytes = outbound_bytes.wrapping_add(entry.conn.take_outbound_delta() as u64);
             // B1: fold any CoDel drops that happened during this flush.
             let cd = entry.conn.take_codel_dropped();
             if cd > 0 {
@@ -3438,6 +3509,7 @@ fn drain_broadcasts(
             local_subs,
             wheel,
             inflight_bytes,
+            outbound_bytes,
             conn_counts,
             app_registry,
             node_conns,
@@ -3994,6 +4066,7 @@ mod tests {
 
         let mut touched: HashSet<usize> = HashSet::new();
         let mut inflight: u64 = 0;
+        let mut outbound: u64 = 0;
         let mut drophead: u64 = 0;
         drain_broadcast_inbox(
             &rx,
@@ -4001,6 +4074,7 @@ mod tests {
             &mut conns,
             64 << 20, // Normal band: every subscriber delivered
             &mut inflight,
+            &mut outbound,
             &mut drophead,
             None,
             1,
@@ -4108,6 +4182,7 @@ mod tests {
         /// post-drain flag maintenance the real loop runs.
         fn loop_pass(&mut self, flag: &SaturationFlag, budget: u64) {
             let mut touched: HashSet<usize> = HashSet::new();
+            let mut outbound: u64 = 0;
             let mut drophead: u64 = 0;
             drain_broadcast_inbox(
                 &self.rx,
@@ -4115,6 +4190,7 @@ mod tests {
                 &mut self.conns,
                 budget,
                 &mut self.inflight,
+                &mut outbound,
                 &mut drophead,
                 Some(&self.slot.budget_saturated),
                 1,
@@ -4405,6 +4481,7 @@ mod tests {
     /// The worker-total bundle every teardown path has to keep in step.
     struct Totals {
         inflight: u64,
+        outbound: u64,
         codel: u64,
         drophead: u64,
         local_subs: LocalSubs,
@@ -4418,6 +4495,7 @@ mod tests {
         fn new() -> Self {
             Totals {
                 inflight: 0,
+                outbound: 0,
                 codel: 0,
                 drophead: 0,
                 local_subs: HashMap::new(),
@@ -4503,6 +4581,7 @@ mod tests {
             &mut t.local_subs,
             &mut t.wheel,
             &mut t.inflight,
+            &mut t.outbound,
             &mut t.codel,
             &mut t.drophead,
             &t.conn_counts,
@@ -4518,6 +4597,10 @@ mod tests {
         assert_eq!(
             t.inflight, 0,
             "its queued 4200 frames leave the worker total with it"
+        );
+        assert_eq!(
+            t.outbound, 0,
+            "its queued 4200 frames leave the outbound total with it too"
         );
     }
 
@@ -4543,10 +4626,11 @@ mod tests {
 
         // The drain's shape: frames queued on a connection that has not flushed.
         queue_shutdown_error(&mut conns, key, 0);
-        fold_delta(&mut conns, key, &mut t.inflight);
+        fold_delta(&mut conns, key, &mut t.inflight, &mut t.outbound);
         let queued = conns[key].conn.out_bytes() as u64;
         assert!(queued > 0, "the drain really queued something");
         assert_eq!(t.inflight, queued);
+        assert_eq!(t.outbound, queued);
 
         handoff_rest(
             &poll,
@@ -4555,10 +4639,12 @@ mod tests {
             &echo_worker_config(addr),
             Vec::new(),
             &mut t.inflight,
+            &mut t.outbound,
         );
 
         assert!(conns.is_empty(), "the entry left the slab");
         assert_eq!(t.inflight, 0, "and its bytes left the worker total with it");
+        assert_eq!(t.outbound, 0, "and the outbound total with it too");
     }
 
     // ---- #74: a partially-received frame is billed to the connection --------
@@ -4588,18 +4674,20 @@ mod tests {
     }
 
     /// Drive the production read path until `done` holds, folding the worker's
-    /// `inflight_bytes` after every pass exactly as the event loop does.
+    /// `inflight_bytes`/`outbound_bytes` after every pass exactly as the event
+    /// loop does.
     fn read_until(
         poll: &Poll,
         conns: &mut slab::Slab<Entry>,
         key: usize,
         cfg: &WorkerConfig,
         inflight: &mut u64,
+        outbound: &mut u64,
         done: impl Fn(&Entry) -> bool,
     ) {
         for _ in 0..1000 {
             assert_eq!(handle_frames(poll, &mut conns[key], cfg, 0), Action::Keep);
-            fold_delta(conns, key, inflight);
+            fold_delta(conns, key, inflight, outbound);
             if done(&conns[key]) {
                 return;
             }
@@ -4628,10 +4716,17 @@ mod tests {
         client.flush().unwrap();
 
         let mut inflight = 0u64;
+        let mut outbound = 0u64;
         let want = partial.len();
-        read_until(&poll, &mut conns, key, &cfg, &mut inflight, |e| {
-            e.inbuf.len() >= want
-        });
+        read_until(
+            &poll,
+            &mut conns,
+            key,
+            &cfg,
+            &mut inflight,
+            &mut outbound,
+            |e| e.inbuf.len() >= want,
+        );
 
         let conn = &conns[key].conn;
         assert_eq!(
@@ -4642,6 +4737,10 @@ mod tests {
         assert_eq!(conn.frame_buffer_bytes(), want);
         assert_eq!(conn.accounted_bytes(), want);
         assert_eq!(inflight, want as u64, "and the worker total carries them");
+        assert_eq!(
+            outbound, 0,
+            "a partial inbound frame owes nothing outbound, so the drain must not wait on it"
+        );
     }
 
     /// The billing follows the buffer back down: completing the frame hands its
@@ -4662,17 +4761,34 @@ mod tests {
         client.flush().unwrap();
 
         let mut inflight = 0u64;
+        let mut outbound = 0u64;
         let buffered = head.len();
-        read_until(&poll, &mut conns, key, &cfg, &mut inflight, |e| {
-            e.inbuf.len() >= buffered
-        });
+        read_until(
+            &poll,
+            &mut conns,
+            key,
+            &cfg,
+            &mut inflight,
+            &mut outbound,
+            |e| e.inbuf.len() >= buffered,
+        );
         assert_eq!(inflight, buffered as u64);
+        assert_eq!(
+            outbound, 0,
+            "still just a buffered partial frame, nothing to send"
+        );
 
         client.write_all(&payload[256..]).unwrap();
         client.flush().unwrap();
-        read_until(&poll, &mut conns, key, &cfg, &mut inflight, |e| {
-            e.inbuf.is_empty()
-        });
+        read_until(
+            &poll,
+            &mut conns,
+            key,
+            &cfg,
+            &mut inflight,
+            &mut outbound,
+            |e| e.inbuf.is_empty(),
+        );
 
         let conn = &conns[key].conn;
         assert_eq!(conn.frame_buffer_bytes(), 0);
@@ -4680,6 +4796,11 @@ mod tests {
             inflight,
             conn.out_bytes() as u64,
             "only the echoed reply is still owed"
+        );
+        assert_eq!(
+            outbound,
+            conn.out_bytes() as u64,
+            "the echoed reply is outbound too, once the frame completed"
         );
     }
 }
