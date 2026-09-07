@@ -37,15 +37,15 @@ slab = "0.4"
 # tokio runtime (SP9 REST handoff): auto HTTP/1+2 server + tower→hyper glue.
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "service", "http1", "http2"] }
 # RFC 6455 Sec-WebSocket-Accept = base64(sha1(key + GUID)).
-sha1 = "0.10"
+sha1 = "0.11"
 base64 = "0.23.1"
 # JSON
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Pusher signature primitives
-hmac = "0.12"
-sha2 = "0.10"
-md-5 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
+md-5 = "0.11"
 hex = "0.4"
 subtle = "2.6"          # constant-time comparison
 # Misc
