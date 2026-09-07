@@ -2836,35 +2836,20 @@ fn flush_and_arm(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action {
 }
 
 /// G2: reconcile a `Handshaking` connection's poll interest with whatever it
-/// still has to write. Two things can be pending mid-handshake:
+/// still has to write — a TLS flight rustls could not finish writing, or the
+/// error/Close frames the shutdown drain queues even mid-handshake.
 ///
-/// * a **blocked TLS flight** — rustls has ciphertext queued for the socket
-///   ([`Connection::tls_wants_write`]) because the flight write hit a full
-///   send buffer (the peer's receive window filled, e.g. a zero-window
-///   client); and
-/// * **queued frames** — the shutdown drain queues error/Close frames even on
-///   a still-Handshaking connection.
+/// mio is level-triggered, so arming WRITABLE means the kernel wakes the loop
+/// the moment the buffer drains and [`handle_writable`] re-drives the
+/// handshake. With nothing pending, a previously-armed WRITABLE drops back to
+/// READABLE-only so the connection never spins on an always-ready writable
+/// socket; a plain-TCP handshake keeps its accept-time registration untouched.
 ///
-/// When either is present we flush via [`flush_and_arm`], which drives the
-/// pending TLS ciphertext FIRST (its Phase 1) and reconciles WRITABLE
-/// interest from the outcome: mio is level-triggered, so arming it means the
-/// kernel wakes the loop the moment the buffer drains and
-/// [`handle_writable`] re-drives the handshake. That also keeps the loop-top
-/// invariant ("queued bytes ⇒ WRITABLE armed") intact for the drain-path
-/// frames. With nothing pending, a previously-armed WRITABLE drops back to
-/// READABLE-only — mirroring `flush_and_arm`'s Drained arm — so the
-/// connection never spins on an always-ready writable socket; and a plain-TCP
-/// handshake (never pending writes) keeps its accept-time READABLE-only
-/// registration with zero extra syscalls.
-///
-/// Task 3.3 (G3 handshake deadline) ultimately did NOT hook here: the
-/// slowloris deadline is ABSOLUTE from accept (armed once in
-/// [`accept_ready`], cleared at session establish), so a connection blocked
-/// in this function on a stalled TLS flight is covered by that accept-time
-/// arm — activity and interest churn never postpone it.
+/// The G3 slowloris deadline is ABSOLUTE from accept, so a connection parked
+/// here on a stalled flight is still reaped on time.
 fn arm_handshake_interest(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action {
     let token = entry.token;
-    if entry.conn.tls_wants_write() || entry.conn.has_pending_writes() {
+    if entry.conn.has_pending_writes() {
         return flush_and_arm(poll, entry, now_ns);
     }
     if entry.conn.writable_armed() {

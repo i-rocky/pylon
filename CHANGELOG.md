@@ -165,6 +165,18 @@ pre-1.0 and versions track `Cargo.toml`.
   the per-connection subscription cap are unaffected), with the presence roster
   read from the same source the original ack used — cluster-wide on a clustered
   node, node-local otherwise.
+- **A TLS connection no longer under-reports up to 60 KiB of unsent data to the
+  byte budget.** The out-queue released a frame the moment rustls accepted the
+  plaintext, not when the bytes reached the socket, so a backpressured TLS
+  connection could sit at zero queued bytes while rustls held a whole 60 KiB
+  batch behind a full send buffer. `inflight_bytes` — and with it the REST 503
+  path, the `client-*` ingress drop and the graduated shed bands — therefore
+  engaged later than configured on TLS deployments, and the shutdown drain's
+  "everything flushed" exit could fire over Close(4200) frames that had not
+  actually gone out, leaving those clients with a bare TCP close (which
+  pusher-js backs off from instead of reconnecting immediately). Plaintext
+  rustls has taken but not yet put on the wire is now billed to the connection
+  until it is written.
 - **A peer can no longer pin up to 1 MiB of reassembly buffer per connection,
   invisible to the byte budget** (security-relevant). The first fragment of a
   fragmented TEXT message (RFC 6455 §5.4) was accepted with no
