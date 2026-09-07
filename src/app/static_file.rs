@@ -60,6 +60,12 @@ impl AppManager for StaticFileAppManager {
         // path always answers synchronously and never offloads.
         Some(Ok(self.resolve(|a| a.key == key)))
     }
+
+    fn known_app_ids(&self) -> Option<Vec<String>> {
+        // Loaded once at startup and never mutated at runtime, so the id set is
+        // both known and bounded — safe to hand back in full.
+        Some(self.apps.iter().map(|a| a.id.clone()).collect())
+    }
 }
 
 #[cfg(test)]

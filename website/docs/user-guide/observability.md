@@ -35,13 +35,28 @@ labels**.
 |---|---|---|---|
 | `pylon_up` | gauge | — | Always `1`; confirms the process is alive and the scrape succeeded |
 
-#### Per-App (emitted for each app with ≥1 tracked connection)
+#### Per-App
 
 | Series | Type | Labels | Description |
 |---|---|---|---|
 | `pylon_connections` | gauge | `app` | Live WebSocket connections for the app |
 | `pylon_channels_occupied` | gauge | `app` | Channels with at least one subscriber |
 | `pylon_subscriptions` | gauge | `app` | Total channel subscriptions across all connections |
+
+Which apps get a series, and whether it stays present at `0` versus
+disappearing, depends on the app manager backend:
+
+- **Static-file app manager** (`PYLON_APP_MANAGER=static` / the default): the
+  app set is fixed at startup, so every configured app always emits all three
+  series, reading `0` while idle. `pylon_connections{app="x"} == 0` alert
+  rules work as written — the series never disappears.
+- **Dynamic backends** (SQL, Mongo): the app set is unbounded, so a series
+  only appears once an app has had at least one tracked connection, and drops
+  again once its connection count returns to zero — retaining every id ever
+  seen would be an unbounded-growth path. Write alerts against these apps
+  with `absent()` (e.g. `absent(pylon_connections{app="x"}) or
+  pylon_connections{app="x"} == 0`), not a bare `== 0` comparison, or the rule
+  will silently stop evaluating the moment the app goes idle.
 
 #### Per-Worker Transport
 

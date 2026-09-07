@@ -286,8 +286,25 @@ pub async fn get_metrics(
 
     use std::sync::atomic::Ordering;
 
-    // Collect per-app metrics.
+    // Collect per-app metrics. Seed from the app manager's known (bounded) app
+    // set first, at zero, so a static-file app with no live connections still
+    // reports a `0` series instead of the gauge disappearing from the
+    // exposition — see `AppManager::known_app_ids`. Dynamic backends (SQL,
+    // Mongo) return `None` here and keep today's behavior unchanged: the map
+    // is built from `conn_counts` alone, so an idle app's series drops.
     let mut apps: HashMap<String, AppMetrics> = HashMap::new();
+    if let Some(known_ids) = state.apps.known_app_ids() {
+        for id in known_ids {
+            apps.insert(
+                id,
+                AppMetrics {
+                    connections: 0,
+                    channels_occupied: 0,
+                    subscriptions: 0,
+                },
+            );
+        }
+    }
     for entry in state.conn_counts.iter() {
         let app_id = entry.key().clone();
         let connections = entry.value().load(Ordering::Relaxed) as u64;
@@ -397,6 +414,45 @@ mod tests {
         assert!(
             text.contains("# TYPE pylon_connections gauge"),
             "missing TYPE connections"
+        );
+    }
+
+    /// Regression for #19: the encoder gates the per-app block on the `apps` map
+    /// being non-empty, NOT on any individual app's counters being non-zero — an
+    /// app present in the snapshot with all-zero counters (e.g. seeded by
+    /// `AppManager::known_app_ids` for a configured-but-idle static-file app)
+    /// must still render its `0` series plus HELP/TYPE, not vanish.
+    #[test]
+    fn encode_per_app_metrics_zero_connections_still_emits_series_and_help_type() {
+        let s = snapshot_with_one_app("idle-app", 0, 0, 0);
+        let text = encode(&s);
+        assert!(
+            text.contains("pylon_connections{app=\"idle-app\"} 0\n"),
+            "zero connections series missing: {text}"
+        );
+        assert!(
+            text.contains("pylon_channels_occupied{app=\"idle-app\"} 0\n"),
+            "zero channels series missing: {text}"
+        );
+        assert!(
+            text.contains("pylon_subscriptions{app=\"idle-app\"} 0\n"),
+            "zero subscriptions series missing: {text}"
+        );
+        assert!(
+            text.contains("# HELP pylon_connections "),
+            "missing HELP connections: {text}"
+        );
+        assert!(
+            text.contains("# TYPE pylon_connections gauge"),
+            "missing TYPE connections: {text}"
+        );
+        assert!(
+            text.contains("# HELP pylon_channels_occupied "),
+            "missing HELP channels_occupied: {text}"
+        );
+        assert!(
+            text.contains("# HELP pylon_subscriptions "),
+            "missing HELP subscriptions: {text}"
         );
     }
 
