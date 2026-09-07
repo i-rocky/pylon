@@ -18,7 +18,8 @@
 //!   dropped) has its counts reclaimed by the sweeper within a short-heartbeat
 //!   window, after which a new connection on the survivor succeeds.
 //! * Fail-open — when the bridge is unavailable, admission still succeeds
-//!   locally (a degraded bridge must not lock clients out of the node).
+//!   locally (a degraded bridge must not lock clients out of the node), and the
+//!   connection it admitted releases nothing at close, because it took nothing.
 //!
 //! Like `percore_cluster.rs`, these talk to a REAL Redis (`PYLON_TEST_REDIS_URL`,
 //! default `redis://127.0.0.1:6390`) behind a random key prefix — NEVER
@@ -26,7 +27,10 @@
 
 mod common;
 
-use common::{connect, established_socket_id, spawn_percore_cluster_with_apps, wait_until, Ws};
+use common::{
+    connect, established_socket_id, next_event_named, send_json, spawn_percore_cluster_with_apps,
+    wait_until, Ws,
+};
 use futures_util::StreamExt;
 use pylon::adapter::local::LocalAdapter;
 use pylon::adapter::redis::client::{RedisClients, Scripts};
@@ -53,6 +57,13 @@ use uuid::Uuid;
 const CAP1_APPS: &str = r#"[
     {"name":"Test","id":"app","key":"app-key","secret":"app-secret",
      "capacity":1,"client_messages_enabled":true}
+]"#;
+
+/// A roomy app: several connections fit under the cluster cap at once, so a
+/// close can be observed against the units its siblings still hold.
+const CAP5_APPS: &str = r#"[
+    {"name":"Test","id":"app","key":"app-key","secret":"app-secret",
+     "capacity":5,"client_messages_enabled":true}
 ]"#;
 
 /// Test Redis URL: `PYLON_TEST_REDIS_URL` or the documented default (port 6390).
@@ -549,6 +560,115 @@ async fn admission_fails_open_when_bridge_unavailable() {
     shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = worker.join();
 
+    use fred::interfaces::ClientLike;
+    let _ = client.quit().await;
+}
+
+/// A connection whose cluster admission FAILED OPEN took no Redis unit, so its
+/// close must fire no release. `RELEASE_APP_LUA`'s node guard only trips when this
+/// node's per-app field is absent or already zero, so on a node holding units for
+/// other connections of the same app a phantom release sails past it and steals a
+/// sibling's unit — the cluster total drifting down by one per fail-open admission
+/// that later closes, and over-admitting by exactly that much.
+///
+/// The fail-open is forced by parking `appconns` behind a wrong-typed key for the
+/// duration of one establish, so `ADMIT_APP_LUA` errors and the verdict is `None`.
+/// The subscribe/close pair then orders the bridge's FIFO command queue: once the
+/// vacate is visible in Redis, the closing connection's `remove` has already
+/// enqueued whatever it was going to, so the next connection's admission — which
+/// blocks on its verdict — cannot be answered before it.
+#[tokio::test]
+async fn a_fail_open_admission_releases_no_unit_at_close() {
+    let prefix = random_prefix();
+    let keys = Keys::new(&prefix);
+    let (addr, _guard) = spawn_percore_cluster_with_apps(&prefix, CAP5_APPS, |_| {}).await;
+    let client = fred_client().await;
+
+    let mut ws1 = connect(addr, "?protocol=7").await;
+    let _sid1 = established_socket_id(&mut ws1).await;
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            hget_i64(&client, &keys.appconns(), "app").await == 1
+        })
+        .await,
+        "the first admission must take one cluster unit"
+    );
+
+    use fred::interfaces::KeysInterface;
+    let parked = format!("{prefix}:appconns-parked");
+    let _: () = client
+        .rename(&keys.appconns(), &parked)
+        .await
+        .expect("RENAME must not error");
+    let _: () = client
+        .set(&keys.appconns(), "not-a-hash", None, None, false)
+        .await
+        .expect("SET must not error");
+
+    let mut ws2 = connect(addr, "?protocol=7").await;
+    let _sid2 = established_socket_id(&mut ws2).await;
+
+    let _: i64 = client
+        .del(&keys.appconns())
+        .await
+        .expect("DEL must not error");
+    let _: () = client
+        .rename(&parked, &keys.appconns())
+        .await
+        .expect("RENAME back must not error");
+    assert_eq!(
+        hget_i64(&client, &keys.appconns(), "app").await,
+        1,
+        "the fail-open admission must not have taken a unit"
+    );
+
+    let channel = format!("order-{}", Uuid::new_v4());
+    send_json(
+        &mut ws2,
+        serde_json::json!({ "event": "pusher:subscribe", "data": { "channel": channel } }),
+    )
+    .await;
+    let _ = next_event_named(&mut ws2, "pusher_internal:subscription_succeeded").await;
+    let occ = keys.occ("app", &channel);
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            key_exists(&client, &occ).await
+        })
+        .await,
+        "the subscribe must reach Redis before the close can order against it"
+    );
+
+    drop(ws2);
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            !key_exists(&client, &occ).await
+        })
+        .await,
+        "the close must vacate the channel in Redis"
+    );
+
+    // Enqueued strictly after the close, so its verdict cannot be answered before
+    // any release the close fired.
+    let mut ws3 = connect(addr, "?protocol=7").await;
+    let _sid3 = established_socket_id(&mut ws3).await;
+
+    let nodes: Vec<String> = fred::interfaces::SetsInterface::smembers(&client, keys.nodes())
+        .await
+        .expect("SMEMBERS must not error");
+    assert_eq!(nodes.len(), 1, "the test spawns one node (got {nodes:?})");
+    assert_eq!(
+        hget_i64(&client, &keys.appconns(), "app").await,
+        2,
+        "the fail-open connection's close must not have taken a sibling's cluster unit"
+    );
+    assert_eq!(
+        hget_i64(&client, &keys.nodeconns(&nodes[0]), "app").await,
+        2,
+        "…nor a sibling's unit on this node's own hash"
+    );
+
+    drop(ws1);
+    drop(ws3);
     use fred::interfaces::ClientLike;
     let _ = client.quit().await;
 }

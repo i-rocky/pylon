@@ -134,6 +134,21 @@ pre-1.0 and versions track `Cargo.toml`.
   effect and produces no warning.
 
 ### Fixed
+- **A connection whose cluster capacity admission failed open no longer steals a
+  sibling connection's unit when it closes.** `admit_app` returning `None` — a
+  bridge channel that was full or closed, a verdict that timed out, or a Redis
+  error — fails open and takes no unit, but the close path fired a release for
+  every connection of an app with a `capacity`. `RELEASE_APP_LUA`'s node guard is a
+  per-NODE aggregate check, not a per-connection one: it only trips when this
+  node's per-app field is absent or already zero, so on a node holding units for
+  other connections of the same app the phantom release sailed past it and
+  decremented the cluster total anyway. Per fail-open admission that later closed,
+  the cluster silently believed one connection fewer than it held and admitted one
+  extra past `capacity` — and on a busy long-lived node the books never re-balanced,
+  because the node's per-app field effectively never bottomed out. The release is
+  now gated on the connection's OWN admission verdict, making the script's floor-0
+  guard the backstop it is described as. An admission whose verdict arrived after
+  the worker gave up is released by the bridge instead, so it leaks nothing either.
 - **A live node reclaimed as dead no longer leaves the cluster permanently
   under-counting that node's per-app connections.** A node whose `node:{id}`
   liveness key merely lapses — three missed heartbeats of Redis unreachability

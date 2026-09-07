@@ -1076,15 +1076,13 @@ impl RedisAdapter {
         }
     }
 
-    /// Cluster-wide per-app capacity admission (Task 4.2 / finding D2). Runs
-    /// `ADMIT_APP_LUA`: atomically reject when the app is at `capacity`
-    /// (`Some(false)`, no state changed) or take one unit on the cluster total
-    /// AND this node's per-app hash (`Some(true)`). Any Redis error FAILS OPEN
-    /// (`None`, no state changed) — a Redis blip must not lock clients out of a
-    /// node whose local checks already passed; the floor-0, node-guarded
-    /// [`RELEASE_APP_LUA`] makes the matching close-side release a no-op, so a
-    /// fail-open admission leaves the counts consistent. Called by the bridge's
-    /// `ClusterCmd::AdmitApp` arm on the worker's behalf.
+    /// Cluster-wide per-app capacity admission. Runs `ADMIT_APP_LUA`: atomically
+    /// reject when the app is at `capacity` (`Some(false)`, no state changed) or
+    /// take one unit on the cluster total AND this node's per-app hash
+    /// (`Some(true)`). Any Redis error FAILS OPEN (`None`, no state changed) — a
+    /// Redis blip must not lock clients out of a node whose local checks already
+    /// passed, and the connection then owes no close-side release. Called by the
+    /// bridge's `ClusterCmd::AdmitApp` arm on the worker's behalf.
     #[doc(hidden)]
     pub async fn cluster_admit_app(&self, app: &str, capacity: u32) -> Option<bool> {
         let ttl = self.cfg.node_conns_ttl_secs();
@@ -1107,21 +1105,15 @@ impl RedisAdapter {
         }
     }
 
-    /// Cluster-wide per-app capacity release (Task 4.2 / finding D2): the
-    /// floor-0, node-guarded give-back of one unit (see [`RELEASE_APP_LUA`]).
-    /// Best-effort like the bridge's other commands — a dropped/failed release
-    /// leaks at most one unit per affected connection. That residue IS
-    /// reclaimable, but only while this node's `nodeconns` hash still holds it:
-    /// a script error leaves the hash unchanged (the sweeper subtracts it when
-    /// the node dies), and if a Redis outage outlasts the hash's TTL, the
-    /// heartbeat's re-seed (see [`node_heartbeat_loop`]) restores the hash from
-    /// the live counts first — EXCEPT for connections that closed during the
-    /// outage itself, whose single unit nobody can account for (the same ≤1-unit
-    /// leak as a dropped release). Called by the bridge's `ClusterCmd::ReleaseApp`
-    /// arm.
-    ///
-    /// [`RELEASE_APP_LUA`]: crate::adapter::redis::client::RELEASE_APP_LUA
-    /// [`node_heartbeat_loop`]: crate::adapter::redis::node_heartbeat_loop
+    /// Cluster-wide per-app capacity release: the floor-0 give-back of one unit
+    /// (`RELEASE_APP_LUA`). Best-effort like the bridge's other commands — a
+    /// dropped/failed release leaks at most one unit per affected connection. That
+    /// residue IS reclaimable, but only while this node's `nodeconns` hash still
+    /// holds it: a script error leaves the hash unchanged (the sweeper subtracts it
+    /// when the node dies), and if a Redis outage outlasts the hash's TTL, the
+    /// heartbeat's re-seed restores the hash from the live counts first — EXCEPT
+    /// for connections that closed during the outage itself, whose single unit
+    /// nobody can account for. Called by the bridge's `ClusterCmd::ReleaseApp` arm.
     #[doc(hidden)]
     pub async fn cluster_release_app(&self, app: &str) {
         if let Err(e) = self

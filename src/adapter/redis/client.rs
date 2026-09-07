@@ -254,13 +254,13 @@ redis.call('EXPIRE', KEYS[2], ARGV[3])
 return 1
 "#;
 
-/// APP RELEASE (Task 4.2 / finding D2): floor-0 give-back of one unit on both
-/// the node's per-app hash and the cluster total — never negative. NODE-GUARDED:
-/// the cluster total is decremented only when this node actually held a unit, so
-/// a phantom release (e.g. an admission that failed open, or a capacity config
-/// that changed between establish and close) can never steal a unit another node
-/// legitimately holds. Fields that reach 0 are HDEL'd so the hashes stay tidy.
-/// Returns the remaining cluster total for the app.
+/// APP RELEASE: floor-0 give-back of one unit on both the node's per-app hash and
+/// the cluster total — never negative. The node guard is an aggregate backstop, not
+/// per-connection: it stops this node's releases from driving the cluster total
+/// below the units this node holds in total, but on a node holding units for the
+/// app it cannot recognise a release that matches no admission. Matching release to
+/// admission is the caller's job (`Session::cluster_admitted`). Fields that reach 0
+/// are HDEL'd so the hashes stay tidy. Returns the remaining cluster total.
 ///
 /// `KEYS[1]` = appconns hash, `KEYS[2]` = nodeconns:{node} hash.
 /// `ARGV[1]` = app_id.
