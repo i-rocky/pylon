@@ -99,9 +99,9 @@ impl App {
     /// just the first. Checks non-empty (and non-whitespace) `id`, `key` and
     /// `secret` — a blank secret is a zero-length HMAC-SHA256 key, and since the
     /// key ships in browser bundles by design, that lets anyone holding it forge
-    /// REST signatures, channel-auth tokens and `pusher:signin`; plus non-empty
-    /// `event_types`, every entry one of the seven, non-empty `url`. A dynamic
-    /// backend row that fails here surfaces from the lookup as
+    /// REST signatures, channel-auth tokens and `pusher:signin`; a colon-free
+    /// `key`; plus non-empty `event_types`, every entry one of the seven, and a
+    /// non-empty `url`. A dynamic backend row that fails here surfaces as
     /// `AppLookupError::Decode`, which the REST auth path (`src/http/rest/auth.rs`)
     /// renders as `503` rather than the disabled/not-found response the row
     /// would otherwise produce.
@@ -111,6 +111,14 @@ impl App {
         }
         if self.key.trim().is_empty() {
             return Err(format!("app '{}': key is empty", self.id));
+        }
+        if self.key.contains(':') {
+            return Err(format!(
+                "app '{}': key must not contain ':' — the channel-auth and \
+                 pusher:signin tokens are '<key>:<signature>' and split at the \
+                 first colon, so such a key fails every websocket auth",
+                self.id
+            ));
         }
         if self.secret.trim().is_empty() {
             return Err(format!("app '{}': secret is empty", self.id));
@@ -281,6 +289,19 @@ mod tests {
         }));
         let err = a.validate().unwrap_err();
         assert!(err.contains("id is empty"), "got: {err}");
+    }
+
+    /// A `:` in the key would be swallowed by the `<key>:<signature>` split in
+    /// `auth::channel::verify` and `auth::user::verify`, breaking every private
+    /// and presence subscribe and every `pusher:signin` while REST — which reads
+    /// `auth_key` as its own query parameter — kept working.
+    #[test]
+    fn key_containing_colon_fails_validation() {
+        let a = parse(serde_json::json!({
+            "name": "t", "id": "app", "key": "team:web", "secret": "s"
+        }));
+        let err = a.validate().unwrap_err();
+        assert!(err.contains("must not contain ':'"), "got: {err}");
     }
 
     #[test]

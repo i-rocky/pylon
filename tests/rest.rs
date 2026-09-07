@@ -1492,6 +1492,37 @@ async fn rest_trigger_invalid_socket_id_is_400() {
     assert_eq!(resp.status(), 400, "malformed socket_id must be 400");
 }
 
+/// POST /events with a `socket_id` that is well-formed but longer than a
+/// `SocketId` holds → 400. Accepting it would truncate the id, match no
+/// connection, and silently exclude nobody while still answering 200.
+#[tokio::test]
+async fn rest_trigger_over_long_socket_id_is_400() {
+    let addr = spawn().await;
+    let socket_id = format!(
+        "{}.2",
+        "1".repeat(pylon::protocol::socket_id::SocketId::CAPACITY)
+    );
+    let body = json!({
+        "name": "ev",
+        "data": "{}",
+        "channel": "room",
+        "socket_id": socket_id
+    })
+    .to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "a socket_id longer than SocketId::CAPACITY must be 400, not truncated"
+    );
+}
+
 /// POST /events with a well-formed `socket_id` → 200 (regression guard).
 #[tokio::test]
 async fn rest_trigger_valid_socket_id_is_200() {

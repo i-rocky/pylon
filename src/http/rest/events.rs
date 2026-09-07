@@ -60,22 +60,16 @@ fn wants(info: Option<&str>, attr: &str) -> bool {
     info.is_some_and(|s| s.split(',').any(|a| a.trim() == attr))
 }
 
-/// Cheap upper bound on `socket_id` length, checked before the shape scan so a
-/// multi-megabyte string is rejected in O(1) instead of walking every byte
-/// first. Every id pylon itself hands out (`SocketId::generate`) is two
-/// decimal `u64`s and a dot — at most 41 bytes — so this is generous headroom
-/// for any client-supplied id shaped like hosted Pusher's.
-const MAX_SOCKET_ID_LEN: usize = 64;
-
 /// Hosted Pusher's HTTP API validates `socket_id` server-side and rejects a
 /// malformed value with 400; `pusher-http-node`'s `validateSocketId` enforces
 /// the same shape client-side: `\A\d+\.\d+\z` — two non-empty runs of ASCII
 /// digits joined by exactly one `.`, no sign, no whitespace, no extra dots.
-/// Pylon previously fed the raw string straight into `SocketId::from_raw`
-/// (which silently truncates rather than rejecting), so any string excluded
-/// nothing and still returned 200.
+/// The length bound is [`SocketId::CAPACITY`] and is checked first: it rejects
+/// a multi-megabyte string in O(1), and it keeps every accepted id short enough
+/// that `SocketId::from_raw` — which truncates rather than rejecting — cannot
+/// shorten it into one that matches no connection and so excludes nothing.
 fn valid_socket_id(s: &str) -> bool {
-    if s.is_empty() || s.len() > MAX_SOCKET_ID_LEN {
+    if s.is_empty() || s.len() > SocketId::CAPACITY {
         return false;
     }
     match s.split_once('.') {
@@ -514,5 +508,18 @@ mod tests {
         assert!(!valid_socket_id("12 3.4")); // whitespace
         assert!(!valid_socket_id("-1.2")); // sign
         assert!(!valid_socket_id(&"1".repeat(100))); // huge, no dot
+    }
+
+    /// A well-formed id longer than a `SocketId` can hold must be REJECTED, not
+    /// accepted and then truncated by `from_raw` into an id that matches no
+    /// connection — which would exclude nobody while still returning 200.
+    #[test]
+    fn valid_socket_id_rejects_ids_longer_than_socket_id_capacity() {
+        let at_capacity = format!("{}.2", "1".repeat(SocketId::CAPACITY - 2));
+        assert_eq!(at_capacity.len(), SocketId::CAPACITY);
+        assert!(valid_socket_id(&at_capacity));
+
+        let over_capacity = format!("{}.2", "1".repeat(SocketId::CAPACITY - 1));
+        assert!(!valid_socket_id(&over_capacity));
     }
 }
