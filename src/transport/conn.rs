@@ -1450,6 +1450,39 @@ mod tests {
         buf
     }
 
+    /// Append everything a non-blocking peer has available right now.
+    /// `false` on EOF.
+    fn drain_ready(peer: &mut StdTcpStream, into: &mut Vec<u8>) -> bool {
+        let mut chunk = [0u8; 32 * 1024];
+        loop {
+            match peer.read(&mut chunk) {
+                Ok(0) => return false,
+                Ok(n) => into.extend_from_slice(&chunk[..n]),
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => return true,
+                Err(e) => panic!("peer read failed: {e}"),
+            }
+        }
+    }
+
+    /// Block until the peer has received `want` bytes in total, so an index
+    /// into `into` names a known point in the written stream.
+    fn drain_until(peer: &mut StdTcpStream, into: &mut Vec<u8>, want: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while into.len() < want {
+            assert!(
+                drain_ready(peer, into),
+                "peer hit EOF with {} of {want} bytes received",
+                into.len()
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "peer drain stalled at {} of {want} bytes",
+                into.len()
+            );
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+    }
+
     // ---- queue + flush drains -------------------------------------------------
     #[test]
     fn queue_then_flush_drains_all_frames() {
@@ -2096,19 +2129,21 @@ mod tests {
     /// partial-write states the writev path now produces.
     #[test]
     fn partial_writev_front_survives_drop_head_eviction() {
-        let (server, peer) = pair_tiny_sndbuf();
-        let mut peer = peer;
+        // 1000 deliberately: the kernel accepts exactly the free send-buffer
+        // space per flush — with SO_SNDBUF 8 KiB that is 8192 bytes, which 1000
+        // does NOT divide, so partial writes reliably land MID-frame; 1024
+        // would align perfectly and never produce a mid-write front here.
+        const FRAME_LEN: usize = 1000;
+        const BACKLOG_FRAMES: usize = 4096;
+        const PRESSURE_FRAMES: usize = 500;
+
+        let (server, mut peer) = pair_tiny_sndbuf();
         peer.set_nonblocking(true).unwrap();
 
-        // ~4.1 MB cap with a ~4.1 MB enqueue of 1000-byte frames (1000 chosen
-        // deliberately: the kernel accepts exactly the free send-buffer space
-        // per flush — with SO_SNDBUF 8 KiB that is 8192 bytes, which 1000
-        // does NOT divide, so partial writes reliably land MID-frame; 1024
-        // would align perfectly and never produce a mid-write front here).
         let mut c = Connection::new(server, 4_100_000);
-        for i in 0..4096u32 {
+        for i in 0..BACKLOG_FRAMES {
             let tag = (i % 251) as u8 + 1;
-            let _ = c.queue(Bytes::from(vec![tag; 1000]), 0);
+            let _ = c.queue(Bytes::from(vec![tag; FRAME_LEN]), 0);
         }
         assert!(c.out_bytes() > 3_000_000, "a real backlog must remain");
 
@@ -2116,21 +2151,13 @@ mod tests {
         // exactly on a frame boundary (cursor 0, front not mid-write — a
         // legal state where eviction is allowed); drain the peer and flush
         // again until the stop is genuinely mid-frame.
-        let mut chunk = vec![0u8; 64 * 1024];
         let mut received = Vec::new();
         let mut rounds = 0usize;
         loop {
             rounds += 1;
             assert!(rounds < 500, "flush never stopped mid-frame");
             let status = c.flush(0);
-            loop {
-                match peer.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => received.extend_from_slice(&chunk[..n]),
-                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                    Err(e) => panic!("peer read failed: {e}"),
-                }
-            }
+            assert!(drain_ready(&mut peer, &mut received), "peer closed early");
             match status {
                 WriteStatus::WouldBlock if c.out_cursor() > 0 => break,
                 WriteStatus::WouldBlock => continue, // boundary-aligned stop; retry
@@ -2146,9 +2173,9 @@ mod tests {
 
         // Pressure the cap with more queues → drop-head evictions take the
         // oldest droppable slot; the MID-WRITE front must survive untouched.
-        for i in 0..500u32 {
+        for i in 0..PRESSURE_FRAMES {
             let tag = (i % 251) as u8 + 1;
-            let _ = c.queue(Bytes::from(vec![tag; 1000]), 0);
+            let _ = c.queue(Bytes::from(vec![tag; FRAME_LEN]), 0);
         }
         assert!(c.out_cursor() > 0, "front still mid-write");
         assert_eq!(
@@ -2159,45 +2186,36 @@ mod tests {
         assert_eq!(c.out.front().unwrap().0.len(), front_len);
         assert!(c.drophead_dropped() > 0, "evictions actually fired");
 
-        // Snapshot the survivors (same module: private field access) and drive
-        // the drain to completion, interleaving peer reads like the classic
-        // partial-write test. Bytes of the mid-write front already on the wire
-        // (`cursor_at_snapshot`) were received earlier; everything still owed
-        // is expected[cursor_at_snapshot..].
+        // Snapshot the survivors (same module: private field access). The two
+        // indices the final comparison uses must name the same point in the
+        // stream, so derive the peer's from the WRITER's position rather than
+        // from whatever it happens to have drained: SO_SNDBUF is tiny here, so
+        // the kernel legitimately holds bytes the peer has not read yet.
         let expected: Vec<u8> = c.out.iter().flat_map(|f| f.0.iter().copied()).collect();
-        let already = received.len();
         let cursor_at_snapshot = c.out_cursor();
+        let owed = expected.len() - cursor_at_snapshot;
+        assert_eq!(c.codel_dropped(), 0, "CoDel is disabled on this connection");
+        // Every queued byte has been written, evicted, or is still owed.
+        let written = (BACKLOG_FRAMES + PRESSURE_FRAMES) * FRAME_LEN
+            - c.drophead_dropped() as usize * FRAME_LEN
+            - owed;
+        drain_until(&mut peer, &mut received, written);
+        assert_eq!(received.len(), written, "peer is at the writer's position");
+
+        // Drive the drain to completion, interleaving peer reads like the
+        // classic partial-write test.
         loop {
-            loop {
-                match peer.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => received.extend_from_slice(&chunk[..n]),
-                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                    Err(e) => panic!("peer read failed: {e}"),
-                }
-            }
+            assert!(drain_ready(&mut peer, &mut received), "peer closed early");
             if c.flush(0) == WriteStatus::Drained {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_micros(50));
         }
-        // Pull the tail the final flush pushed.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let owed = expected.len() - cursor_at_snapshot;
-        while received.len() - already < owed {
-            match peer.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => received.extend_from_slice(&chunk[..n]),
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                    assert!(std::time::Instant::now() < deadline, "tail drain stalled");
-                    std::thread::sleep(std::time::Duration::from_micros(50));
-                }
-                Err(e) => panic!("peer tail read failed: {e}"),
-            }
-        }
+        drain_until(&mut peer, &mut received, written + owed);
+
         // Everything still owed after the snapshot arrived, in order, with no
         // duplication and no gap.
-        assert_eq!(&received[already..], &expected[cursor_at_snapshot..]);
+        assert_eq!(&received[written..], &expected[cursor_at_snapshot..]);
         assert_eq!(c.out_bytes, 0);
         assert!(!c.has_pending_writes());
     }
