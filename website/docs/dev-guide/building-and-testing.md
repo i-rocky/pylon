@@ -72,9 +72,9 @@ AppManager suites included — requires all four services below:
 brings up all four on those ports: `docker compose -f deploy/docker/docker-compose.test.yml up -d`.
 
 With those running and reachable, export the env vars above explicitly —
-explicitly targeting each test instance is safer and clearer for potentially
-destructive operations — and pass `--no-fail-fast` so one missing or
-misbehaving backend doesn't hide the results of the others:
+naming the instance each suite talks to is worth the keystrokes when the run
+writes to it — and pass `--no-fail-fast` so one missing or misbehaving
+backend doesn't hide the results of the others:
 
 ```bash
 export PYLON_TEST_REDIS_URL=redis://127.0.0.1:6390
