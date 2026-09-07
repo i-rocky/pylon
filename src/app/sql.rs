@@ -1,6 +1,6 @@
 use super::{App, AppLookup, AppLookupError, AppManager, WebhookConfig};
 use sqlx::any::{AnyPoolOptions, AnyRow};
-use sqlx::{AnyPool, Row};
+use sqlx::{AnyPool, AssertSqlSafe, Row};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -84,7 +84,10 @@ impl SqlAppManager {
             where_col,
             self.dialect.placeholder()
         );
-        let row = sqlx::query(&sql)
+        // Every fragment above is a literal picked by the closed `Dialect` and
+        // `LookupCol` enums; `val` is the only caller-controlled input and it is
+        // bound, never interpolated. Keep it that way or drop the assertion.
+        let row = sqlx::query(AssertSqlSafe(sql))
             .bind(val)
             .fetch_optional(&self.pool)
             .await
