@@ -72,8 +72,8 @@ AppManager suites included — requires all four services below:
 brings up all four on those ports: `docker compose -f deploy/docker/docker-compose.test.yml up -d`.
 
 With those running and reachable, export the env vars above explicitly —
-not every suite's compiled-in default agrees with the table, so don't rely
-on defaults for the full run — and pass `--no-fail-fast` so one missing or
+explicitly targeting each test instance is safer and clearer for potentially
+destructive operations — and pass `--no-fail-fast` so one missing or
 misbehaving backend doesn't hide the results of the others:
 
 ```bash
