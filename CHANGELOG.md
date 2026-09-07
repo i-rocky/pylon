@@ -134,6 +134,22 @@ pre-1.0 and versions track `Cargo.toml`.
   effect and produces no warning.
 
 ### Fixed
+- **A presence join rejected by the cluster member cap no longer swallows the
+  node's 0→1 Redis `SUBSCRIBE`, which left the node deaf to the channel it still
+  held members of.** `node_first` is a one-shot token — exactly one in-flight
+  bridge command carries it for a given node-local 0→1 edge — and the capacity
+  rejection returned before `cluster_subscribe`, the only place the channel's
+  `msg` key is subscribed. A rejected joiner racing an admitted one (a second
+  connection for a user already on the cluster roster, so not a new distinct user)
+  therefore left the node holding a live presence member of a channel it was not a
+  Redis subscriber of: no `member_added`, no `member_removed`, and no cross-node
+  channel events for anyone on that node, with nothing logged. The membership
+  reconciler introduced alongside this bounded the damage to one tick
+  (`PYLON_REDIS_PRESENCE_HEARTBEAT_SECS`, default 25s) rather than the life of the
+  process, but pub/sub has no replay, so every frame inside that window was still
+  lost. The bridge now spends the pub/sub edge before the admission verdict and
+  hands it back — a matching `UNSUBSCRIBE` — only when the rejection leaves the
+  node with no members for the channel at all.
 - **The cluster-wide `PYLON_MAX_PRESENCE_MEMBERS` cap is now decided atomically
   inside the presence-join script, so concurrent joins landing on different nodes
   can no longer push a presence roster past it.** The bridge previously probed the

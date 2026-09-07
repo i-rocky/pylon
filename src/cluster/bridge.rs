@@ -127,7 +127,8 @@ pub enum ClusterCmd {
     /// (excluding the joiner) and fire the `member_added` webhook. Also fires the single
     /// cluster-wide `channel_occupied` on the cluster 0→1 edge. `node_first` is the
     /// worker's node-local 0→1 subscriber edge (drives the Redis msg-channel subscribe).
-    /// Maps to [`RedisAdapter::cluster_subscribe`] + [`RedisAdapter::cluster_presence_join`].
+    /// Maps to [`RedisAdapter::cluster_sub_channel`] +
+    /// [`RedisAdapter::cluster_presence_join`] + [`RedisAdapter::cluster_membership_join`].
     PresenceSubscribe {
         app: Arc<str>,
         channel: Arc<str>,
@@ -1072,6 +1073,14 @@ async fn handle_cmd(
             mailbox,
             node_first,
         } => {
+            // `node_first` is a ONE-SHOT token: exactly one in-flight command carries it
+            // for a given node-local 0→1 edge on this channel. Spend it here, BEFORE the
+            // admission verdict, or a rejected join consumes the edge and leaves the node
+            // deaf to the channel for every OTHER connection that joined it meanwhile.
+            // The reject arm below hands the edge back when the node has no members left.
+            if node_first {
+                adapter.cluster_sub_channel(&app, &channel).await;
+            }
             // Presence half: the atomic cluster-wide cap decision, the `first_for_user`
             // refcount edge and the cluster roster in ONE Redis-serialized script (Soketi
             // parity: `presence-channel-manager.getChannelMembersCount` is cluster-wide).
@@ -1111,16 +1120,19 @@ async fn handle_cmd(
                 });
                 // Undo the worker's inline node-local join; the worker deindexes its own
                 // delivery index when it drains the `SubscriptionError`. The rejecting
-                // script wrote nothing, so no cluster state needs unwinding.
-                local.unsubscribe(&app, &channel, &socket_id).await;
+                // script wrote nothing, so no cluster state needs unwinding — only the
+                // pub/sub edge above, and only once the node holds no members at all.
+                let out = local.unsubscribe(&app, &channel, &socket_id).await;
+                if out.subscription_count == 0 {
+                    adapter.cluster_unsub_channel(&app, &channel).await;
+                }
                 return;
             };
-            // Membership half: authoritative cluster `(count, occupied)` + the node-local
-            // msg-channel subscribe-on-first + the app index. Presence channels do NOT emit
-            // `subscription_count` (P4), so we ignore the count here — only the `occupied`
-            // edge matters for presence.
+            // Membership half: authoritative cluster `(count, occupied)` + the app index.
+            // Presence channels do NOT emit `subscription_count` (P4), so we ignore the
+            // count here — only the `occupied` edge matters for presence.
             let (_count, occupied) = adapter
-                .cluster_subscribe(&app, &channel, &socket_id, node_first)
+                .cluster_membership_join(&app, &channel, &socket_id)
                 .await;
             // Send the CLUSTER roster back to the joining connection as
             // `subscription_succeeded`. A closed connection's mailbox returns `Err` here —

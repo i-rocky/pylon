@@ -675,8 +675,42 @@ impl RedisAdapter {
 /// identical to the inline code these were extracted from — they are the single source of
 /// truth that both callers now share.
 impl RedisAdapter {
-    /// Cluster half of `subscribe`: record cluster-wide membership (SUBSCRIBE_LUA), index
-    /// the app, and drive the node-local Redis `msg`-channel subscribe-on-first lifecycle.
+    /// Attach this node to a channel's `msg` pub/sub key — the node-local 0→1 subscriber
+    /// edge. The node-local subscription has already succeeded when this runs, so a Redis
+    /// SUBSCRIBE failure costs only cross-node delivery for this channel on this node:
+    /// logged loudly, never fatal, and repaired by the membership reconciler's next tick.
+    #[doc(hidden)]
+    pub async fn cluster_sub_channel(&self, app: &str, channel: &str) {
+        let msg_key = self.keys.msg(app, channel);
+        if let Err(e) =
+            pubsub::sub_channel(&self.clients.sub, msg_key.clone(), self.cfg.sharded_pubsub).await
+        {
+            tracing::warn!(
+                error = %e,
+                channel = %msg_key,
+                "failed to SUBSCRIBE to Redis msg channel on 0→1 edge"
+            );
+        }
+    }
+
+    /// Detach this node from a channel's `msg` pub/sub key — the node-local 1→0 edge.
+    #[doc(hidden)]
+    pub async fn cluster_unsub_channel(&self, app: &str, channel: &str) {
+        let msg_key = self.keys.msg(app, channel);
+        if let Err(e) =
+            pubsub::unsub_channel(&self.clients.sub, msg_key.clone(), self.cfg.sharded_pubsub).await
+        {
+            tracing::warn!(
+                error = %e,
+                channel = %msg_key,
+                "failed to UNSUBSCRIBE from Redis msg channel on 1→0 edge"
+            );
+        }
+    }
+
+    /// Cluster half of `subscribe`: record cluster-wide membership (MEMBERSHIP_JOIN_LUA),
+    /// index the app, and drive the node-local Redis `msg`-channel subscribe-on-first
+    /// lifecycle.
     ///
     /// `node_first` is the node-local 0→1 subscriber edge (the caller computes it from its
     /// own `LocalAdapter` — `out.subscription_count == 1`). Returns the AUTHORITATIVE
@@ -691,24 +725,23 @@ impl RedisAdapter {
         socket_id: &SocketId,
         node_first: bool,
     ) -> (usize, bool) {
-        // Subscribe to the msg channel when this NODE goes 0 → 1 for the channel.
         if node_first {
-            let msg_key = self.keys.msg(app, channel);
-            if let Err(e) =
-                pubsub::sub_channel(&self.clients.sub, msg_key.clone(), self.cfg.sharded_pubsub)
-                    .await
-            {
-                // The local subscription already succeeded; a Redis SUBSCRIBE
-                // failure only costs cross-node delivery for this channel on this
-                // node. Log loudly but never panic the connection task.
-                tracing::warn!(
-                    error = %e,
-                    channel = %msg_key,
-                    "failed to SUBSCRIBE to Redis msg channel on 0→1 edge"
-                );
-            }
+            self.cluster_sub_channel(app, channel).await;
         }
+        self.cluster_membership_join(app, channel, socket_id).await
+    }
 
+    /// The membership half of [`cluster_subscribe`](RedisAdapter::cluster_subscribe),
+    /// without the pub/sub lifecycle: a caller that must take the node's 0→1 pub/sub edge
+    /// on its own schedule (the bridge's presence path, whose admission verdict lands
+    /// between the two) drives the two halves separately.
+    #[doc(hidden)]
+    pub async fn cluster_membership_join(
+        &self,
+        app: &str,
+        channel: &str,
+        socket_id: &SocketId,
+    ) -> (usize, bool) {
         // Record cluster-wide membership and read back the AUTHORITATIVE count.
         // Atomic Lua: HSET member, refresh whole-key TTL, HLEN, index on the 0→1
         // cluster edge. On any Redis error, report a zero count so the caller keeps
@@ -780,19 +813,8 @@ impl RedisAdapter {
         socket_id: &SocketId,
         node_last: bool,
     ) -> (usize, bool) {
-        // Tear down the Redis subscription on the node-LOCAL 1 → 0 edge.
         if node_last {
-            let msg_key = self.keys.msg(app, channel);
-            if let Err(e) =
-                pubsub::unsub_channel(&self.clients.sub, msg_key.clone(), self.cfg.sharded_pubsub)
-                    .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    channel = &msg_key,
-                    "failed to UNSUBSCRIBE from Redis msg channel on 1→0 edge"
-                );
-            }
+            self.cluster_unsub_channel(app, channel).await;
         }
 
         // Remove cluster-wide membership and read back the AUTHORITATIVE remaining
