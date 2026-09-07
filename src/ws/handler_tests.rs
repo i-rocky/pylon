@@ -571,6 +571,84 @@ async fn client_event_dropped_when_not_subscribed() {
     );
 }
 
+/// Issue #64: `subscription_succeeded` rides the connection's bounded mailbox and
+/// is DROPPED when it is full, while the join it acknowledges is already committed.
+/// Re-issuing `pusher:subscribe` is then the client's only route back to a
+/// consistent view, so the duplicate-subscribe path must answer it — a silent
+/// return left the two sides disagreeing about the channel permanently.
+#[tokio::test]
+async fn duplicate_subscribe_re_sends_subscription_succeeded() {
+    let (mut c, mut rx) = ctx(app(false));
+    let sub = || ClientCommand::Subscribe {
+        channel: "room".into(),
+        auth: None,
+        channel_data: None,
+    };
+    c.dispatch(sub()).await;
+    assert!(matches!(
+        rx.try_recv().map(|b| *b),
+        Ok(ServerEvent::SubscriptionSucceeded { .. })
+    ));
+
+    c.dispatch(sub()).await;
+    assert!(
+        matches!(
+            rx.try_recv().map(|b| *b),
+            Ok(ServerEvent::SubscriptionSucceeded { .. })
+        ),
+        "a duplicate subscribe must re-send subscription_succeeded, not return silently"
+    );
+    assert_eq!(
+        c.adapter.channel("app", "room").await.subscription_count,
+        1,
+        "the re-ack must not touch membership"
+    );
+}
+
+/// Issue #64 for presence: the re-ack must carry a roster, and the SAME one the
+/// join was handed — a bare `{}` ack would leave a presence client with no member
+/// list, which is the state the drop put it in.
+#[tokio::test]
+async fn duplicate_presence_subscribe_re_sends_the_roster() {
+    let (mut c, mut rx) = ctx(app(false));
+    let sid = c.socket_id.as_str().to_string();
+    let cd = r#"{"user_id":"u1","user_info":{"name":"Ann"}}"#;
+    let sig = crate::auth::signature::channel_signature("s", &sid, "presence-x", Some(cd));
+    let sub = || ClientCommand::Subscribe {
+        channel: "presence-x".into(),
+        auth: Some(format!("k:{sig}")),
+        channel_data: Some(cd.into()),
+    };
+    c.dispatch(sub()).await;
+    let first = rx
+        .try_recv()
+        .map(|b| *b)
+        .expect("the join must be acknowledged");
+
+    c.dispatch(sub()).await;
+    let second = rx
+        .try_recv()
+        .map(|b| *b)
+        .expect("a duplicate presence subscribe must re-send subscription_succeeded");
+    assert_eq!(
+        raw_json(&first),
+        raw_json(&second),
+        "the re-ack must carry the roster frame of the current membership generation"
+    );
+
+    // The duplicate registered nothing: one distinct user with one connection, so
+    // a single unsubscribe still empties the roster.
+    assert_eq!(
+        c.adapter.channel("app", "presence-x").await.user_count,
+        Some(1)
+    );
+    c.unsubscribe("presence-x".into()).await;
+    assert_eq!(
+        c.adapter.channel("app", "presence-x").await.user_count,
+        None
+    );
+}
+
 #[tokio::test]
 async fn duplicate_presence_subscribe_is_idempotent() {
     let (mut c, _rx) = ctx(app(false));
@@ -2015,7 +2093,8 @@ async fn subscription_cap_blocks_third_channel_but_allows_resubscribe() {
         "subscribed set must remain at 2 after c3 rejection"
     );
 
-    // Re-subscribe to c1 (already held) must NOT produce an error (idempotent)
+    // Re-subscribe to c1 (already held) is exempt from the cap: it must be
+    // re-acknowledged, never rejected.
     c.dispatch(ClientCommand::Subscribe {
         channel: "c1".into(),
         auth: None,
@@ -2023,8 +2102,11 @@ async fn subscription_cap_blocks_third_channel_but_allows_resubscribe() {
     })
     .await;
     assert!(
-        rx.try_recv().map(|b| *b).is_err(),
-        "re-subscribing an already-held channel must be a silent no-op (idempotent)"
+        matches!(
+            rx.try_recv().map(|b| *b),
+            Ok(ServerEvent::SubscriptionSucceeded { .. })
+        ),
+        "re-subscribing an already-held channel must be re-acknowledged, exempt from the cap"
     );
     assert_eq!(
         c.subscribed.len(),
@@ -2331,10 +2413,15 @@ async fn resub_already_held_channel_is_idempotent_under_saturation() {
         channel_data: None,
     })
     .await;
-    // The idempotency guard must return early (no frame queued, no error).
+    // The idempotency guard runs BEFORE the saturation gate, so the re-subscribe is
+    // acknowledged rather than rejected — and registers nothing.
     assert!(
-        rx.try_recv().map(|b| *b).is_err(),
-        "re-subscribe of an already-held channel must produce no frame (idempotent path)"
+        matches!(
+            rx.try_recv().map(|b| *b),
+            Ok(ServerEvent::SubscriptionSucceeded { .. })
+        ),
+        "re-subscribe of an already-held channel must be re-acknowledged, never rejected, \
+         even while saturated"
     );
     assert!(
         c.subscribed.contains("public-held"),

@@ -124,6 +124,17 @@ impl Registry {
             .unwrap_or_default()
     }
 
+    /// The channel's cached `subscription_succeeded` frame — the very `Arc` a join
+    /// of the current membership generation was handed (F-5), so re-sending it to a
+    /// connection that missed its acknowledgement costs one clone. `None` for a
+    /// channel with no presence roster to describe.
+    pub fn roster_frame(&self, app: &str, channel: &str) -> Option<std::sync::Arc<str>> {
+        self.channels
+            .get(&(app.to_string(), channel.to_string()))
+            .filter(|s| s.user_count().is_some())
+            .map(|s| s.cached_roster_frame(channel))
+    }
+
     /// Every local subscription grouped per `(app, channel)`: one entry per
     /// channel carrying that channel's subscriber socket ids. Used by the Redis
     /// adapter's membership TTL heartbeat to re-stamp each local member's

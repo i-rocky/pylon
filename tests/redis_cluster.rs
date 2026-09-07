@@ -9,12 +9,14 @@
 //! is no silent skip.
 
 use fred::prelude::*;
+use pylon::adapter::local::LocalAdapter;
 use pylon::adapter::redis::keys::Keys;
 use pylon::adapter::redis::{client::RedisClients, client::Scripts, RedisAdapter};
 use pylon::adapter::Adapter;
 use pylon::app::static_file::StaticFileAppManager;
 use pylon::app::AppManager;
 use pylon::channel::cache::CachedEvent;
+use pylon::channel::registry::Registry;
 use pylon::connection::handle::ConnectionHandle;
 use pylon::protocol::event::ServerEvent;
 use pylon::protocol::socket_id::SocketId;
@@ -3027,4 +3029,311 @@ async fn reap_cas_ghost_token_reaped_without_emission() {
     })
     .await
     .expect("reap CAS ghost-token test must not hang (Redis up?)");
+}
+
+/// Poll `SISMEMBER key member` until Redis reports membership or `timeout` elapses.
+/// The event-based wait for a reconciler repair: poll the observable rather than
+/// sleeping for a guessed number of ticks.
+async fn await_set_contains(
+    clients: &RedisClients,
+    key: &str,
+    member: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let present: bool = clients
+            .pool
+            .next()
+            .sismember(key, member)
+            .await
+            .unwrap_or(false);
+        if present {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Issue #50: `apps` / `chans` / `users` are the sweeper's ONLY enumeration of
+/// occupied channels and signed-in users, and the `chans` entry is the CAS the
+/// single cluster-wide `channel_vacated` is won on — yet `chans` / `users` were
+/// written only on the cluster 0→1 edge and never re-seeded, while the membership
+/// refresh unconditionally re-created `occ` / `usr`. Any divergence therefore left
+/// the channel functionally occupied and structurally orphaned FOREVER: no
+/// `channel_vacated`, no sweeper reach, and a `GET /channels` that under-reports.
+///
+/// The divergence is reproduced directly — the live entries are removed from all
+/// three indexes, which is the state a Redis restart or a dropped bridge command
+/// leaves once the membership refresh has restored `occ` / `usr` and nothing has
+/// restored the indexes. The reconciler must put all three back from node-local
+/// truth, and the last unsubscribe must then still win the vacate CAS.
+#[tokio::test]
+async fn reconciler_reseeds_the_enumeration_indexes_after_a_divergence() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        // A 1s reconcile cadence keeps the repair inside the test's budget.
+        let adapter = connect_adapter_with_prefix_ttl(&prefix, 60, 1).await;
+        let clients = RedisClients::connect(&test_redis_url(), 2)
+            .await
+            .expect("fred clients must connect to the test Redis");
+
+        let (sock, handle) = fake_handle();
+        adapter
+            .subscribe(TEST_APP, "public-room", handle, None)
+            .await;
+        let (_user_sock, user_handle) = fake_handle();
+        adapter.signin_user(TEST_APP, "u5", user_handle).await;
+
+        let indexed = [
+            (keys.apps(), TEST_APP.to_string()),
+            (keys.chans(TEST_APP), "public-room".to_string()),
+            (keys.users(TEST_APP), "u5".to_string()),
+        ];
+        for (key, member) in &indexed {
+            let removed: i64 = clients
+                .pool
+                .next()
+                .srem(key, member.clone())
+                .await
+                .expect("SREM must succeed");
+            assert_eq!(
+                removed, 1,
+                "{member} must be indexed in {key} before the divergence is staged"
+            );
+        }
+
+        for (key, member) in &indexed {
+            assert!(
+                await_set_contains(&clients, key, member, Duration::from_secs(10)).await,
+                "the reconciler must re-seed {member} into {key} from node-local truth"
+            );
+        }
+
+        // The REST channel listing reads `chans`, so it recovers with the index.
+        let listed = adapter.channels(TEST_APP, None).await;
+        assert!(
+            listed.iter().any(|c| c.name == "public-room"),
+            "channels() must list the re-indexed channel again, got {listed:?}"
+        );
+
+        // And the vacate CAS — the SREM that carries the single cluster-wide
+        // `channel_vacated` emission right — can be won again.
+        let out = adapter.unsubscribe(TEST_APP, "public-room", &sock).await;
+        assert!(
+            out.vacated,
+            "the last unsubscribe must win the vacate CAS on the re-seeded index"
+        );
+
+        let _ = clients.pool.quit().await;
+    })
+    .await
+    .expect("index re-seed test must not hang (Redis up?)");
+}
+
+/// Issue #50, second half: the index write inside `SUBSCRIBE_LUA` / `USER_SIGNIN_LUA`
+/// must be unconditional, not gated on the cluster 0→1 edge. A subscriber that
+/// arrives while the channel is ALREADY occupied elsewhere (`HLEN != 1`) used to
+/// leave a lost index entry lost — the channel could never be re-indexed for as
+/// long as it stayed occupied.
+#[tokio::test]
+async fn subscribe_and_signin_reindex_without_the_cluster_first_edge() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let node_a = connect_adapter_with_prefix(&prefix).await;
+        let node_b = connect_adapter_with_prefix(&prefix).await;
+        let clients = RedisClients::connect(&test_redis_url(), 2)
+            .await
+            .expect("fred clients must connect to the test Redis");
+
+        let (_sock_a, handle_a) = fake_handle();
+        node_a
+            .subscribe(TEST_APP, "public-room", handle_a, None)
+            .await;
+        let (_user_a, user_handle_a) = fake_handle();
+        node_a.signin_user(TEST_APP, "u5", user_handle_a).await;
+
+        // Stage the divergence while both stay occupied cluster-wide.
+        for (key, member) in [
+            (keys.chans(TEST_APP), "public-room"),
+            (keys.users(TEST_APP), "u5"),
+        ] {
+            let removed: i64 = clients
+                .pool
+                .next()
+                .srem(&key, member)
+                .await
+                .expect("SREM must succeed");
+            assert_eq!(removed, 1, "{member} must be indexed in {key} first");
+        }
+
+        // A second member / connection on another node: HLEN goes 1→2, so this is
+        // NOT the cluster-first edge, and it must still re-index.
+        let (_sock_b, handle_b) = fake_handle();
+        let out = node_b
+            .subscribe(TEST_APP, "public-room", handle_b, None)
+            .await;
+        assert_eq!(
+            out.subscription_count, 2,
+            "the second cluster subscriber must see cluster count 2"
+        );
+        let (_user_b, user_handle_b) = fake_handle();
+        node_b.signin_user(TEST_APP, "u5", user_handle_b).await;
+
+        for (key, member) in [
+            (keys.chans(TEST_APP), "public-room"),
+            (keys.users(TEST_APP), "u5"),
+        ] {
+            let present: bool = clients
+                .pool
+                .next()
+                .sismember(&key, member)
+                .await
+                .expect("SISMEMBER must succeed");
+            assert!(
+                present,
+                "a non-first subscribe/signin must still index {member} in {key}"
+            );
+        }
+
+        let _ = clients.pool.quit().await;
+    })
+    .await
+    .expect("non-first-edge reindex test must not hang (Redis up?)");
+}
+
+/// Issue #52: the Redis `SUBSCRIBE` of a channel's `msg` key (and a user's
+/// `usermsg` key) is derived from node-local LEVEL truth but was applied only on
+/// the EDGE the bridge received. That command rides a bounded, drop-on-full
+/// channel, so one dropped node-first command left the node deaf to ALL of that
+/// channel's cross-node traffic — indefinitely, while `redis_connected` stayed
+/// true and only a debug line recorded the drop.
+///
+/// The drop is reproduced directly: node B's shared `LocalAdapter` gains the
+/// subscriber and the signed-in user while `cluster_subscribe` / `cluster_signin`
+/// never run for them — exactly the state a dropped `ClusterCmd::Subscribe` /
+/// `Signin` leaves behind. The reconciler must restore both subscriptions, and a
+/// broadcast and a `send_to_user` from node A must then reach node B.
+#[tokio::test]
+async fn reconciler_resubscribes_pubsub_keys_after_a_dropped_bridge_command() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let channel = "deafened-room";
+        let node_a = connect_adapter_with_prefix(&prefix).await;
+
+        // Node B's adapter shares the LocalAdapter the workers would drive, so the
+        // test can commit node-local membership WITHOUT the bridge command that
+        // normally carries the Redis SUBSCRIBE with it.
+        let local_b = Arc::new(LocalAdapter::new(
+            Arc::new(Registry::new()),
+            Arc::new(pylon::adapter::app_registry::AppRegistry::new()),
+        ));
+        let node_b = RedisAdapter::with_local(
+            &redis_test_config_with_ttl(&prefix, 60, 1),
+            local_b.clone(),
+            None,
+            None,
+        )
+        .await
+        .expect("node B's RedisAdapter must connect to the test Redis");
+
+        let (_sock, handle, mut rx) = recording_handle();
+        local_b.subscribe(TEST_APP, channel, handle, None).await;
+        let (_user_sock, user_handle, mut user_rx) = recording_handle();
+        local_b.signin_user(TEST_APP, "u6", user_handle).await;
+
+        let msg_key = keys.msg(TEST_APP, channel);
+        let usermsg_key = keys.usermsg(TEST_APP, "u6");
+        assert!(
+            await_tracked(&node_b, &msg_key, Duration::from_secs(10)).await,
+            "the reconciler must SUBSCRIBE {msg_key} for a channel node B has local members on"
+        );
+        assert!(
+            await_tracked(&node_b, &usermsg_key, Duration::from_secs(10)).await,
+            "the reconciler must SUBSCRIBE {usermsg_key} for a user signed in on node B"
+        );
+
+        // A completed SUBSCRIBE is not yet an observable attachment, and a publish
+        // that races one is lost outright — gate on the server's own NUMSUB, the
+        // readiness gate this suite shares.
+        let gate = RedisClients::connect(&test_redis_url(), 1)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        require_numsub_at_least(
+            gate.pool.next(),
+            &msg_key,
+            1,
+            Duration::from_secs(5),
+            "node B's reconciled msg subscription",
+        )
+        .await;
+        require_numsub_at_least(
+            gate.pool.next(),
+            &usermsg_key,
+            1,
+            Duration::from_secs(5),
+            "node B's reconciled usermsg subscription",
+        )
+        .await;
+
+        node_a
+            .broadcast(
+                TEST_APP,
+                channel,
+                ServerEvent::ChannelEvent {
+                    channel: channel.into(),
+                    event: "reconciled".into(),
+                    data: serde_json::json!({"k": 1}),
+                    user_id: None,
+                },
+                None,
+            )
+            .await;
+        match with_timeout(async { rx.recv().await }).await.map(|b| *b) {
+            Some(ServerEvent::Raw(frame)) => {
+                let v: serde_json::Value = serde_json::from_str(&frame).expect("raw frame is JSON");
+                assert_eq!(
+                    v["event"], "reconciled",
+                    "node B must receive the cross-node broadcast again"
+                );
+            }
+            other => panic!("expected the cross-node broadcast on node B, got {other:?}"),
+        }
+
+        node_a
+            .send_to_user(
+                TEST_APP,
+                "u6",
+                ServerEvent::ChannelEvent {
+                    channel: "x".into(),
+                    event: "direct".into(),
+                    data: serde_json::json!({"k": 2}),
+                    user_id: None,
+                },
+            )
+            .await;
+        match with_timeout(async { user_rx.recv().await })
+            .await
+            .map(|b| *b)
+        {
+            Some(ServerEvent::Raw(frame)) => {
+                let v: serde_json::Value = serde_json::from_str(&frame).expect("raw frame is JSON");
+                assert_eq!(
+                    v["event"], "direct",
+                    "node B must receive the cross-node send_to_user again"
+                );
+            }
+            other => panic!("expected the cross-node send_to_user on node B, got {other:?}"),
+        }
+
+        let _ = gate.pool.quit().await;
+    })
+    .await
+    .expect("pub/sub reconcile test must not hang (Redis up?)");
 }

@@ -24,7 +24,7 @@
 mod common;
 
 use common::{
-    connect, established_socket_id, next_event_named, next_json_within, send_json,
+    auth_token, connect, established_socket_id, next_event_named, next_json_within, send_json,
     spawn_percore_cluster, spawn_percore_cluster_with, wait_pubsub_subscribers, Ws, KEY, SECRET,
 };
 use pylon::adapter::redis::keys::Keys;
@@ -264,5 +264,91 @@ async fn cross_node_broadcast_with_envelope_compat_off_still_delivers() {
     assert_eq!(
         frame_b["data"], payload,
         "b must receive the compat=off cross-node payload verbatim"
+    );
+}
+
+/// Connect a WS presence client to `addr` as `user_id`, subscribe it to `channel`,
+/// and return the live socket plus the `subscription_succeeded` frame the bridge
+/// sent it. Mirrors the presence connect the clustered presence suite uses.
+async fn connect_presence(addr: SocketAddr, channel: &str, user_id: &str) -> (Ws, Value) {
+    let mut ws = connect(addr, "?protocol=7").await;
+    let sid = established_socket_id(&mut ws).await;
+    let channel_data = json!({ "user_id": user_id, "user_info": {} }).to_string();
+    send_json(
+        &mut ws,
+        json!({
+            "event": "pusher:subscribe",
+            "data": {
+                "channel": channel,
+                "auth": auth_token(&sid, channel, Some(&channel_data)),
+                "channel_data": channel_data
+            }
+        }),
+    )
+    .await;
+    let succeeded = next_event_named(&mut ws, "pusher_internal:subscription_succeeded").await;
+    (ws, succeeded)
+}
+
+/// The roster `{ ids, hash, count }` inside a presence `subscription_succeeded`'s
+/// double-encoded `data` STRING.
+fn roster_of(succeeded: &Value) -> Value {
+    let data: Value = serde_json::from_str(
+        succeeded["data"]
+            .as_str()
+            .expect("presence subscription_succeeded data must be a JSON string"),
+    )
+    .expect("presence subscription_succeeded data must parse");
+    data["presence"].clone()
+}
+
+/// Issue #64 on the CLUSTERED path. `subscription_succeeded` for a presence channel
+/// is sent by the BRIDGE and carries the CLUSTER-wide roster, so the re-ack a
+/// duplicate `pusher:subscribe` earns has to come from that same source: answering
+/// it from the node-local registry would hand the client a roster missing every
+/// member on another node, which is worse than the dropped frame it is recovering
+/// from.
+#[tokio::test]
+async fn duplicate_presence_subscribe_re_sends_the_cluster_roster() {
+    let prefix = random_prefix();
+    let (addr_a, _guard_a) = spawn_percore_cluster(&prefix).await;
+    let (addr_b, _guard_b) = spawn_percore_cluster(&prefix).await;
+
+    let channel = "presence-reack";
+    // u1 joins on node A; u2 then joins on node B and already sees both.
+    let (_ws_a, _roster_a) = connect_presence(addr_a, channel, "u1").await;
+    let (mut ws_b, joined_b) = connect_presence(addr_b, channel, "u2").await;
+    assert_eq!(
+        roster_of(&joined_b)["count"],
+        2,
+        "node B's join must be acknowledged with the CLUSTER roster"
+    );
+
+    // u2 re-issues the subscribe, as a client that never observed its ack would.
+    let channel_data = json!({ "user_id": "u2", "user_info": {} }).to_string();
+    let sid_b = "0.0"; // unused by the duplicate path: the guard answers before auth
+    send_json(
+        &mut ws_b,
+        json!({
+            "event": "pusher:subscribe",
+            "data": {
+                "channel": channel,
+                "auth": auth_token(sid_b, channel, Some(&channel_data)),
+                "channel_data": channel_data
+            }
+        }),
+    )
+    .await;
+
+    let reack = next_event_named(&mut ws_b, "pusher_internal:subscription_succeeded").await;
+    let roster = roster_of(&reack);
+    assert_eq!(
+        roster["count"], 2,
+        "the re-ack must carry the CLUSTER roster (a node-local one would report 1)"
+    );
+    assert_eq!(
+        roster["ids"],
+        json!(["u1", "u2"]),
+        "the re-ack roster must name every cluster member"
     );
 }

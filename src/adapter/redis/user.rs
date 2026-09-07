@@ -27,7 +27,7 @@ pub(super) async fn signin(
 ) -> anyhow::Result<bool> {
     let token = member_token(node_id, socket_id.as_str());
     let conn: i64 = scripts
-        .user_signin
+        .membership_join
         .evalsha_with_reload::<i64, _, _>(
             pool.next(),
             vec![keys.usr(app, user_id), keys.users(app)],

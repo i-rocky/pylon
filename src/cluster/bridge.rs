@@ -212,6 +212,16 @@ pub enum ClusterCmd {
     /// Fire-and-forget exactly like the other close-time commands. Maps to
     /// [`RedisAdapter::cluster_release_app`].
     ReleaseApp { app: Arc<str> },
+    /// Re-send `subscription_succeeded` carrying the CLUSTER-wide presence roster to
+    /// `mailbox`, for a connection re-issuing `pusher:subscribe` on a presence channel
+    /// it has already joined. Read-only: it writes no membership and fires no cluster
+    /// edge, so a re-ack can never disturb the roster it reports. Maps to
+    /// [`RedisAdapter::resend_presence_ack`](crate::adapter::Adapter::resend_presence_ack).
+    PresenceAck {
+        app: Arc<str>,
+        channel: Arc<str>,
+        mailbox: Mailbox,
+    },
 }
 
 /// Cheap-clone handle a percore worker uses to fire [`ClusterCmd`]s at the bridge. `Send +
@@ -277,10 +287,15 @@ impl ClusterHandle {
 
     /// Fire a cluster Subscribe at the bridge. NON-BLOCKING, drop-on-full/closed exactly
     /// like [`publish`](ClusterHandle::publish) — the worker must NEVER block on the
-    /// bridge. A dropped Subscribe at most costs this node a missed cluster count/occupied
-    /// edge for one connection (and, for a cache channel, the cluster cache replay) — the
-    /// node-local subscribe already succeeded on the worker. `mailbox` is the joining
-    /// connection's frame channel, used to deliver the cache replay / `cache_miss`.
+    /// bridge. A dropped Subscribe costs this node the cluster count/occupied edge for
+    /// one connection and, for a cache channel, that connection's cluster cache replay;
+    /// the node-local subscribe already succeeded on the worker. It ALSO skips the Redis
+    /// `SUBSCRIBE` of the channel's `msg` key when the drop takes the node-first
+    /// command — deafness to that channel's cross-node traffic for the whole node, not
+    /// for one connection. That one is level-reconciled: the adapter's membership
+    /// reconciler re-subscribes any `msg` key this node has local members for within a
+    /// tick. `mailbox` is the joining connection's frame channel, used to deliver the
+    /// cache replay / `cache_miss`.
     pub fn subscribe(
         &self,
         app: Arc<str>,
@@ -405,9 +420,11 @@ impl ClusterHandle {
     }
 
     /// Fire a cluster Signin at the bridge. NON-BLOCKING, drop-on-full/closed exactly
-    /// like [`publish`](ClusterHandle::publish). A dropped Signin at most costs this
-    /// connection its cluster online edge (the WatchOnline publish + the usermsg
-    /// subscribe); the node-local signin already succeeded on the worker.
+    /// like [`publish`](ClusterHandle::publish). A dropped Signin costs this connection
+    /// its cluster online edge (the WatchOnline publish); the node-local signin already
+    /// succeeded on the worker. The `usermsg` Redis `SUBSCRIBE` it also skips — without
+    /// which cross-node `send_to_user` and `terminate_user` never reach this node — is
+    /// level-reconciled by the adapter's membership reconciler within a tick.
     pub fn signin(&self, app: Arc<str>, user_id: String, socket_id: SocketId, node_first: bool) {
         let cmd = ClusterCmd::Signin {
             app,
@@ -500,6 +517,23 @@ impl ClusterHandle {
                 self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("cluster bridge gone; dropping cross-node unwatch");
             }
+        }
+    }
+
+    /// Ask the bridge to re-send this connection's `subscription_succeeded` for a
+    /// presence channel it has already joined, with the CLUSTER-wide roster.
+    /// NON-BLOCKING, drop-on-full/closed exactly like
+    /// [`publish`](ClusterHandle::publish): a dropped re-ack leaves the client exactly
+    /// where it was — free to ask again.
+    pub fn presence_ack(&self, app: Arc<str>, channel: Arc<str>, mailbox: Mailbox) {
+        let cmd = ClusterCmd::PresenceAck {
+            app,
+            channel,
+            mailbox,
+        };
+        if self.tx.try_send(cmd).is_err() {
+            self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!("cluster bridge unavailable; dropping presence subscription re-ack");
         }
     }
 
@@ -1321,6 +1355,13 @@ async fn handle_cmd(
         ClusterCmd::ReleaseApp { app } => {
             // Floor-0, node-guarded give-back of one per-app capacity unit.
             adapter.cluster_release_app(&app).await;
+        }
+        ClusterCmd::PresenceAck {
+            app,
+            channel,
+            mailbox,
+        } => {
+            adapter.resend_presence_ack(&app, &channel, mailbox).await;
         }
     }
 }

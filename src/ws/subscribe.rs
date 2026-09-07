@@ -12,10 +12,14 @@ impl ConnectionContext {
         auth: Option<String>,
         channel_data: Option<String>,
     ) {
-        // Idempotent per spec §5.1: ignore a duplicate subscribe to an already-joined
-        // channel (prevents presence conn_count corruption / ghost members).
+        // Idempotent per spec §5.1: a duplicate subscribe to an already-joined channel
+        // must not touch the registry (that would corrupt the presence conn_count and
+        // leave ghost members) — but it is answered, not swallowed. The acknowledgement
+        // rides a bounded mailbox that drops on overload while the join is already
+        // committed, so re-issuing `pusher:subscribe` is a client's ONLY way back to a
+        // consistent view; a silent return makes that state unrecoverable.
         if self.subscribed.contains(&channel) {
-            return;
+            return self.resend_subscription_succeeded(&channel).await;
         }
 
         // Per-connection subscription cap: reject new subscriptions once the limit
@@ -389,6 +393,22 @@ impl ConnectionContext {
             };
             self.send_self(event);
         }
+    }
+
+    /// Answer a duplicate `pusher:subscribe` with a fresh `subscription_succeeded`,
+    /// touching no membership. A presence channel's roster comes from the adapter, so
+    /// the re-ack carries the same cluster-wide or node-local roster the original did.
+    async fn resend_subscription_succeeded(&self, channel: &str) {
+        if ChannelInfo::of(channel).auth == AuthKind::Presence {
+            return self
+                .adapter
+                .resend_presence_ack(&self.app.id, channel, self.handle().mailbox)
+                .await;
+        }
+        self.send_self(ServerEvent::SubscriptionSucceeded {
+            channel: channel.to_string(),
+            presence: None,
+        });
     }
 
     /// Emit `channel_occupied` if this subscribe was the 0→1 edge and the app
