@@ -120,6 +120,33 @@ pre-1.0 and versions track `Cargo.toml`.
   effect and produces no warning.
 
 ### Fixed
+- **A peer can no longer pin up to 1 MiB of reassembly buffer per connection,
+  invisible to the byte budget** (security-relevant). The first fragment of a
+  fragmented TEXT message (RFC 6455 §5.4) was accepted with no
+  `max_message_bytes` check — the documented per-message cap fired only on the
+  next append — so its only bound was the per-frame `max_payload`, whose 1 MiB
+  floor an operator cannot lower. The resulting accumulator hung off the
+  connection entry and was counted nowhere: `inflight_bytes`, the graduated shed
+  bands, the PSI backstop and the node connection ceiling all read green while
+  RSS climbed, and a peer holding N connections that each open an oversize
+  message and never complete it could pin the whole configured memory budget in
+  memory the budget could not see. The cap now applies from the opening fragment
+  on, so an oversize message is never buffered at all; and the buffer a
+  legitimate fragmented message does hold is billed to the connection, so the
+  worker's `inflight_bytes` — and every shedding and admission decision built on
+  it — accounts for reassembly memory.
+- **An oversize fragmented TEXT message is dropped silently instead of closing
+  the connection with 1002** — `max_message_bytes` is documented as dropping an
+  oversize assembled message *without* closing the connection, and the drop did
+  reset the accumulator, but it left no record that the message was still in
+  flight. The next Continuation of that same message therefore hit the
+  stray-Continuation guard and failed the connection with WebSocket Close 1002
+  (protocol error), so the documented silent drop only happened when the
+  overflow landed on the final fragment. A client that legitimately fragments a
+  large-ish payload saw an unexplained 1002 — and, on retry after reconnecting,
+  a reconnect loop. The remaining fragments of an over-cap message are now
+  swallowed until its FIN=1 frame closes it out, matching what the unfragmented
+  path has always done.
 - **A node dying while it held the last members of a presence channel no longer
   leaks its roster into Redis forever, and no longer skips their
   `member_removed`.** The three presence side-tables (`presusers`, `presinfo`,

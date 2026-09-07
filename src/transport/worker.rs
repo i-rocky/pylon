@@ -229,9 +229,10 @@ pub struct WorkerConfig {
     /// Maximum accepted size (bytes) of one REASSEMBLED inbound text message
     /// (the sum of its RFC 6455 §5.4 fragments). Plumbed from
     /// `max_event_payload_bytes` — the same per-message budget the protocol
-    /// layer holds unfragmented events to. An assembled message over this cap
-    /// is dropped (and the fragment accumulator reset) WITHOUT closing the
-    /// connection; each individual fragment stays bounded by `max_payload`.
+    /// layer holds unfragmented events to. It bounds the accumulator from the
+    /// FIRST fragment on: a message over the cap is dropped WITHOUT closing the
+    /// connection, and its remaining fragments are swallowed without being
+    /// buffered.
     pub max_message_bytes: usize,
     /// G3 (slowloris): maximum accepted HTTP request-head size (bytes) — the
     /// window `inbuf` may grow to while the head is incomplete. A head larger
@@ -352,20 +353,20 @@ struct Session {
 
 /// RFC 6455 §5.4: the in-progress fragmented message on this connection.
 ///
-/// `Text` accumulates the payload of a fragmented TEXT message (the only data
-/// kind the Pusher protocol carries): Continuation frames append to it and the
-/// FIN=1 Continuation dispatches the assembled payload through the normal Text
-/// path, resetting this to `None`.
-///
-/// `Binary` marks an in-progress fragmented BINARY message. Binary is not part
-/// of the Pusher protocol — a lone Binary frame is silently ignored — so a
-/// fragmented one is ignored the same way: its Continuations are dropped until
-/// the FIN=1 Continuation completes the message, after which the state resets.
-/// The variant exists only so those Continuations are not mistaken for strays
-/// (which fail the connection per §5.4).
+/// `Text` accumulates a fragmented TEXT message (the only data kind the Pusher
+/// protocol carries) for dispatch on its FIN=1 Continuation. `Binary` and
+/// `Oversize` are ignore-modes: their remaining frames are swallowed until
+/// FIN=1 completes the message. Every variant keeps the message OPEN, so its
+/// Continuations are never mistaken for strays (§5.4 fails the connection on a
+/// stray Continuation).
 enum Fragment {
     Text(Vec<u8>),
+    /// Binary is outside the Pusher protocol; a lone Binary frame is ignored,
+    /// so a fragmented one is ignored frame by frame.
     Binary,
+    /// A TEXT message already over `max_message_bytes` — dropped without
+    /// closing the connection, and without holding the bytes seen so far.
+    Oversize,
 }
 
 /// Per-connection slab entry: the [`Connection`] plus its read remainder and,
@@ -385,10 +386,9 @@ struct Entry {
     /// v7 protocol state; `None` for echo workers and pre-handshake connections.
     session: Option<Session>,
     /// RFC 6455 §5.4: in-progress fragmented message, `Some` once a FIN=0 Text
-    /// or Binary frame has opened one (see [`Fragment`]). Reset — and a partial
-    /// TEXT message dropped — when the assembled size would exceed the
-    /// per-message cap (`max_message_bytes`); the state dies with this `Entry`
-    /// when the connection closes.
+    /// or Binary frame has opened one (see [`Fragment`]). Mutate it only through
+    /// [`Entry::set_fragment`] / [`Entry::take_fragment`], which keep the bytes
+    /// it holds billed to `conn`'s inflight accounting.
     fragment: Option<Fragment>,
     /// Phase 7: set while this connection is PARKED waiting on an offloaded app
     /// lookup (L1 miss). `Open` + `session: None` + `pending_establish: Some(..)`
@@ -396,6 +396,24 @@ struct Entry {
     /// dropped wholesale when the connection closes mid-park (leaking nothing —
     /// no counter was taken). A park holds the slab slot but no app resources.
     pending_establish: Option<PendingEstablish>,
+}
+
+impl Entry {
+    /// Install the connection's fragmentation state, re-billing whatever the new
+    /// state holds to the connection's inflight accounting.
+    fn set_fragment(&mut self, fragment: Option<Fragment>) {
+        self.conn.set_reassembly_bytes(match &fragment {
+            Some(Fragment::Text(buf)) => buf.len(),
+            _ => 0,
+        });
+        self.fragment = fragment;
+    }
+
+    /// Take the fragmentation state, releasing its bytes from the accounting.
+    fn take_fragment(&mut self) -> Option<Fragment> {
+        self.conn.set_reassembly_bytes(0);
+        self.fragment.take()
+    }
 }
 
 /// Phase 7: the establish state captured at park time, replayed by
@@ -519,11 +537,12 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     let mut next_gen: u64 = 0;
 
     // SP10 per-worker byte budget + inflight accounting. `inflight_bytes` is this
-    // worker's local (non-atomic) view of how many bytes are queued across all of
-    // its connections' out-queues — maintained INCREMENTALLY: every site that
-    // touches a connection's out-queue folds in that connection's exact signed
-    // `take_inflight_delta()` (queue/flush/drop-head/CoDel), and `remove` subtracts
-    // a closing connection's still-queued bytes. So the byte-accounting invariant
+    // worker's local (non-atomic) view of how many bytes its connections hold —
+    // queued out-frames plus inbound reassembly buffers — maintained
+    // INCREMENTALLY: every site that touches a connection folds in its exact
+    // signed `take_inflight_delta()` (queue/flush/drop-head/CoDel/fragment), and
+    // `remove` subtracts a closing connection's still-held bytes. So the
+    // byte-accounting invariant
     // ("a byte enqueued is decremented exactly once, on send XOR drop") holds by
     // construction and the hot loop is O(work), not O(connections). It is mirrored
     // into the shared `inflight_slot` for the `percore_total_inflight_bytes()` test
@@ -718,18 +737,19 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
         }
 
         // Debug-only cross-check: the incrementally-maintained `inflight_bytes`
-        // must equal the true sum of every connection's queued bytes. Any missed
-        // delta site (a `queue`/`flush`/drop that didn't fold, or a `remove` that
-        // didn't subtract) makes this panic in tests — the SP10 overload flood
-        // (queue + drop-head + CoDel + send all firing) is the hardest case. Free
-        // in release (compiles out under `#[cfg(debug_assertions)]`).
+        // must equal the true sum of every connection's accounted bytes (its
+        // out-queue plus its reassembly buffer). Any missed delta site (a
+        // `queue`/`flush`/drop/fragment change that didn't fold, or a `remove`
+        // that didn't subtract) makes this panic in tests — the SP10 overload
+        // flood (queue + drop-head + CoDel + send all firing) is the hardest
+        // case. Free in release (compiles out under `#[cfg(debug_assertions)]`).
         debug_assert_eq!(
             inflight_bytes,
             conns
                 .iter()
-                .map(|(_, e)| e.conn.out_bytes() as u64)
+                .map(|(_, e)| e.conn.accounted_bytes() as u64)
                 .sum::<u64>(),
-            "incremental inflight_bytes drifted from the true out_bytes sum",
+            "incremental inflight_bytes drifted from the true accounted_bytes sum",
         );
 
         // G1 invariant: any connection with queued out-bytes MUST hold WRITABLE
@@ -2123,6 +2143,21 @@ fn echo_frames(poll: &Poll, entry: &mut Entry, frames: Vec<frame::Frame>, now_ns
     }
 }
 
+/// The fragmentation state a FIN=0 Text frame opens: an accumulator seeded with
+/// the payload, or the ignore-mode when that first fragment already exceeds the
+/// per-message cap — nothing a peer sends is buffered before it is checked.
+fn open_text_fragment(payload: &[u8], max_message_bytes: usize) -> Fragment {
+    if payload.len() > max_message_bytes {
+        tracing::trace!(
+            assembled = payload.len(),
+            max_message_bytes,
+            "dropping oversize fragmented message"
+        );
+        return Fragment::Oversize;
+    }
+    Fragment::Text(payload.to_vec())
+}
+
 /// [`Mode::Dispatch`]: decode each complete Text message to a [`ClientCommand`]
 /// and drive `ctx.dispatch`, answer pings with pongs, echo a client-initiated
 /// Close per RFC 6455 §5.5.1, then drain this connection's mailbox so any
@@ -2130,13 +2165,15 @@ fn echo_frames(poll: &Poll, entry: &mut Entry, frames: Vec<frame::Frame>, now_ns
 ///
 /// Fragmented text messages (RFC 6455 §5.4) are reassembled in
 /// [`Entry::fragment`] before dispatch: a FIN=0 Text frame opens the
-/// accumulation, Continuation frames append (bounded by `max_message_bytes`),
-/// and the FIN=1 Continuation dispatches the assembled payload through the
-/// same path as an unfragmented Text frame. Fragmented BINARY messages are
-/// ignored frame-by-frame (binary is outside the Pusher protocol, like a lone
-/// Binary frame). Control frames interleaved mid-fragment are handled in
-/// frame order, so a Ping between fragments is answered before the message
-/// completes (RFC 6455 §5.5.2).
+/// accumulation, Continuation frames append, and the FIN=1 Continuation
+/// dispatches the assembled payload through the same path as an unfragmented
+/// Text frame. Every fragment — the first included — is checked against
+/// `max_message_bytes`, and a message that breaches it switches to
+/// [`Fragment::Oversize`]: dropped, unbuffered, connection intact. Fragmented
+/// BINARY messages are ignored frame-by-frame (binary is outside the Pusher
+/// protocol, like a lone Binary frame). Control frames interleaved mid-fragment
+/// are handled in frame order, so a Ping between fragments is answered before
+/// the message completes (RFC 6455 §5.5.2).
 fn dispatch_frames(
     poll: &Poll,
     entry: &mut Entry,
@@ -2147,12 +2184,10 @@ fn dispatch_frames(
     for f in frames {
         match f.opcode {
             // RFC 6455 §5.4: a fragmented message consists of one FIN=0 data
-            // frame followed by Continuation frames ONLY. Interleaving a new
-            // data frame with an open fragmented TEXT message is a protocol
-            // violation — fail the connection with Close 1002. (A Binary frame
-            // interleaved with a text fragment falls here too; Binary frames
-            // while a BINARY fragment is open are ignored below — binary is
-            // outside the protocol and never fatal on its own.)
+            // frame followed by Continuation frames ONLY, so a data frame
+            // interleaved with an open TEXT message fails the connection. A
+            // Binary frame while a BINARY message is open is ignored instead:
+            // binary is outside the protocol and never fatal on its own.
             OpCode::Text if entry.fragment.is_some() => {
                 return close_fragment_violation(
                     poll,
@@ -2161,7 +2196,9 @@ fn dispatch_frames(
                     "data frame interleaved with a fragmented message",
                 );
             }
-            OpCode::Binary if matches!(entry.fragment, Some(Fragment::Text(_))) => {
+            OpCode::Binary
+                if matches!(entry.fragment, Some(Fragment::Text(_) | Fragment::Oversize)) =>
+            {
                 return close_fragment_violation(
                     poll,
                     entry,
@@ -2170,36 +2207,24 @@ fn dispatch_frames(
                 );
             }
             OpCode::Text if !f.fin => {
-                // First fragment of a new message: hold the payload until the
-                // FIN=1 Continuation completes it. No cap check here — a lone
-                // first fragment is already bounded by the per-frame
-                // `max_payload`; the per-message cap fires on the next append.
-                entry.fragment = Some(Fragment::Text(f.payload.to_vec()));
+                entry.set_fragment(Some(open_text_fragment(&f.payload, max_message_bytes)));
             }
             OpCode::Text => {
-                // A complete (unfragmented) message.
                 if dispatch_text_message(poll, entry, &f.payload, now_ns) == Action::Close {
                     return Action::Close;
                 }
             }
             // Binary is not part of the Pusher protocol; ignore, never fatal.
-            // A FIN=0 Binary opens a message whose frames must all be ignored:
-            // mark the fragment state as [`Fragment::Binary`] so its
-            // Continuation frames (below) are dropped until the FIN=1
-            // Continuation completes it — instead of tripping the stray-
-            // Continuation guard.
             OpCode::Binary => {
                 if !f.fin && entry.fragment.is_none() {
-                    entry.fragment = Some(Fragment::Binary);
+                    entry.set_fragment(Some(Fragment::Binary));
                 }
             }
             OpCode::Continuation => {
                 // RFC 6455 §5.4: a Continuation must follow an open fragmented
                 // message on this connection; a stray one is a protocol
-                // violation — fail the connection with Close 1002. (This also
-                // catches further fragments of a TEXT message already dropped
-                // for exceeding the cap below.)
-                let Some(fragment) = entry.fragment.take() else {
+                // violation — fail the connection with Close 1002.
+                let Some(fragment) = entry.take_fragment() else {
                     return close_fragment_violation(
                         poll,
                         entry,
@@ -2208,37 +2233,31 @@ fn dispatch_frames(
                     );
                 };
                 match fragment {
-                    // Continuation of an ignored fragmented Binary: drop the
-                    // payload and stay in ignore-mode until FIN=1 completes it.
-                    Fragment::Binary => {
+                    ignored @ (Fragment::Binary | Fragment::Oversize) => {
                         if !f.fin {
-                            entry.fragment = Some(Fragment::Binary);
+                            entry.set_fragment(Some(ignored));
                         }
                     }
                     Fragment::Text(mut buf) => {
-                        // Per-message byte cap (`max_event_payload_bytes`): the
-                        // same budget an unfragmented protocol message is held
-                        // to. Oversize → drop the partial message AND reset the
-                        // accumulator; the connection stays usable for the next
-                        // well-formed message.
-                        if buf.len().saturating_add(f.payload.len()) > max_message_bytes {
+                        let assembled = buf.len().saturating_add(f.payload.len());
+                        if assembled > max_message_bytes {
                             tracing::trace!(
-                                assembled = buf.len() + f.payload.len(),
+                                assembled,
                                 max_message_bytes,
                                 "dropping oversize fragmented message"
                             );
-                            continue; // `buf` dropped here; accumulator left reset (`None`).
+                            if !f.fin {
+                                entry.set_fragment(Some(Fragment::Oversize));
+                            }
+                            continue;
                         }
                         buf.extend_from_slice(&f.payload);
                         if f.fin {
-                            // Message complete: dispatch the assembled payload
-                            // through the normal Text path (`fragment` stays
-                            // `None`).
                             if dispatch_text_message(poll, entry, &buf, now_ns) == Action::Close {
                                 return Action::Close;
                             }
                         } else {
-                            entry.fragment = Some(Fragment::Text(buf)); // still open
+                            entry.set_fragment(Some(Fragment::Text(buf)));
                         }
                     }
                 }
@@ -2309,7 +2328,7 @@ fn dispatch_text_message(poll: &Poll, entry: &mut Entry, payload: &[u8], now_ns:
 /// flush), and report [`Action::Close`]. The fragment accumulator is reset —
 /// explicit here even though the entry is torn down immediately after.
 fn close_fragment_violation(poll: &Poll, entry: &mut Entry, now_ns: u64, reason: &str) -> Action {
-    entry.fragment = None;
+    entry.set_fragment(None);
     queue_close_frame(entry, 1002, reason, now_ns);
     let _ = flush_and_arm(poll, entry, now_ns);
     Action::Close
@@ -2322,7 +2341,7 @@ fn close_fragment_violation(poll: &Poll, entry: &mut Entry, now_ns: u64, reason:
 /// [`Action::Close`]. This is a WebSocket-level failure, NOT a Pusher protocol
 /// error: no `pusher:error` frame is sent (those carry 4xxx Pusher codes).
 fn close_invalid_utf8(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action {
-    entry.fragment = None;
+    entry.set_fragment(None);
     queue_close_frame(entry, 1007, "invalid UTF-8 in a text message", now_ns);
     let _ = flush_and_arm(poll, entry, now_ns);
     Action::Close
@@ -2983,14 +3002,14 @@ fn remove(
     // connection on the same token never inherits a stale timer.
     wheel.remove(key);
     if let Some(mut entry) = conns.try_remove(key) {
-        // INCREMENTAL INFLIGHT: a removed connection's still-queued bytes leave
-        // the worker total. Fold its outstanding delta up to date, then subtract
-        // its current `out_bytes` so the running counter doesn't leak upward over
-        // the worker's lifetime. (After the fold the connection's contribution to
-        // `inflight_bytes` is exactly `out_bytes`, so subtracting it zeroes it.)
+        // INCREMENTAL INFLIGHT: a removed connection's still-held bytes leave the
+        // worker total. Fold its outstanding delta up to date, then subtract its
+        // current `accounted_bytes` so the running counter doesn't leak upward
+        // over the worker's lifetime. (After the fold the connection's
+        // contribution is exactly `accounted_bytes`, so subtracting it zeroes it.)
         *inflight_bytes = inflight_bytes
             .wrapping_add(entry.conn.take_inflight_delta() as u64)
-            .wrapping_sub(entry.conn.out_bytes() as u64);
+            .wrapping_sub(entry.conn.accounted_bytes() as u64);
         entry.conn.send_close_notify();
         if let Some(mut session) = entry.session.take() {
             deindex_connection(&session, local_subs);
@@ -4200,6 +4219,174 @@ mod tests {
         assert!(
             !flag.is_saturated(),
             "a drain to empty must release the inbox-full half"
+        );
+    }
+
+    // ---- #58 / #60: fragmented-TEXT reassembly bounds + byte accounting ------
+
+    /// A slab entry over a real registered loopback socket, without a session:
+    /// enough to drive the fragmentation state machine, which touches `conn`
+    /// only for the reassembly accounting. `_client` keeps the peer end alive.
+    struct FragmentFixture {
+        poll: Poll,
+        entry: Entry,
+        _client: std::net::TcpStream,
+    }
+
+    fn fragment_fixture() -> FragmentFixture {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let mut conn = Connection::new(mio::net::TcpStream::from_std(server), 1 << 20);
+        let poll = Poll::new().unwrap();
+        poll.registry()
+            .register(conn.stream_mut(), Token(0), Interest::READABLE)
+            .unwrap();
+        FragmentFixture {
+            poll,
+            entry: Entry {
+                conn,
+                inbuf: BytesMut::new(),
+                token: Token(0),
+                session: None,
+                fragment: None,
+                pending_establish: None,
+            },
+            _client: client,
+        }
+    }
+
+    impl FragmentFixture {
+        fn feed(&mut self, opcode: OpCode, fin: bool, payload: Vec<u8>, cap: usize) -> Action {
+            let f = frame::Frame {
+                fin,
+                opcode,
+                payload: bytes::Bytes::from(payload),
+            };
+            dispatch_frames(&self.poll, &mut self.entry, vec![f], cap, 0)
+        }
+    }
+
+    /// Issue #58: an opening fragment over the per-message cap must never be
+    /// buffered. Pre-fix it was copied wholesale onto the entry (bounded only by
+    /// the 1 MiB per-frame ceiling) and billed to nothing.
+    #[test]
+    fn an_oversize_first_text_fragment_buffers_nothing() {
+        let mut fx = fragment_fixture();
+
+        let action = fx.feed(OpCode::Text, false, vec![b'x'; 64 * 1024], 1024);
+
+        assert_eq!(action, Action::Keep);
+        assert!(matches!(fx.entry.fragment, Some(Fragment::Oversize)));
+        assert_eq!(fx.entry.conn.reassembly_bytes(), 0);
+        assert_eq!(fx.entry.conn.take_inflight_delta(), 0);
+    }
+
+    /// Issue #58, the memory pin: a peer opens an oversize message and keeps
+    /// feeding it without ever setting FIN. Nothing accumulates across the
+    /// fragments, and the connection is never closed.
+    #[test]
+    fn an_unfinished_oversize_message_accumulates_nothing() {
+        let mut fx = fragment_fixture();
+        fx.feed(OpCode::Text, false, vec![b'x'; 64 * 1024], 1024);
+
+        for _ in 0..64 {
+            assert_eq!(
+                fx.feed(OpCode::Continuation, false, vec![b'x'; 64 * 1024], 1024),
+                Action::Keep
+            );
+            assert_eq!(fx.entry.conn.reassembly_bytes(), 0);
+        }
+        assert_eq!(fx.entry.conn.take_inflight_delta(), 0);
+    }
+
+    /// Issue #60: the fragments that follow an overflow are swallowed, not read
+    /// as strays — the documented drop is silent and the connection survives.
+    #[test]
+    fn an_oversize_fragmented_message_is_dropped_without_closing() {
+        let mut fx = fragment_fixture();
+
+        assert_eq!(
+            fx.feed(OpCode::Text, false, vec![b'a'; 800], 1024),
+            Action::Keep
+        );
+        assert_eq!(
+            fx.feed(OpCode::Continuation, false, vec![b'b'; 800], 1024),
+            Action::Keep,
+            "the overflowing fragment must not close the connection"
+        );
+        assert!(matches!(fx.entry.fragment, Some(Fragment::Oversize)));
+        assert_eq!(
+            fx.entry.conn.reassembly_bytes(),
+            0,
+            "the partial message's bytes are released on overflow"
+        );
+        assert_eq!(
+            fx.feed(OpCode::Continuation, true, vec![b'c'; 8], 1024),
+            Action::Keep,
+            "the final fragment of a dropped message must not close the connection"
+        );
+        assert!(fx.entry.fragment.is_none());
+    }
+
+    /// The reassembly buffer of a legitimate message is billed to the
+    /// connection, so the worker's `inflight_bytes` — and the shedding built on
+    /// it — sees memory held on the peer's behalf.
+    #[test]
+    fn an_open_text_fragment_is_billed_to_the_connection() {
+        let mut fx = fragment_fixture();
+
+        fx.feed(OpCode::Text, false, vec![b'a'; 600], 4096);
+        assert_eq!(fx.entry.conn.reassembly_bytes(), 600);
+        assert_eq!(fx.entry.conn.accounted_bytes(), 600);
+        assert_eq!(fx.entry.conn.take_inflight_delta(), 600);
+
+        fx.feed(OpCode::Continuation, false, vec![b'b'; 200], 4096);
+        assert_eq!(fx.entry.conn.reassembly_bytes(), 800);
+        assert_eq!(
+            fx.entry.conn.take_inflight_delta(),
+            200,
+            "an append bills only its growth"
+        );
+
+        fx.feed(OpCode::Continuation, false, vec![b'c'; 4096], 4096);
+        assert_eq!(fx.entry.conn.reassembly_bytes(), 0);
+        assert_eq!(
+            fx.entry.conn.take_inflight_delta(),
+            -800,
+            "dropping the message returns its bytes to the budget"
+        );
+    }
+
+    /// An ignored fragmented BINARY message keeps its ignore-mode across
+    /// Continuations and bills nothing.
+    #[test]
+    fn a_fragmented_binary_message_is_ignored_and_bills_nothing() {
+        let mut fx = fragment_fixture();
+
+        assert_eq!(
+            fx.feed(OpCode::Binary, false, vec![0u8; 4096], 1024),
+            Action::Keep
+        );
+        assert!(matches!(fx.entry.fragment, Some(Fragment::Binary)));
+        assert_eq!(
+            fx.feed(OpCode::Continuation, true, vec![0u8; 4096], 1024),
+            Action::Keep
+        );
+        assert!(fx.entry.fragment.is_none());
+        assert_eq!(fx.entry.conn.take_inflight_delta(), 0);
+    }
+
+    /// RFC 6455 §5.4: a Continuation with no message open still fails the
+    /// connection — the ignore-modes must not soften the stray guard.
+    #[test]
+    fn a_stray_continuation_still_closes_the_connection() {
+        let mut fx = fragment_fixture();
+
+        assert_eq!(
+            fx.feed(OpCode::Continuation, true, b"stray".to_vec(), 1024),
+            Action::Close
         );
     }
 
