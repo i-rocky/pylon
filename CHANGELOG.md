@@ -134,6 +134,19 @@ pre-1.0 and versions track `Cargo.toml`.
   effect and produces no warning.
 
 ### Fixed
+- **The cluster-wide `PYLON_MAX_PRESENCE_MEMBERS` cap is now decided atomically
+  inside the presence-join script, so concurrent joins landing on different nodes
+  can no longer push a presence roster past it.** The bridge previously probed the
+  Redis count of record (`HLEN presusers` + `HEXISTS presusers <user>`) and
+  committed the join several round trips later, with nothing reserving the slot in
+  between: N nodes admitting at the same instant each read room and each committed,
+  overshooting the cap by up to N−1 members, and the roster stayed over-cap until
+  members left. `PRESENCE_JOIN_LUA` now takes the cap as an argument and weighs a
+  new distinct user against `HLEN presusers` in the same indivisible script that
+  records the member, returning `-1` for a rejection that wrote nothing; the
+  separate capacity probe is gone. The rejection shape is unchanged — the same 4004
+  `LimitReached` `subscription_error`, and a second connection of a user already on
+  the roster is still admitted with the channel full.
 - **Cluster state that a node computes from live membership is now reconciled
   every heartbeat instead of applied once on an edge, so a single missed edge no
   longer disables a channel for the life of the process.** Three symptoms shared

@@ -826,9 +826,13 @@ impl RedisAdapter {
         }
     }
 
-    /// Cluster half of a presence join: PRESENCE_JOIN refcount + cluster roster read.
-    /// Returns `(first_for_user, cluster_roster)`. Propagates the Redis error (the caller
-    /// keeps its node-local join on `Err`, as the inline path did).
+    /// Cluster half of a presence join: the atomic cap decision + PRESENCE_JOIN refcount +
+    /// cluster roster read, all in one round trip's worth of Redis-serialized script.
+    /// Returns `Ok(Some((first_for_user, cluster_roster)))` when admitted and `Ok(None)`
+    /// when `max_members` rejected it — in which case NOTHING was written, so a caller
+    /// that reports the rejection leaves the cluster count exactly as it found it.
+    /// `max_members: None` is uncapped. Propagates the Redis error (the caller keeps its
+    /// node-local join on `Err`, as the inline path did).
     #[doc(hidden)]
     pub async fn cluster_presence_join(
         &self,
@@ -836,7 +840,8 @@ impl RedisAdapter {
         channel: &str,
         member: &PresenceMember,
         socket_id: &SocketId,
-    ) -> anyhow::Result<(bool, PresencePayload)> {
+        max_members: Option<usize>,
+    ) -> anyhow::Result<Option<(bool, PresencePayload)>> {
         presence::join(
             &self.scripts,
             &self.clients.pool,
@@ -846,6 +851,7 @@ impl RedisAdapter {
             channel,
             member,
             socket_id,
+            max_members,
         )
         .await
     }
@@ -871,41 +877,6 @@ impl RedisAdapter {
             socket_id,
         )
         .await
-    }
-
-    /// Cluster presence capacity probe for the presence-subscribe admission check: the
-    /// cluster distinct-user count (`HLEN presusers`) and whether `user_id` is already in
-    /// the cluster roster (`HEXISTS presusers user_id`). Both reads are best-effort: a
-    /// Redis error degrades to `(0, false)` so the capacity gate fails open rather than
-    /// rejecting a join on a transient blip.
-    #[doc(hidden)]
-    pub async fn cluster_presence_capacity(
-        &self,
-        app: &str,
-        channel: &str,
-        user_id: &str,
-    ) -> (usize, bool) {
-        let count = match presence::user_count(&self.clients.pool, &self.keys, app, channel).await {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!(error = %e, app, channel, "redis presence user_count failed; capacity check degrades to 0");
-                0
-            }
-        };
-        let already_member: bool = match self
-            .clients
-            .pool
-            .next()
-            .hexists(self.keys.presusers(app, channel), user_id)
-            .await
-        {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(error = %e, app, channel, user_id, "redis HEXISTS presusers failed; treating as not-yet-member");
-                false
-            }
-        };
-        (count, already_member)
     }
 
     /// Cluster half of `signin_user`: USER_SIGNIN refcount, the node-local `usermsg`
@@ -1280,32 +1251,32 @@ impl Adapter for RedisAdapter {
         // first_for_user edge (HINCRBY refcount) and the cluster-wide roster. On any
         // Redis error keep the node-local join (graceful degradation).
         if let Some(join) = out.presence.as_mut() {
-            match self
-                .cluster_presence_join(app, channel, &join.member, &socket_id)
+            let admitted = match self
+                .cluster_presence_join(app, channel, &join.member, &socket_id, None)
                 .await
             {
-                Ok((first_for_user, roster)) => {
-                    join.first_for_user = first_for_user;
-                    // F-5: cluster truth REPLACES the node-local cached frame —
-                    // the cluster-wide roster is fresh data on every join, so it
-                    // encodes here through the same `wire::encode` seam
-                    // (byte-identical shape to the node-local path's frame). The
-                    // node-local cache itself is untouched: it tracks only
-                    // node-local membership.
-                    join.roster_frame = Arc::from(
-                        crate::protocol::wire::encode(
-                            crate::protocol::wire::ACTIVE_VERSIONS[0],
-                            &ServerEvent::SubscriptionSucceeded {
-                                channel: channel.to_string(),
-                                presence: Some(roster),
-                            },
-                        )
-                        .as_str(),
-                    );
-                }
+                Ok(admitted) => admitted,
                 Err(e) => {
                     tracing::warn!(error = %e, app, channel, "redis presence join failed; keeping node-local roster");
+                    None
                 }
+            };
+            // F-5: cluster truth REPLACES the node-local cached frame — the cluster
+            // roster is fresh data on every join, so it encodes here through the same
+            // `wire::encode` seam. The node-local cache is untouched: it tracks only
+            // node-local membership.
+            if let Some((first_for_user, roster)) = admitted {
+                join.first_for_user = first_for_user;
+                join.roster_frame = Arc::from(
+                    crate::protocol::wire::encode(
+                        crate::protocol::wire::ACTIVE_VERSIONS[0],
+                        &ServerEvent::SubscriptionSucceeded {
+                            channel: channel.to_string(),
+                            presence: Some(roster),
+                        },
+                    )
+                    .as_str(),
+                );
             }
         }
 

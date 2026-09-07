@@ -274,9 +274,8 @@ impl ConnectionContext {
                 //
                 // Clustered: the node-LOCAL `user_count` here only sees THIS node's members,
                 // so a per-node check would let a presence channel exceed its cap by
-                // `cap × nodes` across the cluster. The bridge enforces the cap CLUSTER-WIDE
-                // (against the Redis count of record) in `ClusterCmd::PresenceSubscribe`
-                // BEFORE it commits the join, sending the SAME 4004 `subscription_error` and
+                // `cap × nodes` across the cluster. The bridge decides the cap CLUSTER-WIDE
+                // inside `PRESENCE_JOIN_LUA`, sending the SAME 4004 `subscription_error` and
                 // undoing the inline local join on reject. So skip this node-local check in
                 // cluster mode; the not-yet-clustered path keeps it byte-identical.
                 if !self.clustered {
