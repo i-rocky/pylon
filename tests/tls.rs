@@ -799,7 +799,7 @@ async fn rest_pipelined_requests_over_native_tls() {
         "GET {get_path}?{get_q} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n"
     );
 
-    // Request 2: a POST whose ~9 KiB body keeps it just under the app's 10 KiB
+    // Request 2: a POST whose ~9 KiB body keeps it just under the app's 10 KB
     // event cap (so the answer is a 200) while its wire size still bursts far
     // past the ~4 KiB `read_tls` chunk — the exact loss window of G4.
     let big: String = "x".repeat(9 * 1024);

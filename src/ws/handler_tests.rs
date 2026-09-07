@@ -504,7 +504,7 @@ async fn client_event_oversize_payload_returns_4301() {
     .await;
     let _ = rx.try_recv().map(|b| *b); // drain subscription_succeeded
 
-    // Build a payload that exceeds the default max_event_payload_bytes (10 KiB = 10240 bytes).
+    // Build a payload that exceeds the default max_event_payload_bytes (10 KB = 10000 bytes).
     let big_data = serde_json::json!({ "x": "a".repeat(11_000) });
     c.dispatch(ClientCommand::ClientEvent {
         event: "client-x".into(),

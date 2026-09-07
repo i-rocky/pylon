@@ -120,7 +120,7 @@ TLS configuration is covered in detail on the [TLS / SSL](tls.md) page.
 | `PYLON_STRICT_PROTOCOL` | `false` | When `true`, reject any Pusher protocol violation instead of silently ignoring it. Set `1` or `true` to enable. |
 | `PYLON_MAX_CHANNEL_NAME_LENGTH` | `200` | Maximum allowed channel name length in bytes. Pusher's own sources disagree — the live channels doc quotes 164, but both actively-maintained official server SDKs (`pusher-http-node`, `pusher-http-go`) validate at 200 client-side. Pylon matches the SDKs so a name they send is never rejected; set `164` to match the published doc literally instead. |
 | `PYLON_MAX_EVENT_NAME_LENGTH` | `200` | Maximum allowed event name length in bytes. |
-| `PYLON_MAX_EVENT_PAYLOAD_BYTES` | `10240` | Maximum event payload size in bytes (10 KiB). |
+| `PYLON_MAX_EVENT_PAYLOAD_BYTES` | `10000` | Maximum event payload size in bytes. Hosted Pusher's docs say "smaller than 10kB" (decimal, not KiB); pylon matches that instead of the old 10240 (10 KiB), which let a 10,001-10,240 byte payload pass pylon and 413 on hosted. |
 | `PYLON_MAX_PRESENCE_MEMBERS` | `100` | Maximum number of members allowed in a presence channel. |
 | `PYLON_MAX_PRESENCE_USER_ID_LENGTH` | `128` | Maximum length of a presence member's `user_id` in bytes. |
 | `PYLON_MAX_PRESENCE_USER_INFO_BYTES` | `1024` | Maximum size of a presence member's `user_info` JSON in bytes. |
@@ -188,8 +188,8 @@ makes sense:
 
 - **REST request body cap.** POST bodies are capped at
   `max_batch_events × max_event_payload_bytes + 64 KiB` of JSON-framing headroom
-  — **164 KiB at the defaults** (10 × 10 KiB + 64 KiB), where hosted Pusher
-  accepts up to a 10 MB envelope. Every legitimate request (a full batch of
+  — **~161.7 KiB at the defaults** (10 × 10,000 bytes + 64 KiB), where hosted
+  Pusher accepts up to a 10 MB envelope. Every legitimate request (a full batch of
   max-size events) fits; the smaller cap simply bounds how much memory one
   unauthenticated request can make the server allocate. Raising
   `PYLON_MAX_BATCH_EVENTS` / `PYLON_MAX_EVENT_PAYLOAD_BYTES` raises the cap with

@@ -63,6 +63,11 @@ pub struct ServerConfig {
     pub strict_protocol: bool,
     pub apps_path: String,
     pub max_presence_members: usize,
+    /// Maximum event payload size in bytes. Hosted Pusher's docs say "smaller
+    /// than 10kB" and the archived OpenAPI spec pins `maxLength: 10000` —
+    /// decimal kilobytes, not KiB. `PYLON_MAX_EVENT_PAYLOAD_BYTES` (default
+    /// 10000): a payload of 10,001-10,240 bytes previously passed pylon and
+    /// got a 413 from hosted, breaking migration out of pylon.
     pub max_event_payload_bytes: usize,
     pub max_channels_per_publish: usize,
     pub rest_auth_window_secs: u64,
@@ -261,7 +266,7 @@ impl Default for ServerConfig {
             strict_protocol: false,
             apps_path: "apps.json".into(),
             max_presence_members: 100,
-            max_event_payload_bytes: 10_240,
+            max_event_payload_bytes: 10_000,
             max_channels_per_publish: 100,
             rest_auth_window_secs: 600,
             max_batch_events: 10,
@@ -665,7 +670,7 @@ mod tests {
         assert_eq!(c.handshake_timeout_ms, 10_000);
         assert!(!c.strict_protocol);
         assert_eq!(c.max_presence_members, 100);
-        assert_eq!(c.max_event_payload_bytes, 10_240);
+        assert_eq!(c.max_event_payload_bytes, 10_000);
         assert_eq!(c.max_channels_per_publish, 100);
         assert_eq!(c.rest_auth_window_secs, 600);
         assert_eq!(c.max_batch_events, 10);

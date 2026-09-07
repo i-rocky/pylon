@@ -39,6 +39,11 @@ pre-1.0 and versions track `Cargo.toml`.
   looks like, and pylon's old default rejected a 165-200 byte channel name the
   SDKs would already send successfully to hosted Pusher. Set `164` to match the
   published doc value instead.
+- **`PYLON_MAX_EVENT_PAYLOAD_BYTES` default lowered from 10,240 to 10,000
+  bytes** — hosted Pusher's docs say "smaller than 10kB" (decimal, not KiB) and
+  the archived OpenAPI spec pins `maxLength: 10000`; the old 10,240 (10 KiB) let
+  a 10,001-10,240 byte payload pass pylon and then 413 on hosted, breaking
+  migration out of pylon. Still overridable via `PYLON_MAX_EVENT_PAYLOAD_BYTES`.
 - **Malformed numeric `PYLON_*` values now fail startup instead of silently
   keeping the default** — every numeric environment variable is rejected when it
   is set to a value that fails to parse. `PYLON_PORT=abc` and

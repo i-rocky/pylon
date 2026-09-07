@@ -1384,7 +1384,7 @@ async fn rest_trigger_valid_channel_name_is_200() {
 #[tokio::test]
 async fn rest_body_too_large_is_413() {
     let addr = spawn().await;
-    // Default limits → body cap = 10*10240 + 64KiB ≈ 164KiB; exceed it. The
+    // Default limits → body cap = 10*10000 + 64KiB ≈ 161.7KiB; exceed it. The
     // limit fires at body extraction, before the signature check runs.
     let big = "x".repeat(200 * 1024);
     let body = json!({"name": "e", "data": big, "channels": ["c"]}).to_string();
@@ -1646,7 +1646,7 @@ async fn rest_error_body_413_event_data_is_json() {
 #[tokio::test]
 async fn rest_error_body_413_body_limit_is_json() {
     let addr = spawn().await;
-    // Default limits → body cap = 10*10240 + 64KiB ≈ 164KiB; exceed it.
+    // Default limits → body cap = 10*10000 + 64KiB ≈ 161.7KiB; exceed it.
     let big = "x".repeat(200 * 1024);
     let body = json!({"name": "e", "data": big, "channels": ["c"]}).to_string();
     let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
