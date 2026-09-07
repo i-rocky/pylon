@@ -28,7 +28,8 @@ work against it unchanged — you just point them at your Pylon host instead of 
   authorization with per-connection rate limiting.
 - **Presence** — member add/remove events, presence rosters, and configurable member/data limits.
 - **Webhooks** — `channel_occupied`/`channel_vacated`, `member_added`/`member_removed`,
-  `client_event`, `cache_miss`; HMAC-signed and batched.
+  `client_event`, `cache_miss`, `subscription_count` (requires `subscription_count_enabled`);
+  HMAC-signed and batched.
 - **REST API** — trigger (single + batch), channel and presence-user queries, and
   terminate-user-connections, all under the Pusher HTTP authentication scheme.
 - **Clustering** — horizontal scale-out across nodes via Redis (presence, user routing/termination,

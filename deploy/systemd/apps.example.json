@@ -7,6 +7,19 @@
     "capacity": 1000000,
     "client_messages_enabled": false,
     "enabled": true,
-    "webhooks": []
+    "webhooks": [
+      {
+        "url": "https://example.test/webhooks",
+        "event_types": [
+          "channel_occupied",
+          "channel_vacated",
+          "member_added",
+          "member_removed",
+          "client_event",
+          "cache_miss",
+          "subscription_count"
+        ]
+      }
+    ]
   }
 ]

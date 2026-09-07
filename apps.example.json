@@ -17,7 +17,8 @@
           "member_added",
           "member_removed",
           "client_event",
-          "cache_miss"
+          "cache_miss",
+          "subscription_count"
         ],
         "headers": { "X-Custom": "value" }
       }
