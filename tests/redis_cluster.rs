@@ -405,6 +405,46 @@ async fn redis_sub_lifecycle_tracks_channels() {
     );
 }
 
+/// Issue #66: a `node_last` teardown token is computed on a percore worker under the
+/// shared registry lock but APPLIED later, in bridge-queue order — so a re-join can
+/// land between the two. Applying the stale token blind unsubscribes this node from a
+/// channel it still has local subscribers on, leaving it deaf to that channel's
+/// cross-node traffic until the reconciler's next tick.
+#[tokio::test]
+async fn stale_node_last_keeps_a_channel_this_node_still_subscribes() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let prefix = random_prefix();
+        let adapter = connect_adapter_with_prefix(&prefix).await;
+        let msg_key = Keys::new(&prefix).msg(TEST_APP, "public-room");
+
+        let (leaving, leaving_handle) = fake_handle();
+        adapter
+            .subscribe(TEST_APP, "public-room", leaving_handle, None)
+            .await;
+        let (_staying, staying_handle) = fake_handle();
+        adapter
+            .subscribe(TEST_APP, "public-room", staying_handle, None)
+            .await;
+        assert!(
+            await_tracked(&adapter, &msg_key, Duration::from_secs(2)).await,
+            "precondition: the node must be subscribed to the msg key after the 0→1 edge"
+        );
+
+        // The token a worker computed while `leaving` was this node's last subscriber,
+        // applied after the re-join `staying` stands for.
+        adapter
+            .cluster_unsubscribe(TEST_APP, "public-room", &leaving, true)
+            .await;
+
+        assert!(
+            tracked_contains(&adapter, &msg_key),
+            "a stale node_last must not unsubscribe a channel with live local subscribers"
+        );
+    })
+    .await
+    .expect("stale node_last test must not hang (Redis up?)");
+}
+
 /// Whether `adapter`'s SubscriberClient currently tracks `key` as a subscription.
 fn tracked_contains(adapter: &RedisAdapter, key: &str) -> bool {
     adapter.tracked_redis_channels().iter().any(|c| c == key)
