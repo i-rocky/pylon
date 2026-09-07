@@ -54,7 +54,7 @@ Pylon fires seven event types:
 | `member_added` | A client joins a presence channel (`presence-*`). Fires immediately, even on a rejoin inside the grace window (the doc's suppression is removal-side only). |
 | `member_removed` | A client leaves a presence channel (`presence-*`). Delayed by the same grace period (`PYLON_WEBHOOK_VACATED_GRACE_MS`); if the user re-joins the channel within the window the webhook is suppressed — see the note below. |
 | `client_event` | A client publishes a `client-` prefixed event (only fired when `client_messages_enabled` is `true` for the app). |
-| `cache_miss` | A new subscriber joins a cache channel (`cache-*`, `private-cache-*`, `presence-cache-*`) and no cached event exists for that channel. |
+| `cache_miss` | A new subscriber joins a cache channel (`cache-*`, `private-cache-*`, `presence-cache-*`, `private-encrypted-cache-*`) and no cached event exists for that channel. |
 | `subscription_count` | A client subscribes to or unsubscribes from a non-presence channel and the app has `subscription_count_enabled: true`. The payload carries the channel's new subscriber count. Fires for every count change (no count is ever `0` — the last subscriber leaving is signalled by `channel_vacated`). |
 
 ---

@@ -43,13 +43,19 @@
     Download, verify, and extract:
 
     ```sh
-    # Replace X.Y.Z and ARCH (x86_64 or aarch64) as appropriate
-    curl -LO https://github.com/i-rocky/pylon/releases/download/vX.Y.Z/pylon-X.Y.Z-ARCH-unknown-linux-gnu.tar.gz
-    curl -LO https://github.com/i-rocky/pylon/releases/download/vX.Y.Z/pylon-X.Y.Z-ARCH-unknown-linux-gnu.tar.gz.sha256
+    # Replace X.Y.Z and ARCH (x86_64 or aarch64) as appropriate.
+    # Note the asset name carries the leading "v" of the tag.
+    ASSET=pylon-vX.Y.Z-ARCH-unknown-linux-gnu
 
-    sha256sum -c pylon-X.Y.Z-ARCH-unknown-linux-gnu.tar.gz.sha256
-    tar xzf pylon-X.Y.Z-ARCH-unknown-linux-gnu.tar.gz
-    ./pylon --version
+    curl -LO "https://github.com/i-rocky/pylon/releases/download/vX.Y.Z/${ASSET}.tar.gz"
+    curl -LO "https://github.com/i-rocky/pylon/releases/download/vX.Y.Z/${ASSET}.tar.gz.sha256"
+
+    sha256sum -c "${ASSET}.tar.gz.sha256"
+    tar xzf "${ASSET}.tar.gz"
+
+    # The tarball unpacks into a directory containing the binary plus
+    # LICENSE, README.md and apps.example.json.
+    "./${ASSET}/pylon" --version
     ```
 
 === "From source"

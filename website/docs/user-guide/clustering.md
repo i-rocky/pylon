@@ -46,12 +46,71 @@ The apps list must be **identical** on every node; pylon does not replicate it t
 | `PYLON_REDIS_PREFIX` | `pylon` | Key prefix for all pylon Redis keys — change if you share a Redis instance with other services. |
 | `PYLON_REDIS_POOL_SIZE` | `6` | Connection-pool size per node. |
 | `PYLON_REDIS_MEMBERSHIP_TTL` | `60` | Seconds before a node's membership entry expires if it stops heartbeating. |
-| `PYLON_REDIS_NODE_HEARTBEAT` | `5` | Heartbeat interval (seconds) each node publishes to Redis. |
-| `PYLON_REDIS_PRESENCE_HEARTBEAT` | `25` | Interval (seconds) at which presence-member entries are refreshed. |
+| `PYLON_REDIS_NODE_HEARTBEAT` | `5` | Heartbeat interval (seconds) at which each node refreshes its own `node:{id}` liveness key and its per-app capacity counts. |
+| `PYLON_REDIS_PRESENCE_HEARTBEAT` | `25` | Interval (seconds) of the **membership reconciliation tick** — see [below](#membership-reconciliation). Despite the name this does considerably more than refresh presence members. |
+| `PYLON_REDIS_SWEEP_INTERVAL` | `10` | Interval (seconds) at which the lease-locked sweeper reclaims stale presence members, channels, and dead nodes' capacity units. |
 | `PYLON_REDIS_SHARDED_PUBSUB` | `false` | Use Redis 7+ sharded Pub/Sub (`SSUBSCRIBE`/`SPUBLISH`) for higher-throughput clusters. Requires Redis 7.0+, and **every** node must set the same value — sharded and ordinary Pub/Sub are separate namespaces. |
 | `PYLON_CLUSTER_ENVELOPE_COMPAT` | `true` | Drop the legacy `event` field from relayed envelopes when set `0`/`false`/`off` — roughly halves cluster-bus bandwidth. **Only safe once every node runs a build that ships this knob; v0.3.0 is NOT enough** (see [below](#cluster-envelope-compat-post-030-fleets-only)). |
 
 See [Configuration](configuration.md) for the full variable reference.
+
+### Membership reconciliation {#membership-reconciliation}
+
+Every `PYLON_REDIS_PRESENCE_HEARTBEAT` seconds (default 25) each node runs a
+**level-driven reconciliation tick**: rather than replaying past events, it
+re-asserts from its own in-process registry the whole of what Redis must know
+about it —
+
+- every local presence member's and user binding's `expireAt` stamp, plus the
+  whole-key TTL backstops on those hashes;
+- the `apps` / `chans` / `users` index sets those entries are enumerated
+  through; and
+- the pub/sub subscriptions that carry cross-node traffic to this node — it
+  `SUBSCRIBE`s any channel or user key it has local members for but is not
+  attached to.
+
+This is what bounds the blast radius of a lost edge. An index entry or a Redis
+`SUBSCRIBE` missed because a bridge command was dropped, because Redis restarted
+and lost its keyspace, or because a sweeper false-reap removed live members, is
+restored on the next tick instead of staying lost for the life of the process.
+Previously such a loss was permanent: the node stayed deaf to that channel's
+cross-node traffic while still reporting `pylon_redis_connected 1`.
+
+Two properties worth knowing when tuning the interval:
+
+- **A healthy node pays no extra Redis round-trip for the pub/sub half** — the
+  desired subscription set is diffed against the client's own in-memory tracked
+  set. All the writes ride a single pipeline per tick.
+- **The interval is your worst-case repair latency.** Pub/sub has no replay, so
+  frames lost inside the window are lost for good. Lowering it shortens that
+  window at the cost of more frequent (but still batched) Redis writes; the
+  stamp horizon `PYLON_REDIS_MEMBERSHIP_TTL` (default 60 s) must stay
+  comfortably above it, since it is what a tick refreshes.
+
+A dead node simply stops ticking — its stamps go stale and the sweeper reaps
+them.
+
+!!! note "Presence rosters follow the oldest live connection"
+    A presence user's advertised `user_info` is seated on that user's oldest
+    still-live connection, cluster-wide, via a per-channel `presseats` hash.
+    When the seating connection leaves, the roster is re-seated onto the
+    next-oldest survivor inside the same atomic script that records the leave.
+    Previously the first writer's value was advertised forever, so a user who
+    updated their profile, opened a new tab and closed the old one kept showing
+    the stale value to everyone who joined afterwards.
+
+    **Sizing:** `presseats` holds one `user_info` copy per presence
+    **connection** rather than per user, each bounded by
+    `PYLON_MAX_PRESENCE_USER_INFO_BYTES` (default 1024 B). Budget roughly
+    `connections × (user_info + ~60 B)` per presence channel.
+
+    **Rolling upgrade:** the hash is purely additive — no flag, no backfill, no
+    coordinated restart. Nodes on older builds neither read nor write it, and
+    `presmembers` (which both builds maintain) stays the liveness truth. A user
+    whose oldest live connection sits on a not-yet-upgraded node keeps the old
+    value until that node is upgraded. Rolling **back** leaves `presseats:*`
+    hashes that the older vacate path will not drain; they are inert and can be
+    deleted manually once every node is downgraded.
 
 ### Cluster envelope compat (post-0.3.0 fleets only)
 
