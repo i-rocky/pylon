@@ -705,6 +705,10 @@ impl RedisAdapter {
         }
     }
 
+    async fn has_local_subscribers(&self, app: &str, channel: &str) -> bool {
+        self.local.channel(app, channel).await.subscription_count > 0
+    }
+
     /// Cluster half of `subscribe`: record cluster-wide membership (MEMBERSHIP_JOIN_LUA),
     /// index the app, and drive the node-local Redis `msg`-channel subscribe-on-first
     /// lifecycle.
@@ -783,8 +787,11 @@ impl RedisAdapter {
     }
 
     /// Cluster half of `unsubscribe`: remove cluster-wide membership (UNSUBSCRIBE_LUA) and
-    /// tear down the node-local Redis `msg`-channel subscription on the node-local 1 → 0
-    /// edge (`node_last`, computed by the caller as `out.subscription_count == 0`). Returns
+    /// tear down the node-local Redis `msg`-channel subscription once this node has no
+    /// subscriber left. `node_last` is the caller's 1 → 0 edge (`out.subscription_count
+    /// == 0`), RE-CHECKED here against the live registry: a percore worker computes the
+    /// edge and the bridge applies it later, so a re-join in between would otherwise be
+    /// unsubscribed out from under. Returns
     /// the AUTHORITATIVE `(cluster_count, vacated)`, where `vacated` is the VACATE CAS
     /// verdict: `true` only when THIS call's atomic SREM actually removed the channel from
     /// the `chans` index — i.e. this caller owns the single cluster-wide
@@ -801,7 +808,7 @@ impl RedisAdapter {
         socket_id: &SocketId,
         node_last: bool,
     ) -> (usize, bool) {
-        if node_last {
+        if node_last && !self.has_local_subscribers(app, channel).await {
             self.cluster_unsub_channel(app, channel).await;
         }
 
@@ -961,7 +968,9 @@ impl RedisAdapter {
     /// Cluster half of `signout_user`: USER_SIGNOUT refcount, the node-local `usermsg`
     /// unsubscribe-on-last lifecycle, and the WatchOffline publish on the cluster 1→0
     /// edge. `node_last` is the node-local last-connection edge (the caller computes it as
-    /// `out.last_for_user`). Returns the cluster `last_for_user`; on Redis error returns
+    /// `out.last_for_user`), re-checked against the live registry for the same reason
+    /// [`cluster_unsubscribe`](RedisAdapter::cluster_unsubscribe) re-checks its own.
+    /// Returns the cluster `last_for_user`; on Redis error returns
     /// `node_last` so the caller keeps its node-local outcome.
     #[doc(hidden)]
     pub async fn cluster_signout(
@@ -971,7 +980,7 @@ impl RedisAdapter {
         socket_id: &SocketId,
         node_last: bool,
     ) -> bool {
-        if node_last {
+        if node_last && !self.local.is_user_online(app, user_id).await {
             if let Err(e) = pubsub::unsub_channel(
                 &self.clients.sub,
                 self.keys.usermsg(app, user_id),

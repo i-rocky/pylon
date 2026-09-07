@@ -159,9 +159,8 @@ pub(super) async fn reap_member(
     if won != 1 {
         return;
     }
-    let dead_node = token.split_once(':').map(|(n, _)| n).unwrap_or_default();
     emit_member_removed(
-        pool, keys, app, channel, &user_id, dead_node, sharded, compat, webhooks,
+        pool, keys, app, channel, &user_id, sharded, compat, webhooks,
     )
     .await;
 }
@@ -182,18 +181,7 @@ pub(super) async fn emit_drained_members(
     webhooks: &WebhookHandle,
 ) {
     for user_id in users {
-        emit_member_removed(
-            pool,
-            keys,
-            app,
-            channel,
-            user_id,
-            NO_ORIGIN_NODE,
-            sharded,
-            compat,
-            webhooks,
-        )
-        .await;
+        emit_member_removed(pool, keys, app, channel, user_id, sharded, compat, webhooks).await;
     }
 }
 
@@ -202,8 +190,10 @@ pub(super) async fn emit_drained_members(
 const NO_ORIGIN_NODE: &str = "";
 
 /// Broadcast one `member_removed` cluster-wide on the channel's msg pub/sub, plus its
-/// webhook. `origin_node` is the node the departed member belonged to (the sweeper is
-/// never it), so every LIVE node — including the sweeper's own — delivers the frame.
+/// webhook. The sweeper delivers to no local socket itself, and the token it reaps may
+/// carry its OWN node id (its stamps went stale while it kept sweeping), so the envelope
+/// is stamped [`NO_ORIGIN_NODE`] — a node that dropped this as a self-echo would starve
+/// its own clients of the removal every other node delivered.
 /// `compat` is the cluster-wide `PYLON_CLUSTER_ENVELOPE_COMPAT` setting: with compat
 /// off the envelope omits the legacy `event` member and `frame_b64` is the sole
 /// carrier. One frame is shared cluster-wide, so it encodes at `ACTIVE_VERSIONS[0]`.
@@ -214,7 +204,6 @@ async fn emit_member_removed(
     app: &str,
     channel: &str,
     user_id: &str,
-    origin_node: &str,
     sharded: bool,
     compat: bool,
     webhooks: &WebhookHandle,
@@ -227,7 +216,7 @@ async fn emit_member_removed(
         },
     );
     let env = Envelope {
-        node_id: origin_node.to_string(),
+        node_id: NO_ORIGIN_NODE.to_string(),
         app: app.to_string(),
         kind: EnvelopeKind::Broadcast,
         channel: channel.to_string(),

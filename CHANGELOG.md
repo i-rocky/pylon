@@ -172,6 +172,25 @@ pre-1.0 and versions track `Cargo.toml`.
   effect and produces no warning.
 
 ### Fixed
+- **A clustered node no longer goes deaf to a channel it still has subscribers
+  on when a leave and a re-join are applied out of order.** The percore worker
+  computes the node-local 1→0 teardown edge under the shared registry lock but
+  the bridge applies it later, in queue order — so a re-join landing between the
+  two made the node UNSUBSCRIBE from a channel it had just re-acquired a
+  subscriber for, dropping every cross-node event on it until the membership
+  reconciler's next tick. The teardown is now re-checked against live node-local
+  truth (channels and per-user `usermsg` bindings alike) at the moment it is
+  applied.
+- **A presence member reaped by the very node that owned it is now removed for
+  that node's own clients too, instead of only for the rest of the cluster.**
+  The sweeper stamped its compensating `member_removed` with the departed
+  member's node id; when a node's own membership stamps went stale while it kept
+  holding the sweep lease, that id was its own and its receive loop dropped the
+  frame as a self-echo. The sweeper delivers to no local socket itself, so its
+  emission now belongs to no publisher and every live node delivers it.
+- **A cache channel's stored last event is written before the event is
+  broadcast**, so a subscriber whose asynchronous replay races a publish can no
+  longer be handed the previous event after the fresh one.
 - **The graceful-shutdown drain no longer waits on inbound buffers it will
   never consume, so a rolling restart exits as soon as queued replies are
   sent instead of always burning the full grace window.** `inflight_bytes`
