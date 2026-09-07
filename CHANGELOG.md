@@ -148,6 +148,71 @@ pre-1.0 and versions track `Cargo.toml`.
   out-frames and its message-reassembly buffer, and released as soon as the
   frame completes. No configuration changes; the per-frame ceiling itself is
   unchanged.
+- **Under `PYLON_REDIS_SHARDED_PUBSUB`, a node no longer comes back from a Redis
+  reconnect subscribed to only a fraction of its channels.** Pylon subscribes
+  exclusively with `SSUBSCRIBE` in that mode, so fred's ordinary-channel and pattern
+  sets are empty by construction — but its `resubscribe_all` replayed them anyway,
+  writing a zero-argument `SUBSCRIBE` and `PSUBSCRIBE` that Redis answers with
+  errors. Neither command is response-tracked while the `SSUBSCRIBE`s that follow
+  are, so a stray error frame was handed to an in-flight shard resubscribe and the
+  batch was abandoned at the first hash-slot group — every later group (one per
+  channel, since pylon's keys are hash-tagged) never re-issued. That node silently
+  stopped delivering cross-node broadcasts, user sends, terminates and watchlist
+  transitions for those channels, while it kept publishing normally, other nodes saw
+  it as healthy, and its own `redis_connected` gauge stayed `true`. The membership
+  reconciler does not cover this: it diffs against fred's tracked sets, which still
+  list every channel after the aborted resubscribe. Pylon now owns the reconnect
+  repair and re-issues each tracked channel, pattern and shard channel one at a
+  time, logging and continuing past a failure instead of abandoning the rest.
+- **The sweeper's user-binding reap can no longer wipe a live binding and report an
+  online user as offline.** `reap_user` was a five-round-trip read-modify-write —
+  the un-fixed twin of the channel-member reap already made atomic. Its `HLEN` guard
+  closed the window between the `HDEL` and the guard itself, but not the one between
+  the guard and the `DEL` that followed: a signin landing there had its fresh binding
+  deleted, was dropped out of `users(app)` — where nothing re-adds it, since the
+  heartbeat only re-`HSET`s the binding — and had a `WatchOffline` published for it,
+  stamped with the DEAD node's id so no live node self-dedups it. Watchlist clients
+  saw a user go online and immediately offline while they were connected and signed
+  in, `is_user_online` answered `false` for up to a heartbeat, and that user became
+  invisible to every later sweep, so a genuine crash of the node holding them would
+  never fire `WatchOffline` at all. The reap is now one `USER_REAP_LUA` CAS, which
+  Redis serialises against the signin script: the offline edge belongs to whichever
+  caller's `SREM` actually removed the `users(app)` entry, exactly as the channel
+  vacate and member reap already decide theirs, so a concurrent signout that
+  de-indexed the user first also leaves the reap silent.
+- **A connection whose cluster capacity admission failed open no longer steals a
+  sibling connection's unit when it closes.** `admit_app` returning `None` — a
+  bridge channel that was full or closed, a verdict that timed out, or a Redis
+  error — fails open and takes no unit, but the close path fired a release for
+  every connection of an app with a `capacity`. `RELEASE_APP_LUA`'s node guard is a
+  per-NODE aggregate check, not a per-connection one: it only trips when this
+  node's per-app field is absent or already zero, so on a node holding units for
+  other connections of the same app the phantom release sailed past it and
+  decremented the cluster total anyway. Per fail-open admission that later closed,
+  the cluster silently believed one connection fewer than it held and admitted one
+  extra past `capacity` — and on a busy long-lived node the books never re-balanced,
+  because the node's per-app field effectively never bottomed out. The release is
+  now gated on the connection's OWN admission verdict, making the script's floor-0
+  guard the backstop it is described as. An admission whose verdict arrived after
+  the worker gave up is released by the bridge instead, so it leaks nothing either.
+- **A live node reclaimed as dead no longer leaves the cluster permanently
+  under-counting that node's per-app connections.** A node whose `node:{id}`
+  liveness key merely lapses — three missed heartbeats of Redis unreachability
+  *from that node* is enough, while it keeps serving every one of its clients — is
+  swept up by another node's dead-node reclaim, which subtracts its per-app units
+  from the cluster total `appconns` and deletes its `nodeconns` hash. The
+  heartbeat's self-heal then re-seeded only `nodeconns`, so `appconns` stayed short
+  by one node's worth of connections for the life of the deployment, admitting that
+  many extra past the app's configured `capacity` — and double-subtracting as the
+  node's pre-existing connections closed. The self-heal now re-seeds this node's
+  hash from the worker fleet's live per-app counts *and*, in the same script,
+  recomputes each of those apps' cluster total as the sum over every node's hash.
+  Summing rather than adding back is what makes the repair correct for both ways
+  the hash can vanish: a plain TTL lapse (the units were never subtracted, so
+  adding them again would double-count) and a reclaim (they were). The reclaim
+  itself now re-checks the liveness key *inside* its script and declines, so a node
+  that re-advertised between the sweeper's `EXISTS` probe and the `EVALSHA` is left
+  alone.
 - **A presence roster no longer advertises the `user_info` of a connection that
   has already left.** `ChannelState` keeps one `user_info` per distinct presence
   user, seeded by that user's first connection; `remove` only decremented the

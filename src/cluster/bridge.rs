@@ -60,7 +60,7 @@ impl Default for ClusterMetrics {
 const CMD_CHANNEL_CAPACITY: usize = 8192;
 
 /// How long [`ClusterHandle::admit_app`] blocks the calling worker for the
-/// bridge's capacity verdict before failing open (Task 4.2). The verdict is one
+/// bridge's capacity verdict before failing open. The verdict is one
 /// Redis round trip on the bridge's drain loop; a healthy bridge answers in
 /// single-digit milliseconds. The bound exists for the DEGRADED case: a worker
 /// must never block indefinitely on a stalled bridge — after it elapses the
@@ -194,7 +194,7 @@ pub enum ClusterCmd {
         socket_id: SocketId,
         no_longer_watched: Vec<String>,
     },
-    /// Cluster-wide per-app capacity ADMISSION (Task 4.2 / finding D2): run
+    /// Cluster-wide per-app capacity ADMISSION: run
     /// `ADMIT_APP_LUA` on the bridge's RedisAdapter and hand the verdict back
     /// over `reply`. Unlike the fire-and-forget commands, this one is
     /// REQUEST-RESPONSE: the calling worker blocks (bounded by
@@ -208,8 +208,8 @@ pub enum ClusterCmd {
         capacity: u32,
         reply: std::sync::mpsc::SyncSender<Option<bool>>,
     },
-    /// Cluster-wide per-app capacity RELEASE (Task 4.2): the floor-0, node-guarded
-    /// give-back of one unit (`RELEASE_APP_LUA`) for a connection that closed.
+    /// Cluster-wide per-app capacity RELEASE: the floor-0 give-back of one unit
+    /// (`RELEASE_APP_LUA`) for a closed connection whose admission took one.
     /// Fire-and-forget exactly like the other close-time commands. Maps to
     /// [`RedisAdapter::cluster_release_app`].
     ReleaseApp { app: Arc<str> },
@@ -538,7 +538,7 @@ impl ClusterHandle {
         }
     }
 
-    /// Cluster-wide per-app capacity ADMISSION (Task 4.2 / finding D2). Unlike the
+    /// Cluster-wide per-app capacity ADMISSION. Unlike the
     /// fire-and-forget commands, this one needs the bridge's VERDICT before the
     /// caller may proceed, so it sends the command and then blocks — bounded by
     /// [`ADMIT_REPLY_TIMEOUT`] — for the reply:
@@ -550,10 +550,9 @@ impl ClusterHandle {
     ///   the node-local check (no state changed).
     /// * `None` — the bridge is UNAVAILABLE (channel full/closed, the verdict did
     ///   not arrive in time, or Redis errored): FAIL OPEN — admit. A degraded
-    ///   bridge must not lock clients out of a node whose local checks passed, and
-    ///   no unit was taken, so the close-side release (floor-0, node-guarded) is a
-    ///   harmless no-op. Logged at debug because it is the expected degradation,
-    ///   not an error.
+    ///   bridge must not lock clients out of a node whose local checks passed. No
+    ///   unit was taken, so the caller must NOT release one at close. Logged at
+    ///   debug because it is the expected degradation, not an error.
     ///
     /// The command still rides the SAME bounded channel as everything else (the
     /// try_send never blocks the worker); only the reply wait blocks, and it is
@@ -710,7 +709,7 @@ impl Drop for ClusterBridge {
 /// bridge hands it to the adapter's node heartbeat, which uses it to RE-SEED this
 /// node's `nodeconns` capacity hash after a Redis outage longer than the hash's TTL
 /// backstop — without the re-seed, pre-outage capacity units would drift in the
-/// cluster totals forever (Task 4.2 fix).
+/// cluster totals forever.
 pub fn start(
     cfg: &ServerConfig,
     local: Arc<LocalAdapter>,
@@ -1338,17 +1337,15 @@ async fn handle_cmd(
             capacity,
             reply,
         } => {
-            // Cluster-wide per-app capacity verdict (ADMIT_APP_LUA): check the
-            // cluster count and take a unit atomically. The worker is blocked
-            // (bounded) on `reply`, so answer FIRST-class: a dropped reply (the
-            // worker timed out first) is a harmless no-op — the worker already
-            // failed open, and if this verdict takes a unit the connection's
-            // close-side release gives it back.
             let verdict = adapter.cluster_admit_app(&app, capacity).await;
-            let _ = reply.send(verdict);
+            // A dropped reply means the worker timed out and failed open, so its
+            // connection owes no release and nothing else would ever give this
+            // unit back. Hand it back here instead.
+            if reply.send(verdict).is_err() && verdict == Some(true) {
+                adapter.cluster_release_app(&app).await;
+            }
         }
         ClusterCmd::ReleaseApp { app } => {
-            // Floor-0, node-guarded give-back of one per-app capacity unit.
             adapter.cluster_release_app(&app).await;
         }
         ClusterCmd::PresenceAck {

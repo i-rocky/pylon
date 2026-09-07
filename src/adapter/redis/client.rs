@@ -2,9 +2,9 @@
 //!
 //! Holds the command pool (one [`Pool`] of `pool_size` connections) used for all
 //! ordinary commands + PUBLISH, and a dedicated [`SubscriberClient`] for the
-//! pub/sub side. The subscriber's resubscribe task ([`SubscriberClient::manage_subscriptions`])
-//! is kept alive by storing its [`JoinHandle`] — dropping it would stop the
-//! automatic re-subscribe on reconnect.
+//! pub/sub side, plus the task that re-subscribes it after a reconnect. That task's
+//! [`JoinHandle`] is kept alive — dropping it would leave the node deaf to every
+//! cross-node channel after the next reconnect.
 
 use fred::clients::{Pool, SubscriberClient};
 use fred::error::Error as FredError;
@@ -55,7 +55,6 @@ impl RedisClients {
     /// spawns the subscriber's resubscribe-on-reconnect task.
     pub async fn connect(redis_url: &str, pool_size: u32) -> anyhow::Result<RedisClients> {
         let config = Config::from_url(redis_url)?;
-        // `max_attempts = 0` means retry forever; min 100ms, max 30s, base 2.
         let policy = ReconnectPolicy::new_exponential(0, 100, 30_000, 2);
 
         let mut builder = Builder::from_config(config);
@@ -67,14 +66,56 @@ impl RedisClients {
         pool.init().await?;
         sub.init().await?;
 
-        // Keep the resubscribe task handle so it isn't dropped (which would stop it).
-        let sub_manager = sub.manage_subscriptions();
+        let sub_manager = tokio::spawn(resubscribe_on_reconnect(sub.clone()));
 
         Ok(RedisClients {
             pool,
             sub,
             sub_manager,
         })
+    }
+}
+
+/// Re-issue every subscription the client tracks after each reconnect, ONE key at a
+/// time, logging and continuing past a failure.
+///
+/// fred's own [`SubscriberClient::manage_subscriptions`] cannot do this job. Its
+/// `resubscribe_all` opens by replaying the tracked ordinary-channel and pattern sets
+/// verbatim — and under `PYLON_REDIS_SHARDED_PUBSUB` both are empty by construction,
+/// since pylon then subscribes exclusively with `SSUBSCRIBE`. fred still builds and
+/// writes those two commands, so Redis answers a zero-argument `SUBSCRIBE` and
+/// `PSUBSCRIBE` with errors. Neither command is response-tracked (fred resolves them
+/// locally and buffers nothing), while the `SSUBSCRIBE`s that follow are, so a stray
+/// error frame is handed to an in-flight shard resubscribe and the `?` abandons every
+/// remaining hash-slot group. The node comes back subscribed to a fraction of its
+/// keys — no `msg`, no `usermsg`, no `watch` for the rest — while it keeps publishing
+/// normally and its `redis_connected` gauge reads healthy.
+async fn resubscribe_on_reconnect(sub: SubscriberClient) {
+    let mut reconnects = sub.reconnect_rx();
+    loop {
+        // A lagged receiver missed reconnect events, which is all the more reason to
+        // re-assert the subscriptions; only a closed channel ends the task.
+        if let Err(tokio::sync::broadcast::error::RecvError::Closed) = reconnects.recv().await {
+            return;
+        }
+        for channel in sub.tracked_channels() {
+            log_resubscribe(sub.subscribe(channel.clone()).await, &channel);
+        }
+        for pattern in sub.tracked_patterns() {
+            log_resubscribe(sub.psubscribe(pattern.clone()).await, &pattern);
+        }
+        for channel in sub.tracked_shard_channels() {
+            log_resubscribe(sub.ssubscribe(channel.clone()).await, &channel);
+        }
+    }
+}
+
+fn log_resubscribe(result: Result<(), FredError>, channel: &str) {
+    if let Err(e) = result {
+        tracing::warn!(
+            error = %e, channel,
+            "failed to re-subscribe a Redis pub/sub channel after a reconnect"
+        );
     }
 }
 
@@ -219,6 +260,50 @@ local left = redis.call('HINCRBY', KEYS[1], user_id, -1)
 return {user_id, left, 0}
 "#;
 
+/// USER_REAP CAS script (the sweeper's stale-binding reap), the user twin of
+/// [`REAP_MEMBER_LUA`]. HDELs every binding whose `expireAt` is in the past (an
+/// unparseable stamp counts as stale — no live node can ever re-stamp it to a valid
+/// future value) and, when that leaves the user with none, DELs the hash and
+/// de-indexes them. `won == 1` iff THIS call's `SREM` removed the `users` entry: the
+/// single cluster-wide `WatchOffline` emission right, so a concurrent signout that
+/// already de-indexed the user leaves this reap silent.
+///
+/// Decision and writes are one script, so a signin landing anywhere near it is
+/// serialised either wholly before (this call then sees a fresh binding and
+/// declines) or wholly after (it re-establishes the user behind a reap that won).
+/// Split across round trips, the decision could be made before the signin and the
+/// `DEL` + `SREM` land after it — wiping a live binding, dropping an online user out
+/// of `users(app)` for good, and publishing an offline for them.
+///
+/// Returns `{won, dead_node}` — `dead_node` is the first stale token's node prefix
+/// (the publisher stamped on the `WatchOffline` so no live node self-dedups it), or
+/// `''` when the hash had already TTL-lapsed while still indexed.
+///
+/// `KEYS[1]` = usr hash, `KEYS[2]` = users set.
+/// `ARGV[1]` = now_ms, `ARGV[2]` = user_id.
+const USER_REAP_LUA: &str = r#"
+local now = tonumber(ARGV[1])
+local bindings = redis.call('HGETALL', KEYS[1])
+local dead_node = ''
+local fresh = 0
+for i = 1, #bindings, 2 do
+  local expire_at = tonumber(bindings[i + 1])
+  if expire_at ~= nil and expire_at >= now then
+    fresh = fresh + 1
+  else
+    if dead_node == '' then
+      local node = string.match(bindings[i], '^([^:]+):')
+      if node then dead_node = node end
+    end
+    redis.call('HDEL', KEYS[1], bindings[i])
+  end
+end
+if fresh > 0 then return {0, ''} end
+redis.call('DEL', KEYS[1])
+if redis.call('SREM', KEYS[2], ARGV[2]) == 0 then return {0, ''} end
+return {1, dead_node}
+"#;
+
 /// USER_SIGNOUT. Removes this connection's binding token and — on the cluster 1→0
 /// user edge — deletes the now-empty hash and de-indexes the user. Returns the
 /// remaining `HLEN` (authoritative cluster-wide connection count).
@@ -232,7 +317,7 @@ if conn <= 0 then redis.call('DEL', KEYS[1]); redis.call('SREM', KEYS[2], ARGV[2
 return conn
 "#;
 
-/// APP ADMIT (Task 4.2 / finding D2): the cluster-wide per-app capacity gate.
+/// APP ADMIT: the cluster-wide per-app capacity gate.
 /// Atomically checks the CLUSTER count (`appconns`) against the app's capacity
 /// and, when there is room, takes one unit there AND on the admitting node's
 /// own per-app hash (which also re-arms that hash's TTL backstop). Returns `1`
@@ -254,13 +339,13 @@ redis.call('EXPIRE', KEYS[2], ARGV[3])
 return 1
 "#;
 
-/// APP RELEASE (Task 4.2 / finding D2): floor-0 give-back of one unit on both
-/// the node's per-app hash and the cluster total — never negative. NODE-GUARDED:
-/// the cluster total is decremented only when this node actually held a unit, so
-/// a phantom release (e.g. an admission that failed open, or a capacity config
-/// that changed between establish and close) can never steal a unit another node
-/// legitimately holds. Fields that reach 0 are HDEL'd so the hashes stay tidy.
-/// Returns the remaining cluster total for the app.
+/// APP RELEASE: floor-0 give-back of one unit on both the node's per-app hash and
+/// the cluster total — never negative. The node guard is an aggregate backstop, not
+/// per-connection: it stops this node's releases from driving the cluster total
+/// below the units this node holds in total, but on a node holding units for the
+/// app it cannot recognise a release that matches no admission. Matching release to
+/// admission is the caller's job (`Session::cluster_admitted`). Fields that reach 0
+/// are HDEL'd so the hashes stay tidy. Returns the remaining cluster total.
 ///
 /// `KEYS[1]` = appconns hash, `KEYS[2]` = nodeconns:{node} hash.
 /// `ARGV[1]` = app_id.
@@ -276,14 +361,18 @@ if total <= 0 then redis.call('HDEL', KEYS[1], ARGV[1]) end
 return total
 "#;
 
-/// DEAD-NODE RECLAIM (Task 4.2 / finding D2, run by the sweeper): subtract a
-/// dead node's per-app counts from the cluster totals, floored at 0 per app
-/// (never negative), then delete the dead node's hash. One script = the whole
-/// read-subtract-delete decision is atomic, so it cannot straddle a concurrent
-/// admission. Returns the number of apps reclaimed.
+/// DEAD-NODE RECLAIM (run by the sweeper): subtract a dead node's per-app counts
+/// from the cluster totals, floored at 0 per app (never negative), then delete the
+/// dead node's hash. One script = the whole read-subtract-delete decision is atomic,
+/// so it cannot straddle a concurrent admission. Returns the number of apps
+/// reclaimed, or `-1` when the node's liveness key is back — the sweeper's own
+/// `EXISTS` probe and this call are separate round trips, and a node that
+/// re-advertised in between is alive and still holds every unit on its hash.
 ///
-/// `KEYS[1]` = appconns hash, `KEYS[2]` = nodeconns:{dead_node} hash.
+/// `KEYS[1]` = appconns hash, `KEYS[2]` = nodeconns:{dead_node} hash,
+/// `KEYS[3]` = node:{dead_node} liveness key.
 const RECLAIM_NODE_LUA: &str = r#"
+if redis.call('EXISTS', KEYS[3]) == 1 then return -1 end
 local counts = redis.call('HGETALL', KEYS[2])
 for i = 1, #counts, 2 do
   local app = counts[i]
@@ -297,6 +386,38 @@ for i = 1, #counts, 2 do
 end
 redis.call('DEL', KEYS[2])
 return math.floor(#counts / 2)
+"#;
+
+/// NODE CAPACITY RE-SEED (run by the node heartbeat when its `nodeconns` hash has
+/// gone): write this node's live per-app counts back onto its hash and rebuild each
+/// of those apps' cluster total as `Σ nodeconns[node][app]` over the `nodes` set.
+///
+/// Recomputing the sum — rather than adding the live counts back — is what makes the
+/// repair correct for BOTH ways the hash can vanish. A plain TTL lapse leaves this
+/// node's units in `appconns` (adding them again would double-count); a dead-node
+/// reclaim subtracted them (leaving them out under-counts forever). The sum is the
+/// invariant both cases must land on, and Redis serializes the script, so it cannot
+/// straddle a concurrent admission on another node.
+///
+/// `KEYS[1]` = appconns hash, `KEYS[2]` = this node's nodeconns hash, `KEYS[3]` = nodes
+/// set. `ARGV[1]` = nodeconns key prefix, `ARGV[2]` = this node id, `ARGV[3]` = nodeconns
+/// ttl_secs, `ARGV[4..]` = app/count pairs. Returns the number of apps re-seeded.
+const RESEED_NODE_CAPACITY_LUA: &str = r#"
+for i = 4, #ARGV, 2 do
+  redis.call('HSET', KEYS[2], ARGV[i], ARGV[i + 1])
+end
+redis.call('EXPIRE', KEYS[2], ARGV[3])
+local nodes = redis.call('SMEMBERS', KEYS[3])
+for i = 4, #ARGV, 2 do
+  local total = tonumber(ARGV[i + 1])
+  for _, node in ipairs(nodes) do
+    if node ~= ARGV[2] then
+      total = total + (tonumber(redis.call('HGET', ARGV[1] .. node, ARGV[i])) or 0)
+    end
+  end
+  redis.call('HSET', KEYS[1], ARGV[i], total)
+end
+return math.floor((#ARGV - 3) / 2)
 "#;
 
 /// The membership/presence Lua scripts, compiled (SHA-1 hashed) at adapter build
@@ -321,6 +442,10 @@ pub struct Scripts {
     /// `won == 1` iff THIS call took the user's refcount to exactly 0 and owns
     /// the single `member_removed` emission right.
     pub reap_member: Script,
+    /// The sweeper's atomic user-binding reap: returns `{won, dead_node}` — `won == 1`
+    /// iff THIS call de-indexed the user and owns the single `WatchOffline` emission
+    /// right.
+    pub user_reap: Script,
     /// Records a user signout and returns the user's remaining cluster connection count.
     pub user_signout: Script,
     /// Cluster-wide per-app capacity gate: returns 1 when admitted (unit taken
@@ -331,6 +456,9 @@ pub struct Scripts {
     /// Sweeper's dead-node reclaim: subtracts a dead node's per-app counts from
     /// the cluster totals (floored at 0) and deletes its hash.
     pub reclaim_node: Script,
+    /// Heartbeat's capacity self-heal: re-seeds this node's per-app hash from the
+    /// live counts and rebuilds each app's cluster total from every node's hash.
+    pub reseed_node_capacity: Script,
 }
 
 impl Scripts {
@@ -343,10 +471,12 @@ impl Scripts {
             presence_join: Script::from_lua(PRESENCE_JOIN_LUA),
             presence_leave: Script::from_lua(PRESENCE_LEAVE_LUA),
             reap_member: Script::from_lua(REAP_MEMBER_LUA),
+            user_reap: Script::from_lua(USER_REAP_LUA),
             user_signout: Script::from_lua(USER_SIGNOUT_LUA),
             admit_app: Script::from_lua(ADMIT_APP_LUA),
             release_app: Script::from_lua(RELEASE_APP_LUA),
             reclaim_node: Script::from_lua(RECLAIM_NODE_LUA),
+            reseed_node_capacity: Script::from_lua(RESEED_NODE_CAPACITY_LUA),
         }
     }
 }
@@ -375,6 +505,8 @@ mod tests {
         let s = Scripts::new();
         assert_ne!(s.membership_join.sha1(), s.user_signout.sha1());
         assert_ne!(s.user_signout.sha1(), s.unsubscribe.sha1());
+        assert_ne!(s.user_reap.sha1(), s.user_signout.sha1());
+        assert_ne!(s.user_reap.sha1(), s.reap_member.sha1());
     }
 
     #[test]
@@ -390,5 +522,6 @@ mod tests {
         assert_ne!(s.admit_app.sha1(), s.release_app.sha1());
         assert_ne!(s.admit_app.sha1(), s.reclaim_node.sha1());
         assert_ne!(s.admit_app.sha1(), s.membership_join.sha1());
+        assert_ne!(s.reseed_node_capacity.sha1(), s.reclaim_node.sha1());
     }
 }

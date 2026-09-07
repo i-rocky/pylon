@@ -9,7 +9,7 @@ use super::envelope::{Envelope, EnvelopeKind};
 use super::keys::{member_token, Keys};
 use crate::protocol::socket_id::SocketId;
 use fred::clients::Pool;
-use fred::interfaces::{HashesInterface, KeysInterface, SetsInterface};
+use fred::interfaces::HashesInterface;
 use serde_json::Value;
 
 /// Run USER_SIGNIN. Returns the cluster `first_for_user` edge (HLEN == 1 → the user
@@ -76,21 +76,19 @@ pub(super) async fn is_online(
     Ok(n > 0)
 }
 
-/// Sweeper crash-time reap of ONE indexed user's stale bindings. A live node re-stamps
-/// its own bindings' `expireAt`; a crashed node stops, so its bindings go stale. This
-/// HDELs every stale token of `user_id`; when no fresh binding remains — the user's last
-/// cluster connection was on the dead node, OR the `usr` hash already TTL-expired while
-/// still indexed in `users(app)` (the orphan case, mirroring the channel sweep) — it is
-/// the cluster offline edge: DEL the (now-empty) hash, de-index, and publish WatchOffline
-/// so every live node notifies its local watchers. Best-effort; logs + continues.
+/// Sweeper crash-time reap of ONE indexed user's stale bindings, via the atomic
+/// USER_REAP CAS. A live node re-stamps its own bindings' `expireAt`; a crashed node
+/// stops, so its bindings go stale. Winning the CAS (`won == 1`) means this call took
+/// the user to no bindings at all and de-indexed them — the cluster offline edge, and
+/// the single cluster-wide `WatchOffline` emission right. Best-effort: a failed script
+/// leaves the user indexed and the next sweep retries.
 ///
-/// The WatchOffline envelope's publisher `node_id` is the DEAD node (the stale token's
-/// prefix, or an empty sentinel for an already-gone hash) so this sweeper's OWN receive
-/// loop does NOT self-dedup it — A must still notify its local watchers of u7's offline.
-/// `compat` is the cluster-wide `PYLON_CLUSTER_ENVELOPE_COMPAT` setting (the
-/// WatchOffline control envelope keeps its shape either way; threaded for
-/// uniformity with the frame-carrying reap paths).
+/// The WatchOffline envelope's publisher `node_id` is the DEAD node the script resolved
+/// (or an empty sentinel for an already-lapsed hash), so this sweeper's OWN receive loop
+/// does NOT self-dedup it — it must still notify its local watchers.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn reap_user(
+    scripts: &Scripts,
     pool: &Pool,
     keys: &Keys,
     app: &str,
@@ -99,77 +97,23 @@ pub(super) async fn reap_user(
     compat: bool,
     now: u64,
 ) {
-    let usr = keys.usr(app, user_id);
-    let members: Vec<(String, String)> = match pool.next().hgetall(&usr).await {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(error = %e, app, user_id, "sweeper: HGETALL usr failed");
-            return;
-        }
-    };
-
-    // Partition into stale tokens (to HDEL) and a dead-node attribution for the offline
-    // publish. A fresh (future-`expireAt`) binding means a live node still holds the user.
-    let mut stale: Vec<String> = Vec::new();
-    let mut had_fresh = false;
-    let mut dead_node = String::new();
-    for (token, expire_at) in &members {
-        let is_stale = expire_at
-            .parse::<u64>()
-            .map(|exp| exp < now)
-            .unwrap_or(true);
-        if is_stale {
-            if dead_node.is_empty() {
-                if let Some((n, _)) = token.split_once(':') {
-                    dead_node = n.to_string();
-                }
-            }
-            stale.push(token.clone());
-        } else {
-            had_fresh = true;
-        }
-    }
-
-    if !stale.is_empty() {
-        if let Err(e) = pool.next().hdel::<i64, _, _>(&usr, stale.clone()).await {
-            tracing::warn!(error = %e, app, user_id, "sweeper: HDEL usr stale failed");
-            return;
-        }
-    }
-
-    // A user with any fresh binding is still online cluster-wide — leave it.
-    if had_fresh {
-        return;
-    }
-
-    // No fresh binding remains. `HLEN usr` is the authoritative post-reap count (also 0
-    // when the hash already TTL-expired). A non-zero count means a concurrent signin
-    // landed between our HGETALL and now — skip the offline edge for it.
-    let remaining: i64 = match pool.next().hlen(&usr).await {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::warn!(error = %e, app, user_id, "sweeper: HLEN usr failed");
-            return;
-        }
-    };
-    if remaining != 0 {
-        return;
-    }
-
-    // Cluster offline edge: DEL the (now-empty) hash, de-index, publish WatchOffline.
-    // Both stay best-effort (log-only on error): a failed SREM leaves the user indexed,
-    // so the next sweep's reap retries the DEL/SREM — and the empty `usr` hash is
-    // bounded by its whole-key TTL backstop from signin — so repeated failures
-    // self-heal on the next sweep.
-    if let Err(e) = pool.next().del::<i64, _>(&usr).await {
-        tracing::warn!(error = %e, app, user_id, "sweeper: DEL usr failed");
-    }
-    if let Err(e) = pool
-        .next()
-        .srem::<i64, _, _>(keys.users(app), user_id.to_string())
+    let (won, dead_node): (i64, String) = match scripts
+        .user_reap
+        .evalsha_with_reload(
+            pool.next(),
+            vec![keys.usr(app, user_id), keys.users(app)],
+            vec![now.to_string(), user_id.to_string()],
+        )
         .await
     {
-        tracing::warn!(error = %e, app, user_id, "sweeper: SREM users failed");
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, app, user_id, "sweeper: user reap CAS failed");
+            return;
+        }
+    };
+    if won != 1 {
+        return;
     }
     publish(
         pool,
@@ -177,8 +121,8 @@ pub(super) async fn reap_user(
         &dead_node,
         app,
         user_id,
-        super::envelope::EnvelopeKind::WatchOffline,
-        serde_json::Value::Null,
+        EnvelopeKind::WatchOffline,
+        Value::Null,
         sharded,
         compat,
     )

@@ -18,7 +18,8 @@
 //!   dropped) has its counts reclaimed by the sweeper within a short-heartbeat
 //!   window, after which a new connection on the survivor succeeds.
 //! * Fail-open — when the bridge is unavailable, admission still succeeds
-//!   locally (a degraded bridge must not lock clients out of the node).
+//!   locally (a degraded bridge must not lock clients out of the node), and the
+//!   connection it admitted releases nothing at close, because it took nothing.
 //!
 //! Like `percore_cluster.rs`, these talk to a REAL Redis (`PYLON_TEST_REDIS_URL`,
 //! default `redis://127.0.0.1:6390`) behind a random key prefix — NEVER
@@ -26,9 +27,13 @@
 
 mod common;
 
-use common::{connect, established_socket_id, spawn_percore_cluster_with_apps, wait_until, Ws};
+use common::{
+    connect, established_socket_id, next_event_named, send_json, spawn_percore_cluster_with_apps,
+    wait_until, Ws,
+};
 use futures_util::StreamExt;
 use pylon::adapter::local::LocalAdapter;
+use pylon::adapter::redis::client::{RedisClients, Scripts};
 use pylon::adapter::redis::keys::Keys;
 use pylon::adapter::redis::RedisAdapter;
 use pylon::adapter::Adapter;
@@ -52,6 +57,13 @@ use uuid::Uuid;
 const CAP1_APPS: &str = r#"[
     {"name":"Test","id":"app","key":"app-key","secret":"app-secret",
      "capacity":1,"client_messages_enabled":true}
+]"#;
+
+/// A roomy app: several connections fit under the cluster cap at once, so a
+/// close can be observed against the units its siblings still hold.
+const CAP5_APPS: &str = r#"[
+    {"name":"Test","id":"app","key":"app-key","secret":"app-secret",
+     "capacity":5,"client_messages_enabled":true}
 ]"#;
 
 /// Test Redis URL: `PYLON_TEST_REDIS_URL` or the documented default (port 6390).
@@ -254,6 +266,65 @@ async fn sweeper_reclaims_dead_node_connection_counts() {
         "capacity must be usable immediately after the reclaim"
     );
     adapter.cluster_release_app("t4").await;
+
+    use fred::interfaces::ClientLike;
+    let _ = client.quit().await;
+}
+
+/// The dead-node reclaim re-checks the liveness key INSIDE the script: a node that
+/// re-advertised itself between the sweeper's `EXISTS` probe and the `EVALSHA` is
+/// alive and still holds every unit on its hash, so the reclaim must decline.
+#[tokio::test]
+async fn reclaim_declines_a_node_that_re_advertised_itself() {
+    let prefix = random_prefix();
+    let keys = Keys::new(&prefix);
+    let scripts = Scripts::new();
+    let clients = RedisClients::connect(&test_redis_url(), 1)
+        .await
+        .expect("fred clients must connect to the test Redis");
+    let client = fred_client().await;
+
+    use fred::interfaces::{HashesInterface, KeysInterface};
+    let _: () = client.hset(&keys.appconns(), ("t6", 2)).await.unwrap();
+    let _: () = client
+        .hset(keys.nodeconns("revived"), ("t6", 2))
+        .await
+        .unwrap();
+    let _: () = client
+        .set(
+            keys.node("revived"),
+            "1",
+            Some(fred::types::Expiration::EX(120)),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let verdict: i64 = scripts
+        .reclaim_node
+        .evalsha_with_reload(
+            clients.pool.next(),
+            vec![
+                keys.appconns(),
+                keys.nodeconns("revived"),
+                keys.node("revived"),
+            ],
+            Vec::<String>::new(),
+        )
+        .await
+        .expect("RECLAIM_NODE_LUA must eval");
+
+    assert_eq!(verdict, -1, "a live node's reclaim must decline");
+    assert_eq!(
+        hget_i64(&client, &keys.appconns(), "t6").await,
+        2,
+        "a declined reclaim must leave the cluster total untouched"
+    );
+    assert!(
+        key_exists(&client, &keys.nodeconns("revived")).await,
+        "a declined reclaim must leave the live node's hash in place"
+    );
 
     use fred::interfaces::ClientLike;
     let _ = client.quit().await;
@@ -493,6 +564,115 @@ async fn admission_fails_open_when_bridge_unavailable() {
     let _ = client.quit().await;
 }
 
+/// A connection whose cluster admission FAILED OPEN took no Redis unit, so its
+/// close must fire no release. `RELEASE_APP_LUA`'s node guard only trips when this
+/// node's per-app field is absent or already zero, so on a node holding units for
+/// other connections of the same app a phantom release sails past it and steals a
+/// sibling's unit — the cluster total drifting down by one per fail-open admission
+/// that later closes, and over-admitting by exactly that much.
+///
+/// The fail-open is forced by parking `appconns` behind a wrong-typed key for the
+/// duration of one establish, so `ADMIT_APP_LUA` errors and the verdict is `None`.
+/// The subscribe/close pair then orders the bridge's FIFO command queue: once the
+/// vacate is visible in Redis, the closing connection's `remove` has already
+/// enqueued whatever it was going to, so the next connection's admission — which
+/// blocks on its verdict — cannot be answered before it.
+#[tokio::test]
+async fn a_fail_open_admission_releases_no_unit_at_close() {
+    let prefix = random_prefix();
+    let keys = Keys::new(&prefix);
+    let (addr, _guard) = spawn_percore_cluster_with_apps(&prefix, CAP5_APPS, |_| {}).await;
+    let client = fred_client().await;
+
+    let mut ws1 = connect(addr, "?protocol=7").await;
+    let _sid1 = established_socket_id(&mut ws1).await;
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            hget_i64(&client, &keys.appconns(), "app").await == 1
+        })
+        .await,
+        "the first admission must take one cluster unit"
+    );
+
+    use fred::interfaces::KeysInterface;
+    let parked = format!("{prefix}:appconns-parked");
+    let _: () = client
+        .rename(&keys.appconns(), &parked)
+        .await
+        .expect("RENAME must not error");
+    let _: () = client
+        .set(&keys.appconns(), "not-a-hash", None, None, false)
+        .await
+        .expect("SET must not error");
+
+    let mut ws2 = connect(addr, "?protocol=7").await;
+    let _sid2 = established_socket_id(&mut ws2).await;
+
+    let _: i64 = client
+        .del(&keys.appconns())
+        .await
+        .expect("DEL must not error");
+    let _: () = client
+        .rename(&parked, &keys.appconns())
+        .await
+        .expect("RENAME back must not error");
+    assert_eq!(
+        hget_i64(&client, &keys.appconns(), "app").await,
+        1,
+        "the fail-open admission must not have taken a unit"
+    );
+
+    let channel = format!("order-{}", Uuid::new_v4());
+    send_json(
+        &mut ws2,
+        serde_json::json!({ "event": "pusher:subscribe", "data": { "channel": channel } }),
+    )
+    .await;
+    let _ = next_event_named(&mut ws2, "pusher_internal:subscription_succeeded").await;
+    let occ = keys.occ("app", &channel);
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            key_exists(&client, &occ).await
+        })
+        .await,
+        "the subscribe must reach Redis before the close can order against it"
+    );
+
+    drop(ws2);
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            !key_exists(&client, &occ).await
+        })
+        .await,
+        "the close must vacate the channel in Redis"
+    );
+
+    // Enqueued strictly after the close, so its verdict cannot be answered before
+    // any release the close fired.
+    let mut ws3 = connect(addr, "?protocol=7").await;
+    let _sid3 = established_socket_id(&mut ws3).await;
+
+    let nodes: Vec<String> = fred::interfaces::SetsInterface::smembers(&client, keys.nodes())
+        .await
+        .expect("SMEMBERS must not error");
+    assert_eq!(nodes.len(), 1, "the test spawns one node (got {nodes:?})");
+    assert_eq!(
+        hget_i64(&client, &keys.appconns(), "app").await,
+        2,
+        "the fail-open connection's close must not have taken a sibling's cluster unit"
+    );
+    assert_eq!(
+        hget_i64(&client, &keys.nodeconns(&nodes[0]), "app").await,
+        2,
+        "…nor a sibling's unit on this node's own hash"
+    );
+
+    drop(ws1);
+    drop(ws3);
+    use fred::interfaces::ClientLike;
+    let _ = client.quit().await;
+}
+
 // ── 5. Self-heal: the heartbeat re-seeds the node's counts after a Redis outage ──
 
 /// If Redis is unreachable for longer than the `nodeconns:{node}` TTL backstop,
@@ -569,6 +749,85 @@ async fn heartbeat_reseeds_nodeconns_after_hash_expiry() {
     let mut ws2 = connect(addr, "?protocol=7").await;
     let _sid2 = established_socket_id(&mut ws2).await;
     drop(ws2);
+
+    use fred::interfaces::ClientLike;
+    let _ = client.quit().await;
+}
+
+/// A LIVE node whose liveness key merely lapsed — 3 heartbeats of Redis
+/// unreachability is enough — is reclaimed as dead by another node's sweeper, which
+/// SUBTRACTS its per-app units from the cluster total. Re-seeding only `nodeconns`
+/// leaves the cluster permanently under-counting that app by one node's worth of
+/// connections, and admitting that many extra. The self-heal must restore BOTH
+/// sides, and must not disturb the units a sibling node legitimately holds.
+///
+/// The reclaim is applied directly here (its exact three effects) rather than waited
+/// out through a real 15s liveness lapse.
+#[tokio::test]
+async fn heartbeat_reseed_restores_the_cluster_total_after_a_reclaim() {
+    let prefix = random_prefix();
+    let keys = Keys::new(&prefix);
+    let (addr, _guard) = spawn_percore_cluster_with_apps(&prefix, CAP1_APPS, |c| {
+        c.redis_node_heartbeat_secs = 1;
+    })
+    .await;
+
+    // The live node's one admitted connection: appconns = 1, nodeconns:A = 1.
+    let mut ws = connect(addr, "?protocol=7").await;
+    let _sid = established_socket_id(&mut ws).await;
+    let client = fred_client().await;
+
+    use fred::interfaces::{HashesInterface, KeysInterface, SetsInterface};
+    let nodes: Vec<String> = client.smembers(keys.nodes()).await.unwrap();
+    assert_eq!(nodes.len(), 1, "the test spawns one node (got {nodes:?})");
+    let node_a = nodes[0].clone();
+
+    // A sibling node holding 2 units of the same app, heart-beating normally.
+    let _: () = client.sadd(keys.nodes(), "sibling").await.unwrap();
+    let _: () = client
+        .set(
+            keys.node("sibling"),
+            "1",
+            Some(fred::types::Expiration::EX(120)),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let _: () = client
+        .hset(keys.nodeconns("sibling"), ("app", 2))
+        .await
+        .unwrap();
+    let _: i64 = client.hincrby(&keys.appconns(), "app", 2).await.unwrap();
+
+    // The sibling's sweeper reclaims A while A is still serving its connection.
+    let _: i64 = client.srem(keys.nodes(), node_a.clone()).await.unwrap();
+    let _: i64 = client.hincrby(&keys.appconns(), "app", -1).await.unwrap();
+    let _: i64 = client.del(keys.nodeconns(&node_a)).await.unwrap();
+
+    let healed = wait_until(Duration::from_secs(10), || async {
+        hget_i64(&client, &keys.nodeconns(&node_a), "app").await == 1
+            && hget_i64(&client, &keys.appconns(), "app").await == 3
+    })
+    .await;
+    assert!(
+        healed,
+        "the heartbeat must restore BOTH this node's units and the cluster total \
+         (appconns={}, nodeconns={})",
+        hget_i64(&client, &keys.appconns(), "app").await,
+        hget_i64(&client, &keys.nodeconns(&node_a), "app").await
+    );
+
+    // The restored unit is given back exactly once — the sibling's 2 survive.
+    drop(ws);
+    let released = wait_until(Duration::from_secs(10), || async {
+        hget_i64(&client, &keys.appconns(), "app").await == 2
+    })
+    .await;
+    assert!(
+        released,
+        "the close must give back exactly the one unit this node held"
+    );
 
     use fred::interfaces::ClientLike;
     let _ = client.quit().await;
