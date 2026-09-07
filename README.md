@@ -174,8 +174,8 @@ A recent stable Rust toolchain is required.
 
 ```sh
 cargo build --release        # binary at target/release/pylon
-cargo test                   # unit + integration suite
-#   (some clustering tests require a local Redis; see the test files)
+cargo test                   # full suite needs Redis, MySQL, Postgres, and Mongo running —
+#   see CONTRIBUTING.md for the infra-free subset and the full service requirements
 ```
 
 ## Compatibility
