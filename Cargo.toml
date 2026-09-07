@@ -60,7 +60,7 @@ futures-util = "0.3"
 # readiness-driven (non-async) per-core worker loop (SP9). LocalAdapter's async
 # methods never await real I/O, so this completes without parking a runtime.
 futures-executor = "0.3"
-thiserror = "1"
+thiserror = "2.0.20"
 # TLS: rustls (direct dep — already transitively present at 0.23 via reqwest/fred) + PEM loader.
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pemfile = "2"
