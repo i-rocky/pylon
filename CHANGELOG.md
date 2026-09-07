@@ -165,6 +165,37 @@ pre-1.0 and versions track `Cargo.toml`.
   the per-connection subscription cap are unaffected), with the presence roster
   read from the same source the original ack used — cluster-wide on a clustered
   node, node-local otherwise.
+- **A connection handed off to the REST plane no longer leaks its queued bytes
+  into the worker's byte total.** Every other teardown subtracts what the
+  connection still holds; `handoff_rest` removed the slab entry without doing
+  so, while its call sites folded those same bytes *in* first. The drain queues
+  its 4200 frames onto still-handshaking connections too, so a request head
+  arriving mid-drain left `inflight_bytes` permanently above zero — a phantom
+  floor that no connection holds, which makes `pylon_percore_inflight_bytes`
+  over-report for the life of the worker and stops the drain's fast exit from
+  ever firing again (debug builds panicked on the accounting cross-check).
+- **Shutdown no longer waits out the full `shutdown_grace_ms` when a peer has
+  already gone away.** The drain queued its `pusher:error` 4200 + Close(4200)
+  and discarded the flush's verdict, so a connection whose peer had RST'd —
+  routine on a rolling restart, where the load balancer drains clients while
+  the node is stopping — was left in the slab with those frames queued and no
+  WRITABLE interest armed. `inflight_bytes` could then never reach zero, so the
+  drain's "everything flushed, exit now" path stopped applying and every
+  restart paid the whole grace window (10 s by default); debug builds panicked
+  on the queued-bytes-imply-armed invariant instead. Such a connection is now
+  torn down as soon as the flush reports it unwritable.
+- **A TLS connection no longer under-reports up to 60 KiB of unsent data to the
+  byte budget.** The out-queue released a frame the moment rustls accepted the
+  plaintext, not when the bytes reached the socket, so a backpressured TLS
+  connection could sit at zero queued bytes while rustls held a whole 60 KiB
+  batch behind a full send buffer. `inflight_bytes` — and with it the REST 503
+  path, the `client-*` ingress drop and the graduated shed bands — therefore
+  engaged later than configured on TLS deployments, and the shutdown drain's
+  "everything flushed" exit could fire over Close(4200) frames that had not
+  actually gone out, leaving those clients with a bare TCP close (which
+  pusher-js backs off from instead of reconnecting immediately). Plaintext
+  rustls has taken but not yet put on the wire is now billed to the connection
+  until it is written.
 - **A peer can no longer pin up to 1 MiB of reassembly buffer per connection,
   invisible to the byte budget** (security-relevant). The first fragment of a
   fragmented TEXT message (RFC 6455 §5.4) was accepted with no
