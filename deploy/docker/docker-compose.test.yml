@@ -1,11 +1,15 @@
 # docker-compose.test.yml — the four services `cargo test`'s full suite needs,
-# on the ports the test suites already default to (see CONTRIBUTING.md and the
-# dev guide's Testing section). Mirrors the service containers in
+# on the documented safe ports for local test runs (see CONTRIBUTING.md and
+# the dev guide's Testing section). Mirrors the service containers in
 # .github/workflows/ci.yml. Not for production use — no persistence, no auth
 # hardening.
 #
 # Usage:
 #   docker compose -f deploy/docker/docker-compose.test.yml up -d
+#   export PYLON_TEST_REDIS_URL=redis://127.0.0.1:6390
+#   export PYLON_TEST_MYSQL_URL=mysql://root:pylon@127.0.0.1:3307/pylon_test
+#   export PYLON_TEST_POSTGRES_URL=postgres://postgres:pylon@127.0.0.1:5433/pylon_test
+#   export PYLON_TEST_MONGO_URL=mongodb://127.0.0.1:27018/pylon_test
 #   cargo test --locked --no-fail-fast -- --test-threads=1
 #   docker compose -f deploy/docker/docker-compose.test.yml down -v
 
