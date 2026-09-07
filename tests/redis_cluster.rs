@@ -3356,3 +3356,144 @@ async fn reconciler_resubscribes_pubsub_keys_after_a_dropped_bridge_command() {
     .await
     .expect("pub/sub reconcile test must not hang (Redis up?)");
 }
+
+// ---------------------------------------------------------------------------
+// User-reap CAS (live-binding wipe + spurious WatchOffline regression).
+//
+// The user reap is the twin of the member reap above: it resolves stale tokens,
+// decides the cluster →0 offline edge, and emits. Split across separate
+// round trips, its decision could straddle a signin — the reap reading an empty
+// hash, a signin on another node writing a live binding and indexing the user,
+// and the reap's later DEL + SREM then wiping BOTH while publishing an offline
+// for a user that is online. As one script, Redis serialises it against
+// MEMBERSHIP_JOIN_LUA and the straddle has nowhere to land.
+// ---------------------------------------------------------------------------
+
+/// Run the signin half of MEMBERSHIP_JOIN_LUA for `user_id`/`token`, stamping a
+/// binding that stays fresh for a minute. Returns the cluster connection count.
+async fn run_user_signin(
+    scripts: &Scripts,
+    pool: &fred::clients::Pool,
+    keys: &Keys,
+    user_id: &str,
+    token: &str,
+    now: u64,
+) -> i64 {
+    scripts
+        .membership_join
+        .evalsha_with_reload::<i64, _, _>(
+            pool.next(),
+            vec![keys.usr(TEST_APP, user_id), keys.users(TEST_APP)],
+            vec![
+                token.to_string(),
+                (now + 60_000).to_string(),
+                "60".to_string(),
+                user_id.to_string(),
+            ],
+        )
+        .await
+        .expect("MEMBERSHIP_JOIN_LUA must eval")
+}
+
+/// A signin racing the sweeper's reap of the SAME user must survive it, whichever
+/// way the two land: the reap either finds the fresh binding and declines, or wins
+/// the offline edge outright and the signin re-establishes the user behind it.
+/// What must never happen is the reap's decision being made before the signin and
+/// its writes landing after — wiping a live binding, de-indexing an online user
+/// from `users(app)` for good, and publishing an offline for them.
+///
+/// The race is driven directly: each round arms one stale binding on a dead node,
+/// starts a sweep, and fires the signin the instant the reap's own HDEL empties the
+/// hash — the window the pre-CAS reap left between its `HLEN` guard and its `DEL`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn user_reap_cannot_wipe_a_signin_it_straddles() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let adapter = connect_adapter_with_prefix(&prefix).await;
+        let clients = RedisClients::connect(&test_redis_url(), 4)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let webhooks = pylon::webhook::WebhookHandle::null();
+        let _: () = clients
+            .pool
+            .next()
+            .sadd(keys.apps(), TEST_APP)
+            .await
+            .expect("sadd apps");
+
+        for _ in 0..40 {
+            let user_id = format!("u-{}", Uuid::new_v4());
+            let usr = keys.usr(TEST_APP, &user_id);
+            let now = now_ms();
+
+            // One binding from a node that stopped heart-beating: stale, and the only
+            // record of the user besides the `users(app)` index entry.
+            let _: () = clients
+                .pool
+                .next()
+                .hset(&usr, ("deadnode:s1", (now - 1_000).to_string()))
+                .await
+                .expect("hset stale binding");
+            let _: () = clients
+                .pool
+                .next()
+                .sadd(keys.users(TEST_APP), user_id.clone())
+                .await
+                .expect("sadd users");
+
+            let signin = {
+                let pool = clients.pool.clone();
+                let scripts = Scripts::new();
+                let keys = keys.clone();
+                let usr = usr.clone();
+                let user_id = user_id.clone();
+                tokio::spawn(async move {
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                    while tokio::time::Instant::now() < deadline {
+                        let live: i64 = pool.next().exists(&usr).await.unwrap_or(1);
+                        if live == 0 {
+                            break;
+                        }
+                    }
+                    run_user_signin(&scripts, &pool, &keys, &user_id, "nodec:s2", now).await
+                })
+            };
+
+            let (_acquired, _reaped, _vacated) = adapter.sweep_now(&webhooks, now).await;
+            let conns = signin.await.expect("signin task must not panic");
+            assert_eq!(conns, 1, "the signin must record the user's only binding");
+
+            let bound: Option<String> = clients
+                .pool
+                .next()
+                .hget(&usr, "nodec:s2")
+                .await
+                .expect("hget binding");
+            assert!(
+                bound.is_some(),
+                "the reap must not wipe a binding a signin established after its decision"
+            );
+            let indexed: bool = clients
+                .pool
+                .next()
+                .sismember(keys.users(TEST_APP), user_id.clone())
+                .await
+                .expect("sismember users");
+            assert!(
+                indexed,
+                "the reap must not de-index a user a signin brought back online"
+            );
+
+            let _: i64 = clients.pool.next().del(&usr).await.expect("del usr");
+            let _: i64 = clients
+                .pool
+                .next()
+                .srem(keys.users(TEST_APP), user_id)
+                .await
+                .expect("srem users");
+        }
+    })
+    .await
+    .expect("user reap CAS race test must not hang (Redis up?)");
+}
