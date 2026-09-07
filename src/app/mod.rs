@@ -198,6 +198,23 @@ pub trait AppManager: Send + Sync {
     fn by_key_cached(&self, _key: &str) -> Option<Result<AppLookup, AppLookupError>> {
         None
     }
+
+    /// The full set of configured app ids, when — and only when — that set is
+    /// known and bounded in memory. Returns `Some(ids)` for a static-file store,
+    /// where every app was loaded at startup and the id list can never grow
+    /// without a restart. Returns `None` (the default) for a dynamic store
+    /// (SQL, Mongo, or a cache wrapping either): app ids there are unbounded and
+    /// only known by querying the backend, so there is nothing to enumerate
+    /// cheaply.
+    ///
+    /// Used by the `/metrics` handler to seed per-app gauges at 0 for configured
+    /// apps with no live connections, so `pylon_connections{app="x"}` keeps
+    /// reporting a series (rather than vanishing) once the app goes idle. Same
+    /// "static answers synchronously, dynamic opts out" split as
+    /// [`Self::by_key_cached`].
+    fn known_app_ids(&self) -> Option<Vec<String>> {
+        None
+    }
 }
 
 #[cfg(test)]

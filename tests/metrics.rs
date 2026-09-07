@@ -207,6 +207,50 @@ async fn metrics_per_app_gauges_reflect_subscription() {
     );
 }
 
+/// Regression for #19: with a static-file app manager, a configured app with
+/// zero live connections must still report its per-app gauges at `0` — HELP
+/// and TYPE lines included — rather than the series vanishing from the
+/// exposition entirely. Before the fix, `get_metrics` built the `apps` map
+/// purely from `conn_counts`, which the worker prunes back to empty once the
+/// last connection for an app closes (and here none ever opened), so the
+/// whole per-app block was skipped.
+#[tokio::test]
+async fn metrics_per_app_gauges_present_at_zero_when_no_connections() {
+    let addr = spawn().await;
+
+    // No WebSocket ever connects, so `conn_counts` is empty for the whole
+    // test — this is exactly the state the old code rendered as "no series".
+    let body = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        body.contains("# HELP pylon_connections "),
+        "HELP pylon_connections must be present even when idle:\n{body}"
+    );
+    assert!(
+        body.contains("# TYPE pylon_connections gauge"),
+        "TYPE pylon_connections must be present even when idle:\n{body}"
+    );
+    assert!(
+        body.contains(r#"pylon_connections{app="mapp1"} 0"#),
+        "pylon_connections for idle mapp1 must be 0, not absent:\n{body}"
+    );
+    assert!(
+        body.contains(r#"pylon_channels_occupied{app="mapp1"} 0"#),
+        "pylon_channels_occupied for idle mapp1 must be 0, not absent:\n{body}"
+    );
+    assert!(
+        body.contains(r#"pylon_subscriptions{app="mapp1"} 0"#),
+        "pylon_subscriptions for idle mapp1 must be 0, not absent:\n{body}"
+    );
+}
+
 /// Per-core worker metrics appear (inflight, budget, drops).
 #[tokio::test]
 async fn metrics_percore_metrics_present() {
