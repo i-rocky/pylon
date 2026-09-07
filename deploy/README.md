@@ -33,7 +33,9 @@ SIGTERM
   └─ exit
 ```
 
-Worst-case drain: ~12 s. All stop-timeouts in these artifacts are set to **20 s**.
+Worst-case drain: ~12 s. The systemd unit and Docker Compose both allow **20 s**
+(`TimeoutStopSec=20`, `stop_grace_period: 20s`); the Helm chart allows **30 s**
+(`terminationGracePeriodSeconds: 30`). All three comfortably exceed the worst case.
 
 ---
 
@@ -353,6 +355,15 @@ not be publicly reachable. Options:
   annotation on a separate Ingress rule for `/metrics`, or use a dedicated
   Prometheus `ServiceMonitor` that scrapes the pod IP directly (bypassing the
   Ingress entirely).
+- **Built-in token gate:** set `PYLON_METRICS_TOKEN`. A scrape must then carry
+  `Authorization: Bearer <token>`; anything else gets **404** (not 401, so an
+  unauthenticated prober cannot even learn the endpoint exists). `/health` and
+  `/ready` are never gated, so load-balancer probes keep working. An empty value
+  is treated as unset. This works without any proxy in front.
+
+The admin API (`POST /admin/apps/{id}/invalidate`) is gated the same way by
+`PYLON_ADMIN_TOKEN`, and is **disabled entirely** (404) when that is unset —
+which is the default.
 
 ---
 
@@ -368,8 +379,15 @@ deploy/
 │   └── apps.example.json            Sample apps.json (change the secret!)
 ├── docker/
 │   ├── Dockerfile                   Multi-stage build (rust:bookworm → debian-slim)
+│   ├── Dockerfile.release           Runtime-only image over a prebuilt binary (CI)
 │   ├── .dockerignore
-│   └── docker-compose.yml           2-node cluster + Redis
+│   ├── docker-compose.yml           2-node cluster + Redis
+│   └── docker-compose.test.yml      Test services (Redis/MySQL/Postgres/Mongo)
+├── db/                              DDL for the database-backed app store
+│   ├── sqlite/001_apps.sql
+│   ├── postgres/001_apps.sql
+│   ├── mysql/001_apps.sql
+│   └── mongo/001_indexes.js
 ├── helm/
 │   └── pylon/
 │       ├── Chart.yaml

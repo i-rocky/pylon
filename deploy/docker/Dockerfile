@@ -19,7 +19,14 @@ FROM rust:1-bookworm AS builder
 WORKDIR /build
 
 # Cache dependency compilation separately from application source.
-COPY Cargo.toml Cargo.lock ./
+# `rust-toolchain.toml` must be copied too, or the pin is silently ignored and
+# the image builds with whatever 1.x the base image happens to ship.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+# The root manifest declares a workspace member (`load`) and four `[[bench]]`
+# targets; cargo fails to parse the manifest if either is absent, so both must
+# be present before any `cargo build` runs — including the dependency-cache one.
+COPY load ./load
+COPY benches ./benches
 # Create a stub lib/main so `cargo build` can compile deps.
 RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && \
     cargo build --release --locked && \

@@ -9,9 +9,11 @@
 # Caddy proxies WebSocket Upgrade frames transparently; no special WS directives
 # are needed. Long-lived connections are also handled correctly by default.
 #
-# X-Forwarded-For, X-Forwarded-Proto, and X-Forwarded-Host are set automatically
-# by Caddy's reverse_proxy directive. pylon reads X-Forwarded-For if configured
-# to trust the proxy (see PYLON_TRUSTED_PROXIES in your env file).
+# Caddy's reverse_proxy directive sets X-Forwarded-For, X-Forwarded-Proto and
+# X-Forwarded-Host automatically. Note that pylon does NOT read any of them --
+# it has no trusted-proxy configuration and never derives a client address from
+# a request header. They are harmless to send, and useful to whatever else sits
+# in the chain, but pylon logs and metrics are unaffected by them.
 #
 # Usage:
 #   caddy run --config Caddyfile.example
