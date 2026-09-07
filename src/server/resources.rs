@@ -65,12 +65,14 @@ pub fn mem_limit_v1(s: &str) -> Option<u64> {
 /// minus an OS reserve of `max(1.5 GiB, 7%)` (Seastar's exact OS-reserve
 /// formula — a flat floor on small boxes, 7% on big), capped at half the
 /// envelope. Seastar's formula assumes a machine large enough that the flat
-/// 1.5 GiB floor is a minority of RAM; below ~3 GiB that floor alone can
-/// consume the entire envelope, saturating the budget to 0 and silently
-/// disabling every control the budget sizes (shedding, admission gates, the
-/// derived connection ceiling). Halving the envelope as a ceiling on the
-/// reserve keeps a small box's budget small but never zero. Saturating so a
-/// zero envelope yields 0 rather than underflowing.
+/// 1.5 GiB floor is a minority of RAM, which breaks down twice on small hosts:
+/// at or below 1.5 GiB the floor alone meets or exceeds the whole envelope, so
+/// the budget saturates to 0 and silently disables every control it sizes
+/// (shedding, admission gates, the derived connection ceiling); between there
+/// and 3 GiB the budget stays positive but the floor still reserves more than
+/// half the envelope. Capping the reserve at half bounds both cases, so a small
+/// box keeps a proportionate, non-zero budget. Saturating so a zero envelope
+/// yields 0 rather than underflowing.
 pub fn memory_budget(effective_mem: u64) -> u64 {
     let reserve = (1536u64 << 20)
         .max(effective_mem * 7 / 100)
@@ -228,9 +230,10 @@ mod tests {
     #[test]
     fn budget_reserve_cap_binds_below_crossover() {
         // reserve = min(max(1.5 GiB, 7%), 50% of envelope). Below the crossover
-        // the flat 1.5 GiB floor would otherwise consume the whole envelope (or
-        // more), so the half-envelope cap takes over and a small box keeps a
-        // real, non-zero budget instead of saturating to 0.
+        // the flat 1.5 GiB floor claims more than half the envelope — at or
+        // below 1.5 GiB it claims all of it, which is where the uncapped
+        // formula saturated the budget to 0 — so the half-envelope cap takes
+        // over and a small box keeps a real, proportionate budget.
         assert_eq!(memory_budget(1u64 << 30), 512 << 20); // 1 GiB -> 512 MiB
         assert_eq!(memory_budget(512u64 << 20), 256 << 20); // 512 MiB -> 256 MiB
 
