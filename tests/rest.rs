@@ -1384,10 +1384,17 @@ async fn rest_trigger_valid_channel_name_is_200() {
 #[tokio::test]
 async fn rest_body_too_large_is_413() {
     let addr = spawn().await;
-    // Default limits → body cap = 10*10000 + 64KiB ≈ 161.7KiB; exceed it. The
-    // limit fires at body extraction, before the signature check runs.
-    let big = "x".repeat(200 * 1024);
+    const BODY_CAP: usize = 10 * 10_000 + 64 * 1024;
+    // Overshoot by a little, not a lot: the limit fires at body extraction and the
+    // server answers 413 and closes, so a large body is still being written when
+    // that close lands and the client sees a reset instead of the status.
+    const OVERSHOOT: usize = 1024;
+    let envelope = json!({"name": "e", "data": "", "channels": ["c"]})
+        .to_string()
+        .len();
+    let big = "x".repeat(BODY_CAP + OVERSHOOT - envelope);
     let body = json!({"name": "e", "data": big, "channels": ["c"]}).to_string();
+    assert!(body.len() > BODY_CAP, "body must exceed the cap under test");
     let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/apps/app1/events?{q}"))
