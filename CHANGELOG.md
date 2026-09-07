@@ -98,6 +98,14 @@ pre-1.0 and versions track `Cargo.toml`.
   sending a non-conforming `socket_id` and relying on the previous `200`**:
   that call now returns `400 "Invalid socket id"` — audit callers before
   upgrading.
+- **An empty `channel_data` on a presence subscribe no longer signs as a
+  private-channel token** — `channel_signature` collapsed `Some("")` onto the
+  private signing string, so such a subscribe verified against a token signed
+  without channel data and was kept out only by `parse_channel_data("")` failing
+  afterwards. The join was already refused either way; the wire effect is that
+  the `pusher:subscription_error` for this (malformed) request now reads
+  "Invalid signature" rather than "Invalid channel_data", both still
+  `AuthError`/401 and non-fatal.
 - **A REST request carrying two query keys that differ only by case is now
   rejected with `401 "Invalid query: two parameters differ only by case"`** —
   the signing string lowercases every key, so `Info` and `info` collapsed into
