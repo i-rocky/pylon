@@ -292,8 +292,7 @@ pub struct Connection {
     /// [`take_drophead_dropped`](Self::take_drophead_dropped).
     drophead_dropped: u64,
     /// Reusable frame batch for the coalescing flush (F4): the frames popped
-    /// for the writev batch currently in flight. Kept on the connection so a
-    /// flush performs no allocation once warmed up.
+    /// for the writev batch currently in flight.
     writev_batch: Vec<OutFrame>,
     /// Reusable contiguous plaintext batch for the TLS flush (F4): the current
     /// frame batch, copied for one `rustls::Writer::write`.
@@ -1236,9 +1235,9 @@ fn flush_coalesced<W: WriteSink>(
             );
         }
 
-        // One vectored write for the whole batch. The iovecs borrow `batch`
-        // (a local vec of owned frames), never `out`, so the deque stays
-        // freely mutable while the slices are live.
+        // The iovecs borrow `batch`, so unlike `batch` itself they cannot be
+        // kept on the connection between flushes: this vec is the batch's one
+        // allocation, sized to the frames gathered rather than to the cap.
         let slices: Vec<IoSlice<'_>> = batch
             .iter()
             .enumerate()
