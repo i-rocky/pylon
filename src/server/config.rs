@@ -133,7 +133,8 @@ pub struct ServerConfig {
     pub memory_budget_bytes: u64,
     /// Memory budget as a fraction of the effective envelope (0.0..=1.0), applied
     /// when `memory_budget_bytes == 0`. `0.0` (default) ⇒ use the
-    /// `max(1.5 GiB, 7%)` reserve formula instead. `PYLON_MEMORY_BUDGET_FRACTION`.
+    /// `max(1.5 GiB, 7%)` reserve formula instead (capped at 50% of the
+    /// envelope). `PYLON_MEMORY_BUDGET_FRACTION`.
     pub memory_budget_fraction: f64,
     /// Expected concurrent connections per worker, used to derive the
     /// per-connection out-queue cap. `PYLON_EXPECTED_CONNS_PER_WORKER` (default 50_000).
@@ -581,7 +582,9 @@ impl ServerConfig {
 
     /// Resolve the percore total memory budget (bytes): the explicit
     /// `memory_budget_bytes` override if non-zero; else the configured fraction
-    /// of `effective_mem` if set; else the `max(1.5 GiB, 7%)` reserve formula.
+    /// of `effective_mem` if set; else the `max(1.5 GiB, 7%)` reserve formula,
+    /// capped at 50% of the envelope so a small host keeps a real, non-zero
+    /// budget instead of the flat floor consuming the whole envelope.
     pub fn resolved_memory_budget(&self, effective_mem: u64) -> u64 {
         if self.memory_budget_bytes != 0 {
             self.memory_budget_bytes
