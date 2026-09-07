@@ -19,6 +19,19 @@ All variables are optional. Unset variables fall back to the defaults shown belo
     Boolean (`0`/`false`/`off`) and plain-string variables are unaffected — only the numeric knobs
     are parsed this strictly.
 
+!!! note "Empty values on numeric vs. string variables"
+    An **empty string is a value an operator can hit by accident** — a Compose `env_file` or a
+    Kubernetes `configMapKeyRef` can render an unset variable as `PYLON_WORKERS=` rather than
+    omitting it. For a **numeric** `PYLON_*` variable this is exactly the failure above: the empty
+    string fails to parse into the expected type, so it is fatal, the same as `PYLON_PORT=abc`. For
+    a **string** `PYLON_*` variable, an empty value can never fail to parse (a `String` accepts any
+    input, including empty), so it never hits the fatal path — most string knobs (`PYLON_BIND`,
+    `PYLON_APPS_PATH`, `PYLON_REDIS_URL`, and similar) accept the empty string as a literal value,
+    while a few security-sensitive ones (`PYLON_METRICS_TOKEN`, `PYLON_TLS_CERT`, `PYLON_TLS_KEY`,
+    `PYLON_TLS_CA`) explicitly treat an empty value the same as unset and keep their default. Either
+    way, this is existing behaviour, not something this change alters — only numeric knobs are fatal
+    on empty.
+
 !!! note "Auto-tuned defaults"
     Several defaults self-tune to the host at startup: `PYLON_WORKERS` defaults to the number
     of available CPU cores, and the memory budget is derived from the cgroup/host effective
@@ -144,7 +157,7 @@ a specific workload.
 
 | Variable | Default | Description |
 |---|---|---|
-| `PYLON_MEMORY_BUDGET_BYTES` | `0` | Total memory budget in bytes for the transport layer. `0` = auto (derived from cgroup/host memory using the `max(1.5 GiB, 7%)` reserve formula). |
+| `PYLON_MEMORY_BUDGET_BYTES` | `0` | Total memory budget in bytes for the transport layer. `0` = auto (derived from cgroup/host memory using the `max(1.5 GiB, 7%)` reserve formula, capped at 50% of the envelope so a small host keeps a real, non-zero budget instead of the flat floor consuming the whole envelope). |
 | `PYLON_MEMORY_BUDGET_FRACTION` | `0.0` | Memory budget as a fraction of effective host memory (0.0–1.0). Applied when `PYLON_MEMORY_BUDGET_BYTES` is `0`. `0.0` = use the built-in reserve formula. |
 | `PYLON_MAX_CONNECTIONS` | `0` | Node-wide ceiling on simultaneous connections across all apps. Connections beyond it are closed with WebSocket code `4100`. `0` = auto-derive from the memory budget (`budget / PYLON_EXPECTED_PER_CONN_BYTES`). |
 | `PYLON_EXPECTED_PER_CONN_BYTES` | `8192` | Expected per-connection memory footprint (bytes), used to auto-derive `PYLON_MAX_CONNECTIONS` when it is `0`. |

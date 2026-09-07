@@ -116,7 +116,13 @@ cargo fmt --all --check   # check formatting (CI gate)
 cargo fmt --all           # apply formatting (before committing)
 
 cargo clippy --all-targets --locked -- -D warnings   # lint (CI gate; zero warnings allowed)
+cargo clippy --locked --lib --bins -- -D warnings    # lint, default features only (CI gate)
 ```
+
+CI runs **both** clippy commands, not just the first. A dev-dependency self-reference enables the
+`test-hooks` feature whenever test targets are in the build graph, so `--all-targets` cannot see
+warnings that only appear in the default-features build (`cargo build --release`, `cargo install`)
+— the second command is the only one that lints that build.
 
 ---
 

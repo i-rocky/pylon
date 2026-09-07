@@ -11,11 +11,21 @@ in the repository root. This page summarises the key expectations.
 Before opening a pull request:
 
 1. **Format:** run `cargo fmt --all` and confirm the tree is clean.
-2. **Lint:** run `cargo clippy --all-targets -- -D warnings`. Zero warnings are
-   permitted; the CI gate enforces this.
-3. **Test:** run `cargo test` (unit + integration). If your change touches the
-   cluster or Redis adapter, also run the relevant cluster tests with
-   `PYLON_TEST_REDIS_URL` set. Use `--test-threads=1` for deterministic results.
+2. **Lint:** run BOTH `cargo clippy --all-targets -- -D warnings` AND
+   `cargo clippy --locked --lib --bins -- -D warnings`. A dev-dependency
+   self-reference enables the `test-hooks` feature whenever test targets are
+   in the build graph, so `--all-targets` alone cannot see warnings that only
+   appear in the default-features build (`cargo build --release`, `cargo
+   install`) our users actually run — CI gates on both, and zero warnings are
+   permitted on either.
+3. **Test:** run the infrastructure-free suite at minimum (see
+   [Building & Testing](building-and-testing.md#tests-that-need-no-infrastructure));
+   run the full suite, or the relevant cluster tests with `PYLON_TEST_REDIS_URL`
+   set, if your change touches the cluster or Redis adapter. A bare `cargo
+   test` is not the gate: it builds and runs every test binary in the
+   workspace and stops at the first one whose backing service isn't reachable,
+   silently skipping every binary Cargo would have run after it. Use
+   `--test-threads=1` for deterministic results.
 4. **Add or update tests** for any behaviour you change. New behaviour should
    have a failing test first.
 

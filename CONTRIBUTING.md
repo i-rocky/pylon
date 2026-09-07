@@ -29,8 +29,20 @@ cargo test               # full suite — requires Redis, MySQL, Postgres, and M
 if their service isn't reachable. Cargo stops the whole run at the first binary that fails, so on
 a machine missing a service, everything ordered after it never runs either — including binaries
 that need no infrastructure at all. If you don't have all four services below running locally, run
-the infrastructure-free subset instead; see the "Testing" section of the
-[dev guide](website/docs/dev-guide/building-and-testing.md) for the exact command.
+the infrastructure-free subset instead:
+
+```sh
+cargo test --locked --lib \
+  --test admin --test health --test integration --test metrics \
+  --test percore --test percore_drain --test percore_liveness \
+  --test percore_multiworker --test percore_nonblocking_establish \
+  --test percore_overload --test percore_selective_drain \
+  --test rest --test signin --test tls --test watchlist --test webhooks \
+  -- --test-threads=1
+```
+
+See the "Testing" section of the [dev guide](website/docs/dev-guide/building-and-testing.md) for
+the full-suite and per-service commands.
 
 Cluster and Redis-backed tests (e.g. `cluster_bridge`, `redis_cluster`, `percore_cluster`) require a
 local Redis and **fail loudly without one** — they default to `redis://127.0.0.1:6390` (port 6390,
@@ -52,7 +64,11 @@ schema, and isolates its rows with a UUID prefix, so it's safe to point at a sha
 ## Before you open a pull request
 
 - **Format:** `cargo fmt --all`
-- **Lint:** `cargo clippy --all-targets -- -D warnings` (the tree is kept warning-clean)
+- **Lint:** `cargo clippy --all-targets -- -D warnings` AND
+  `cargo clippy --locked --lib --bins -- -D warnings` (the tree is kept warning-clean under both —
+  a dev-dependency self-reference enables the `test-hooks` feature whenever test targets are in the
+  build graph, so `--all-targets` alone can't see warnings that only appear in the default-features
+  build our users actually run)
 - **Test:** at minimum, the infrastructure-free suite (see "Tests" above); the full suite if you
   have the four services running
 - Add or update tests for behavior you change. New behavior should come with a failing test first.
