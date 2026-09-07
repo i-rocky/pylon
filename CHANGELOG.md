@@ -98,6 +98,18 @@ pre-1.0 and versions track `Cargo.toml`.
   sending a non-conforming `socket_id` and relying on the previous `200`**:
   that call now returns `400 "Invalid socket id"` — audit callers before
   upgrading.
+- **An app `key` containing `:` is now rejected at validation instead of
+  silently breaking every websocket auth** — the channel-auth and
+  `pusher:signin` tokens are `<key>:<signature>` and both verifiers split at the
+  first colon, so a key like `team:web` made every private and presence
+  subscribe answer "Auth key mismatch" and every `pusher:signin` close the
+  connection with 4009, permanently. REST was unaffected (it reads `auth_key` as
+  its own query parameter), so the failure looked like a client-library bug. It
+  failed closed, so nothing was exposed. `App::validate` now rejects such a key,
+  naming the reason; as with the other credential checks this runs at load for
+  the static-file manager and per-lookup for the SQL and Mongo backends. **This
+  is breaking for any deployment whose app key contains a colon: the server now
+  refuses to load it** — rotate the key before upgrading.
 - **REST `socket_id` validation now caps length at 24 bytes instead of 64**,
   closing the 25–64 byte band that passed validation and was then silently
   truncated. A `SocketId` stores 24 bytes inline and `SocketId::from_raw`
