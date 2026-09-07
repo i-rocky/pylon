@@ -316,42 +316,75 @@ impl Default for ServerConfig {
     }
 }
 
+// Every numeric `PYLON_*` knob in `from_env` routes through `env_parse` below,
+// matching `main.rs`'s CLI-flag policy (see the comment above `handle_cli_args`
+// there): an operator who mistypes `PYLON_MAX_CONNECTIONS` did not "choose the
+// default", they typed something wrong, and booting on the default anyway
+// would silently hand them behavior they never asked for. Unset stays unset
+// (default applies, no error); set-but-unparseable is a fatal misconfiguration
+// — logged and exited (same exit code as a bad CLI flag) rather than
+// swallowed by the old `if let Ok(p) = v.parse() { ... }` shape, which had no
+// `else` and so discarded a bad value with no trace.
+//
+// Split into `try_env_parse` (the decision, returns `Result` — unit-tested)
+// and `env_parse` (the process-exiting wrapper `from_env` calls): `std::
+// process::exit` can't be caught in-process, so only the pure half is
+// testable — see the `try_env_parse_*` tests below.
+
+/// Parse `name`'s environment value into `*slot`. `Ok(())` covers both "unset"
+/// (slot left at whatever `*slot` already was) and "set and parsed" (slot
+/// updated in place); `Err` carries a message naming the variable, the
+/// offending value, and the expected type, for the caller to report.
+fn try_env_parse<T>(name: &str, slot: &mut T) -> Result<(), String>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    let Ok(raw) = std::env::var(name) else {
+        return Ok(());
+    };
+    match raw.parse::<T>() {
+        Ok(v) => {
+            *slot = v;
+            Ok(())
+        }
+        Err(e) => Err(format!(
+            "invalid {name}={raw:?}: {e} (expected {})",
+            std::any::type_name::<T>()
+        )),
+    }
+}
+
+/// `try_env_parse`, but a parse failure is logged at `error` and exits the
+/// process with status `1` — the same exit code `main.rs` uses for a bad CLI
+/// flag (`unknown_arg_text`'s path). A malformed `PYLON_*` value is a startup
+/// error either way, so the convention matches.
+fn env_parse<T>(name: &str, slot: &mut T)
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    if let Err(msg) = try_env_parse(name, slot) {
+        tracing::error!("{msg}");
+        std::process::exit(1);
+    }
+}
+
 impl ServerConfig {
     pub fn from_env() -> Self {
         let mut c = Self::default();
         if let Ok(v) = std::env::var("PYLON_BIND") {
             c.bind = v;
         }
-        if let Ok(v) = std::env::var("PYLON_PORT") {
-            if let Ok(p) = v.parse() {
-                c.port = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_ACTIVITY_TIMEOUT") {
-            if let Ok(p) = v.parse() {
-                c.activity_timeout = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_PONG_TIMEOUT") {
-            if let Ok(p) = v.parse() {
-                c.pong_timeout = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_MAX_CONN_LIFETIME_SECS") {
-            if let Ok(p) = v.parse() {
-                c.max_conn_lifetime_secs = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_MAX_HEAD_BYTES") {
-            if let Ok(p) = v.parse() {
-                c.max_head_bytes = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_HANDSHAKE_TIMEOUT_MS") {
-            if let Ok(p) = v.parse() {
-                c.handshake_timeout_ms = p;
-            }
-        }
+        env_parse("PYLON_PORT", &mut c.port);
+        env_parse("PYLON_ACTIVITY_TIMEOUT", &mut c.activity_timeout);
+        env_parse("PYLON_PONG_TIMEOUT", &mut c.pong_timeout);
+        env_parse(
+            "PYLON_MAX_CONN_LIFETIME_SECS",
+            &mut c.max_conn_lifetime_secs,
+        );
+        env_parse("PYLON_MAX_HEAD_BYTES", &mut c.max_head_bytes);
+        env_parse("PYLON_HANDSHAKE_TIMEOUT_MS", &mut c.handshake_timeout_ms);
         if let Ok(v) = std::env::var("PYLON_STRICT_PROTOCOL") {
             c.strict_protocol = v == "1" || v.eq_ignore_ascii_case("true");
         }
@@ -363,26 +396,10 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("PYLON_APP_CACHE") {
             c.app_cache = v != "0" && v.to_lowercase() != "off" && v.to_lowercase() != "false";
         }
-        if let Ok(v) = std::env::var("PYLON_APP_CACHE_MAX") {
-            if let Ok(n) = v.parse() {
-                c.app_cache_max = n;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_APP_CACHE_TTL") {
-            if let Ok(n) = v.parse() {
-                c.app_cache_ttl = n;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_APP_CACHE_NEG_MAX") {
-            if let Ok(n) = v.parse() {
-                c.app_cache_neg_max = n;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_APP_CACHE_NEG_TTL") {
-            if let Ok(n) = v.parse() {
-                c.app_cache_neg_ttl = n;
-            }
-        }
+        env_parse("PYLON_APP_CACHE_MAX", &mut c.app_cache_max);
+        env_parse("PYLON_APP_CACHE_TTL", &mut c.app_cache_ttl);
+        env_parse("PYLON_APP_CACHE_NEG_MAX", &mut c.app_cache_neg_max);
+        env_parse("PYLON_APP_CACHE_NEG_TTL", &mut c.app_cache_neg_ttl);
         c.app_cache_redis_url = std::env::var("PYLON_APP_CACHE_REDIS_URL").ok();
         c.app_admin_token = std::env::var("PYLON_ADMIN_TOKEN").ok();
         // S1: empty string is treated as "not set" (same convention as the TLS
@@ -393,109 +410,62 @@ impl ServerConfig {
                 c.metrics_token = Some(v);
             }
         }
-        if let Ok(v) = std::env::var("PYLON_APP_SWEEP_INTERVAL") {
-            if let Ok(n) = v.parse() {
-                c.app_sweep_interval_secs = n;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_MAX_PRESENCE_MEMBERS") {
-            if let Ok(p) = v.parse() {
-                c.max_presence_members = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_MAX_EVENT_PAYLOAD_BYTES") {
-            if let Ok(p) = v.parse() {
-                c.max_event_payload_bytes = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_MAX_CHANNELS_PER_PUBLISH") {
-            if let Ok(p) = v.parse() {
-                c.max_channels_per_publish = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_REST_AUTH_WINDOW_SECS") {
-            if let Ok(p) = v.parse() {
-                c.rest_auth_window_secs = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_MAX_BATCH_EVENTS") {
-            if let Ok(p) = v.parse() {
-                c.max_batch_events = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_CACHE_TTL_SECS") {
-            if let Ok(p) = v.parse() {
-                c.cache_ttl_secs = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_MAX_WATCHLIST_SIZE") {
-            if let Ok(p) = v.parse() {
-                c.max_watchlist_size = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_WEBHOOK_BATCH_MS") {
-            if let Ok(p) = v.parse() {
-                c.webhook_batch_ms = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_WEBHOOK_TIMEOUT_MS") {
-            if let Ok(p) = v.parse() {
-                c.webhook_timeout_ms = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_WEBHOOK_BACKOFF_BASE_MS") {
-            if let Ok(p) = v.parse() {
-                c.webhook_backoff_base_ms = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_WEBHOOK_BACKOFF_CAP_MS") {
-            if let Ok(p) = v.parse() {
-                c.webhook_backoff_cap_ms = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_WEBHOOK_RETRY_BUDGET_MS") {
-            if let Ok(p) = v.parse() {
-                c.webhook_retry_budget_ms = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_WEBHOOK_MAX_CONCURRENCY") {
-            if let Ok(p) = v.parse() {
-                c.webhook_max_concurrency = p;
-            }
-        }
+        env_parse("PYLON_APP_SWEEP_INTERVAL", &mut c.app_sweep_interval_secs);
+        env_parse("PYLON_MAX_PRESENCE_MEMBERS", &mut c.max_presence_members);
+        env_parse(
+            "PYLON_MAX_EVENT_PAYLOAD_BYTES",
+            &mut c.max_event_payload_bytes,
+        );
+        env_parse(
+            "PYLON_MAX_CHANNELS_PER_PUBLISH",
+            &mut c.max_channels_per_publish,
+        );
+        env_parse("PYLON_REST_AUTH_WINDOW_SECS", &mut c.rest_auth_window_secs);
+        env_parse("PYLON_MAX_BATCH_EVENTS", &mut c.max_batch_events);
+        env_parse("PYLON_CACHE_TTL_SECS", &mut c.cache_ttl_secs);
+        env_parse("PYLON_MAX_WATCHLIST_SIZE", &mut c.max_watchlist_size);
+        env_parse("PYLON_WEBHOOK_BATCH_MS", &mut c.webhook_batch_ms);
+        env_parse("PYLON_WEBHOOK_TIMEOUT_MS", &mut c.webhook_timeout_ms);
+        env_parse(
+            "PYLON_WEBHOOK_BACKOFF_BASE_MS",
+            &mut c.webhook_backoff_base_ms,
+        );
+        env_parse(
+            "PYLON_WEBHOOK_BACKOFF_CAP_MS",
+            &mut c.webhook_backoff_cap_ms,
+        );
+        env_parse(
+            "PYLON_WEBHOOK_RETRY_BUDGET_MS",
+            &mut c.webhook_retry_budget_ms,
+        );
+        env_parse(
+            "PYLON_WEBHOOK_MAX_CONCURRENCY",
+            &mut c.webhook_max_concurrency,
+        );
         if let Ok(v) = std::env::var("PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS") {
             c.webhook_allow_private_targets = v == "1" || v.eq_ignore_ascii_case("true");
         }
-        if let Ok(v) = std::env::var("PYLON_MAX_CHANNEL_NAME_LENGTH") {
-            if let Ok(p) = v.parse() {
-                c.max_channel_name_length = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_MAX_EVENT_NAME_LENGTH") {
-            if let Ok(p) = v.parse() {
-                c.max_event_name_length = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_MAX_CLIENT_EVENTS_PER_SECOND") {
-            if let Ok(p) = v.parse() {
-                c.max_client_events_per_second = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_MAX_PRESENCE_USER_ID_LENGTH") {
-            if let Ok(p) = v.parse() {
-                c.max_presence_user_id_length = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_MAX_PRESENCE_USER_INFO_BYTES") {
-            if let Ok(p) = v.parse() {
-                c.max_presence_user_info_bytes = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION") {
-            if let Ok(p) = v.parse() {
-                c.max_subscriptions_per_connection = p;
-            }
-        }
+        env_parse(
+            "PYLON_MAX_CHANNEL_NAME_LENGTH",
+            &mut c.max_channel_name_length,
+        );
+        env_parse("PYLON_MAX_EVENT_NAME_LENGTH", &mut c.max_event_name_length);
+        env_parse(
+            "PYLON_MAX_CLIENT_EVENTS_PER_SECOND",
+            &mut c.max_client_events_per_second,
+        );
+        env_parse(
+            "PYLON_MAX_PRESENCE_USER_ID_LENGTH",
+            &mut c.max_presence_user_id_length,
+        );
+        env_parse(
+            "PYLON_MAX_PRESENCE_USER_INFO_BYTES",
+            &mut c.max_presence_user_info_bytes,
+        );
+        env_parse(
+            "PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION",
+            &mut c.max_subscriptions_per_connection,
+        );
         if let Ok(v) = std::env::var("PYLON_ADAPTER") {
             c.adapter = v;
         }
@@ -505,36 +475,27 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("PYLON_REDIS_PREFIX") {
             c.redis_prefix = v;
         }
-        if let Ok(v) = std::env::var("PYLON_REDIS_POOL_SIZE") {
-            if let Ok(p) = v.parse() {
-                c.redis_pool_size = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_REDIS_MEMBERSHIP_TTL") {
-            if let Ok(p) = v.parse() {
-                c.redis_membership_ttl_secs = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_REDIS_PRESENCE_HEARTBEAT") {
-            if let Ok(p) = v.parse() {
-                c.redis_presence_heartbeat_secs = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_REDIS_NODE_HEARTBEAT") {
-            if let Ok(p) = v.parse() {
-                c.redis_node_heartbeat_secs = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_REDIS_SWEEP_INTERVAL") {
-            if let Ok(p) = v.parse() {
-                c.redis_sweep_interval_secs = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_WEBHOOK_VACATED_GRACE_MS") {
-            if let Ok(p) = v.parse() {
-                c.webhook_vacated_grace_ms = p;
-            }
-        }
+        env_parse("PYLON_REDIS_POOL_SIZE", &mut c.redis_pool_size);
+        env_parse(
+            "PYLON_REDIS_MEMBERSHIP_TTL",
+            &mut c.redis_membership_ttl_secs,
+        );
+        env_parse(
+            "PYLON_REDIS_PRESENCE_HEARTBEAT",
+            &mut c.redis_presence_heartbeat_secs,
+        );
+        env_parse(
+            "PYLON_REDIS_NODE_HEARTBEAT",
+            &mut c.redis_node_heartbeat_secs,
+        );
+        env_parse(
+            "PYLON_REDIS_SWEEP_INTERVAL",
+            &mut c.redis_sweep_interval_secs,
+        );
+        env_parse(
+            "PYLON_WEBHOOK_VACATED_GRACE_MS",
+            &mut c.webhook_vacated_grace_ms,
+        );
         if let Ok(v) = std::env::var("PYLON_REDIS_SHARDED_PUBSUB") {
             c.redis_sharded_pubsub = v == "1" || v.eq_ignore_ascii_case("true");
         }
@@ -545,69 +506,33 @@ impl ServerConfig {
             c.cluster_envelope_compat =
                 v != "0" && v.to_lowercase() != "off" && v.to_lowercase() != "false";
         }
-        if let Ok(v) = std::env::var("PYLON_WORKERS") {
-            if let Ok(p) = v.parse() {
-                c.workers = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_MEMORY_BUDGET_BYTES") {
-            if let Ok(p) = v.parse() {
-                c.memory_budget_bytes = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_MEMORY_BUDGET_FRACTION") {
-            if let Ok(p) = v.parse() {
-                c.memory_budget_fraction = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_EXPECTED_CONNS_PER_WORKER") {
-            if let Ok(p) = v.parse() {
-                c.expected_conns_per_worker = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_PERCONN_QUEUE_MIN_BYTES") {
-            if let Ok(p) = v.parse() {
-                c.perconn_queue_min_bytes = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_PERCONN_QUEUE_MAX_BYTES") {
-            if let Ok(p) = v.parse() {
-                c.perconn_queue_max_bytes = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_BROADCAST_HANDOFF_CAP") {
-            if let Ok(p) = v.parse() {
-                c.broadcast_handoff_cap = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_CODEL_TARGET_MS") {
-            if let Ok(p) = v.parse() {
-                c.codel_target_ms = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_CODEL_INTERVAL_MS") {
-            if let Ok(p) = v.parse() {
-                c.codel_interval_ms = p;
-            }
-        }
+        env_parse("PYLON_WORKERS", &mut c.workers);
+        env_parse("PYLON_MEMORY_BUDGET_BYTES", &mut c.memory_budget_bytes);
+        env_parse(
+            "PYLON_MEMORY_BUDGET_FRACTION",
+            &mut c.memory_budget_fraction,
+        );
+        env_parse(
+            "PYLON_EXPECTED_CONNS_PER_WORKER",
+            &mut c.expected_conns_per_worker,
+        );
+        env_parse(
+            "PYLON_PERCONN_QUEUE_MIN_BYTES",
+            &mut c.perconn_queue_min_bytes,
+        );
+        env_parse(
+            "PYLON_PERCONN_QUEUE_MAX_BYTES",
+            &mut c.perconn_queue_max_bytes,
+        );
+        env_parse("PYLON_BROADCAST_HANDOFF_CAP", &mut c.broadcast_handoff_cap);
+        env_parse("PYLON_CODEL_TARGET_MS", &mut c.codel_target_ms);
+        env_parse("PYLON_CODEL_INTERVAL_MS", &mut c.codel_interval_ms);
         if let Ok(v) = std::env::var("PYLON_PSI_BACKSTOP") {
             c.psi_backstop = Some(v == "1" || v.eq_ignore_ascii_case("true"));
         }
-        if let Ok(v) = std::env::var("PYLON_PSI_THRESHOLD") {
-            if let Ok(p) = v.parse() {
-                c.psi_threshold = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_SHUTDOWN_GRACE_MS") {
-            if let Ok(p) = v.parse() {
-                c.shutdown_grace_ms = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_SHUTDOWN_PREDRAIN_MS") {
-            if let Ok(p) = v.parse() {
-                c.shutdown_predrain_ms = p;
-            }
-        }
+        env_parse("PYLON_PSI_THRESHOLD", &mut c.psi_threshold);
+        env_parse("PYLON_SHUTDOWN_GRACE_MS", &mut c.shutdown_grace_ms);
+        env_parse("PYLON_SHUTDOWN_PREDRAIN_MS", &mut c.shutdown_predrain_ms);
         // TLS — empty string is treated as "not set" (same as absent).
         if let Ok(v) = std::env::var("PYLON_TLS_CERT") {
             if !v.is_empty() {
@@ -624,22 +549,21 @@ impl ServerConfig {
                 c.tls_ca_path = Some(v);
             }
         }
-        if let Ok(v) = std::env::var("PYLON_MAX_CONNECTIONS") {
-            if let Ok(p) = v.parse() {
-                c.max_connections = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_EXPECTED_PER_CONN_BYTES") {
-            if let Ok(p) = v.parse() {
-                c.expected_per_conn_bytes = p;
-            }
-        }
-        if let Ok(v) = std::env::var("PYLON_MAILBOX_CAPACITY") {
-            if let Ok(p) = v.parse::<usize>() {
-                if p > 0 {
-                    c.mailbox_capacity = p;
-                }
-            }
+        env_parse("PYLON_MAX_CONNECTIONS", &mut c.max_connections);
+        env_parse(
+            "PYLON_EXPECTED_PER_CONN_BYTES",
+            &mut c.expected_per_conn_bytes,
+        );
+        // `0` parses fine but isn't a meaningful mailbox capacity — that's a
+        // semantic guard, not a parse failure, so it keeps its pre-existing
+        // silent-fallback-to-default behavior: only a value `env_parse` can't
+        // PARSE exits now. Parse into a scratch slot so a malformed value
+        // still exits (via `env_parse`) without the `0` guard ever writing
+        // into `c.mailbox_capacity` directly.
+        let mut mailbox_capacity = c.mailbox_capacity;
+        env_parse("PYLON_MAILBOX_CAPACITY", &mut mailbox_capacity);
+        if mailbox_capacity > 0 {
+            c.mailbox_capacity = mailbox_capacity;
         }
         c
     }
@@ -1077,6 +1001,62 @@ mod tests {
     /// foreign thread evaluating a warn! callsite under the no-op global
     /// subscriber can cache it as disabled, dropping the event).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // `try_env_parse` is the pure decision behind `env_parse`'s hard-fail
+    // policy; `std::process::exit` can't be caught in-process, so these test
+    // the `Result` directly rather than the exiting wrapper.
+
+    #[test]
+    fn try_env_parse_sets_slot_on_a_good_value() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("PYLON_TEST_ENV_PARSE_GOOD", "42");
+        let mut slot: u32 = 7;
+        assert!(try_env_parse("PYLON_TEST_ENV_PARSE_GOOD", &mut slot).is_ok());
+        assert_eq!(slot, 42);
+        std::env::remove_var("PYLON_TEST_ENV_PARSE_GOOD");
+    }
+
+    #[test]
+    fn try_env_parse_reports_a_bad_value_and_leaves_the_slot_untouched() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("PYLON_TEST_ENV_PARSE_BAD", "not_a_number");
+        let mut slot: u32 = 7;
+        let err = try_env_parse("PYLON_TEST_ENV_PARSE_BAD", &mut slot)
+            .expect_err("an unparseable value must be reported, not silently dropped");
+        // The message names the variable and the offending value so an
+        // operator can find and fix the typo without reading source.
+        assert!(err.contains("PYLON_TEST_ENV_PARSE_BAD"), "{err}");
+        assert!(err.contains("not_a_number"), "{err}");
+        assert_eq!(slot, 7, "a bad value must not mutate the slot");
+        std::env::remove_var("PYLON_TEST_ENV_PARSE_BAD");
+    }
+
+    #[test]
+    fn try_env_parse_leaves_the_slot_untouched_when_unset() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("PYLON_TEST_ENV_PARSE_UNSET");
+        let mut slot: u32 = 7;
+        assert!(try_env_parse("PYLON_TEST_ENV_PARSE_UNSET", &mut slot).is_ok());
+        assert_eq!(slot, 7, "an unset variable must not touch the default");
+    }
+
+    #[test]
+    fn mailbox_capacity_zero_falls_back_to_default_not_an_error() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // `0` PARSES fine but isn't a meaningful capacity — the pre-existing
+        // `> 0` guard is preserved verbatim: it's a silent fallback, not a
+        // hard-fail (only genuinely unparseable values exit now).
+        std::env::set_var("PYLON_MAILBOX_CAPACITY", "0");
+        let c = ServerConfig::from_env();
+        assert_eq!(
+            c.mailbox_capacity, 256,
+            "0 must keep the default, not zero it out"
+        );
+        std::env::set_var("PYLON_MAILBOX_CAPACITY", "128");
+        let c = ServerConfig::from_env();
+        assert_eq!(c.mailbox_capacity, 128);
+        std::env::remove_var("PYLON_MAILBOX_CAPACITY");
+    }
 
     #[test]
     fn webhook_env_overrides_apply() {
