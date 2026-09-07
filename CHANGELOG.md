@@ -181,6 +181,13 @@ pre-1.0 and versions track `Cargo.toml`.
   reconciler's next tick. The teardown is now re-checked against live node-local
   truth (channels and per-user `usermsg` bindings alike) at the moment it is
   applied.
+- **A presence member reaped by the very node that owned it is now removed for
+  that node's own clients too, instead of only for the rest of the cluster.**
+  The sweeper stamped its compensating `member_removed` with the departed
+  member's node id; when a node's own membership stamps went stale while it kept
+  holding the sweep lease, that id was its own and its receive loop dropped the
+  frame as a self-echo. The sweeper delivers to no local socket itself, so its
+  emission now belongs to no publisher and every live node delivers it.
 - **The graceful-shutdown drain no longer waits on inbound buffers it will
   never consume, so a rolling restart exits as soon as queued replies are
   sent instead of always burning the full grace window.** `inflight_bytes`

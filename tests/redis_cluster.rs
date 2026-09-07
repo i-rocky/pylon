@@ -1436,6 +1436,105 @@ async fn sweeper_emits_member_removed_for_crashed_presence_member() {
     .expect("sweeper member_removed test must not hang (Redis up?)");
 }
 
+/// Issue #66: a node whose own membership stamps went stale keeps holding the sweep
+/// lease, so the token it reaps can carry its OWN node id. Stamping the compensating
+/// `member_removed` with that id makes the sweeper's own receive loop drop the frame
+/// as a self-echo — the member then vanishes for every node except the one that
+/// reaped it. The sweeper delivers to no local socket itself, so its emission belongs
+/// to no publisher and no node may dedup it.
+#[tokio::test]
+async fn self_reaped_presence_member_reaches_the_reaping_node() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let prefix = random_prefix();
+        // A heartbeat far longer than the test: the reconciler re-stamps once at
+        // startup and never again, so the stale stamp written below stays stale.
+        let adapter = connect_adapter_with_prefix_ttl(&prefix, 60, 60).await;
+        let keys = Keys::new(&prefix);
+        let msg_key = keys.msg(TEST_APP, "presence-room");
+
+        let (reaped_socket, reaped_handle, reaped_member) =
+            presence_handle("u1", serde_json::json!({"name": "Ann"}));
+        adapter
+            .subscribe(
+                TEST_APP,
+                "presence-room",
+                reaped_handle,
+                Some(reaped_member),
+            )
+            .await;
+
+        let observer_socket = SocketId::generate();
+        let (observer_tx, mut observer_rx) = tokio::sync::mpsc::channel(1024);
+        adapter
+            .subscribe(
+                TEST_APP,
+                "presence-room",
+                ConnectionHandle {
+                    socket_id: observer_socket,
+                    mailbox: pylon::connection::handle::Mailbox::new(observer_tx, None, None),
+                },
+                Some(pylon::presence::member::PresenceMember {
+                    user_id: "u2".into(),
+                    user_info: serde_json::json!({"name": "Bob"}),
+                }),
+            )
+            .await;
+        assert!(
+            await_tracked(&adapter, &msg_key, Duration::from_secs(2)).await,
+            "precondition: the node must be subscribed to the presence channel's msg key"
+        );
+
+        // Age u1's OWN stamp past `now` without touching u2's, exactly as a stalled
+        // reconciler on this node would.
+        let clients = RedisClients::connect(&test_redis_url(), 1)
+            .await
+            .expect("test clients must connect");
+        let stale_token =
+            pylon::adapter::redis::keys::member_token(adapter.node_id(), reaped_socket.as_str());
+        let _: i64 = clients
+            .pool
+            .next()
+            .hset(
+                keys.occ(TEST_APP, "presence-room"),
+                vec![(stale_token, "1".to_string())],
+            )
+            .await
+            .expect("HSET stale expireAt must succeed");
+
+        let webhooks = pylon::webhook::WebhookHandle::null();
+        let (acquired, reaped, vacated) = adapter.sweep_now(&webhooks, now_ms()).await;
+        assert!(acquired, "precondition: the only node must take the lease");
+        assert_eq!(
+            reaped, 1,
+            "precondition: exactly u1's own token must be reaped"
+        );
+        assert!(
+            vacated.is_empty(),
+            "u2 is still fresh, so the channel must not be vacated"
+        );
+
+        let frame = tokio::time::timeout(Duration::from_secs(5), observer_rx.recv())
+            .await
+            .expect("u2 must receive the self-reaped member_removed within 5s")
+            .expect("u2's mailbox must yield an event");
+        match *frame {
+            ServerEvent::Raw(s) => {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&s).expect("Raw frame must be valid JSON");
+                assert_eq!(parsed["event"], "pusher_internal:member_removed");
+                assert_eq!(parsed["channel"], "presence-room");
+                assert!(
+                    s.contains("u1"),
+                    "the removal must name the reaped user: {s}"
+                );
+            }
+            other => panic!("u2 expected a Raw member_removed frame, got {other:?}"),
+        }
+    })
+    .await
+    .expect("self-reap delivery test must not hang (Redis up?)");
+}
+
 /// A real webhook dispatcher backed by a `RecordingTransport`, so a sweep's
 /// `webhooks.enqueue(...)` is batched and signed exactly as in production but captured
 /// in memory. `vacated_grace_ms` is 0, so `member_removed` / `channel_vacated` deliver
