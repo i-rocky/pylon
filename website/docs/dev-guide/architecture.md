@@ -8,7 +8,7 @@ This page describes the major subsystems and how data flows through them.
 ## Per-Core Transport
 
 The entry point is [`src/transport/mod.rs`](https://github.com/i-rocky/pylon/blob/master/src/transport/mod.rs).
-`run_percore` spawns exactly one OS thread per logical CPU, each running an
+`run_percore` spawns one OS thread per logical CPU by default (`PYLON_WORKERS` overrides the count), each running an
 independent [`mio`](https://docs.rs/mio) event loop
 ([`src/transport/worker.rs`](https://github.com/i-rocky/pylon/blob/master/src/transport/worker.rs)).
 
@@ -126,12 +126,19 @@ via `PYLON_CODEL_TARGET_MS` / `PYLON_CODEL_INTERVAL_MS`.
 
 **Graduated shedding.** The worker tracks total queued bytes across all its
 connections (`inflight_bytes`, maintained incrementally — O(work), not
-O(connections)). At 80 % of the per-worker budget, backed-up connections are
-skipped during fan-out; at 95 %, only fully-drained connections receive
-broadcasts; at 100 %, all broadcasts are dropped and the saturated flag is set.
+O(connections)). Below 80 % of the per-worker budget every broadcast is
+enqueued. From 80 %, a broadcast skips subscribers whose own out-queue is more
+than **half** full. From 95 %, it skips any subscriber that is non-trivially
+backed up (more than 1/16 of its cap) — a connection that drained between
+iterations still receives. At 100 %, all broadcasts are dropped for that worker
+and its budget-pressure bit is raised; the bit is released only once the worker
+falls back below 80 %, so the node-wide saturation signal cannot flap at the
+boundary. That signal is what the REST `503` gate, the `client-*` ingress drop,
+the subscribe-time gate and the accept gate all read.
 
-**PSI backstop.** A control-plane task (not a worker) polls the Linux
-`/proc/pressure/memory` pressure file approximately once per second. When the
+**PSI backstop.** A control-plane task (not a worker) polls the kernel memory
+pressure file approximately once per second — the cgroup v2 `memory.pressure`
+when it is readable, falling back to the host's `/proc/pressure/memory`. When the
 `full avg10` value exceeds the configured threshold, the shared `budget_factor`
 (fixed-point ×1000) is multiplied down toward a 0.8× floor; when pressure
 clears, it ramps back toward 1.0×. Workers read this factor once per loop

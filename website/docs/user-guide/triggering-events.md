@@ -94,6 +94,32 @@ sign requests yourself.
 | `GET` | `/apps/{app_id}/channels/{channel_name}/users` | List presence members (presence channels only) |
 | `POST` | `/apps/{app_id}/users/{user_id}/terminate_connections` | Disconnect all connections for a user |
 
+### Error responses
+
+Every error is returned as JSON in the shape `{"error": "<message>", "status": <code>}`.
+
+| Status | When |
+|---|---|
+| `400` | Malformed request — a bad `socket_id`, an empty or over-long channel list, an unparseable body, an `info` attribute that is not valid for the channel |
+| `401` | Authentication failed: bad or missing signature, wrong key, expired timestamp (outside `PYLON_REST_AUTH_WINDOW_SECS`), bad `body_md5`, or two query keys that differ only by case |
+| `403` | The app exists but is disabled |
+| `404` | Unknown app, or a gated endpoint whose token is not configured |
+| `413` | The event payload exceeds `PYLON_MAX_EVENT_PAYLOAD_BYTES` (default 10,000), or the request body exceeds the REST body cap |
+| **`503`** | **The node is over capacity.** The publish is rejected before any broadcast, and the response carries `Retry-After: 1` so a well-behaved publisher backs off. See below |
+
+!!! warning "`503` under load is new in practice"
+    Admission control has always been described, but the node-wide saturation
+    flag it reads was cleared unconditionally on every worker loop, so this
+    `503` could never actually fire. It now does. A publisher that has been
+    hammering a node past its memory budget will start seeing
+    `503 {"error":"Server overloaded","status":503}` with `Retry-After: 1`
+    where it previously got `200` and silently-shed delivery.
+
+    **Retry on it.** The official Pusher SDKs do not retry a `503` for you, so
+    if your publish path matters, add a backoff that honours `Retry-After`.
+    Diagnosis and remedies are in
+    [Troubleshooting — Overload](troubleshooting.md#overload).
+
 ---
 
 #### `POST /apps/{app_id}/events`
@@ -105,13 +131,13 @@ Trigger a single named event on one or more channels.
 | Field | Required | Description |
 |---|---|---|
 | `name` | yes | Event name (e.g. `"order-updated"`) |
-| `data` | yes | Event payload as a JSON-encoded string; max 10 240 bytes |
+| `data` | yes | Event payload as a JSON-encoded string; max 10,000 bytes (`PYLON_MAX_EVENT_PAYLOAD_BYTES`) |
 | `channels` | yes* | Array of channel names (up to 100) |
 | `channel` | yes* | Single channel name (alternative to `channels`) |
-| `socket_id` | no | Socket ID to exclude from delivery (prevents echo) |
+| `socket_id` | no | Socket ID to exclude from delivery (prevents echo). Must be `\d+\.\d+` — two runs of ASCII digits joined by one dot — and at most 24 bytes, else `400 "Invalid socket id"` |
 | `info` | no | Comma-separated attributes to return: `subscription_count`, `user_count` |
 
-*Provide either `channel` or `channels`, not both.
+*Provide either `channel` or `channels`. If both are sent, `channels` wins and `channel` is ignored — this is not an error.
 
 Encrypted channels (`private-encrypted-*`) must be targeted alone — mixing them with other channels
 in one call returns an error.
@@ -171,6 +197,10 @@ Trigger up to 10 events in a single request. Each item targets exactly one chann
 Each item has the same fields as a single event (`channel`, `name`, `data`, optional `socket_id`
 and `info`).
 
+Every item's `socket_id` is validated **before any delivery runs**, so a single malformed
+`socket_id` anywhere in the batch rejects the whole request with `400 "Invalid socket id"` rather
+than delivering the earlier items and then failing.
+
 ---
 
 #### `GET /apps/{app_id}/channels`
@@ -196,7 +226,13 @@ Fetch the state of one channel.
 
 | Parameter | Description |
 |---|---|
-| `info` | Comma-separated attributes: `occupied`, `subscription_count`, `user_count` |
+| `info` | Comma-separated attributes: `subscription_count`, `user_count`, `cache` |
+
+`occupied` is **not** an `info` attribute — it is returned unconditionally on every response, and
+passing `info=occupied` is silently ignored. `cache` is valid only on a cache channel (any of the
+`cache-`, `private-cache-`, `presence-cache-`, `private-encrypted-cache-` forms) and returns
+`{"data": …, "ttl": …}`, or `null` when nothing is cached; requesting it on a non-cache channel is a
+`400`.
 
 ---
 

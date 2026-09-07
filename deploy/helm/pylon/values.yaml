@@ -3,7 +3,7 @@
 
 # ── Image ─────────────────────────────────────────────────────────────────────
 image:
-  repository: pylon
+  repository: ghcr.io/i-rocky/pylon
   tag: "latest"
   pullPolicy: IfNotPresent
 

@@ -21,8 +21,8 @@ fees, keeps connection data entirely within your network, and removes a hard dep
 third-party service.
 
 **Full protocol parity.** Pylon supports every Channels v7 feature: public, private, presence,
-private-encrypted, and cache channels (including all `cache-`, `private-cache-`, and
-`presence-cache-` variants); client events; user authentication (`pusher:signin`); webhooks
+private-encrypted, and cache channels (including all `cache-`, `private-cache-`,
+`presence-cache-`, and `private-encrypted-cache-` variants); client events; user authentication (`pusher:signin`); webhooks
 (`channel_occupied`, `channel_vacated`, `member_added`, `member_removed`, `client_event`,
 `cache_miss`, `subscription_count`); and the complete Pusher HTTP REST API including batch publish and presence queries.
 

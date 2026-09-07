@@ -76,10 +76,17 @@ on all pull requests. It gates on:
    step 2 alone cannot see warnings that only appear in the default-features build (`cargo build
    --release`, `cargo install`); this step is the one that catches those.
 4. Unit + integration tests (`--test-threads=1`)
+5. Cluster / Redis tests, against a real Redis service container
+6. DB-backed app-manager tests (MySQL, Postgres, Mongo service containers)
 
-Cluster/Redis tests are run in the same CI job (with a Redis service container)
-but are marked `continue-on-error: true` because they assert on short Redis
-timing windows that can flake on the shared CI instance.
+**Every one of these is blocking.** Steps 5 and 6 run with `--no-fail-fast` so
+each suite reports its own result rather than halting at the first failure, but
+a failure in either still fails the job — nothing in the workflow is marked
+`continue-on-error`.
+
+A second top-level job, `failover`, runs the Redis failover/self-heal
+regression: it spawns a dedicated throwaway Redis container, bounces it, and
+asserts that cross-node delivery resumes. It is blocking too.
 
 The Rust toolchain is pinned by `rust-toolchain.toml` in the repository root;
 `rustup show` installs it automatically in both CI and release jobs, so local

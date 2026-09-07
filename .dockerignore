@@ -1,0 +1,46 @@
+# .dockerignore — applies to the REPOSITORY ROOT build context.
+#
+# Both image builds use the repo root as their context:
+#   • deploy/docker/docker-compose.yml   context: ../..   dockerfile: deploy/docker/Dockerfile
+#   • .github/workflows/release.yml      context: .       file: deploy/docker/Dockerfile.release
+#
+# Docker only reads `<context>/.dockerignore`, so this file must live here, not
+# beside the Dockerfiles. Excluding `deploy/` below does not prevent either
+# build from using its Dockerfile — the Dockerfile is read separately from the
+# context.
+
+# Build artifacts — largest directory; always exclude.
+target/
+
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# Reference oracles (large; not needed for the build)
+reference/
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Deploy artifacts (not needed inside the image)
+deploy/
+
+# CI/CD / tooling configs
+.github/
+.cargo/config.toml
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Test data / fixtures (if any)
+tests/fixtures/
+
+# Scripts (runtime binary only)
+scripts/

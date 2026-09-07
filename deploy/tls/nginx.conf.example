@@ -15,6 +15,24 @@
 # Include this file from your main nginx.conf, or drop it in /etc/nginx/conf.d/.
 
 # ---------------------------------------------------------------------------
+# Connection header — MUST be upgrade-aware
+# ---------------------------------------------------------------------------
+# A WebSocket upgrade needs `Connection: upgrade`, but a plain HTTP request
+# (/health, /ready, /metrics, the REST API) must NOT carry it — and hard-coding
+# `Connection "upgrade"` for every request while also setting `Connection ""`
+# to enable the upstream keepalive pool is a contradiction: nginx applies the
+# LAST proxy_set_header for a given header name, so the keepalive line silently
+# wins and every WebSocket upgrade breaks.
+#
+# This map is the standard idiom that satisfies both: upgrades get
+# `Connection: upgrade`, everything else gets an empty value, which is exactly
+# what the `keepalive` directive below requires.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      '';
+}
+
+# ---------------------------------------------------------------------------
 # Upstream — pylon backend node(s)
 # ---------------------------------------------------------------------------
 # For a single node:
@@ -96,11 +114,12 @@ server {
         # These three headers MUST be present and in this form.
         proxy_http_version 1.1;
         proxy_set_header Upgrade    $http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Connection $connection_upgrade;
 
-        # Standard forwarding headers. pylon uses X-Forwarded-For for
-        # client IP logging; X-Forwarded-Proto lets pylon know the
-        # original scheme was HTTPS (wss://).
+        # Standard forwarding headers. pylon does NOT read any of these --
+        # it has no trusted-proxy configuration and never derives a client
+        # address or scheme from a request header. They are set because the
+        # rest of your chain may want them, not because pylon needs them.
         proxy_set_header Host              $host;
         proxy_set_header X-Real-IP         $remote_addr;
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
@@ -116,8 +135,10 @@ server {
         # Disable buffering for streaming/WS responses.
         proxy_buffering off;
 
-        # Reuse keepalive connections to upstream.
-        proxy_set_header Connection "";
+        # The upstream `keepalive 64` pool is served by the $connection_upgrade
+        # map above: a non-upgrade request sends an empty Connection header,
+        # which is what keepalive needs. Do NOT add `proxy_set_header
+        # Connection "";` here — it would override the map and break upgrades.
     }
 
     # ------------------------------------------------------------------

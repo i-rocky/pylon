@@ -115,6 +115,12 @@ the cap is rejected with a non-fatal `pusher:subscription_error` (`LimitReached`
 the connection stays open and every subscription already held remains live. Re-subscribing to a
 channel the connection already holds is exempt from the cap and never errors.
 
+The same `4004` `LimitReached` error is also how a subscribe is refused when the **node** is over
+capacity — see [Troubleshooting — Overload](troubleshooting.md#overload). The two are
+distinguishable by their message ("Subscription limit reached for this connection" versus "Server
+is over capacity; try again shortly"); both are non-fatal, and neither affects subscriptions the
+connection already holds.
+
 This is a deliberate pylon-specific resource guard, not Pusher parity. Hosted Pusher documents no
 per-connection subscription limit: the [channels doc][pusher-channels] and the
 [WebSocket protocol reference][pusher-protocol] specify no cap on subscriptions per connection, and
@@ -143,6 +149,13 @@ Clients may publish events directly to other subscribers on private and presence
 `client-` event prefix. Client events are enabled per-app with the `client_messages_enabled` field
 in `apps.json` and are subject to a per-connection rate limit (`PYLON_MAX_CLIENT_EVENTS_PER_SECOND`,
 default 10). Client events are not available on public or encrypted channels.
+
+A client event that exceeds the rate limit, or whose name or payload is too large, is answered with
+an in-band `pusher:error` `4301` on an otherwise open connection. One case is **silent**, though:
+while the node is [over capacity](troubleshooting.md#overload) inbound `client-*` events are dropped
+at ingress with no frame sent back, because that is a server-side shed rather than a client-side
+limit. If clients report client events vanishing without a `4301`, check
+`pylon_saturation_flag`.
 
 ---
 

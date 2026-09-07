@@ -140,12 +140,34 @@ among workers. A rough planning constant: **≈3.2 KB of unswappable kernel
 memory per idle connection** (socket buffer floors; see sysctl section above)
 plus a few KB of application-level state per connection.
 
+By default the budget is the effective envelope minus an OS reserve of
+`max(1.5 GiB, 7 %)`, **and that reserve is capped at half the envelope**:
+
+```
+budget = envelope − min( max(1.5 GiB, 7% of envelope), 50% of envelope )
+```
+
+The cap matters only below the ~3 GiB crossover, where the flat 1.5 GiB floor
+would otherwise claim more than half the envelope — and at or below 1.5 GiB
+would claim all of it, leaving a budget of zero. A 1 GiB container now gets a
+512 MiB budget rather than none. Above ~3 GiB the cap never binds, so larger
+hosts are arithmetically unchanged (4 GiB → 2.5 GiB, 256 GiB → 238 GiB).
+
+!!! danger "A budget of zero disables every overload control"
+    A resolved budget of `0` is read downstream as "unconfigured": the
+    graduated shed pins to its normal band, which disables the REST `503`
+    admission gate, the `client-*` ingress drop, and the subscribe-time
+    pressure gate — and the node connection ceiling becomes unlimited. Pylon
+    now logs a startup `warn` naming exactly which controls are off whenever
+    the resolved budget is still `0`, so this can no longer happen silently.
+    If you see that warning, set `PYLON_MEMORY_BUDGET_BYTES` explicitly.
+
 Override the budget with environment variables:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PYLON_MEMORY_BUDGET_FRACTION` | auto | Budget as a fraction of effective (host/cgroup) memory, range 0.0–1.0; if `PYLON_MEMORY_BUDGET_BYTES` is also set it takes precedence |
-| `PYLON_MEMORY_BUDGET_BYTES` | — | Total budget across all workers in bytes (takes precedence over `PYLON_MEMORY_BUDGET_FRACTION`) |
+| `PYLON_MEMORY_BUDGET_BYTES` | `0` | Total budget across all workers in bytes. Takes precedence over everything else; `0` means "not set" |
+| `PYLON_MEMORY_BUDGET_FRACTION` | `0.0` | Budget as a fraction of effective (host/cgroup) memory, range 0.0–1.0. Applied only when `PYLON_MEMORY_BUDGET_BYTES` is `0`; `0.0` means "use the reserve formula above" |
 
 When a worker's inflight queue approaches its budget, pylon applies
 backpressure (per-connection drop-head eviction and CoDel drops) and sheds new
@@ -156,6 +178,35 @@ budget down toward a `0.8` floor while pressure exceeds
 `PYLON_PSI_THRESHOLD` (default 15%), ramping back toward `1.0` when it
 clears — so the metric's steady-state range is **0.8–1.0**, and a sustained
 value below `0.9` means the host is genuinely under memory pressure.
+
+### Admission control under overload
+
+The budget is not only a shedding input — it drives a node-wide **saturation
+signal** that rejects work outright. Each worker raises its budget-pressure bit
+at **100 %** of its share of the budget and releases it below **80 %**; while
+any worker holds it (or a publisher has found a worker's broadcast hand-off
+full), the node:
+
+- answers `POST /apps/{id}/events` and `/batch_events` with **`503`** and
+  `Retry-After: 1`,
+- refuses **new** subscriptions with a non-fatal `pusher:subscription_error`
+  (`LimitReached`, `4004`),
+- **silently drops** inbound `client-*` events, and
+- refuses new connections with close code **`4100`**.
+
+!!! warning "New in this release: these actually fire now"
+    The node-wide flag was previously cleared unconditionally on every worker
+    loop, so none of these responses could engage. After upgrading, a node that
+    was already running past its budget will begin returning 503s and dropping
+    client events where it silently queued them before. Budget for this before
+    a rolling upgrade, and see
+    [Troubleshooting — Overload](troubleshooting.md#overload) for how to
+    diagnose and respond.
+
+Graduated shedding runs below the saturation point and is unchanged: above
+80 % of budget a broadcast skips subscribers whose own out-queue is more than
+half full, and above 95 % it skips any subscriber that is non-trivially backed
+up.
 
 ### Per-App Connection Cap
 

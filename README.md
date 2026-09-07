@@ -159,7 +159,7 @@ Rather than quoting benchmark numbers from someone else's machine, measure on
 yours:
 
 - **Micro-benchmarks** — criterion benches in [`benches/`](benches/)
-  (`fanout`, `mailbox`, `app_lookup`): `cargo bench`.
+  (`fanout`, `fanout_sink`, `mailbox`, `app_lookup`): `cargo bench`.
 - **Scenario harness** — [`load/`](load/) drives a running server through the
   four load shapes (connection density, hot-channel fan-out, many-channels, and
   cross-node cluster latency): `cargo run -p pylon-load -- --help`.
@@ -170,7 +170,9 @@ yours:
 
 ## Building from source
 
-A recent stable Rust toolchain is required.
+The toolchain is pinned by [`rust-toolchain.toml`](rust-toolchain.toml) — rustup reads it
+automatically, so no manual `rustup override` is needed. Build with the pinned toolchain rather
+than an arbitrary stable release.
 
 ```sh
 cargo build --release        # binary at target/release/pylon

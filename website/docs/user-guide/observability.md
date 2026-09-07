@@ -88,7 +88,23 @@ disappearing, depends on the app manager backend:
 | `pylon_inflight_bytes_sum` | gauge | — | Sum of `pylon_inflight_bytes` across all workers |
 | `pylon_worker_budget_bytes` | gauge | — | Per-worker memory budget in bytes |
 | `pylon_budget_factor` | gauge | — | PSI memory-pressure budget factor. A background loop polls kernel memory pressure (`full avg10`) once per second; above `PYLON_PSI_THRESHOLD` (default 15%) each worker's effective budget shrinks toward a 0.8 floor and recovers toward 1.0 when pressure clears. Steady-state range is **0.8–1.0** — a sustained value below 0.9 indicates real memory pressure, not queue backlog |
-| `pylon_saturation_flag` | gauge | — | `1` if the broadcast pipeline is saturated, `0` otherwise; omitted when the saturation monitor is not running |
+| `pylon_saturation_flag` | gauge | — | `1` while the node is shedding, `0` otherwise; omitted when the saturation monitor is not running. **This is an actionable alert series** — see the note below |
+
+!!! warning "`pylon_saturation_flag` now has teeth — alert on it"
+    The flag is raised by any worker whose queued outbound bytes reach 100 % of
+    its share of the memory budget (released below 80 %), or by a publisher that
+    found a worker's broadcast hand-off channel full. **While it is `1` the node
+    is actively rejecting work**: REST publishes get `503` + `Retry-After: 1`,
+    new subscriptions get a non-fatal `4004` `LimitReached`, inbound `client-*`
+    events are dropped silently, and new connections are closed with `4100`.
+
+    Earlier builds cleared the underlying flag unconditionally every worker
+    loop, so it effectively never read `1` and none of those responses fired. It
+    now works, so a dashboard or alert that was never triggered before may start
+    firing after an upgrade. Alert on a sustained `1`, and read it alongside
+    `pylon_inflight_bytes` (per worker) versus `pylon_worker_budget_bytes`.
+    Full diagnosis steps are in
+    [Troubleshooting — Overload](troubleshooting.md#overload).
 
 #### Webhook Pipeline
 
@@ -149,6 +165,11 @@ Import the series above into Grafana dashboards. Useful panel ideas:
 - **Memory pressure**: `pylon_budget_factor` — alert when sustained below 0.9
   (the factor only ever ranges 0.8–1.0; it tracks kernel PSI memory pressure,
   not queue depth).
+- **Overload / shedding**: `pylon_saturation_flag` as a status panel, alerting
+  on a sustained `1` — the node is rejecting publishes with `503` and dropping
+  client events while it reads high. Pair it with
+  `pylon_inflight_bytes / on() group_left pylon_worker_budget_bytes` to see how
+  close each worker is to its 100 % raise / 80 % release band.
 
 ---
 

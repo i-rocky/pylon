@@ -11,7 +11,7 @@ in the repository root. This page summarises the key expectations.
 Before opening a pull request:
 
 1. **Format:** run `cargo fmt --all` and confirm the tree is clean.
-2. **Lint:** run BOTH `cargo clippy --all-targets -- -D warnings` AND
+2. **Lint:** run BOTH `cargo clippy --all-targets --locked -- -D warnings` AND
    `cargo clippy --locked --lib --bins -- -D warnings`. A dev-dependency
    self-reference enables the `test-hooks` feature whenever test targets are
    in the build graph, so `--all-targets` alone cannot see warnings that only

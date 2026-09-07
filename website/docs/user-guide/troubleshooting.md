@@ -18,7 +18,7 @@ their meanings, and the recommended client action.
 | `4007` | Unsupported protocol version | Do not reconnect; upgrade client library |
 | `4008` | No protocol version supplied | Do not reconnect; upgrade client library |
 | `4009` | Connection not authorised — sign-in verification failed, the user's connections were terminated, or the app was removed/disabled mid-connection | Do not reconnect; fix authentication or check the app's status |
-| `4100` | Server is over capacity (node connection ceiling reached, or the broadcast pipeline is saturated) | Reconnect with exponential back-off |
+| `4100` | Server is over capacity (node connection ceiling reached, or the node is [saturated](#overload)) | Reconnect with exponential back-off |
 | `4103` | Application store temporarily unavailable | Reconnect with exponential back-off |
 | `4200` | Server restarting | Reconnect immediately; pylon is doing a graceful restart |
 | `4201` | Activity / pong timeout | Reconnect; connection went silent too long |
@@ -34,8 +34,81 @@ ready / the lifetime recycle is routine).
 Codes `4301` and `4302` are delivered as `pusher:error` events on an otherwise
 open connection — they do not close the socket. A `pusher:subscription_error`
 frame is likewise non-fatal: `data.status` `4009` means the channel name was
-invalid and `401` means the subscription auth failed — the connection stays
-open in both cases.
+invalid, `401` means the subscription auth failed, and `4004`
+(`LimitReached`) means either the per-connection subscription cap was hit or
+the node is [over capacity](#overload) — the connection stays open in all
+cases.
+
+---
+
+## Overload: 503s and dropped client events {#overload}
+
+Pylon has a node-wide **saturation signal** that every admission-control path
+reads. Each worker raises its own budget-pressure bit when its queued outbound
+bytes reach **100 %** of its share of the memory budget, and releases it only
+once it has fallen back below **80 %** (the gap is deliberate, so the signal
+cannot flap at the boundary). The signal is also raised by a publisher that
+finds a worker's broadcast hand-off channel full, and cleared by that worker
+once it drains.
+
+!!! warning "This engages where it previously did not"
+    In earlier builds the node-wide flag was cleared unconditionally on every
+    worker loop, so none of the responses below could ever fire. They now do.
+    An operator upgrading onto a node that was already running hot will start
+    seeing 503s and dropped `client-*` events under sustained load — that is
+    the shedding working, not a new fault.
+
+While the node is saturated:
+
+| Path | What happens | What the caller sees |
+|---|---|---|
+| `POST /apps/{id}/events`, `POST /apps/{id}/batch_events` | Publish rejected before any broadcast | **`503`** with `Retry-After: 1` and body `{"error":"Server overloaded","status":503}` |
+| A **new** `pusher:subscribe` | Subscription refused | `pusher:subscription_error` — `LimitReached`, status `4004`, "Server is over capacity; try again shortly". Non-fatal; the connection and its existing subscriptions stay live |
+| A `client-*` event | Dropped at ingress, not broadcast | **Nothing** — the drop is silent by design (it is a server-side shed, not a client-side limit, so it sends no in-band `4301`) |
+| A new connection | Refused at accept | Close code **`4100`** ("Server is over capacity") |
+
+Re-subscribing to a channel a connection already holds is **not** refused —
+the gate runs after the idempotency check, so only genuinely new subscriptions
+are shed.
+
+### Diagnosing it
+
+`pylon_saturation_flag` reads `1` while the node is shedding. Correlate it with
+`pylon_inflight_bytes` (per worker) against `pylon_worker_budget_bytes`, and
+with `pylon_broadcast_dropped_total`. See [Observability](observability.md).
+
+```bash
+curl -s http://localhost:7000/metrics | grep -E 'saturation_flag|inflight_bytes|worker_budget'
+```
+
+### What to do about it
+
+- **Confirm the budget is real.** A resolved memory budget of `0` disables all
+  of the above. Pylon logs a startup `warn` naming the disabled controls when
+  that happens. See
+  [Production Tuning — Memory Budget](production-tuning.md#memory-budget).
+- **Add capacity** — more nodes behind the load balancer, or a larger memory
+  envelope, is the actual fix for sustained saturation.
+- **Check for slow consumers.** A backed-up outbound queue is what drives a
+  worker over budget; rising `pylon_drophead_dropped_total` and
+  `pylon_codel_dropped_total` point at consumers that cannot keep up.
+- **Do not simply raise the budget** past what the host really has: the point
+  of the ceiling is that the node degrades predictably instead of being killed
+  by the OOM killer.
+
+---
+
+## Other rejections you may not have seen before
+
+These are all validation failures that older builds accepted:
+
+| Symptom | Cause |
+|---|---|
+| `400 "Invalid socket id"` from a REST trigger | `socket_id` must be two runs of ASCII digits joined by one dot (`\d+\.\d+`) and at most 24 bytes. Previously any string was accepted and silently excluded nothing. For `batch_events` every item is validated before any delivery, so one bad `socket_id` rejects the whole batch |
+| `401 "Invalid query: two parameters differ only by case"` | Two REST query keys that differ only by case (e.g. `info` and `Info`). The signing string lowercases keys, so such a request had no stable signature. No official SDK builds one |
+| `431 Request Header Fields Too Large` | The request head carried more than 128 header fields. Answered as JSON in the usual Pusher error shape, on both the REST plane and a WebSocket upgrade. The head's total *size* is bounded separately by `PYLON_MAX_HEAD_BYTES` |
+| The server refuses to start, naming an app | An app `id`, `key`, or `secret` is empty/whitespace-only; an app `key` contains `:`; or two apps share an `id` or `key`. See [Applications](applications.md) |
+| The server exits non-zero at startup, naming a variable | A numeric `PYLON_*` variable is set to a value that cannot be parsed. See [Configuration](configuration.md) |
 
 ---
 

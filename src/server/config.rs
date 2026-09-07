@@ -178,8 +178,11 @@ pub struct ServerConfig {
     /// C2a: how long (ms) each percore worker waits for in-flight connections to
     /// drain before force-closing. After `shutdown` is set workers queue a
     /// `pusher:error` 4200 text frame plus a WS Close(4200) on every open
-    /// connection, then keep flushing until
-    /// `inflight_bytes == 0` OR this deadline passes, then clean up and exit.
+    /// connection, then keep flushing until that worker's queued OUTBOUND bytes
+    /// reach zero OR this deadline passes, then clean up and exit. Deliberately
+    /// not `inflight_bytes`, which also counts inbound reassembly: a connection
+    /// mid-frame pins that above zero forever once the peer stops sending, so
+    /// reading it burned the whole grace window on every restart.
     /// `PYLON_SHUTDOWN_GRACE_MS` (default `10000`).
     pub shutdown_grace_ms: u64,
     /// C2a: how long (ms) to wait after setting `draining=true` (→ `/ready` 503)
