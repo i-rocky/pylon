@@ -54,7 +54,7 @@ Redis instance. Point at it with the `PYLON_TEST_REDIS_URL` environment
 variable:
 
 ```bash
-PYLON_TEST_REDIS_URL=redis://127.0.0.1:6379 \
+PYLON_TEST_REDIS_URL=redis://127.0.0.1:6390 \
   cargo test --test cluster_bridge --test redis_cluster -- --test-threads=1
 ```
 
