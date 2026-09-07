@@ -2029,73 +2029,92 @@ async fn cluster_subscribe_returns_cluster_count_without_local() {
     .expect("cluster_subscribe direct test must not hang (Redis up?)");
 }
 
-/// `cluster_presence_capacity` returns the cluster distinct-user count and whether a
-/// given user is already in the cluster roster — the presence-subscribe admission probe —
-/// reading cross-node Redis state, not any node-local roster. After `cluster_presence_join`
-/// of u1 on A and u2 on B, A's probe sees count 2, `already_member` true for u1 / u2 and
-/// false for an unseen u3.
+/// The cluster presence cap is decided INSIDE `PRESENCE_JOIN_LUA`, so it holds across
+/// nodes admitting at the same instant. The roster is pre-filled to `CAP - 1`, then eight
+/// distinct new users race the last slot — half through node A, half through node B, all
+/// in flight together, which is exactly the interleaving a probe-then-commit gate loses:
+/// every racer reads room and every racer commits, overshooting by up to one member per
+/// node. Exactly ONE may be admitted and `HLEN presusers` must land exactly on `CAP`.
+///
+/// A second connection for a user ALREADY on the roster is not a new distinct user and
+/// stays admitted with the channel full.
 #[tokio::test]
-async fn cluster_presence_capacity_is_cluster_wide() {
-    tokio::time::timeout(Duration::from_secs(5), async {
+async fn cluster_presence_cap_is_atomic_across_nodes() {
+    const CAP: usize = 4;
+    const RACERS: usize = 8;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
         let prefix = random_prefix();
         let adapter_a = connect_adapter_with_prefix(&prefix).await;
         let adapter_b = connect_adapter_with_prefix(&prefix).await;
+        let keys = Keys::new(&prefix);
 
-        let (s1, _h1, m1) = presence_handle("u1", serde_json::json!({"name":"Ann"}));
-        let (first1, _roster1) = adapter_a
-            .cluster_presence_join(TEST_APP, "presence-room", &m1, &s1)
+        // Fill the roster to CAP - 1 across BOTH nodes, so the contested slot is the last.
+        for i in 0..CAP - 1 {
+            let node = if i % 2 == 0 { &adapter_a } else { &adapter_b };
+            let (sid, _h, m) = presence_handle(&format!("seed{i}"), serde_json::json!({"i": i}));
+            let admitted = node
+                .cluster_presence_join(TEST_APP, "presence-cap", &m, &sid, Some(CAP))
+                .await
+                .expect("seeding join must reach Redis");
+            assert!(
+                admitted.is_some(),
+                "seed{i} is below the cap and must be admitted"
+            );
+        }
+
+        // Race the final slot: every racer's EVALSHA is in flight before any completes.
+        let racers: Vec<_> = (0..RACERS)
+            .map(|i| {
+                let (sid, _h, m) =
+                    presence_handle(&format!("race{i}"), serde_json::json!({"i": i}));
+                (if i % 2 == 0 { &adapter_a } else { &adapter_b }, sid, m)
+            })
+            .collect();
+        let verdicts = futures_util::future::join_all(racers.iter().map(|(node, sid, m)| {
+            node.cluster_presence_join(TEST_APP, "presence-cap", m, sid, Some(CAP))
+        }))
+        .await;
+
+        let admitted = verdicts
+            .iter()
+            .filter(|v| v.as_ref().expect("every racer must reach Redis").is_some())
+            .count();
+        assert_eq!(
+            admitted, 1,
+            "exactly one of {RACERS} concurrent racers may take the last slot"
+        );
+
+        let clients = RedisClients::connect(&test_redis_url(), 1)
             .await
-            .expect("cluster_presence_join on A must succeed");
-        assert!(
-            first1,
-            "u1's first cluster connection must be first_for_user"
-        );
-
-        let (s2, _h2, m2) = presence_handle("u2", serde_json::json!({"name":"Bob"}));
-        adapter_b
-            .cluster_presence_join(TEST_APP, "presence-room", &m2, &s2)
+            .expect("fred clients must connect to the test Redis");
+        let occupants: i64 = clients
+            .pool
+            .next()
+            .hlen(keys.presusers(TEST_APP, "presence-cap"))
             .await
-            .expect("cluster_presence_join on B must succeed");
-
-        // A's capacity probe is cluster-wide: 2 distinct users, u1 & u2 already members.
-        let (count, u1_member) = adapter_a
-            .cluster_presence_capacity(TEST_APP, "presence-room", "u1")
-            .await;
-        assert_eq!(count, 2, "cluster distinct-user count must be 2");
-        assert!(u1_member, "u1 must read as already a cluster member");
-
-        let (_c, u2_member) = adapter_a
-            .cluster_presence_capacity(TEST_APP, "presence-room", "u2")
-            .await;
-        assert!(
-            u2_member,
-            "u2 (joined on B) must read as already a member on A"
+            .expect("HLEN presusers must succeed");
+        assert_eq!(
+            occupants as usize, CAP,
+            "the cluster roster must land exactly on the cap, never above it"
         );
 
-        let (_c, u3_member) = adapter_a
-            .cluster_presence_capacity(TEST_APP, "presence-room", "u3")
-            .await;
-        assert!(
-            !u3_member,
-            "an unseen user must NOT read as already a member"
-        );
-
-        // Leaving drops the cluster count back down (last_for_user edge).
-        let last1 = adapter_a
-            .cluster_presence_leave(TEST_APP, "presence-room", "u1", &s1)
+        // A second connection for a user already on the FULL roster is still admitted:
+        // it adds no distinct user.
+        let (_sid0, _h0, m0) = presence_handle("seed0", serde_json::json!({"i": 0}));
+        let second_sid = SocketId::generate();
+        let rejoin = adapter_b
+            .cluster_presence_join(TEST_APP, "presence-cap", &m0, &second_sid, Some(CAP))
             .await
-            .expect("cluster_presence_leave must succeed");
+            .expect("the rejoin must reach Redis")
+            .expect("an existing roster member must be admitted at the cap");
         assert!(
-            last1,
-            "u1's only cluster connection leaving → last_for_user"
+            !rejoin.0,
+            "a second connection of an existing user is not first_for_user"
         );
-        let (count_after, _) = adapter_a
-            .cluster_presence_capacity(TEST_APP, "presence-room", "u1")
-            .await;
-        assert_eq!(count_after, 1, "after u1 leaves, cluster count is 1 (u2)");
     })
     .await
-    .expect("cluster_presence_capacity direct test must not hang (Redis up?)");
+    .expect("cluster presence cap race must not hang (Redis up?)");
 }
 
 /// `cluster_publish_broadcast` PUBLISHes the Broadcast envelope on the channel's `msg`

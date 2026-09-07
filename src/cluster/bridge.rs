@@ -127,7 +127,8 @@ pub enum ClusterCmd {
     /// (excluding the joiner) and fire the `member_added` webhook. Also fires the single
     /// cluster-wide `channel_occupied` on the cluster 0→1 edge. `node_first` is the
     /// worker's node-local 0→1 subscriber edge (drives the Redis msg-channel subscribe).
-    /// Maps to [`RedisAdapter::cluster_subscribe`] + [`RedisAdapter::cluster_presence_join`].
+    /// Maps to [`RedisAdapter::cluster_sub_channel`] +
+    /// [`RedisAdapter::cluster_presence_join`] + [`RedisAdapter::cluster_membership_join`].
     PresenceSubscribe {
         app: Arc<str>,
         channel: Arc<str>,
@@ -1072,64 +1073,34 @@ async fn handle_cmd(
             mailbox,
             node_first,
         } => {
-            // Cluster-wide presence capacity gate (Soketi parity:
-            // `presence-channel-manager.getChannelMembersCount` is cluster-wide). The
-            // count of record is in REDIS — and Redis is only written by
-            // `cluster_presence_join` BELOW, never by the worker's inline LOCAL join — so
-            // we can authoritatively check the cluster count HERE, before committing the
-            // join, and reject cleanly without ever having corrupted the count. The inline
-            // node-local capacity check in `ws::subscribe` is GUARDED OFF in cluster mode
-            // (it only sees this node's members), so this is the SOLE cap enforcement on
-            // the cluster path. A distinct new user that would exceed the cap is rejected:
-            //   1) send the SAME 4004 `subscription_error` the inline path sends
-            //      (`send_subscription_error(channel,"LimitReached","Presence channel is
-            //      full",4004)`) straight to the joining connection's mailbox,
-            //   2) undo the inline LOCAL join the worker already performed (the bridge
-            //      holds the shared `local`), so the connection is not left a node-local
-            //      member, and
-            //   3) return WITHOUT running `cluster_subscribe`/`cluster_presence_join`/
-            //      roster/`member_added` — Redis was never written for this member, so the
-            //      cluster count stays exactly correct.
-            // An `already_member` user (a second connection for a user already in the
-            // cluster roster) is NOT a new distinct user and is admitted as normal.
-            let (cluster_user_count, already_member) = adapter
-                .cluster_presence_capacity(&app, &channel, &member.user_id)
-                .await;
-            if !already_member && cluster_user_count >= max_presence_members {
-                let _ = mailbox.send(ServerEvent::SubscriptionError {
-                    channel: channel.to_string(),
-                    error_type: "LimitReached".to_string(),
-                    error: "Presence channel is full".to_string(),
-                    status: 4004,
-                });
-                // Undo the worker's inline node-local join (in `ctx.subscribed` +
-                // `presence_membership` on the worker side, and `L.subscribe` here). The
-                // worker deindexes its delivery index when it drains the
-                // `SubscriptionError`; this removes the matching node-local membership so
-                // the rejected connection is fully cleaned up. Redis was never written for
-                // this member, so the cluster count is unaffected.
-                local.unsubscribe(&app, &channel, &socket_id).await;
-                return;
+            // `node_first` is a ONE-SHOT token: exactly one in-flight command carries it
+            // for a given node-local 0→1 edge on this channel. Spend it here, BEFORE the
+            // admission verdict, or a rejected join consumes the edge and leaves the node
+            // deaf to the channel for every OTHER connection that joined it meanwhile.
+            // The reject arm below hands the edge back when the node has no members left.
+            if node_first {
+                adapter.cluster_sub_channel(&app, &channel).await;
             }
-            // Membership half: authoritative cluster `(count, occupied)` + the node-local
-            // msg-channel subscribe-on-first + the app index. Presence channels do NOT emit
-            // `subscription_count` (P4), so we ignore the count here — only the `occupied`
-            // edge (and the presence join below) matter for presence.
-            let (_count, occupied) = adapter
-                .cluster_subscribe(&app, &channel, &socket_id, node_first)
-                .await;
-            // Presence half: the cluster-wide `first_for_user` refcount edge + the
-            // cluster-wide roster. On a Redis error we keep the join best-effort: read the
-            // cluster roster directly (mirrors the trait method KEEPING its node-local
-            // roster on error — here the bridge has no node-local roster, so a best-effort
-            // cluster read is the closest equivalent; an empty payload only if that fails
-            // too). `first_for_user` degrades to `false` so a transient blip never emits a
-            // spurious cross-node `member_added`.
-            let (first_for_user, roster) = match adapter
-                .cluster_presence_join(&app, &channel, &member, &socket_id)
+            // Presence half: the atomic cluster-wide cap decision, the `first_for_user`
+            // refcount edge and the cluster roster in ONE Redis-serialized script (Soketi
+            // parity: `presence-channel-manager.getChannelMembersCount` is cluster-wide).
+            // The inline node-local check in `ws::subscribe` is guarded off in cluster
+            // mode, so this is the SOLE cap enforcement on the cluster path. On a Redis
+            // error we keep the join best-effort — the cap fails OPEN rather than
+            // rejecting on a blip — and read the cluster roster directly, with
+            // `first_for_user` degraded to `false` so no spurious cross-node
+            // `member_added` is emitted.
+            let admitted = match adapter
+                .cluster_presence_join(
+                    &app,
+                    &channel,
+                    &member,
+                    &socket_id,
+                    Some(max_presence_members),
+                )
                 .await
             {
-                Ok(r) => r,
+                Ok(admitted) => admitted,
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -1137,9 +1108,32 @@ async fn handle_cmd(
                         "redis presence join failed on bridge; sending best-effort roster"
                     );
                     let roster = adapter.presence_members(&app, &channel).await;
-                    (false, roster_payload(roster))
+                    Some((false, roster_payload(roster)))
                 }
             };
+            let Some((first_for_user, roster)) = admitted else {
+                let _ = mailbox.send(ServerEvent::SubscriptionError {
+                    channel: channel.to_string(),
+                    error_type: "LimitReached".to_string(),
+                    error: "Presence channel is full".to_string(),
+                    status: 4004,
+                });
+                // Undo the worker's inline node-local join; the worker deindexes its own
+                // delivery index when it drains the `SubscriptionError`. The rejecting
+                // script wrote nothing, so no cluster state needs unwinding — only the
+                // pub/sub edge above, and only once the node holds no members at all.
+                let out = local.unsubscribe(&app, &channel, &socket_id).await;
+                if out.subscription_count == 0 {
+                    adapter.cluster_unsub_channel(&app, &channel).await;
+                }
+                return;
+            };
+            // Membership half: authoritative cluster `(count, occupied)` + the app index.
+            // Presence channels do NOT emit `subscription_count` (P4), so we ignore the
+            // count here — only the `occupied` edge matters for presence.
+            let (_count, occupied) = adapter
+                .cluster_membership_join(&app, &channel, &socket_id)
+                .await;
             // Send the CLUSTER roster back to the joining connection as
             // `subscription_succeeded`. A closed connection's mailbox returns `Err` here —
             // a safe no-op that doubles as the generation guard (the connection is gone).

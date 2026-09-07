@@ -149,12 +149,26 @@ redis.call('DEL', KEYS[3], KEYS[4], KEYS[5])
 return {1, roster}
 "#;
 
-/// PRESENCE_JOIN. Records this connection's member, bumps the user's cluster-wide
-/// connection refcount, and on the 0→1 user edge stores the user_info for the roster.
-/// Returns the new refcount (== 1 means first_for_user → emit member_added).
+/// PRESENCE_JOIN. Decides the cluster-wide distinct-user cap and, when the join is
+/// admitted, records this connection's member, bumps the user's cluster-wide connection
+/// refcount and on the 0→1 user edge stores the user_info for the roster.
+///
+/// Deciding the cap HERE is what makes it a real ceiling: Redis serializes scripts, so a
+/// new distinct user is weighed against `HLEN presusers` and committed in one indivisible
+/// step. Split across a probe and a later write, two nodes admitting concurrently both
+/// read room and both commit.
+///
+/// Returns `-1` when the cap rejected the join — nothing was written — else the user's new
+/// refcount (`1` means first_for_user → emit member_added). Negative `ARGV[4]` = uncapped.
 /// KEYS\[1\]=presusers KEYS\[2\]=presinfo KEYS\[3\]=presmembers
-/// ARGV\[1\]=user_id ARGV\[2\]=user_info ARGV\[3\]=member_token
+/// ARGV\[1\]=user_id ARGV\[2\]=user_info ARGV\[3\]=member_token ARGV\[4\]=max_members
 const PRESENCE_JOIN_LUA: &str = r#"
+local cap = tonumber(ARGV[4])
+if cap >= 0
+   and redis.call('HEXISTS', KEYS[1], ARGV[1]) == 0
+   and redis.call('HLEN', KEYS[1]) >= cap then
+  return -1
+end
 redis.call('HSET', KEYS[3], ARGV[3], ARGV[1])
 local conn = redis.call('HINCRBY', KEYS[1], ARGV[1], 1)
 if conn == 1 then redis.call('HSET', KEYS[2], ARGV[1], ARGV[2]) end
@@ -299,7 +313,7 @@ pub struct Scripts {
     /// iff THIS call's SREM removed the chans entry, in which case it also drained
     /// the presence side-tables and each returned user is owed a `member_removed`.
     pub vacate: Script,
-    /// Records a presence join and returns the user's new connection refcount.
+    /// Decides the cluster-wide presence cap and, on admission, records the join.
     pub presence_join: Script,
     /// Records a presence leave and returns the user's remaining connection refcount.
     pub presence_leave: Script,

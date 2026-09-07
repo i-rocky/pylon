@@ -16,7 +16,8 @@ use fred::interfaces::HashesInterface;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
-/// Run PRESENCE_JOIN and read the cluster roster. Returns `(first_for_user, roster)`.
+/// Run PRESENCE_JOIN under `max_members` and read the cluster roster. `Ok(None)` means the
+/// cluster-wide distinct-user cap rejected the join and nothing was written.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn join(
     scripts: &Scripts,
@@ -27,9 +28,11 @@ pub(super) async fn join(
     channel: &str,
     member: &PresenceMember,
     socket_id: &SocketId,
-) -> anyhow::Result<(bool, PresencePayload)> {
+    max_members: Option<usize>,
+) -> anyhow::Result<Option<(bool, PresencePayload)>> {
     let token = member_token(node_id, socket_id.as_str());
     let info = serde_json::to_string(&member.user_info)?;
+    let cap = max_members.map_or(-1, |n| i64::try_from(n).unwrap_or(i64::MAX));
     let conn: i64 = scripts
         .presence_join
         .evalsha_with_reload::<i64, _, _>(
@@ -39,11 +42,14 @@ pub(super) async fn join(
                 keys.presinfo(app, channel),
                 keys.presmembers(app, channel),
             ],
-            vec![member.user_id.clone(), info, token],
+            vec![member.user_id.clone(), info, token, cap.to_string()],
         )
         .await?;
+    if conn < 0 {
+        return Ok(None);
+    }
     let roster = roster(pool, keys, app, channel).await?;
-    Ok((conn == 1, roster))
+    Ok(Some((conn == 1, roster)))
 }
 
 /// Run PRESENCE_LEAVE. Returns `last_for_user`.

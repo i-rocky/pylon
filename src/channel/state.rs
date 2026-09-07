@@ -26,9 +26,12 @@ struct Subscriber {
     member: Option<PresenceMember>,
 }
 
+/// One distinct presence user's roster entry. `conns` holds that user's live connections
+/// in JOIN order and `user_info` mirrors `conns[0]`'s — the roster advertises the value
+/// the user's OLDEST live connection presented, and only ever a live one's.
 struct PresenceUser {
     user_info: Value,
-    conn_count: usize,
+    conns: Vec<SocketId>,
 }
 
 /// Shared membership snapshot for fan-out: every `(socket_id, subscriber)` pair
@@ -39,13 +42,12 @@ type SharedSnapshot = Arc<[(SocketId, Arc<Subscriber>)]>;
 #[derive(Default)]
 pub struct ChannelState {
     subscribers: HashMap<SocketId, Arc<Subscriber>>,
-    /// Distinct presence users (user_id -> info + live connection count) in a
-    /// `BTreeMap`: the map keeps the user ids in SORTED order incrementally on
-    /// every add/remove, so the roster walk below is already ordered — no
-    /// per-join `keys()` collect + re-sort, no unsorted scatter pass (F8). The
-    /// per-join allocation left is one `Arc` refcount bump on the cached
-    /// encoded roster frame (F-5); the owned per-join `PresencePayload` clone
-    /// is gone.
+    /// Distinct presence users in a `BTreeMap`: the map keeps the user ids in
+    /// SORTED order incrementally on every add/remove, so the roster walk below
+    /// is already ordered — no per-join `keys()` collect + re-sort, no unsorted
+    /// scatter pass (F8). The per-join allocation left is one `Arc` refcount
+    /// bump on the cached encoded roster frame (F-5); the owned per-join
+    /// `PresencePayload` clone is gone.
     users: BTreeMap<String, PresenceUser>,
     /// Membership snapshot for fan-out, rebuilt lazily: `add`/`remove` reset it,
     /// the next `fanout` rebuilds it under the caller's registry shard guard.
@@ -56,16 +58,14 @@ pub struct ChannelState {
     /// completes).
     snapshot: OnceLock<SharedSnapshot>,
     /// The ENCODED `pusher_internal:subscription_succeeded` frame for the
-    /// current distinct-user set (F-5): built once per membership GENERATION
-    /// by the same `wire::encode` seam every frame uses, shared (`Arc`) by
-    /// every presence join of that generation instead of deep-cloning the
-    /// roster into an owned `PresencePayload` per join. Invalidated (taken)
-    /// whenever the user SET changes — a new user's first connection or a
-    /// user's last disconnection; a second connection of an existing user
-    /// leaves the roster byte-identical, so the cached frame (and its `Arc`)
-    /// survives, which is exactly the sharing that makes this one encode per
-    /// generation rather than per join. Same OnceLock/take-on-mutation
-    /// memoization pattern as `snapshot` (R20).
+    /// current roster (F-5): built once per membership GENERATION by the same
+    /// `wire::encode` seam every frame uses, shared (`Arc`) by every presence
+    /// join of that generation instead of deep-cloning the roster into an owned
+    /// `PresencePayload` per join. A generation is everything the encoded bytes
+    /// depend on, so it ends on a change to the user SET *or* to any user's
+    /// `user_info`; a second connection of an existing user changes neither and
+    /// keeps sharing the `Arc`. Same OnceLock/take-on-mutation memoization
+    /// pattern as `snapshot` (R20).
     roster_frame: OnceLock<Arc<str>>,
 }
 
@@ -84,17 +84,16 @@ impl ChannelState {
     ) -> Option<PresenceJoin> {
         let socket_id = handle.socket_id;
         let join = member.as_ref().map(|m| {
-            let first_for_user = !self.users.contains_key(&m.user_id);
             let u = self
                 .users
                 .entry(m.user_id.clone())
                 .or_insert_with(|| PresenceUser {
                     user_info: m.user_info.clone(),
-                    conn_count: 0,
+                    conns: Vec::new(),
                 });
-            u.conn_count += 1;
+            u.conns.push(socket_id);
             PresenceJoin {
-                first_for_user,
+                first_for_user: u.conns.len() == 1,
                 roster_frame: Arc::from(""), // filled below after insert
                 member: m.clone(),
             }
@@ -103,10 +102,6 @@ impl ChannelState {
             .insert(socket_id, Arc::new(Subscriber { handle, member }));
         self.snapshot.take(); // membership changed: next fan-out rebuilds
         if join.as_ref().is_some_and(|j| j.first_for_user) {
-            // A NEW distinct user joined: the roster generation changed — drop
-            // the cached frame (the next presence join rebuilds it). A second
-            // connection of an EXISTING user keeps the generation (and the
-            // cached frame's `Arc`) alive.
             self.roster_frame.take();
         }
         join.map(|mut j| {
@@ -121,25 +116,48 @@ impl ChannelState {
         let sub = self.subscribers.remove(socket_id)?;
         self.snapshot.take(); // membership changed: next fan-out rebuilds
         let member = sub.member.clone()?;
-        let last_for_user = match self.users.get_mut(&member.user_id) {
+        let oldest_left = match self.users.get_mut(&member.user_id) {
             Some(u) => {
-                u.conn_count -= 1;
-                if u.conn_count == 0 {
-                    self.users.remove(&member.user_id);
-                    // The user left the roster: membership generation changed —
-                    // the cached `subscription_succeeded` frame is stale.
-                    self.roster_frame.take();
-                    true
-                } else {
-                    false
-                }
+                u.conns.retain(|s| s != socket_id);
+                u.conns.first().copied()
             }
-            None => true,
+            None => None,
         };
+        let last_for_user = oldest_left.is_none();
+        match oldest_left {
+            None => {
+                self.users.remove(&member.user_id);
+                self.roster_frame.take();
+            }
+            Some(oldest) => self.reseat_user_info(&member.user_id, oldest),
+        }
         Some(PresenceLeave {
             last_for_user,
             user_id: member.user_id,
         })
+    }
+
+    /// Point a user's roster entry back at its oldest SURVIVING connection's `user_info`.
+    /// The entry mirrors one connection's value, so when that connection departs the entry
+    /// must follow, or the roster advertises metadata no live connection ever presented.
+    /// A changed value ends the roster generation just as a changed user set does.
+    fn reseat_user_info(&mut self, user_id: &str, oldest: SocketId) {
+        let Some(info) = self
+            .subscribers
+            .get(&oldest)
+            .and_then(|s| s.member.as_ref())
+            .map(|m| m.user_info.clone())
+        else {
+            return;
+        };
+        let Some(user) = self.users.get_mut(user_id) else {
+            return;
+        };
+        if user.user_info == info {
+            return;
+        }
+        user.user_info = info;
+        self.roster_frame.take();
     }
 
     pub fn subscription_count(&self) -> usize {
@@ -333,6 +351,7 @@ impl Fanout<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tokio::sync::mpsc;
 
     fn handle() -> ConnectionHandle {
@@ -729,6 +748,113 @@ mod tests {
         assert_eq!(&*s.cached_roster_frame(ch), three);
     }
 
+    /// The roster's `user_info` for a user always belongs to a LIVE connection of that
+    /// user — the oldest. Its departure re-seats the entry on the next-oldest, and the
+    /// memoised roster frame must be invalidated with it or the bytes go stale.
+    #[test]
+    fn roster_reseats_user_info_when_the_oldest_connection_leaves() {
+        let ch = "presence-reseat";
+        let m = |info: Value| PresenceMember {
+            user_id: "u1".into(),
+            user_info: info,
+        };
+        let mut s = ChannelState::default();
+
+        let (h_old, h_new) = (handle(), handle());
+        let (sid_old, sid_new) = (h_old.socket_id, h_new.socket_id);
+        let j_old = s.add(ch, h_old, Some(m(json!({"name":"Old"})))).unwrap();
+        let j_new = s.add(ch, h_new, Some(m(json!({"name":"New"})))).unwrap();
+        assert_eq!(
+            roster_json(&j_new.roster_frame)["presence"]["hash"]["u1"],
+            json!({"name":"Old"}),
+            "a second connection does not displace the oldest live connection's info"
+        );
+        assert!(
+            Arc::ptr_eq(&j_old.roster_frame, &j_new.roster_frame),
+            "the dedup join must share the cached frame"
+        );
+
+        s.remove(&sid_old);
+        let reseated = s.cached_roster_frame(ch);
+        assert_eq!(
+            roster_json(&reseated)["presence"]["hash"]["u1"],
+            json!({"name":"New"}),
+            "with the seeding connection gone the roster must carry the survivor's info"
+        );
+        assert!(
+            !Arc::ptr_eq(&j_old.roster_frame, &reseated),
+            "the re-seat ends the roster generation: the stale frame must not be served"
+        );
+        assert_eq!(
+            s.members(),
+            vec![PresenceMember {
+                user_id: "u1".into(),
+                user_info: json!({"name":"New"}),
+            }],
+            "the REST members view reads the same re-seated info"
+        );
+
+        let leave = s.remove(&sid_new).unwrap();
+        assert!(
+            leave.last_for_user,
+            "u1's last connection leaving is the edge"
+        );
+        assert_eq!(s.user_count(), None);
+    }
+
+    /// Three connections of one user: the roster follows JOIN order, showing the oldest
+    /// survivor at every step — never the newest, never a departed connection's.
+    #[test]
+    fn roster_follows_join_order_across_successive_departures() {
+        let ch = "presence-order";
+        let m = |info: Value| PresenceMember {
+            user_id: "u1".into(),
+            user_info: info,
+        };
+        let mut s = ChannelState::default();
+
+        let (h1, h2, h3) = (handle(), handle(), handle());
+        let (s1, s2) = (h1.socket_id, h2.socket_id);
+        s.add(ch, h1, Some(m(json!({"n": 1}))));
+        s.add(ch, h2, Some(m(json!({"n": 2}))));
+        s.add(ch, h3, Some(m(json!({"n": 3}))));
+
+        s.remove(&s1);
+        assert_eq!(
+            roster_json(&s.cached_roster_frame(ch))["presence"]["hash"]["u1"],
+            json!({"n": 2}),
+            "the second connection, not the newest, inherits the roster entry"
+        );
+        s.remove(&s2);
+        assert_eq!(
+            roster_json(&s.cached_roster_frame(ch))["presence"]["hash"]["u1"],
+            json!({"n": 3}),
+            "the last survivor's info takes over"
+        );
+    }
+
+    /// A departure that leaves the roster bytes unchanged must NOT invalidate the cached
+    /// frame — the memoisation stays exactly as tight as the generation it tracks.
+    #[test]
+    fn identical_user_info_survivor_keeps_the_cached_roster_frame() {
+        let ch = "presence-same";
+        let m = || PresenceMember {
+            user_id: "u1".into(),
+            user_info: json!({"name":"Same"}),
+        };
+        let mut s = ChannelState::default();
+
+        let (h1, h2) = (handle(), handle());
+        let s1 = h1.socket_id;
+        let j = s.add(ch, h1, Some(m())).unwrap();
+        s.add(ch, h2, Some(m()));
+
+        s.remove(&s1);
+        assert!(
+            Arc::ptr_eq(&j.roster_frame, &s.cached_roster_frame(ch)),
+            "an unchanged roster keeps its one encode"
+        );
+    }
     /// The empty roster shape: empty `ids` array, empty `hash` object, count 0.
     /// The node-local cache never ships this (a joiner is always in its own
     /// roster); this pins the ENCODER's empty-payload arm, still reachable via

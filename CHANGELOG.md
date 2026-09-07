@@ -134,6 +134,52 @@ pre-1.0 and versions track `Cargo.toml`.
   effect and produces no warning.
 
 ### Fixed
+- **A presence roster no longer advertises the `user_info` of a connection that
+  has already left.** `ChannelState` keeps one `user_info` per distinct presence
+  user, seeded by that user's first connection; `remove` only decremented the
+  refcount, so once the seeding connection left, every later subscriber's
+  `subscription_succeeded` roster and every `GET /apps/{id}/channels/{c}/users`
+  kept serving a value **no live connection had ever presented** — for as long as
+  any other connection of that user remained. The everyday shape: update a
+  profile, open a new tab, close the old one, and everyone who joins afterwards
+  sees the old profile. The roster entry now follows the user's OLDEST LIVE
+  connection: unchanged while that connection lasts (a second connection of the
+  same user still does not displace it, and still emits no `member_added`), and
+  re-seated on the next-oldest survivor when it departs. Because a `user_info`
+  can now change without the user set changing, the memoised
+  `subscription_succeeded` frame is invalidated on that change too — a roster
+  generation is everything its encoded bytes depend on, not just the set of ids.
+  The cluster (Redis) roster keeps first-writer-wins for now; only the node-local
+  roster is re-seated.
+- **A presence join rejected by the cluster member cap no longer swallows the
+  node's 0→1 Redis `SUBSCRIBE`, which left the node deaf to the channel it still
+  held members of.** `node_first` is a one-shot token — exactly one in-flight
+  bridge command carries it for a given node-local 0→1 edge — and the capacity
+  rejection returned before `cluster_subscribe`, the only place the channel's
+  `msg` key is subscribed. A rejected joiner racing an admitted one (a second
+  connection for a user already on the cluster roster, so not a new distinct user)
+  therefore left the node holding a live presence member of a channel it was not a
+  Redis subscriber of: no `member_added`, no `member_removed`, and no cross-node
+  channel events for anyone on that node, with nothing logged. The membership
+  reconciler introduced alongside this bounded the damage to one tick
+  (`PYLON_REDIS_PRESENCE_HEARTBEAT_SECS`, default 25s) rather than the life of the
+  process, but pub/sub has no replay, so every frame inside that window was still
+  lost. The bridge now spends the pub/sub edge before the admission verdict and
+  hands it back — a matching `UNSUBSCRIBE` — only when the rejection leaves the
+  node with no members for the channel at all.
+- **The cluster-wide `PYLON_MAX_PRESENCE_MEMBERS` cap is now decided atomically
+  inside the presence-join script, so concurrent joins landing on different nodes
+  can no longer push a presence roster past it.** The bridge previously probed the
+  Redis count of record (`HLEN presusers` + `HEXISTS presusers <user>`) and
+  committed the join several round trips later, with nothing reserving the slot in
+  between: N nodes admitting at the same instant each read room and each committed,
+  overshooting the cap by up to N−1 members, and the roster stayed over-cap until
+  members left. `PRESENCE_JOIN_LUA` now takes the cap as an argument and weighs a
+  new distinct user against `HLEN presusers` in the same indivisible script that
+  records the member, returning `-1` for a rejection that wrote nothing; the
+  separate capacity probe is gone. The rejection shape is unchanged — the same 4004
+  `LimitReached` `subscription_error`, and a second connection of a user already on
+  the roster is still admitted with the channel full.
 - **Cluster state that a node computes from live membership is now reconciled
   every heartbeat instead of applied once on an edge, so a single missed edge no
   longer disables a channel for the life of the process.** Three symptoms shared

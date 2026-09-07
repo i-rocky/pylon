@@ -675,8 +675,41 @@ impl RedisAdapter {
 /// identical to the inline code these were extracted from — they are the single source of
 /// truth that both callers now share.
 impl RedisAdapter {
-    /// Cluster half of `subscribe`: record cluster-wide membership (SUBSCRIBE_LUA), index
-    /// the app, and drive the node-local Redis `msg`-channel subscribe-on-first lifecycle.
+    /// Attach this node to a channel's `msg` pub/sub key — the node-local 0→1 edge. The
+    /// node-local subscription has already succeeded, so a failure costs only cross-node
+    /// delivery on this node: logged, never fatal, repaired by the reconciler's next tick.
+    #[doc(hidden)]
+    pub async fn cluster_sub_channel(&self, app: &str, channel: &str) {
+        let msg_key = self.keys.msg(app, channel);
+        if let Err(e) =
+            pubsub::sub_channel(&self.clients.sub, msg_key.clone(), self.cfg.sharded_pubsub).await
+        {
+            tracing::warn!(
+                error = %e,
+                channel = %msg_key,
+                "failed to SUBSCRIBE to Redis msg channel on 0→1 edge"
+            );
+        }
+    }
+
+    /// Detach this node from a channel's `msg` pub/sub key — the node-local 1→0 edge.
+    #[doc(hidden)]
+    pub async fn cluster_unsub_channel(&self, app: &str, channel: &str) {
+        let msg_key = self.keys.msg(app, channel);
+        if let Err(e) =
+            pubsub::unsub_channel(&self.clients.sub, msg_key.clone(), self.cfg.sharded_pubsub).await
+        {
+            tracing::warn!(
+                error = %e,
+                channel = %msg_key,
+                "failed to UNSUBSCRIBE from Redis msg channel on 1→0 edge"
+            );
+        }
+    }
+
+    /// Cluster half of `subscribe`: record cluster-wide membership (MEMBERSHIP_JOIN_LUA),
+    /// index the app, and drive the node-local Redis `msg`-channel subscribe-on-first
+    /// lifecycle.
     ///
     /// `node_first` is the node-local 0→1 subscriber edge (the caller computes it from its
     /// own `LocalAdapter` — `out.subscription_count == 1`). Returns the AUTHORITATIVE
@@ -691,24 +724,22 @@ impl RedisAdapter {
         socket_id: &SocketId,
         node_first: bool,
     ) -> (usize, bool) {
-        // Subscribe to the msg channel when this NODE goes 0 → 1 for the channel.
         if node_first {
-            let msg_key = self.keys.msg(app, channel);
-            if let Err(e) =
-                pubsub::sub_channel(&self.clients.sub, msg_key.clone(), self.cfg.sharded_pubsub)
-                    .await
-            {
-                // The local subscription already succeeded; a Redis SUBSCRIBE
-                // failure only costs cross-node delivery for this channel on this
-                // node. Log loudly but never panic the connection task.
-                tracing::warn!(
-                    error = %e,
-                    channel = %msg_key,
-                    "failed to SUBSCRIBE to Redis msg channel on 0→1 edge"
-                );
-            }
+            self.cluster_sub_channel(app, channel).await;
         }
+        self.cluster_membership_join(app, channel, socket_id).await
+    }
 
+    /// The membership half of [`cluster_subscribe`](RedisAdapter::cluster_subscribe),
+    /// without the pub/sub lifecycle — for a caller whose admission verdict lands between
+    /// the two (the bridge's presence path) and so must schedule the edge itself.
+    #[doc(hidden)]
+    pub async fn cluster_membership_join(
+        &self,
+        app: &str,
+        channel: &str,
+        socket_id: &SocketId,
+    ) -> (usize, bool) {
         // Record cluster-wide membership and read back the AUTHORITATIVE count.
         // Atomic Lua: HSET member, refresh whole-key TTL, HLEN, index on the 0→1
         // cluster edge. On any Redis error, report a zero count so the caller keeps
@@ -780,19 +811,8 @@ impl RedisAdapter {
         socket_id: &SocketId,
         node_last: bool,
     ) -> (usize, bool) {
-        // Tear down the Redis subscription on the node-LOCAL 1 → 0 edge.
         if node_last {
-            let msg_key = self.keys.msg(app, channel);
-            if let Err(e) =
-                pubsub::unsub_channel(&self.clients.sub, msg_key.clone(), self.cfg.sharded_pubsub)
-                    .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    channel = &msg_key,
-                    "failed to UNSUBSCRIBE from Redis msg channel on 1→0 edge"
-                );
-            }
+            self.cluster_unsub_channel(app, channel).await;
         }
 
         // Remove cluster-wide membership and read back the AUTHORITATIVE remaining
@@ -826,9 +846,11 @@ impl RedisAdapter {
         }
     }
 
-    /// Cluster half of a presence join: PRESENCE_JOIN refcount + cluster roster read.
-    /// Returns `(first_for_user, cluster_roster)`. Propagates the Redis error (the caller
-    /// keeps its node-local join on `Err`, as the inline path did).
+    /// Cluster half of a presence join: the atomic cap decision + PRESENCE_JOIN refcount +
+    /// cluster roster read. `Ok(None)` means `max_members` rejected it, having written
+    /// NOTHING — so a caller that reports the rejection leaves the cluster count exactly
+    /// as it found it. `None` is uncapped. Propagates the Redis error (the caller keeps
+    /// its node-local join on `Err`, as the inline path did).
     #[doc(hidden)]
     pub async fn cluster_presence_join(
         &self,
@@ -836,7 +858,8 @@ impl RedisAdapter {
         channel: &str,
         member: &PresenceMember,
         socket_id: &SocketId,
-    ) -> anyhow::Result<(bool, PresencePayload)> {
+        max_members: Option<usize>,
+    ) -> anyhow::Result<Option<(bool, PresencePayload)>> {
         presence::join(
             &self.scripts,
             &self.clients.pool,
@@ -846,6 +869,7 @@ impl RedisAdapter {
             channel,
             member,
             socket_id,
+            max_members,
         )
         .await
     }
@@ -871,41 +895,6 @@ impl RedisAdapter {
             socket_id,
         )
         .await
-    }
-
-    /// Cluster presence capacity probe for the presence-subscribe admission check: the
-    /// cluster distinct-user count (`HLEN presusers`) and whether `user_id` is already in
-    /// the cluster roster (`HEXISTS presusers user_id`). Both reads are best-effort: a
-    /// Redis error degrades to `(0, false)` so the capacity gate fails open rather than
-    /// rejecting a join on a transient blip.
-    #[doc(hidden)]
-    pub async fn cluster_presence_capacity(
-        &self,
-        app: &str,
-        channel: &str,
-        user_id: &str,
-    ) -> (usize, bool) {
-        let count = match presence::user_count(&self.clients.pool, &self.keys, app, channel).await {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!(error = %e, app, channel, "redis presence user_count failed; capacity check degrades to 0");
-                0
-            }
-        };
-        let already_member: bool = match self
-            .clients
-            .pool
-            .next()
-            .hexists(self.keys.presusers(app, channel), user_id)
-            .await
-        {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(error = %e, app, channel, user_id, "redis HEXISTS presusers failed; treating as not-yet-member");
-                false
-            }
-        };
-        (count, already_member)
     }
 
     /// Cluster half of `signin_user`: USER_SIGNIN refcount, the node-local `usermsg`
@@ -1280,32 +1269,32 @@ impl Adapter for RedisAdapter {
         // first_for_user edge (HINCRBY refcount) and the cluster-wide roster. On any
         // Redis error keep the node-local join (graceful degradation).
         if let Some(join) = out.presence.as_mut() {
-            match self
-                .cluster_presence_join(app, channel, &join.member, &socket_id)
+            let admitted = match self
+                .cluster_presence_join(app, channel, &join.member, &socket_id, None)
                 .await
             {
-                Ok((first_for_user, roster)) => {
-                    join.first_for_user = first_for_user;
-                    // F-5: cluster truth REPLACES the node-local cached frame —
-                    // the cluster-wide roster is fresh data on every join, so it
-                    // encodes here through the same `wire::encode` seam
-                    // (byte-identical shape to the node-local path's frame). The
-                    // node-local cache itself is untouched: it tracks only
-                    // node-local membership.
-                    join.roster_frame = Arc::from(
-                        crate::protocol::wire::encode(
-                            crate::protocol::wire::ACTIVE_VERSIONS[0],
-                            &ServerEvent::SubscriptionSucceeded {
-                                channel: channel.to_string(),
-                                presence: Some(roster),
-                            },
-                        )
-                        .as_str(),
-                    );
-                }
+                Ok(admitted) => admitted,
                 Err(e) => {
                     tracing::warn!(error = %e, app, channel, "redis presence join failed; keeping node-local roster");
+                    None
                 }
+            };
+            // F-5: cluster truth REPLACES the node-local cached frame — the cluster
+            // roster is fresh data on every join, so it encodes here through the same
+            // `wire::encode` seam. The node-local cache is untouched: it tracks only
+            // node-local membership.
+            if let Some((first_for_user, roster)) = admitted {
+                join.first_for_user = first_for_user;
+                join.roster_frame = Arc::from(
+                    crate::protocol::wire::encode(
+                        crate::protocol::wire::ACTIVE_VERSIONS[0],
+                        &ServerEvent::SubscriptionSucceeded {
+                            channel: channel.to_string(),
+                            presence: Some(roster),
+                        },
+                    )
+                    .as_str(),
+                );
             }
         }
 
