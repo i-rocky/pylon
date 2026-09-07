@@ -223,13 +223,6 @@ non-2xx response and every transport error** (timeout, connection refused, DNS f
 With the defaults and an unresponsive endpoint, attempts are made at roughly 0, 1, 3, 7, 15, 31,
 63, 123, 183, 243, and 300 seconds (11 attempts, giving up at the 5-minute mark).
 
-### Deprecated variables
-
-| Variable | Status |
-|---|---|
-| `PYLON_WEBHOOK_RETRY_BASE_MS` | Deprecated alias of `PYLON_WEBHOOK_BACKOFF_BASE_MS`; honored (with a startup warning) for one release. If both are set, the new variable wins. |
-| `PYLON_WEBHOOK_MAX_RETRIES` | Deprecated and ignored (warns at startup). Retries are bounded by `PYLON_WEBHOOK_RETRY_BUDGET_MS` (total time, not attempt count). |
-
 Deliveries that never receive a 2xx within the retry budget are counted as failures in the
 Prometheus metrics exposed at `/metrics`.
 

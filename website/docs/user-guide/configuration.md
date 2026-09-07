@@ -126,8 +126,6 @@ TLS configuration is covered in detail on the [TLS / SSL](tls.md) page.
 | `PYLON_WEBHOOK_ALLOW_PRIVATE_TARGETS` | `false` | SSRF guard escape hatch: set `1`/`true` to allow webhook delivery to private/loopback/link-local targets. Refused targets fail fast (no HTTP sent, no retries — a configuration error). See [Webhooks: Target restrictions](webhooks.md#target-restrictions-ssrf-guard). |
 | `PYLON_WEBHOOK_VACATED_GRACE_MS` | `3000` | Reconnect grace period (milliseconds) before a `channel_vacated` / `member_removed` webhook fires; the webhook is suppressed if the channel is re-occupied / the user re-joins within the window. `0` fires immediately. |
 
-Deprecated (honored or ignored with a startup warning, for one release): `PYLON_WEBHOOK_RETRY_BASE_MS` (alias of `PYLON_WEBHOOK_BACKOFF_BASE_MS`), `PYLON_WEBHOOK_MAX_RETRIES` (ignored — retries are budget-bounded, not count-bounded).
-
 ---
 
 ## Overload / Capacity
