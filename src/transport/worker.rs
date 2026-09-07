@@ -933,14 +933,18 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             }
                             Action::Handoff(prefix) => {
                                 // A REST handoff is not a WS session; drop its
-                                // (spurious) wheel entry so it can't fire later. A
-                                // REST head queued nothing, so any folded delta is
-                                // 0; fold anyway so a removed conn never leaks.
-                                fold_delta(&mut conns, key, &mut inflight_bytes);
+                                // (spurious) wheel entry so it can't fire later.
                                 fold_codel(&mut conns, key, &mut codel_dropped_total);
                                 fold_drophead(&mut conns, key, &mut drophead_dropped_total);
                                 wheel.remove(key);
-                                handoff_rest(&poll, &mut conns, key, &cfg, prefix);
+                                handoff_rest(
+                                    &poll,
+                                    &mut conns,
+                                    key,
+                                    &cfg,
+                                    prefix,
+                                    &mut inflight_bytes,
+                                );
                                 continue;
                             }
                             Action::Keep => {
@@ -1004,7 +1008,14 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             // blocked flight.
                             Action::Handoff(prefix) => {
                                 wheel.remove(key);
-                                handoff_rest(&poll, &mut conns, key, &cfg, prefix);
+                                handoff_rest(
+                                    &poll,
+                                    &mut conns,
+                                    key,
+                                    &cfg,
+                                    prefix,
+                                    &mut inflight_bytes,
+                                );
                             }
                             Action::Keep => {
                                 // A session established by the writable-path
@@ -2917,16 +2928,26 @@ fn arm_handshake_interest(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action
 /// On a missing handoff sender, or a closed channel, the connection is simply
 /// dropped (closed). A pre-handshake REST connection never has a [`Session`], so
 /// no on-close hook / counter decrement is needed.
+///
+/// Like [`remove`], this subtracts whatever the connection still holds from the
+/// worker total. The shutdown drain queues its 4200 frames onto `Handshaking`
+/// entries too, so a REST head arriving mid-drain reaches here with a non-empty
+/// queue — and bytes not subtracted here are a permanent phantom floor under
+/// `inflight_bytes` for the life of the worker.
 fn handoff_rest(
     poll: &Poll,
     conns: &mut slab::Slab<Entry>,
     key: usize,
     cfg: &WorkerConfig,
     prefix: Vec<u8>,
+    inflight_bytes: &mut u64,
 ) {
     let Some(mut entry) = conns.try_remove(key) else {
         return;
     };
+    *inflight_bytes = inflight_bytes
+        .wrapping_add(entry.conn.take_inflight_delta() as u64)
+        .wrapping_sub(entry.conn.accounted_bytes() as u64);
     let _ = poll.registry().deregister(entry.conn.stream_mut());
 
     let Some(tx) = cfg.rest_handoff.as_ref() else {
@@ -4566,5 +4587,45 @@ mod tests {
             t.inflight, 0,
             "its queued 4200 frames leave the worker total with it"
         );
+    }
+
+    /// Issue #62: a REST handoff must return the connection's queued bytes to
+    /// the worker total, exactly as `remove` does. The drain queues its 4200
+    /// frames onto `Handshaking` entries too, so a request head arriving
+    /// mid-drain hands off a connection with a non-empty queue; bytes left
+    /// behind there are a phantom floor no connection holds, which the drain's
+    /// `inflight_bytes == 0` exit can never clear again.
+    #[test]
+    fn rest_handoff_returns_the_connections_queued_bytes() {
+        use std::os::fd::OwnedFd;
+        let poll = Poll::new().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = std::net::TcpStream::connect(addr).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        accepted.set_nonblocking(true).unwrap();
+        let (mut conns, key) =
+            slab_with_conn(&poll, mio::net::TcpStream::from(OwnedFd::from(accepted)));
+        conns[key].conn.state = ConnState::Handshaking;
+        let mut t = Totals::new();
+
+        // The drain's shape: frames queued on a connection that has not flushed.
+        queue_shutdown_error(&mut conns, key, 0);
+        fold_delta(&mut conns, key, &mut t.inflight);
+        let queued = conns[key].conn.out_bytes() as u64;
+        assert!(queued > 0, "the drain really queued something");
+        assert_eq!(t.inflight, queued);
+
+        handoff_rest(
+            &poll,
+            &mut conns,
+            key,
+            &echo_worker_config(addr),
+            Vec::new(),
+            &mut t.inflight,
+        );
+
+        assert!(conns.is_empty(), "the entry left the slab");
+        assert_eq!(t.inflight, 0, "and its bytes left the worker total with it");
     }
 }
