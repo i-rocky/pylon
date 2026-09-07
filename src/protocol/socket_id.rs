@@ -1,6 +1,6 @@
 //! `socket_id` = two random integers joined by `.` (e.g. `123.456`).
 
-use rand::Rng;
+use rand::RngExt;
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -15,9 +15,9 @@ impl SocketId {
 
     /// Each half is drawn from `[1, 10^10)` — large enough to be unguessable.
     pub fn generate() -> Self {
-        let mut rng = rand::thread_rng();
-        let a: u64 = rng.gen_range(1..10_000_000_000);
-        let b: u64 = rng.gen_range(1..10_000_000_000);
+        let mut rng = rand::rng();
+        let a: u64 = rng.random_range(1..10_000_000_000);
+        let b: u64 = rng.random_range(1..10_000_000_000);
         Self::from_raw(format!("{a}.{b}"))
     }
 

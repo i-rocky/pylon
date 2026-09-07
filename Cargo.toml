@@ -54,7 +54,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dashmap = "6"           # sharded concurrent map for the channel registry
 async-trait = "0.1"
-rand = "0.8"
+rand = "0.10"
 futures-util = "0.3"
 # Synchronous `block_on` to drive the async protocol dispatch from the
 # readiness-driven (non-async) per-core worker loop (SP9). LocalAdapter's async
