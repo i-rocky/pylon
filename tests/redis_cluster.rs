@@ -17,6 +17,7 @@ use pylon::connection::handle::ConnectionHandle;
 use pylon::protocol::event::ServerEvent;
 use pylon::protocol::socket_id::SocketId;
 use pylon::server::config::ServerConfig;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -265,13 +266,26 @@ async fn recover_lost_copy(
 /// command-pool `Client` works, and so does a second, unsubscribed
 /// connection built solely for this check.
 ///
+/// `last_seen` is stamped with every count this function reads (including
+/// ones below `want`), so a caller whose OUTER timeout cancels this loop
+/// mid-poll can still report the last count it actually observed — this
+/// function only ever returns on success, so that's the one channel a
+/// canceling caller has to that history.
+///
 /// Only ever resolves `true`; the caller's timeout supplies the `false`.
 /// Never panics.
-async fn poll_numsub_at_least<C: PubsubInterface>(client: &C, channel: &str, want: i64) -> bool {
+async fn poll_numsub_at_least<C: PubsubInterface>(
+    client: &C,
+    channel: &str,
+    want: i64,
+    last_seen: &AtomicI64,
+) -> bool {
     loop {
         let counts: std::collections::HashMap<String, i64> =
             client.pubsub_numsub(channel).await.unwrap_or_default();
-        if counts.get(channel).copied().unwrap_or(0) >= want {
+        let count = counts.get(channel).copied().unwrap_or(0);
+        last_seen.store(count, Ordering::Relaxed);
+        if count >= want {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -291,6 +305,11 @@ async fn poll_numsub_at_least<C: PubsubInterface>(client: &C, channel: &str, wan
 ///
 /// `client` carries the same constraint as [`poll_numsub_at_least`]: it must
 /// not itself be the subscribed connection whose attachment you're checking.
+///
+/// On timeout the panic states both `want` and the last NUMSUB count this
+/// call actually observed, so a future reader of a failed run can tell "saw
+/// 0, nothing ever attached" from "saw want-1, one subscriber short" without
+/// re-running anything.
 async fn require_numsub_at_least<C: PubsubInterface>(
     client: &C,
     channel: &str,
@@ -298,13 +317,21 @@ async fn require_numsub_at_least<C: PubsubInterface>(
     bound: Duration,
     context: &str,
 ) {
-    let attached = tokio::time::timeout(bound, poll_numsub_at_least(client, channel, want))
-        .await
-        .unwrap_or(false);
+    let last_seen = AtomicI64::new(-1);
+    let attached = tokio::time::timeout(
+        bound,
+        poll_numsub_at_least(client, channel, want, &last_seen),
+    )
+    .await
+    .unwrap_or(false);
+    let observed = match last_seen.load(Ordering::Relaxed) {
+        -1 => "no NUMSUB read completed in time".to_string(),
+        n => format!("last saw {n}"),
+    };
     assert!(
         attached,
-        "server never reported >= {want} subscriber(s) on {channel} within {bound:?} — \
-         the pub/sub round trip is broken, not slow ({context})"
+        "server never reported >= {want} subscriber(s) on {channel} within {bound:?} \
+         ({observed}) — the pub/sub round trip is broken, not slow ({context})"
     );
 }
 
@@ -2022,11 +2049,18 @@ async fn cluster_envelope_compat_knob_shapes_the_wire_and_relay_still_works() {
             .subscribe(usermsg_off.clone())
             .await
             .expect("probe SUBSCRIBE");
-        // Same readiness gate as Part 1, on the compat=off broadcast channel.
+        // want=2, not 1: `adapter_b.subscribe` above already SUBSCRIBEd its OWN
+        // `SubscriberClient` to this exact `msg_off` channel (the node-local
+        // 0->1 edge — see the B1 lifecycle test), so NUMSUB is never 0 here
+        // even before the probe catches up. Gating on >=1 would pass on
+        // adapter_b's own subscriber alone and let the broadcast below race
+        // the probe's SUBSCRIBE — the same flake this gate exists to close,
+        // just one subscriber short of catching it. Only >=2 (adapter_b +
+        // probe) is the observable fact that the probe itself is attached.
         require_numsub_at_least(
             &numsub,
             &msg_off,
-            1,
+            2,
             Duration::from_secs(2),
             "probe readiness before the compat=off broadcast",
         )
@@ -2063,14 +2097,21 @@ async fn cluster_envelope_compat_knob_shapes_the_wire_and_relay_still_works() {
         }
 
         // A (compat=off) sends to u1: the UserSend envelope also omits `event`,
-        // and B still delivers the frame to its local u1 connection. Gate the
-        // usermsg leg the same way — this subscription has had time to settle
-        // by now, but the gate is what makes that an observed fact rather than
-        // an assumption.
+        // and B still delivers the frame to its local u1 connection.
+        //
+        // want=2, not 1: `adapter_b.signin_user` above already SUBSCRIBEd its
+        // OWN `SubscriberClient` to this exact `usermsg_off` channel (the same
+        // node-local 0->1 edge `send_to_user_feeds_the_same_encoded_bytes_...`
+        // relies on), so NUMSUB is never 0 here even before the probe catches
+        // up. Gating on >=1 would pass on adapter_b's own subscriber alone and
+        // prove only "someone is subscribed" — already true before this gate
+        // ever ran — letting the send below race the probe's SUBSCRIBE. Only
+        // >=2 (adapter_b + probe) is the observable fact that the probe itself
+        // is attached.
         require_numsub_at_least(
             &numsub,
             &usermsg_off,
-            1,
+            2,
             Duration::from_secs(2),
             "probe readiness before the compat=off user send",
         )
