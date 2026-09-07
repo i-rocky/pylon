@@ -58,6 +58,23 @@ disappearing, depends on the app manager backend:
   pylon_connections{app="x"} == 0`), not a bare `== 0` comparison, or the rule
   will silently stop evaluating the moment the app goes idle.
 
+!!! warning "Clustered deployments: `pylon_channels_occupied` / `pylon_subscriptions` are cluster-wide, per node"
+    `pylon_connections` is always this node's own local count. But
+    `pylon_channels_occupied` and `pylon_subscriptions` are sourced from the
+    configured adapter's channel view, and under `PYLON_ADAPTER=redis`
+    `RedisAdapter::channels` returns a **cluster-wide** view, not a per-node
+    one. A node reports these two series only for an app it has at least one
+    local connection for — a node with zero local connections for an app
+    reports `0` (from the static-file zero-seeding above), while a node with
+    even one local connection reports the FULL cluster-wide occupied-channel
+    and subscription count for that app, not just its own share. In a
+    multi-node deployment where an app's connections are spread across
+    nodes, `avg by(app)` or `min by(app)` aggregations across
+    `pylon_channels_occupied{app="x"}` / `pylon_subscriptions{app="x"}` can
+    therefore read low (the average is diluted by idle nodes' `0`s; the min
+    is `0` whenever any node is idle for that app) — `max by(app)` is the
+    aggregation that reflects the true cluster-wide value in this mode.
+
 #### Per-Worker Transport
 
 | Series | Type | Labels | Description |
