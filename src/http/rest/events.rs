@@ -175,6 +175,24 @@ async fn deliver(
             .await;
         return;
     }
+    // Cache channels retain their last event for replay to new subscribers. Written
+    // BEFORE the broadcast: a subscriber joining concurrently replays from this cache
+    // asynchronously, so a cache still holding the PREVIOUS event once this one is
+    // already on the wire hands that subscriber a stale event after the fresh one.
+    if ChannelInfo::of(channel).cache {
+        state
+            .adapter
+            .cache_set(
+                app_id,
+                channel,
+                CachedEvent {
+                    event: name.to_string(),
+                    data: data.to_string(),
+                },
+                Duration::from_secs(state.config.cache_ttl_secs),
+            )
+            .await;
+    }
     let except = socket_id.map(SocketId::from_raw);
     state
         .adapter
@@ -190,21 +208,6 @@ async fn deliver(
             except,
         )
         .await;
-    // Cache channels retain their last event for replay to new subscribers.
-    if ChannelInfo::of(channel).cache {
-        state
-            .adapter
-            .cache_set(
-                app_id,
-                channel,
-                CachedEvent {
-                    event: name.to_string(),
-                    data: data.to_string(),
-                },
-                Duration::from_secs(state.config.cache_ttl_secs),
-            )
-            .await;
-    }
 }
 
 /// Build the per-channel `info` attributes object (empty if nothing requested).
@@ -521,5 +524,162 @@ mod tests {
 
         let over_capacity = format!("{}.2", "1".repeat(SocketId::CAPACITY - 1));
         assert!(!valid_socket_id(&over_capacity));
+    }
+
+    use crate::adapter::local::LocalAdapter;
+    use crate::adapter::Adapter;
+    use crate::channel::outcome::{ChannelSummary, SubscribeOutcome, UnsubscribeOutcome};
+    use crate::connection::handle::{ConnectionHandle, Mailbox};
+    use crate::presence::member::PresenceMember;
+    use crate::user::{UserJoinOutcome, UserLeaveOutcome};
+    use std::sync::{Arc, Mutex};
+
+    /// A `LocalAdapter` that records the order in which `deliver` makes the two
+    /// writes a cache-channel publish makes.
+    struct WriteOrderAdapter {
+        inner: Arc<LocalAdapter>,
+        writes: Mutex<Vec<&'static str>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Adapter for WriteOrderAdapter {
+        async fn broadcast(
+            &self,
+            app: &str,
+            channel: &str,
+            event: ServerEvent,
+            except: Option<SocketId>,
+        ) {
+            self.writes.lock().unwrap().push("broadcast");
+            self.inner.broadcast(app, channel, event, except).await
+        }
+        async fn cache_set(&self, app: &str, channel: &str, event: CachedEvent, ttl: Duration) {
+            self.writes.lock().unwrap().push("cache_set");
+            self.inner.cache_set(app, channel, event, ttl).await
+        }
+        async fn subscribe(
+            &self,
+            app: &str,
+            channel: &str,
+            handle: ConnectionHandle,
+            member: Option<PresenceMember>,
+        ) -> SubscribeOutcome {
+            self.inner.subscribe(app, channel, handle, member).await
+        }
+        async fn unsubscribe(
+            &self,
+            app: &str,
+            channel: &str,
+            socket_id: &SocketId,
+        ) -> UnsubscribeOutcome {
+            self.inner.unsubscribe(app, channel, socket_id).await
+        }
+        async fn channels(&self, app: &str, prefix: Option<&str>) -> Vec<ChannelSummary> {
+            self.inner.channels(app, prefix).await
+        }
+        async fn channel(&self, app: &str, channel: &str) -> ChannelSummary {
+            self.inner.channel(app, channel).await
+        }
+        async fn presence_members(&self, app: &str, channel: &str) -> Vec<PresenceMember> {
+            self.inner.presence_members(app, channel).await
+        }
+        async fn resend_presence_ack(&self, app: &str, channel: &str, mailbox: Mailbox) {
+            self.inner.resend_presence_ack(app, channel, mailbox).await
+        }
+        async fn cache_get(&self, app: &str, channel: &str) -> Option<CachedEvent> {
+            self.inner.cache_get(app, channel).await
+        }
+        async fn signin_user(
+            &self,
+            app: &str,
+            user_id: &str,
+            handle: ConnectionHandle,
+        ) -> UserJoinOutcome {
+            self.inner.signin_user(app, user_id, handle).await
+        }
+        async fn signout_user(
+            &self,
+            app: &str,
+            user_id: &str,
+            socket_id: &SocketId,
+        ) -> UserLeaveOutcome {
+            self.inner.signout_user(app, user_id, socket_id).await
+        }
+        async fn is_user_online(&self, app: &str, user_id: &str) -> bool {
+            self.inner.is_user_online(app, user_id).await
+        }
+        async fn send_to_user(&self, app: &str, user_id: &str, event: ServerEvent) {
+            self.inner.send_to_user(app, user_id, event).await
+        }
+        async fn terminate_user(&self, app: &str, user_id: &str) -> Vec<SocketId> {
+            self.inner.terminate_user(app, user_id).await
+        }
+        async fn purge_app(&self, app_id: &str) -> Vec<SocketId> {
+            self.inner.purge_app(app_id).await
+        }
+        async fn watch(
+            &self,
+            app: &str,
+            handle: ConnectionHandle,
+            watched: Vec<String>,
+        ) -> Vec<String> {
+            self.inner.watch(app, handle, watched).await
+        }
+        async fn unwatch(&self, app: &str, socket_id: &SocketId) {
+            self.inner.unwatch(app, socket_id).await
+        }
+        async fn watchers_of(&self, app: &str, user_id: &str) -> Vec<ConnectionHandle> {
+            self.inner.watchers_of(app, user_id).await
+        }
+    }
+
+    fn write_order_state(adapter: Arc<WriteOrderAdapter>) -> AppState {
+        AppState {
+            config: crate::server::config::ServerConfig::default(),
+            apps: Arc::new(crate::app::static_file::StaticFileAppManager::from_json("[]").unwrap()),
+            adapter,
+            conn_counts: Arc::new(dashmap::DashMap::new()),
+            webhooks: crate::webhook::WebhookHandle::null(),
+            saturated: None,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cluster_metrics: None,
+            invalidator: None,
+        }
+    }
+
+    fn write_order_adapter() -> Arc<WriteOrderAdapter> {
+        Arc::new(WriteOrderAdapter {
+            inner: Arc::new(LocalAdapter::new(
+                Arc::new(crate::channel::registry::Registry::new()),
+                Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+            )),
+            writes: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// A subscriber joining a cache channel replays the stored last event
+    /// asynchronously, so a cache still holding the PREVIOUS event once this one
+    /// is already on the wire hands that subscriber stale data after fresh. The
+    /// store must therefore be written before the broadcast, never after.
+    #[tokio::test]
+    async fn cache_channel_publish_stores_before_it_broadcasts() {
+        let adapter = write_order_adapter();
+        let state = write_order_state(adapter.clone());
+        deliver(&state, "app1", "cache-x", "ev", "\"payload\"", None).await;
+        assert_eq!(
+            adapter.writes.lock().unwrap().as_slice(),
+            ["cache_set", "broadcast"],
+            "a cache channel's store must be written before the event is broadcast"
+        );
+    }
+
+    /// The store is for cache channels only — an ordinary channel publishes with
+    /// a single write.
+    #[tokio::test]
+    async fn ordinary_channel_publish_only_broadcasts() {
+        let adapter = write_order_adapter();
+        let state = write_order_state(adapter.clone());
+        deliver(&state, "app1", "plain-x", "ev", "\"payload\"", None).await;
+        assert_eq!(adapter.writes.lock().unwrap().as_slice(), ["broadcast"]);
     }
 }

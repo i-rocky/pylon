@@ -188,6 +188,9 @@ pre-1.0 and versions track `Cargo.toml`.
   holding the sweep lease, that id was its own and its receive loop dropped the
   frame as a self-echo. The sweeper delivers to no local socket itself, so its
   emission now belongs to no publisher and every live node delivers it.
+- **A cache channel's stored last event is written before the event is
+  broadcast**, so a subscriber whose asynchronous replay races a publish can no
+  longer be handed the previous event after the fresh one.
 - **The graceful-shutdown drain no longer waits on inbound buffers it will
   never consume, so a rolling restart exits as soon as queued replies are
   sent instead of always burning the full grace window.** `inflight_bytes`
