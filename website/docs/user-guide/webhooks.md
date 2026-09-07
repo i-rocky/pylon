@@ -262,6 +262,9 @@ HTTP is sent, every delivery runs a pre-flight check:
    - NAT64 well-known prefix (`64:ff9b::/96`, RFC 6052) — a NAT64 gateway
      translates the embedded IPv4 into interior address space, so these are
      refused whether the embedded v4 is public or private.
+   - 6to4 (`2002::/16`, RFC 3056) — a 6to4 relay translates the embedded IPv4
+     into interior address space, so these are refused whether the embedded v4
+     is public or private.
 3. **Pinning**: for hostname URLs the delivery is pinned to the addresses the
    pre-flight resolved (`ClientBuilder::resolve_to_addrs`), so the actual
    connect cannot drift to a second, un-checked DNS lookup between the check
