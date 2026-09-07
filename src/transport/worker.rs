@@ -1702,7 +1702,7 @@ fn handle_readable(
             next_gen,
             wheel,
         ),
-        ConnState::Open | ConnState::Closing => handle_frames(poll, entry, cfg, now_ns),
+        ConnState::Open => handle_frames(poll, entry, cfg, now_ns),
     }
 }
 
@@ -2836,7 +2836,7 @@ fn handle_writable(
             next_gen,
             wheel,
         ),
-        ConnState::Open | ConnState::Closing => flush_and_arm(poll, entry, now_ns),
+        ConnState::Open => flush_and_arm(poll, entry, now_ns),
     }
 }
 

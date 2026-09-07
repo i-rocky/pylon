@@ -34,8 +34,6 @@ pub enum ConnState {
     Handshaking,
     /// Upgrade complete; WS frames flow in both directions.
     Open,
-    /// A close handshake is underway; draining remaining writes.
-    Closing,
 }
 
 /// Outcome of a [`Connection::flush`] call.
