@@ -1326,11 +1326,11 @@ async fn rest_users_on_presence_channel_is_200() {
 
 // ── P8 parity tests — channel-name length + charset ─────────────────────────
 
-/// P8: POST /events with a channel name exceeding 164 chars → 400.
+/// P8: POST /events with a channel name exceeding 200 chars → 400.
 #[tokio::test]
 async fn rest_trigger_channel_name_over_length_is_400() {
     let addr = spawn().await;
-    let long_name = "a".repeat(165);
+    let long_name = "a".repeat(201);
     let body = json!({"name":"ev","data":"{}","channels":[long_name]}).to_string();
     let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
     let resp = reqwest::Client::new()
@@ -1342,7 +1342,7 @@ async fn rest_trigger_channel_name_over_length_is_400() {
     assert_eq!(
         resp.status(),
         400,
-        "channel name over 164 chars must be 400"
+        "channel name over 200 chars must be 400"
     );
 }
 

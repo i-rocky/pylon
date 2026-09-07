@@ -1434,7 +1434,7 @@ async fn cache_channel_miss_emits_cache_miss_webhook() {
 
 #[tokio::test]
 async fn subscribe_over_length_channel_name_errors_4009() {
-    let long_name = "a".repeat(165); // > default max of 164
+    let long_name = "a".repeat(201); // > default max of 200
     let (mut c, mut rx) = ctx(app(false));
     c.dispatch(ClientCommand::Subscribe {
         channel: long_name.clone(),

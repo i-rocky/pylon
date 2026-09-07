@@ -32,6 +32,13 @@ pre-1.0 and versions track `Cargo.toml`.
   for reviewed exceptions (empty today).
 
 ### Changed
+- **`PYLON_MAX_CHANNEL_NAME_LENGTH` default raised from 164 to 200 bytes** — both
+  actively-maintained official server SDKs (`pusher-http-node`, `pusher-http-go`)
+  validate channel names up to 200 bytes client-side; the live pusher.com docs
+  quote 164, but a maintained SDK is the stronger signal of what real traffic
+  looks like, and pylon's old default rejected a 165-200 byte channel name the
+  SDKs would already send successfully to hosted Pusher. Set `164` to match the
+  published doc value instead.
 - **Malformed numeric `PYLON_*` values now fail startup instead of silently
   keeping the default** — every numeric environment variable is rejected when it
   is set to a value that fails to parse. `PYLON_PORT=abc` and
