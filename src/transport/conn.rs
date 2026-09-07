@@ -874,10 +874,9 @@ impl Connection {
     }
 
     /// Whether WRITABLE interest is currently armed on this connection's poll
-    /// registration (see the [`writable_armed`](Self::writable_armed) field
-    /// doc). Read by the worker loop's debug invariant: a connection with
-    /// queued out-bytes MUST hold WRITABLE interest, or an idle poll could
-    /// strand its backlog.
+    /// registration. Read by the worker loop's debug invariant: a connection
+    /// with [`has_pending_writes`](Self::has_pending_writes) MUST hold
+    /// WRITABLE interest, or an idle poll could strand its backlog.
     pub fn writable_armed(&self) -> bool {
         self.writable_armed
     }

@@ -766,16 +766,18 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
             "incremental outbound_bytes drifted from the true outbound_bytes sum",
         );
 
-        // G1 invariant: queued out-bytes MUST come with WRITABLE interest, or
-        // the idle 50ms poll can sleep on a backlog nothing will wake it for.
-        // Every queue site goes through `flush_and_arm` before control returns
-        // here, so a violation means one of them let an unarmed connection live.
+        // G1 invariant: owed outbound bytes — queued frames or ciphertext
+        // rustls has not put on the wire — MUST come with WRITABLE interest,
+        // or the idle 50ms poll can sleep on a backlog nothing will wake it
+        // for. Every write site goes through `flush_and_arm` before control
+        // returns here, so a violation means one let an unarmed connection
+        // live.
         debug_assert!(
             conns
                 .iter()
-                .all(|(_, e)| e.conn.out_bytes() == 0 || e.conn.writable_armed()),
-            "connection has queued out-bytes but no WRITABLE interest armed; \
-             the idle poll could strand its backlog"
+                .all(|(_, e)| !e.conn.has_pending_writes() || e.conn.writable_armed()),
+            "connection owes outbound bytes but has no WRITABLE interest armed; \
+             the idle poll could strand them"
         );
 
         // Mirror the incrementally-maintained total into the shared slot for the
