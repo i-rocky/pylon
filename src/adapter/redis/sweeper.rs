@@ -190,6 +190,7 @@ pub(crate) async fn sweep_once(
                         keys.presusers(&app, &channel),
                         keys.presinfo(&app, &channel),
                         keys.presmembers(&app, &channel),
+                        keys.presseats(&app, &channel),
                     ],
                     vec![channel.clone()],
                 )
