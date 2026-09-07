@@ -222,28 +222,24 @@ fn group_by_app(groups: &LocalGroups) -> std::collections::BTreeMap<String, Vec<
 /// and `SADD nodes node_id`. A dead node simply stops ticking — its `node` key TTL-
 /// expires, and the sweeper's dead-node prune removes it from the `nodes` set.
 ///
-/// It also refreshes this node's `nodeconns:{node_id}` TTL (Task 4.2): a live node
-/// holding connections must never let its per-app capacity hash expire, or its
-/// close-time releases would floor-0 as phantoms and the cluster total would leak.
-/// The TTL sizing is [`RedisConfig::node_conns_ttl_secs`] — long enough that the
-/// sweeper reclaims a dead node BEFORE the backstop expires it.
+/// It also re-arms this node's `nodeconns:{node_id}` TTL: a live node holding
+/// connections must never let its per-app capacity hash expire, or its close-time
+/// releases would floor-0 as phantoms and the cluster total would leak. The TTL
+/// sizing is [`RedisConfig::node_conns_ttl_secs`] — long enough that the sweeper
+/// reclaims a dead node BEFORE the backstop expires it.
 ///
-/// SELF-HEAL (Task 4.2 fix): if Redis was unreachable for longer than that TTL,
-/// the hash expires while this node (and its connections) live on — and the plain
-/// `EXPIRE` below is a no-op on the missing key. Without more, every pre-outage
-/// unit would sit in `appconns` FOREVER: the release guard treats each surviving
-/// connection's close as a phantom (this node holds no recorded unit), and the
-/// sweeper reclaims nothing when the node eventually dies (its hash is gone). So
-/// when the EXPIRE reports the hash missing, the tick RE-SEEDS it from
-/// `conn_counts` — the worker fleet's AUTHORITATIVE live per-app counts, shared
-/// into the bridge at construction (the same `DashMap` the workers bump at
-/// establish and roll back at close/reject). Once the hash mirrors live truth
-/// again, the release guard and the dead-node reclaim both work exactly as on the
-/// never-outage path. Residual, bounded: connections that CLOSED during the
-/// outage leak their single unit (nothing knows they existed — the same ≤1-unit
-/// leak as a dropped release), and an admission racing the snapshot→HSET
-/// round-trip can leave a ±1 residue for its app (`conn_counts` leads Redis — it
-/// is incremented before the admit fires — so the window is one round trip).
+/// SELF-HEAL: the hash can go missing under a LIVE node two ways — its TTL lapsed
+/// through a Redis outage this node could not reach past, or another node's sweeper
+/// saw this node's liveness key expire and RECLAIMED it. What each leaves in
+/// `appconns` differs: the lapse left this node's units there, the reclaim
+/// subtracted them. So the repair adds nothing back. It re-seeds the hash from
+/// `conn_counts` — the worker fleet's AUTHORITATIVE live per-app counts, shared into
+/// the bridge at construction — and has RESEED_NODE_CAPACITY_LUA recompute each of
+/// those apps' cluster total as the sum over every node's hash, the one invariant
+/// both cases must land on. Residual, bounded: connections that CLOSED during the
+/// outage leak their single unit (nothing knows they existed — the same ≤1-unit leak
+/// as a dropped release), and an admission racing the snapshot→script round trip can
+/// leave a ±1 residue for its app.
 ///
 /// One Redis error is logged and skipped, never fatal — the loop runs for the
 /// adapter's lifetime.
@@ -262,6 +258,7 @@ async fn node_heartbeat_loop(
 ) {
     let interval = interval_secs.max(1);
     let ttl = (3 * interval) as i64;
+    let scripts = client::Scripts::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(interval));
     loop {
         ticker.tick().await;
@@ -294,63 +291,82 @@ async fn node_heartbeat_loop(
             tracing::warn!(error = %e, node_id, "redis node heartbeat SADD nodes failed; skipping this tick");
             continue;
         }
-        // Task 4.2: re-arm this node's per-app capacity hash TTL. EXPIRE answers
-        // 0 only when the key does NOT exist — either the node simply has no
-        // connections yet (nothing to do) or the hash TTL-lapsed during a Redis
-        // outage while connections live on (re-seed, see the loop doc). A failure
-        // here only shortens the backstop window, so it is logged and retried
-        // next tick rather than failing the whole heartbeat.
+        // A failed TTL re-arm only shortens the backstop window, so it is logged and
+        // retried next tick rather than failing the whole heartbeat.
         let nodeconns = keys.nodeconns(&node_id);
         let armed: Result<i64, _> = pool.next().expire(&nodeconns, ttl_secs as i64, None).await;
         match armed {
             Ok(1) => {}
+            // EXPIRE answers 0 only when the key is gone: either this node holds no
+            // connections yet, or its capacity hash needs the self-heal.
             Ok(_) => {
-                // Hash missing: re-seed it from the live per-app counts. One
-                // multi-field HSET (all-or-nothing at the command level, so a
-                // failure leaves the hash missing and the NEXT tick retries the
-                // whole re-seed), then re-arm the TTL.
-                if let Some(counts) = conn_counts.as_ref() {
-                    let snapshot: Vec<(String, i64)> = counts
-                        .iter()
-                        .filter_map(|e| {
-                            let v = e.value().load(Ordering::SeqCst) as i64;
-                            (v > 0).then(|| (e.key().clone(), v))
-                        })
-                        .collect();
-                    if !snapshot.is_empty() {
-                        let seeded = pool
-                            .next()
-                            .hset::<(), _, _>(&nodeconns, snapshot.clone())
-                            .await;
-                        match seeded {
-                            Ok(()) => {
-                                if let Err(e) = pool
-                                    .next()
-                                    .expire::<(), _>(&nodeconns, ttl_secs as i64, None)
-                                    .await
-                                {
-                                    tracing::warn!(error = %e, node_id, "redis nodeconns re-seed EXPIRE failed; retrying next tick");
-                                }
-                                tracing::info!(
-                                    node_id,
-                                    apps = snapshot.len(),
-                                    "re-seeded this node's per-app capacity counts after the nodeconns hash expired (Redis outage self-heal)"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, node_id, "redis nodeconns re-seed HSET failed; retrying next tick");
-                            }
-                        }
-                    }
-                }
+                reseed_node_capacity(
+                    &pool,
+                    &scripts,
+                    &keys,
+                    &node_id,
+                    ttl_secs,
+                    conn_counts.as_deref(),
+                )
+                .await
             }
             Err(e) => {
                 tracing::warn!(error = %e, node_id, "redis nodeconns TTL refresh failed; retrying next tick");
             }
         }
-        // Both ops succeeded: mark connected.
         if let Some(ref c) = connected {
             c.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Run RESEED_NODE_CAPACITY_LUA for whichever apps this node currently holds
+/// connections for. A node with no live counts — or no worker fleet behind it —
+/// has nothing to re-seed. A failure leaves the hash missing and the next tick
+/// retries the whole re-seed.
+async fn reseed_node_capacity(
+    pool: &Pool,
+    scripts: &client::Scripts,
+    keys: &keys::Keys,
+    node_id: &str,
+    ttl_secs: u64,
+    conn_counts: Option<&DashMap<String, Arc<AtomicUsize>>>,
+) {
+    let Some(counts) = conn_counts else {
+        return;
+    };
+    let mut argv = vec![
+        keys.nodeconns_prefix(),
+        node_id.to_string(),
+        ttl_secs.to_string(),
+    ];
+    for entry in counts.iter() {
+        let live = entry.value().load(Ordering::SeqCst);
+        if live > 0 {
+            argv.push(entry.key().clone());
+            argv.push(live.to_string());
+        }
+    }
+    let apps = (argv.len() - 3) / 2;
+    if apps == 0 {
+        return;
+    }
+    match scripts
+        .reseed_node_capacity
+        .evalsha_with_reload::<i64, _, _>(
+            pool.next(),
+            vec![keys.appconns(), keys.nodeconns(node_id), keys.nodes()],
+            argv,
+        )
+        .await
+    {
+        Ok(_) => tracing::info!(
+            node_id,
+            apps,
+            "re-seeded this node's per-app capacity counts and rebuilt their cluster totals from every node's counts"
+        ),
+        Err(e) => {
+            tracing::warn!(error = %e, node_id, "redis nodeconns re-seed failed; retrying next tick")
         }
     }
 }
@@ -505,9 +521,6 @@ impl RedisAdapter {
         let keys = keys::Keys::new(&cfg.redis_prefix);
         let clients = client::RedisClients::connect(&cfg.redis_url, cfg.redis_pool_size).await?;
 
-        // Spawn the pub/sub receive loop. It shares the local adapter so remote
-        // broadcasts land on this node's sockets. The handle is stored on the
-        // struct so the task is not dropped (which would stop cross-node delivery).
         let rx = clients.sub.message_rx();
         let recv_local = local.clone();
         let recv_node = node_id.clone();
@@ -516,20 +529,11 @@ impl RedisAdapter {
 
         let redis_cfg = RedisConfig::from_server_config(cfg);
         if redis_cfg.sharded_pubsub {
-            // The knob selects SSUBSCRIBE/SPUBLISH (Redis 7 sharded pub/sub) for
-            // every pub/sub channel this adapter touches. SPUBLISH reaches ONLY
-            // SSUBSCRIBErs — a cluster must run the flag uniformly, and the server
-            // must be Redis 7.0+ (older servers reject SSUBSCRIBE, degrading to
-            // log-warned no-op cross-node delivery).
             tracing::info!(
                 "PYLON_REDIS_SHARDED_PUBSUB enabled: using SSUBSCRIBE/SPUBLISH (requires Redis 7.0+ on every node)"
             );
         }
 
-        // Spawn the membership reconciler. Every `presence_heartbeat_secs` it
-        // re-asserts this node's whole Redis footprint from its local registry. fred
-        // clients are cheap clones; the handle is stored so the task is not dropped
-        // (which would stop the refresh).
         let rc_local = local.clone();
         let rc_pool = clients.pool.clone();
         let rc_sub = clients.sub.clone();
@@ -539,9 +543,6 @@ impl RedisAdapter {
             membership_reconcile_loop(rc_local, rc_pool, rc_sub, rc_keys, rc_node, redis_cfg).await
         });
 
-        // Spawn the node-liveness heartbeat. It advertises this node as alive every
-        // `node_heartbeat_secs` (re-stamping the `node` key with a TTL and SADDing to
-        // the `nodes` set), so a dead node's `node` key simply TTL-expires.
         let nh_pool = clients.pool.clone();
         let nh_keys = keys.clone();
         let nh_node = node_id.clone();
@@ -566,13 +567,10 @@ impl RedisAdapter {
             keys,
             node_id,
             cfg: redis_cfg,
-            // `from_lua` is local (SHA-1 only) — no Redis round-trip here.
             scripts: client::Scripts::new(),
             recv_handle,
             reconcile_handle,
             node_heartbeat_handle,
-            // The sweeper is started later via `start_sweeper` once the webhook
-            // handle exists (see the doc on the field).
             sweeper_handle: std::sync::Mutex::new(None),
         })
     }
@@ -740,11 +738,6 @@ impl RedisAdapter {
         channel: &str,
         socket_id: &SocketId,
     ) -> (usize, bool) {
-        // Record cluster-wide membership and read back the AUTHORITATIVE count.
-        // Atomic Lua: HSET member, refresh whole-key TTL, HLEN, index on the 0→1
-        // cluster edge. On any Redis error, report a zero count so the caller keeps
-        // its node-local outcome (graceful degradation — a membership write failure
-        // must never fail the subscribe).
         let ttl_secs = self.cfg.membership_ttl_secs;
         let occ = self.keys.occ(app, channel);
         let chans = self.keys.chans(app);
@@ -776,9 +769,6 @@ impl RedisAdapter {
             }
         }
 
-        // Index the app so the sweeper can enumerate it (SMEMBERS apps → SMEMBERS
-        // chans(app)). Idempotent and cheap; the apps set is bounded by configured
-        // apps so it needs no cleanup. Log + ignore errors — this is best-effort.
         if let Err(e) = self
             .clients
             .pool
@@ -815,11 +805,6 @@ impl RedisAdapter {
             self.cluster_unsub_channel(app, channel).await;
         }
 
-        // Remove cluster-wide membership and read back the AUTHORITATIVE remaining
-        // count. Atomic Lua: HDEL member, HLEN, and on the 1→0 cluster edge DEL the
-        // now-empty hash + de-index, returning whether THIS call's SREM won the
-        // de-index (the vacate emission right). On Redis error, report a zero count
-        // so the caller keeps its node-local outcome.
         let occ = self.keys.occ(app, channel);
         let chans = self.keys.chans(app);
         let token = keys::member_token(&self.node_id, socket_id.as_str());
@@ -910,9 +895,6 @@ impl RedisAdapter {
         socket_id: &SocketId,
         node_first: bool,
     ) -> bool {
-        // usermsg sub lifecycle on the node-LOCAL first-connection edge: when this node
-        // gains its first connection for the user (0→1), SUBSCRIBE the per-user `usermsg`
-        // channel so cross-node send/terminate reach this node.
         if node_first {
             if let Err(e) = pubsub::sub_channel(
                 &self.clients.sub,
@@ -925,11 +907,8 @@ impl RedisAdapter {
             }
         }
 
-        // Index the app so the sweeper can enumerate it (SMEMBERS apps → SMEMBERS
-        // users(app)) for the user-binding sweep — exactly as `subscribe` does for the
-        // channel sweep. Without this, a user that only ever SIGNED IN (never subscribed
-        // a channel) would leave `apps` empty and the sweeper could not reap its stale
-        // bindings on a crash. Idempotent + cheap; log + ignore errors (best-effort).
+        // A user that only ever SIGNED IN, never subscribing a channel, would otherwise
+        // leave `apps` empty and the sweeper could not reap its stale bindings.
         if let Err(e) = self
             .clients
             .pool
@@ -940,8 +919,6 @@ impl RedisAdapter {
             tracing::warn!(error = %e, app, "redis SADD apps (signin) failed; sweeper may miss this app");
         }
 
-        // Cluster online edge: USER_SIGNIN returns the cluster `first_for_user`
-        // (HLEN == 1). On any Redis error, report false so the caller keeps node-local.
         match user::signin(
             &self.scripts,
             &self.clients.pool,
@@ -994,7 +971,6 @@ impl RedisAdapter {
         socket_id: &SocketId,
         node_last: bool,
     ) -> bool {
-        // usermsg sub teardown on the node-LOCAL last-connection edge (1→0).
         if node_last {
             if let Err(e) = pubsub::unsub_channel(
                 &self.clients.sub,
@@ -1007,8 +983,6 @@ impl RedisAdapter {
             }
         }
 
-        // Cluster offline edge: USER_SIGNOUT returns the cluster `last_for_user`
-        // (HLEN == 0). On any Redis error, report false so the caller keeps node-local.
         match user::signout(
             &self.scripts,
             &self.clients.pool,
@@ -1057,8 +1031,6 @@ impl RedisAdapter {
         watched: &[String],
         newly_watched: &[String],
     ) -> Vec<String> {
-        // Subscribe to each newly-watched user's watch channel so this node receives
-        // their cluster online/offline transitions.
         for u in newly_watched {
             if let Err(e) = pubsub::sub_channel(
                 &self.clients.sub,
@@ -1070,7 +1042,6 @@ impl RedisAdapter {
                 tracing::warn!(error = %e, app, user = %u, "failed to SUBSCRIBE watch channel");
             }
         }
-        // Cluster-wide initial online snapshot: is_user_online per watched user.
         let mut online = Vec::new();
         for u in watched {
             match user::is_online(&self.clients.pool, &self.keys, app, u).await {

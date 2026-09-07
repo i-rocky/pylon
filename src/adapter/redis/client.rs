@@ -276,14 +276,18 @@ if total <= 0 then redis.call('HDEL', KEYS[1], ARGV[1]) end
 return total
 "#;
 
-/// DEAD-NODE RECLAIM (Task 4.2 / finding D2, run by the sweeper): subtract a
-/// dead node's per-app counts from the cluster totals, floored at 0 per app
-/// (never negative), then delete the dead node's hash. One script = the whole
-/// read-subtract-delete decision is atomic, so it cannot straddle a concurrent
-/// admission. Returns the number of apps reclaimed.
+/// DEAD-NODE RECLAIM (run by the sweeper): subtract a dead node's per-app counts
+/// from the cluster totals, floored at 0 per app (never negative), then delete the
+/// dead node's hash. One script = the whole read-subtract-delete decision is atomic,
+/// so it cannot straddle a concurrent admission. Returns the number of apps
+/// reclaimed, or `-1` when the node's liveness key is back — the sweeper's own
+/// `EXISTS` probe and this call are separate round trips, and a node that
+/// re-advertised in between is alive and still holds every unit on its hash.
 ///
-/// `KEYS[1]` = appconns hash, `KEYS[2]` = nodeconns:{dead_node} hash.
+/// `KEYS[1]` = appconns hash, `KEYS[2]` = nodeconns:{dead_node} hash,
+/// `KEYS[3]` = node:{dead_node} liveness key.
 const RECLAIM_NODE_LUA: &str = r#"
+if redis.call('EXISTS', KEYS[3]) == 1 then return -1 end
 local counts = redis.call('HGETALL', KEYS[2])
 for i = 1, #counts, 2 do
   local app = counts[i]
@@ -297,6 +301,38 @@ for i = 1, #counts, 2 do
 end
 redis.call('DEL', KEYS[2])
 return math.floor(#counts / 2)
+"#;
+
+/// NODE CAPACITY RE-SEED (run by the node heartbeat when its `nodeconns` hash has
+/// gone): write this node's live per-app counts back onto its hash and rebuild each
+/// of those apps' cluster total as `Σ nodeconns[node][app]` over the `nodes` set.
+///
+/// Recomputing the sum — rather than adding the live counts back — is what makes the
+/// repair correct for BOTH ways the hash can vanish. A plain TTL lapse leaves this
+/// node's units in `appconns` (adding them again would double-count); a dead-node
+/// reclaim subtracted them (leaving them out under-counts forever). The sum is the
+/// invariant both cases must land on, and Redis serializes the script, so it cannot
+/// straddle a concurrent admission on another node.
+///
+/// `KEYS[1]` = appconns hash, `KEYS[2]` = this node's nodeconns hash, `KEYS[3]` = nodes
+/// set. `ARGV[1]` = nodeconns key prefix, `ARGV[2]` = this node id, `ARGV[3]` = nodeconns
+/// ttl_secs, `ARGV[4..]` = app/count pairs. Returns the number of apps re-seeded.
+const RESEED_NODE_CAPACITY_LUA: &str = r#"
+for i = 4, #ARGV, 2 do
+  redis.call('HSET', KEYS[2], ARGV[i], ARGV[i + 1])
+end
+redis.call('EXPIRE', KEYS[2], ARGV[3])
+local nodes = redis.call('SMEMBERS', KEYS[3])
+for i = 4, #ARGV, 2 do
+  local total = tonumber(ARGV[i + 1])
+  for _, node in ipairs(nodes) do
+    if node ~= ARGV[2] then
+      total = total + (tonumber(redis.call('HGET', ARGV[1] .. node, ARGV[i])) or 0)
+    end
+  end
+  redis.call('HSET', KEYS[1], ARGV[i], total)
+end
+return math.floor((#ARGV - 3) / 2)
 "#;
 
 /// The membership/presence Lua scripts, compiled (SHA-1 hashed) at adapter build
@@ -331,6 +367,9 @@ pub struct Scripts {
     /// Sweeper's dead-node reclaim: subtracts a dead node's per-app counts from
     /// the cluster totals (floored at 0) and deletes its hash.
     pub reclaim_node: Script,
+    /// Heartbeat's capacity self-heal: re-seeds this node's per-app hash from the
+    /// live counts and rebuilds each app's cluster total from every node's hash.
+    pub reseed_node_capacity: Script,
 }
 
 impl Scripts {
@@ -347,6 +386,7 @@ impl Scripts {
             admit_app: Script::from_lua(ADMIT_APP_LUA),
             release_app: Script::from_lua(RELEASE_APP_LUA),
             reclaim_node: Script::from_lua(RECLAIM_NODE_LUA),
+            reseed_node_capacity: Script::from_lua(RESEED_NODE_CAPACITY_LUA),
         }
     }
 }
@@ -390,5 +430,6 @@ mod tests {
         assert_ne!(s.admit_app.sha1(), s.release_app.sha1());
         assert_ne!(s.admit_app.sha1(), s.reclaim_node.sha1());
         assert_ne!(s.admit_app.sha1(), s.membership_join.sha1());
+        assert_ne!(s.reseed_node_capacity.sha1(), s.reclaim_node.sha1());
     }
 }

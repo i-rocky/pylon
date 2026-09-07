@@ -29,6 +29,7 @@ mod common;
 use common::{connect, established_socket_id, spawn_percore_cluster_with_apps, wait_until, Ws};
 use futures_util::StreamExt;
 use pylon::adapter::local::LocalAdapter;
+use pylon::adapter::redis::client::{RedisClients, Scripts};
 use pylon::adapter::redis::keys::Keys;
 use pylon::adapter::redis::RedisAdapter;
 use pylon::adapter::Adapter;
@@ -254,6 +255,65 @@ async fn sweeper_reclaims_dead_node_connection_counts() {
         "capacity must be usable immediately after the reclaim"
     );
     adapter.cluster_release_app("t4").await;
+
+    use fred::interfaces::ClientLike;
+    let _ = client.quit().await;
+}
+
+/// The dead-node reclaim re-checks the liveness key INSIDE the script: a node that
+/// re-advertised itself between the sweeper's `EXISTS` probe and the `EVALSHA` is
+/// alive and still holds every unit on its hash, so the reclaim must decline.
+#[tokio::test]
+async fn reclaim_declines_a_node_that_re_advertised_itself() {
+    let prefix = random_prefix();
+    let keys = Keys::new(&prefix);
+    let scripts = Scripts::new();
+    let clients = RedisClients::connect(&test_redis_url(), 1)
+        .await
+        .expect("fred clients must connect to the test Redis");
+    let client = fred_client().await;
+
+    use fred::interfaces::{HashesInterface, KeysInterface};
+    let _: () = client.hset(&keys.appconns(), ("t6", 2)).await.unwrap();
+    let _: () = client
+        .hset(keys.nodeconns("revived"), ("t6", 2))
+        .await
+        .unwrap();
+    let _: () = client
+        .set(
+            keys.node("revived"),
+            "1",
+            Some(fred::types::Expiration::EX(120)),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let verdict: i64 = scripts
+        .reclaim_node
+        .evalsha_with_reload(
+            clients.pool.next(),
+            vec![
+                keys.appconns(),
+                keys.nodeconns("revived"),
+                keys.node("revived"),
+            ],
+            Vec::<String>::new(),
+        )
+        .await
+        .expect("RECLAIM_NODE_LUA must eval");
+
+    assert_eq!(verdict, -1, "a live node's reclaim must decline");
+    assert_eq!(
+        hget_i64(&client, &keys.appconns(), "t6").await,
+        2,
+        "a declined reclaim must leave the cluster total untouched"
+    );
+    assert!(
+        key_exists(&client, &keys.nodeconns("revived")).await,
+        "a declined reclaim must leave the live node's hash in place"
+    );
 
     use fred::interfaces::ClientLike;
     let _ = client.quit().await;
@@ -569,6 +629,85 @@ async fn heartbeat_reseeds_nodeconns_after_hash_expiry() {
     let mut ws2 = connect(addr, "?protocol=7").await;
     let _sid2 = established_socket_id(&mut ws2).await;
     drop(ws2);
+
+    use fred::interfaces::ClientLike;
+    let _ = client.quit().await;
+}
+
+/// A LIVE node whose liveness key merely lapsed — 3 heartbeats of Redis
+/// unreachability is enough — is reclaimed as dead by another node's sweeper, which
+/// SUBTRACTS its per-app units from the cluster total. Re-seeding only `nodeconns`
+/// leaves the cluster permanently under-counting that app by one node's worth of
+/// connections, and admitting that many extra. The self-heal must restore BOTH
+/// sides, and must not disturb the units a sibling node legitimately holds.
+///
+/// The reclaim is applied directly here (its exact three effects) rather than waited
+/// out through a real 15s liveness lapse.
+#[tokio::test]
+async fn heartbeat_reseed_restores_the_cluster_total_after_a_reclaim() {
+    let prefix = random_prefix();
+    let keys = Keys::new(&prefix);
+    let (addr, _guard) = spawn_percore_cluster_with_apps(&prefix, CAP1_APPS, |c| {
+        c.redis_node_heartbeat_secs = 1;
+    })
+    .await;
+
+    // The live node's one admitted connection: appconns = 1, nodeconns:A = 1.
+    let mut ws = connect(addr, "?protocol=7").await;
+    let _sid = established_socket_id(&mut ws).await;
+    let client = fred_client().await;
+
+    use fred::interfaces::{HashesInterface, KeysInterface, SetsInterface};
+    let nodes: Vec<String> = client.smembers(keys.nodes()).await.unwrap();
+    assert_eq!(nodes.len(), 1, "the test spawns one node (got {nodes:?})");
+    let node_a = nodes[0].clone();
+
+    // A sibling node holding 2 units of the same app, heart-beating normally.
+    let _: () = client.sadd(keys.nodes(), "sibling").await.unwrap();
+    let _: () = client
+        .set(
+            keys.node("sibling"),
+            "1",
+            Some(fred::types::Expiration::EX(120)),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let _: () = client
+        .hset(keys.nodeconns("sibling"), ("app", 2))
+        .await
+        .unwrap();
+    let _: i64 = client.hincrby(&keys.appconns(), "app", 2).await.unwrap();
+
+    // The sibling's sweeper reclaims A while A is still serving its connection.
+    let _: i64 = client.srem(keys.nodes(), node_a.clone()).await.unwrap();
+    let _: i64 = client.hincrby(&keys.appconns(), "app", -1).await.unwrap();
+    let _: i64 = client.del(keys.nodeconns(&node_a)).await.unwrap();
+
+    let healed = wait_until(Duration::from_secs(10), || async {
+        hget_i64(&client, &keys.nodeconns(&node_a), "app").await == 1
+            && hget_i64(&client, &keys.appconns(), "app").await == 3
+    })
+    .await;
+    assert!(
+        healed,
+        "the heartbeat must restore BOTH this node's units and the cluster total \
+         (appconns={}, nodeconns={})",
+        hget_i64(&client, &keys.appconns(), "app").await,
+        hget_i64(&client, &keys.nodeconns(&node_a), "app").await
+    );
+
+    // The restored unit is given back exactly once — the sibling's 2 survive.
+    drop(ws);
+    let released = wait_until(Duration::from_secs(10), || async {
+        hget_i64(&client, &keys.appconns(), "app").await == 2
+    })
+    .await;
+    assert!(
+        released,
+        "the close must give back exactly the one unit this node held"
+    );
 
     use fred::interfaces::ClientLike;
     let _ = client.quit().await;

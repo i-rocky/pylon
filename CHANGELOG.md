@@ -134,6 +134,24 @@ pre-1.0 and versions track `Cargo.toml`.
   effect and produces no warning.
 
 ### Fixed
+- **A live node reclaimed as dead no longer leaves the cluster permanently
+  under-counting that node's per-app connections.** A node whose `node:{id}`
+  liveness key merely lapses — three missed heartbeats of Redis unreachability
+  *from that node* is enough, while it keeps serving every one of its clients — is
+  swept up by another node's dead-node reclaim, which subtracts its per-app units
+  from the cluster total `appconns` and deletes its `nodeconns` hash. The
+  heartbeat's self-heal then re-seeded only `nodeconns`, so `appconns` stayed short
+  by one node's worth of connections for the life of the deployment, admitting that
+  many extra past the app's configured `capacity` — and double-subtracting as the
+  node's pre-existing connections closed. The self-heal now re-seeds this node's
+  hash from the worker fleet's live per-app counts *and*, in the same script,
+  recomputes each of those apps' cluster total as the sum over every node's hash.
+  Summing rather than adding back is what makes the repair correct for both ways
+  the hash can vanish: a plain TTL lapse (the units were never subtracted, so
+  adding them again would double-count) and a reclaim (they were). The reclaim
+  itself now re-checks the liveness key *inside* its script and declines, so a node
+  that re-advertised between the sweeper's `EXISTS` probe and the `EVALSHA` is left
+  alone.
 - **A presence roster no longer advertises the `user_info` of a connection that
   has already left.** `ChannelState` keeps one `user_info` per distinct presence
   user, seeded by that user's first connection; `remove` only decremented the

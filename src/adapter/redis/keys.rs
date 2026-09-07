@@ -118,7 +118,13 @@ impl Keys {
     ///
     /// [`RedisConfig::node_conns_ttl_secs`]: crate::adapter::redis::RedisConfig::node_conns_ttl_secs
     pub fn nodeconns(&self, node_id: &str) -> String {
-        format!("{}:nodeconns:{}", self.prefix, node_id)
+        format!("{}{}", self.nodeconns_prefix(), node_id)
+    }
+
+    /// The prefix every [`Keys::nodeconns`] hash shares, so a script handed a node
+    /// id out of the `nodes` set can address that node's hash.
+    pub fn nodeconns_prefix(&self) -> String {
+        format!("{}:nodeconns:", self.prefix)
     }
 }
 
