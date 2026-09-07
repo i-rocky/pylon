@@ -38,7 +38,7 @@ slab = "0.4"
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "service", "http1", "http2"] }
 # RFC 6455 Sec-WebSocket-Accept = base64(sha1(key + GUID)).
 sha1 = "0.10"
-base64 = "0.22"
+base64 = "0.23.1"
 # JSON
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -60,7 +60,7 @@ futures-util = "0.3"
 # readiness-driven (non-async) per-core worker loop (SP9). LocalAdapter's async
 # methods never await real I/O, so this completes without parking a runtime.
 futures-executor = "0.3"
-thiserror = "1"
+thiserror = "2.0.20"
 # TLS: rustls (direct dep — already transitively present at 0.23 via reqwest/fred) + PEM loader.
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pemfile = "2"
@@ -76,7 +76,7 @@ dhat = { version = "0.3", optional = true }
 # SO_REUSEPORT/SO_REUSEADDR listener sockets — one per per-core worker so the
 # kernel load-balances accepts across worker threads (SP9 multi-worker). The
 # `all` feature unlocks `set_reuse_port` (gated `cfg(all(feature="all", unix))`).
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6.5", features = ["all"] }
 # Pin each per-core worker thread to a CPU (SP9 multi-worker core affinity).
 core_affinity = "0.8"
 # Parallelize the per-subscriber broadcast enqueue across a work-stealing pool
@@ -102,7 +102,7 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 criterion = "0.5"
 futures-util = "0.3"
 # Used by transport::conn tests to shrink SO_SNDBUF and force partial writes.
-socket2 = "0.5"
+socket2 = "0.6.5"
 # Temp files for SqlAppManager tests (avoids in-memory SQLite pool isolation issue)
 tempfile = "3"
 

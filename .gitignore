@@ -23,3 +23,6 @@
 # Git worktrees for isolated development sessions
 /.worktrees
 /.superpowers
+
+# Redis background saves, if a test Redis is ever started with its cwd here.
+dump.rdb
