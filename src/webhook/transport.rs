@@ -76,6 +76,13 @@ pub fn is_private_target(ip: IpAddr) -> bool {
             if let Some(v4) = v6.to_ipv4() {
                 return is_private_target(IpAddr::V4(v4));
             }
+            // 6to4 (RFC 3056) 2002::/16 embeds the IPv4 address in segments 1-2. A
+            // 6to4 relay TRANSLATES to that address, so the target is interior
+            // regardless of whether the embedded v4 is itself private — the same
+            // fail-closed reading as the NAT64 prefix above.
+            if v6.segments()[0] == 0x2002 {
+                return true;
+            }
             (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
                 || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
                 || v6.is_multicast() // ff00::/8
@@ -1350,6 +1357,31 @@ mod tests {
         assert!(
             !private("64:ff9c::195.0.0.1"),
             "the well-known prefix is 64:ff9b, not 64:ff9c"
+        );
+    }
+
+    /// Fix (Task 5): 6to4 address prefix (`2002::/16`, RFC 3056). The 6to4
+    /// address format embeds the IPv4 address in segments 1-2. A 6to4 relay
+    /// gateway TRANSLATES the embedded IPv4 into interior address space, so the
+    /// target is refused regardless of whether the embedded v4 is itself public
+    /// or private — the same fail-closed reading as the NAT64 prefix.
+    #[test]
+    fn classifier_blocks_6to4_2002_slash_16() {
+        assert!(
+            private("2002:c0a8:0101::"),
+            "2002:c0a8:0101:: embeds 192.168.1.1 — private"
+        );
+        assert!(
+            private("2002:0808:0808::"),
+            "2002:0808:0808:: embeds 8.8.8.8 (PUBLIC v4) → still private (the relay translates interior)"
+        );
+        assert!(
+            !private("2003::1"),
+            "adjacent prefix 2003::/16 must be unaffected"
+        );
+        assert!(
+            !private("2001:db8::1"),
+            "guards against over-broad match (2001:db8::/32 is documentation prefix)"
         );
     }
 
