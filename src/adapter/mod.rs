@@ -46,6 +46,23 @@ pub trait Adapter: Send + Sync {
 
     async fn presence_members(&self, app: &str, channel: &str) -> Vec<PresenceMember>;
 
+    /// Re-send `subscription_succeeded` with the CURRENT presence roster to
+    /// `mailbox`, changing no membership.
+    ///
+    /// The acknowledgement rides the connection's bounded mailbox and is dropped
+    /// when it is full, while the join it acknowledges is already committed — so a
+    /// client that never saw it must be able to ask again by re-issuing
+    /// `pusher:subscribe`. This is that answer, and it comes from the same roster
+    /// source the original acknowledgement did: node-local for [`local::LocalAdapter`],
+    /// cluster-wide for [`redis::RedisAdapter`] and — through the bridge —
+    /// [`ClusterAdapter`](crate::cluster::adapter::ClusterAdapter).
+    async fn resend_presence_ack(
+        &self,
+        app: &str,
+        channel: &str,
+        mailbox: crate::connection::handle::Mailbox,
+    );
+
     /// Store the last event for a cache channel with the given TTL. Overwrites
     /// any previous entry for `(app, channel)`.
     async fn cache_set(&self, app: &str, channel: &str, event: CachedEvent, ttl: Duration);

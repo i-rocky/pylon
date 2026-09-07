@@ -78,20 +78,28 @@ impl RedisClients {
     }
 }
 
-/// SUBSCRIBE membership script. Records this member in the channel's occupancy
-/// hash, refreshes the whole-key TTL backstop, and — on the cluster 0→1 edge —
-/// indexes the channel in the app's active-channels set. Returns the new `HLEN`
-/// (the authoritative cluster-wide subscription count).
+/// MEMBERSHIP JOIN script, shared by a channel subscribe (`occ` + `chans`) and a
+/// user signin (`usr` + `users`) — the two membership hashes have the same shape,
+/// the same TTL backstop and the same app-level enumeration index, so they take
+/// the same program. Records the connection's token, refreshes the hash's
+/// whole-key TTL backstop, indexes the hash's subject, and returns the new `HLEN`
+/// (the authoritative cluster-wide count).
 ///
-/// `KEYS[1]` = occ hash, `KEYS[2]` = chans set.
-/// `ARGV[1]` = member_token, `ARGV[2]` = expire_at_ms, `ARGV[3]` = key_ttl_secs,
-/// `ARGV[4]` = channel.
-const SUBSCRIBE_LUA: &str = r#"
+/// The `SADD` is unconditional rather than gated on the cluster 0→1 edge. For a
+/// channel that index entry IS the CAS the single cluster-wide `channel_vacated`
+/// is won on ([`UNSUBSCRIBE_LUA`]), and for a user it is the sweeper's only
+/// enumeration of who is signed in; an entry lost while the subject stayed
+/// occupied — a Redis restart, a dropped bridge command, a sweeper false-reap —
+/// would silence both for good. Every join re-asserts it instead.
+///
+/// `KEYS[1]` = membership hash (`occ` / `usr`), `KEYS[2]` = index set
+/// (`chans` / `users`). `ARGV[1]` = member_token, `ARGV[2]` = expire_at_ms,
+/// `ARGV[3]` = key_ttl_secs, `ARGV[4]` = index member (channel / user_id).
+const MEMBERSHIP_JOIN_LUA: &str = r#"
 redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
 redis.call('EXPIRE', KEYS[1], ARGV[3])
-local count = redis.call('HLEN', KEYS[1])
-if count == 1 then redis.call('SADD', KEYS[2], ARGV[4]) end
-return count
+redis.call('SADD', KEYS[2], ARGV[4])
+return redis.call('HLEN', KEYS[1])
 "#;
 
 /// UNSUBSCRIBE membership script. Removes this member from the occupancy hash and
@@ -197,21 +205,6 @@ local left = redis.call('HINCRBY', KEYS[1], user_id, -1)
 return {user_id, left, 0}
 "#;
 
-/// USER_SIGNIN. Records this connection's binding token, refreshes the whole-key
-/// TTL backstop, and — on the cluster 0→1 user edge (HLEN == 1) — indexes the user
-/// in the app's `users` set. Returns the new `HLEN` (cluster-wide connection count).
-///
-/// `KEYS[1]` = usr hash, `KEYS[2]` = users set.
-/// `ARGV[1]` = member_token, `ARGV[2]` = expire_at_ms, `ARGV[3]` = ttl_secs,
-/// `ARGV[4]` = user_id.
-const USER_SIGNIN_LUA: &str = r#"
-redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
-redis.call('EXPIRE', KEYS[1], ARGV[3])
-local conn = redis.call('HLEN', KEYS[1])
-if conn == 1 then redis.call('SADD', KEYS[2], ARGV[4]) end
-return conn
-"#;
-
 /// USER_SIGNOUT. Removes this connection's binding token and — on the cluster 1→0
 /// user edge — deletes the now-empty hash and de-indexes the user. Returns the
 /// remaining `HLEN` (authoritative cluster-wide connection count).
@@ -296,8 +289,10 @@ return math.floor(#counts / 2)
 /// time. `Script::from_lua` is purely local — no Redis round-trip — and the scripts
 /// are loaded lazily on first use via `evalsha_with_reload`'s NOSCRIPT fallback.
 pub struct Scripts {
-    /// Records a member and returns the new cluster-wide subscription count.
-    pub subscribe: Script,
+    /// Records one connection in a membership hash, re-arms that hash's TTL
+    /// backstop, indexes its subject, and returns the new cluster-wide count.
+    /// Drives BOTH the channel subscribe and the user signin.
+    pub membership_join: Script,
     /// Removes a member and returns `{remaining cluster-wide count, vacate-CAS won}`.
     pub unsubscribe: Script,
     /// The sweeper's atomic vacate: returns `{won, drained_user_ids}` — `won == 1`
@@ -312,8 +307,6 @@ pub struct Scripts {
     /// `won == 1` iff THIS call took the user's refcount to exactly 0 and owns
     /// the single `member_removed` emission right.
     pub reap_member: Script,
-    /// Records a user signin and returns the user's new cluster connection count.
-    pub user_signin: Script,
     /// Records a user signout and returns the user's remaining cluster connection count.
     pub user_signout: Script,
     /// Cluster-wide per-app capacity gate: returns 1 when admitted (unit taken
@@ -330,13 +323,12 @@ impl Scripts {
     /// Compile the membership scripts. No Redis access — just SHA-1 hashing.
     pub fn new() -> Self {
         Self {
-            subscribe: Script::from_lua(SUBSCRIBE_LUA),
+            membership_join: Script::from_lua(MEMBERSHIP_JOIN_LUA),
             unsubscribe: Script::from_lua(UNSUBSCRIBE_LUA),
             vacate: Script::from_lua(VACATE_LUA),
             presence_join: Script::from_lua(PRESENCE_JOIN_LUA),
             presence_leave: Script::from_lua(PRESENCE_LEAVE_LUA),
             reap_member: Script::from_lua(REAP_MEMBER_LUA),
-            user_signin: Script::from_lua(USER_SIGNIN_LUA),
             user_signout: Script::from_lua(USER_SIGNOUT_LUA),
             admit_app: Script::from_lua(ADMIT_APP_LUA),
             release_app: Script::from_lua(RELEASE_APP_LUA),
@@ -359,7 +351,7 @@ mod tests {
     fn scripts_compile_including_presence() {
         let s = Scripts::new();
         assert_ne!(s.presence_join.sha1(), s.presence_leave.sha1());
-        assert_ne!(s.subscribe.sha1(), s.presence_join.sha1());
+        assert_ne!(s.membership_join.sha1(), s.presence_join.sha1());
         assert_ne!(s.reap_member.sha1(), s.presence_leave.sha1());
         assert_ne!(s.reap_member.sha1(), s.vacate.sha1());
     }
@@ -367,15 +359,15 @@ mod tests {
     #[test]
     fn scripts_compile_including_user() {
         let s = Scripts::new();
-        assert_ne!(s.user_signin.sha1(), s.user_signout.sha1());
-        assert_ne!(s.user_signin.sha1(), s.subscribe.sha1());
+        assert_ne!(s.membership_join.sha1(), s.user_signout.sha1());
+        assert_ne!(s.user_signout.sha1(), s.unsubscribe.sha1());
     }
 
     #[test]
     fn scripts_compile_including_vacate() {
         let s = Scripts::new();
         assert_ne!(s.vacate.sha1(), s.unsubscribe.sha1());
-        assert_ne!(s.vacate.sha1(), s.subscribe.sha1());
+        assert_ne!(s.vacate.sha1(), s.membership_join.sha1());
     }
 
     #[test]
@@ -383,6 +375,6 @@ mod tests {
         let s = Scripts::new();
         assert_ne!(s.admit_app.sha1(), s.release_app.sha1());
         assert_ne!(s.admit_app.sha1(), s.reclaim_node.sha1());
-        assert_ne!(s.admit_app.sha1(), s.subscribe.sha1());
+        assert_ne!(s.admit_app.sha1(), s.membership_join.sha1());
     }
 }

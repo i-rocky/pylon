@@ -190,6 +190,17 @@ impl Adapter for LocalAdapter {
         self.registry.presence_members(app, channel)
     }
 
+    async fn resend_presence_ack(
+        &self,
+        app: &str,
+        channel: &str,
+        mailbox: crate::connection::handle::Mailbox,
+    ) {
+        if let Some(frame) = self.registry.roster_frame(app, channel) {
+            let _ = mailbox.send(ServerEvent::Raw(frame));
+        }
+    }
+
     async fn cache_set(&self, app: &str, channel: &str, event: CachedEvent, ttl: Duration) {
         // The store stamps the per-entry TTL itself (moka evicts once it passes,
         // even if the entry is never read again — G7).

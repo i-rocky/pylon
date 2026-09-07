@@ -134,6 +134,37 @@ pre-1.0 and versions track `Cargo.toml`.
   effect and produces no warning.
 
 ### Fixed
+- **Cluster state that a node computes from live membership is now reconciled
+  every heartbeat instead of applied once on an edge, so a single missed edge no
+  longer disables a channel for the life of the process.** Three symptoms shared
+  one shape. (1) The `chans` / `users` indexes — the sweeper's only enumeration
+  of occupied channels and signed-in users, and the CAS the single cluster-wide
+  `channel_vacated` is won on — were written only on the cluster 0→1 edge while
+  the membership heartbeat unconditionally re-created `occ` / `usr`, so a Redis
+  restart, a dropped bridge command or a sweeper false-reap left every affected
+  channel functionally occupied and structurally orphaned **permanently**: zero
+  further `channel_vacated`, an under-reporting `GET /channels`, and no
+  crash-driven `member_removed` or `WatchOffline` for those channels and users.
+  (2) A dropped bridge `Subscribe` / `Signin` skipped the Redis `SUBSCRIBE` of
+  the channel's `msg` key or the user's `usermsg` key, and nothing ever retried
+  it — the node stayed deaf to **all** of that channel's cross-node traffic (and
+  silently no-op'd cross-node `terminate_user`) indefinitely, while reporting
+  `redis_connected = true`. The membership heartbeat is now a full
+  reconciliation tick: it re-seeds `apps` / `chans` / `users` from the node's own
+  registry in the same pipeline that re-stamps `occ` / `usr`, and re-subscribes
+  any `msg` / `usermsg` key the node has local members for but is not attached to
+  — a diff against the subscriber client's in-memory tracked set, so a healthy
+  node pays no extra Redis round-trip. The index write inside the membership join
+  script is now unconditional rather than gated on the 0→1 edge, so any
+  subscribe or signin also repairs a lost entry immediately. (3) A dropped
+  `pusher:subscription_succeeded` was unrecoverable, because the ack rides the
+  connection's bounded mailbox and is dropped when it is full while the join it
+  acknowledges is already committed — and re-issuing `pusher:subscribe`, the
+  client's only recovery, was a silent `return`. A duplicate subscribe is now
+  re-acknowledged (still registering nothing, so presence connection counts and
+  the per-connection subscription cap are unaffected), with the presence roster
+  read from the same source the original ack used — cluster-wide on a clustered
+  node, node-local otherwise.
 - **A peer can no longer pin up to 1 MiB of reassembly buffer per connection,
   invisible to the byte budget** (security-relevant). The first fragment of a
   fragmented TEXT message (RFC 6455 §5.4) was accepted with no

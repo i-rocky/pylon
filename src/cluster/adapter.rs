@@ -189,6 +189,19 @@ impl Adapter for ClusterAdapter {
         self.local.presence_members(app, channel).await
     }
 
+    async fn resend_presence_ack(
+        &self,
+        app: &str,
+        channel: &str,
+        mailbox: crate::connection::handle::Mailbox,
+    ) {
+        // The roster of record is the bridge's (Redis) one — the node-local registry
+        // sees only this node's members — so the re-ack is fired there, exactly as the
+        // original `PresenceSubscribe` ack was.
+        self.handle
+            .presence_ack(Arc::from(app), Arc::from(channel), mailbox);
+    }
+
     async fn cache_set(&self, app: &str, channel: &str, event: CachedEvent, ttl: Duration) {
         // Cache WRITES on the percore worker path stay node-local: the cluster (Redis)
         // cache is populated by the REST publish path on each node (which drives the
