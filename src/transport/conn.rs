@@ -337,6 +337,13 @@ pub struct Connection {
     /// across any sequence of operations the SUM of the deltas taken equals the
     /// net change in `accounted_bytes`.
     inflight_delta: i64,
+    /// Same incremental shape as `inflight_delta`, but for
+    /// [`outbound_bytes`](Self::outbound_bytes) only: folded at every `out_bytes`/
+    /// `tls_unflushed_bytes` mutation site (`queue`, `flush`, the CoDel staleness
+    /// drop), never at `set_reassembly_bytes`/`set_frame_buffer_bytes`. Backs the
+    /// shutdown drain's "everything queued has been sent" exit, which must not
+    /// wait on inbound buffers the way `inflight_delta` deliberately does.
+    outbound_delta: i64,
 }
 
 impl Connection {
@@ -362,6 +369,7 @@ impl Connection {
             reassembly_bytes: 0,
             frame_buffer_bytes: 0,
             inflight_delta: 0,
+            outbound_delta: 0,
         }
     }
 
@@ -387,6 +395,7 @@ impl Connection {
             reassembly_bytes: 0,
             frame_buffer_bytes: 0,
             inflight_delta: 0,
+            outbound_delta: 0,
         }
     }
 
@@ -597,6 +606,7 @@ impl Connection {
             // worker total then) and is now gone without being sent, so fold the
             // negative delta in so the worker's incremental total tracks it.
             self.inflight_delta -= victim.len() as i64;
+            self.outbound_delta -= victim.len() as i64;
             // G8: count the eviction on the connection accumulator (mirroring
             // `codel_dropped`) so the worker can fold it into
             // `pylon_drophead_dropped_total` — every `queue` call site is
@@ -608,6 +618,7 @@ impl Connection {
         // The newly-queued frame adds to this connection's queued bytes; fold the
         // positive delta in for the worker's incremental inflight total.
         self.inflight_delta += flen as i64;
+        self.outbound_delta += flen as i64;
         self.out.push_back((frame, now_ns));
         dropped
     }
@@ -654,6 +665,7 @@ impl Connection {
             &mut self.out_cursor,
             &mut self.out_bytes,
             &mut self.inflight_delta,
+            &mut self.outbound_delta,
             self.codel,
             &mut self.codel_state,
             &mut self.codel_dropped,
@@ -672,7 +684,9 @@ impl Connection {
     fn flush_tls(&mut self, now_ns: u64) -> WriteStatus {
         let before = self.tls_unflushed_bytes;
         let status = self.flush_tls_phases(now_ns);
-        self.inflight_delta += self.tls_unflushed_bytes as i64 - before as i64;
+        let delta = self.tls_unflushed_bytes as i64 - before as i64;
+        self.inflight_delta += delta;
+        self.outbound_delta += delta;
         status
     }
 
@@ -700,6 +714,7 @@ impl Connection {
                 &mut self.out_cursor,
                 &mut self.out_bytes,
                 &mut self.inflight_delta,
+                &mut self.outbound_delta,
                 self.codel,
                 &mut self.codel_state,
                 &mut self.codel_dropped,
@@ -942,6 +957,23 @@ impl Connection {
         std::mem::take(&mut self.inflight_delta)
     }
 
+    /// Bytes this connection still needs to put on the wire: queued out-frames
+    /// plus rustls plaintext already taken but not yet flushed. Unlike
+    /// [`accounted_bytes`](Self::accounted_bytes), excludes the inbound
+    /// reassembly and frame buffers — a peer that will send nothing more still
+    /// leaves those pinned, but owes this connection nothing.
+    pub fn outbound_bytes(&self) -> usize {
+        self.out_bytes + self.tls_unflushed_bytes
+    }
+
+    /// Take and reset the accumulated [`outbound_bytes`](Self::outbound_bytes)
+    /// delta, the same incremental mechanism as
+    /// [`take_inflight_delta`](Self::take_inflight_delta) but scoped to outbound
+    /// bytes only.
+    pub fn take_outbound_delta(&mut self) -> i64 {
+        std::mem::take(&mut self.outbound_delta)
+    }
+
     // ---- test accessors -------------------------------------------------------
     // Read-only views of the private out-queue state, used by the drop-head unit
     // tests. `#[cfg(test)]` so they add no surface (or dead-code warnings) to the
@@ -1055,6 +1087,7 @@ fn codel_dequeue(
     front_locked: bool,
     out_bytes: &mut usize,
     inflight_delta: &mut i64,
+    outbound_delta: &mut i64,
     codel: CodelParams,
     codel_state: &mut CodelState,
     codel_dropped: &mut u64,
@@ -1098,6 +1131,7 @@ fn codel_dequeue(
             // CoDel staleness drop: this queued byte is discarded unsent, so
             // fold the negative delta in for the worker's incremental total.
             *inflight_delta -= victim.len() as i64;
+            *outbound_delta -= victim.len() as i64;
             *codel_dropped += 1;
             continue;
         }
@@ -1131,6 +1165,7 @@ fn flush_coalesced<W: WriteSink>(
     out_cursor: &mut usize,
     out_bytes: &mut usize,
     inflight_delta: &mut i64,
+    outbound_delta: &mut i64,
     codel: CodelParams,
     codel_state: &mut CodelState,
     codel_dropped: &mut u64,
@@ -1150,6 +1185,7 @@ fn flush_coalesced<W: WriteSink>(
             *out_cursor > 0 && batch.is_empty(),
             out_bytes,
             inflight_delta,
+            outbound_delta,
             codel,
             codel_state,
             codel_dropped,
@@ -1194,6 +1230,7 @@ fn flush_coalesced<W: WriteSink>(
                 *out_cursor > 0 && batch.is_empty(),
                 out_bytes,
                 inflight_delta,
+                outbound_delta,
                 codel,
                 codel_state,
                 codel_dropped,
@@ -1232,6 +1269,7 @@ fn flush_coalesced<W: WriteSink>(
                     n -= rem;
                     *out_bytes -= batch[idx].0.len();
                     *inflight_delta -= batch[idx].0.len() as i64;
+                    *outbound_delta -= batch[idx].0.len() as i64;
                     idx += 1;
                 }
                 if idx == batch.len() {
@@ -1608,6 +1646,7 @@ mod tests {
         out_cursor: usize,
         out_bytes: usize,
         inflight_delta: i64,
+        outbound_delta: i64,
         codel: CodelParams,
         codel_state: CodelState,
         codel_dropped: u64,
@@ -1621,6 +1660,7 @@ mod tests {
                 out_cursor: 0,
                 out_bytes: 0,
                 inflight_delta: 0,
+                outbound_delta: 0,
                 codel: CodelParams::DISABLED,
                 codel_state: CodelState::default(),
                 codel_dropped: 0,
@@ -1640,6 +1680,7 @@ mod tests {
                 &mut self.out_cursor,
                 &mut self.out_bytes,
                 &mut self.inflight_delta,
+                &mut self.outbound_delta,
                 self.codel,
                 &mut self.codel_state,
                 &mut self.codel_dropped,

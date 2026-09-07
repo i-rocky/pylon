@@ -249,6 +249,7 @@ fn broadcast_and_drain(world: &mut SinkWorld, event: &ServerEvent, now_ns: u64) 
 
     let mut touched = HashSet::new();
     let mut inflight: u64 = 0;
+    let mut outbound: u64 = 0;
     let mut drophead: u64 = 0;
     drain_broadcast_inbox(
         &world.rx,
@@ -256,6 +257,7 @@ fn broadcast_and_drain(world: &mut SinkWorld, event: &ServerEvent, now_ns: u64) 
         &mut world.conns,
         EFFECTIVE_BUDGET,
         &mut inflight,
+        &mut outbound,
         &mut drophead,
         None,
         now_ns,

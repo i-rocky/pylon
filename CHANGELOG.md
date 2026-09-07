@@ -134,6 +134,19 @@ pre-1.0 and versions track `Cargo.toml`.
   effect and produces no warning.
 
 ### Fixed
+- **The graceful-shutdown drain no longer waits on inbound buffers it will
+  never consume, so a rolling restart exits as soon as queued replies are
+  sent instead of always burning the full grace window.** `inflight_bytes`
+  (the worker's memory-pressure signal) counts inbound reassembly and
+  frame buffers alongside queued outbound bytes — correct for shedding and
+  admission control, but the drain's exit check read that same conflated
+  total, and a connection mid-frame or mid-message pins it above zero
+  forever once the peer stops sending. On a busy node some connection is
+  essentially always mid-frame, so every restart burned the entire
+  `shutdown_grace_ms` (10s in the shipped Helm values) per node. The drain
+  now exits on a connection's queued-outbound-bytes total instead, tracked
+  incrementally the same way `inflight_bytes` is; `inflight_bytes` itself is
+  unchanged and still governs shedding and admission.
 - **A partially-received WebSocket frame is now billed to its connection, so
   the bytes a peer pins by trickling a large frame are visible to the byte
   budget** (security-relevant). The per-connection read buffer holds a frame's
