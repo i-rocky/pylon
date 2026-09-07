@@ -257,12 +257,13 @@ pub fn run_percore(
     let saturated_flag = local.as_ref().map(|l| l.saturation_flag());
 
     // SP10 self-sizing: worker count (explicit or `available_parallelism`), the
-    // total memory budget (explicit/fraction override or the `max(1.5 GiB, 7%)`
-    // reserve formula over the effective — cgroup-aware — envelope), each
-    // worker's budget slice, and the per-connection out-queue cap clamped to the
-    // configured [min, max] window. `per_conn_cap` becomes each `Connection`'s
-    // `high_water`, so a slow consumer's drop-head queue is sized to the host.
-    // Computed before `env` so `resolved_max_connections` can consume the budget.
+    // total memory budget (explicit/fraction override or the `max(1.5 GiB, 7%)`,
+    // capped at 50% of the envelope, reserve formula over the effective —
+    // cgroup-aware — envelope), each worker's budget slice, and the
+    // per-connection out-queue cap clamped to the configured [min, max] window.
+    // `per_conn_cap` becomes each `Connection`'s `high_water`, so a slow
+    // consumer's drop-head queue is sized to the host. Computed before `env` so
+    // `resolved_max_connections` can consume the budget.
     let worker_count = config.worker_count();
     let effective_mem = resources::detect_effective_mem();
     let budget = config.resolved_memory_budget(effective_mem);
@@ -305,6 +306,24 @@ pub fn run_percore(
     // CPU ids to pin to. May be empty if the OS won't report them — workers then
     // run unpinned (still fully functional, just not affinity-bound).
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+
+    if budget == 0 {
+        // A budget of 0 is read downstream as "unconfigured": `shed_band`
+        // stays pinned to `Normal` (the REST 503 admission gate, the WS
+        // client-event ingress drop, and the subscribe-time memory-pressure
+        // gate all become no-ops), and `resolved_max_connections` treats it as
+        // an unlimited connection ceiling. That's correct for a genuinely
+        // unconfigured budget, but silent for one that resolved to 0 by
+        // accident — flag it loudly rather than let it pass as the routine
+        // INFO line below.
+        tracing::warn!(
+            %addr,
+            workers = worker_count,
+            "pylon percore: memory budget resolved to 0 — overload shedding and the \
+             memory-derived connection ceiling are both disabled; set \
+             PYLON_MEMORY_BUDGET_BYTES to a non-zero value to restore them",
+        );
+    }
 
     tracing::info!(
         %addr,

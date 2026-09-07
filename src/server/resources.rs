@@ -63,10 +63,20 @@ pub fn mem_limit_v1(s: &str) -> Option<u64> {
 
 /// The usable memory **budget** from the effective memory envelope: the envelope
 /// minus an OS reserve of `max(1.5 GiB, 7%)` (Seastar's exact OS-reserve
-/// formula — a flat floor on small boxes, 7% on big). Saturating so a tiny
-/// envelope yields 0 rather than underflowing.
+/// formula — a flat floor on small boxes, 7% on big), capped at half the
+/// envelope. Seastar's formula assumes a machine large enough that the flat
+/// 1.5 GiB floor is a minority of RAM, which breaks down twice on small hosts:
+/// at or below 1.5 GiB the floor alone meets or exceeds the whole envelope, so
+/// the budget saturates to 0 and silently disables every control it sizes
+/// (shedding, admission gates, the derived connection ceiling); between there
+/// and 3 GiB the budget stays positive but the floor still reserves more than
+/// half the envelope. Capping the reserve at half bounds both cases, so a small
+/// box keeps a proportionate, non-zero budget. Saturating so a zero envelope
+/// yields 0 rather than underflowing.
 pub fn memory_budget(effective_mem: u64) -> u64 {
-    let reserve = (1536u64 << 20).max(effective_mem * 7 / 100);
+    let reserve = (1536u64 << 20)
+        .max(effective_mem * 7 / 100)
+        .min(effective_mem / 2);
     effective_mem.saturating_sub(reserve)
 }
 
@@ -215,6 +225,28 @@ mod tests {
             memory_budget(256u64 << 30),
             (256u64 << 30) - (256u64 << 30) * 7 / 100
         ); // big box: 7%
+    }
+
+    #[test]
+    fn budget_reserve_cap_binds_below_crossover() {
+        // reserve = min(max(1.5 GiB, 7%), 50% of envelope). Below the crossover
+        // the flat 1.5 GiB floor claims more than half the envelope — at or
+        // below 1.5 GiB it claims all of it, which is where the uncapped
+        // formula saturated the budget to 0 — so the half-envelope cap takes
+        // over and a small box keeps a real, proportionate budget.
+        assert_eq!(memory_budget(1u64 << 30), 512 << 20); // 1 GiB -> 512 MiB
+        assert_eq!(memory_budget(512u64 << 20), 256 << 20); // 512 MiB -> 256 MiB
+
+        // Crossover: at exactly 3 GiB, half the envelope (1.5 GiB) equals the
+        // flat floor (1.5 GiB), so the cap and the uncapped formula agree. Above
+        // 3 GiB the flat floor is already less than half the envelope, so the
+        // cap never binds again (until 7% overtakes the floor much higher up,
+        // where it is smaller still) — this is why 4 GiB and 256 GiB above are
+        // unaffected.
+        assert_eq!(memory_budget(3u64 << 30), 1536 << 20); // 3 GiB -> 1.5 GiB
+
+        // A zero envelope must not panic or underflow.
+        assert_eq!(memory_budget(0), 0);
     }
 
     #[test]

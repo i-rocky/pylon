@@ -28,7 +28,9 @@ config:
   workers: 0
 
   # Memory cap in bytes. 0 = auto-derived from total RAM
-  # (budget = RAM − reserve, where reserve = max(1.5 GiB, 7% of RAM)).
+  # (budget = RAM − reserve, where reserve = max(1.5 GiB, 7% of RAM),
+  # capped at 50% of RAM so small-memory pods still keep a real,
+  # non-zero budget instead of the reserve consuming the whole limit).
   memoryBudgetBytes: 0
 
   # Graceful shutdown timing (must sum to less than terminationGracePeriodSeconds).
