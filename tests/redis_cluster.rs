@@ -1,7 +1,7 @@
 //! Integration tests for the Redis scaling adapter (SP7a).
 //!
 //! These talk to a REAL Redis. Point `PYLON_TEST_REDIS_URL` at a throwaway
-//! instance (default `redis://127.0.0.1:6379`). Each run uses a random key/channel
+//! instance (default `redis://127.0.0.1:6390`). Each run uses a random key/channel
 //! prefix (`pylontest:<uuid>`) so a shared Redis is never clobbered — we NEVER
 //! issue FLUSHALL/FLUSHDB or any unscoped destructive command.
 //!
@@ -27,7 +27,7 @@ const TEST_APP: &str = "app1";
 
 /// Test Redis URL: `PYLON_TEST_REDIS_URL` or the documented default.
 fn test_redis_url() -> String {
-    std::env::var("PYLON_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
+    std::env::var("PYLON_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6390".to_string())
 }
 
 /// A random, run-unique key/channel prefix for isolation on a shared Redis.

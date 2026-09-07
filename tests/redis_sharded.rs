@@ -28,7 +28,7 @@ const TEST_APP: &str = "app1";
 
 /// Test Redis URL: `PYLON_TEST_REDIS_URL` or the documented default.
 fn test_redis_url() -> String {
-    std::env::var("PYLON_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
+    std::env::var("PYLON_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6390".to_string())
 }
 
 /// A random, run-unique key/channel prefix for isolation on a shared Redis.
