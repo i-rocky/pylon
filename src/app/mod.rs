@@ -91,11 +91,20 @@ impl App {
         self.has_subscription_count_webhooks = any("subscription_count");
     }
 
-    /// Fail-fast load validation (spec §6): non-empty (and non-whitespace) `id`,
-    /// `key` and `secret` — a blank secret is a zero-length HMAC-SHA256 key, and
-    /// since the key ships in browser bundles by design, that lets anyone holding
-    /// it forge REST signatures, channel-auth tokens and `pusher:signin`; plus
-    /// non-empty `event_types`, every entry one of the seven, non-empty `url`.
+    /// Fail-fast validation (spec §6), run both at load AND per-lookup — not
+    /// load only. The static-file app manager calls this once per app at
+    /// startup; the SQL and Mongo backends call it from every `by_id`/`by_key`
+    /// fetch (`src/app/sql.rs`'s `row_to_app`, `src/app/mongo.rs`'s `find`), so
+    /// a stored row that fails this check fails every lookup against it, not
+    /// just the first. Checks non-empty (and non-whitespace) `id`, `key` and
+    /// `secret` — a blank secret is a zero-length HMAC-SHA256 key, and since the
+    /// key ships in browser bundles by design, that lets anyone holding it forge
+    /// REST signatures, channel-auth tokens and `pusher:signin`; plus non-empty
+    /// `event_types`, every entry one of the seven, non-empty `url`. A dynamic
+    /// backend row that fails here surfaces from the lookup as
+    /// `AppLookupError::Decode`, which the REST auth path (`src/http/rest/auth.rs`)
+    /// renders as `503` rather than the disabled/not-found response the row
+    /// would otherwise produce.
     pub fn validate(&self) -> Result<(), String> {
         if self.id.trim().is_empty() {
             return Err(format!("app '{}': id is empty", self.id));

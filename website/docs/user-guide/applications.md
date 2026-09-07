@@ -57,6 +57,16 @@ default `apps.json` (configurable via [`PYLON_APPS_PATH`](configuration.md)).
     `statistics_enabled` — these are **not** read by Pylon and have no effect; they are safe to
     leave in an existing file but are no longer documented.
 
+!!! warning "`id`, `key`, and `secret` are validated"
+    An empty or whitespace-only `id`, `key`, or `secret` is rejected — a blank `secret` is a
+    zero-length HMAC key, and since `key` is public by design (it ships in browser bundles), a
+    blank `secret` would let anyone holding the key forge signed requests. For `apps.json`, `id`
+    and `key` must also each be unique across the file; a duplicate fails the whole file at
+    startup, naming the offending value. This validation runs again on every lookup against a
+    database-backed store (not just at load), so a row with a blank field fails every lookup
+    against it rather than only the first — see [Database-backed app stores](#database-backed-app-stores)
+    below.
+
 ---
 
 ## Database-backed app stores
