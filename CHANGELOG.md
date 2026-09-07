@@ -347,7 +347,7 @@ pre-1.0 and versions track `Cargo.toml`.
   Redis subscriber of: no `member_added`, no `member_removed`, and no cross-node
   channel events for anyone on that node, with nothing logged. The membership
   reconciler introduced alongside this bounded the damage to one tick
-  (`PYLON_REDIS_PRESENCE_HEARTBEAT_SECS`, default 25s) rather than the life of the
+  (`PYLON_REDIS_PRESENCE_HEARTBEAT`, default 25s) rather than the life of the
   process, but pub/sub has no replay, so every frame inside that window was still
   lost. The bridge now spends the pub/sub edge before the admission verdict and
   hands it back — a matching `UNSUBSCRIBE` — only when the rejection leaves the
@@ -402,7 +402,7 @@ pre-1.0 and versions track `Cargo.toml`.
   so, while its call sites folded those same bytes *in* first. The drain queues
   its 4200 frames onto still-handshaking connections too, so a request head
   arriving mid-drain left `inflight_bytes` permanently above zero — a phantom
-  floor that no connection holds, which makes `pylon_percore_inflight_bytes`
+  floor that no connection holds, which makes `pylon_inflight_bytes`
   over-report for the life of the worker and stops the drain's fast exit from
   ever firing again (debug builds panicked on the accounting cross-check).
 - **Shutdown no longer waits out the full `shutdown_grace_ms` when a peer has
