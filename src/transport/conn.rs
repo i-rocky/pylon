@@ -307,15 +307,11 @@ pub struct Connection {
     /// "everything flushed" test would pass over unsent Close frames. Zeroed
     /// whenever a ciphertext drain empties rustls's send buffer.
     tls_unflushed_bytes: usize,
-    /// Whether this connection's `mio` poll registration currently includes
-    /// [`mio::Interest::WRITABLE`] — the tracked mirror of the actual registry
-    /// interest, maintained by the worker at every re-registration site
-    /// ([`flush_and_arm`](crate::transport::worker) records each outcome; the
-    /// accept-time READABLE-only registration matches the `false` construction
-    /// default). Powers the worker-loop debug invariant "queued out-bytes ⇒
-    /// WRITABLE armed" — the tripwire proving an idle 50 ms poll can never
-    /// strand a backpressured connection's out-queue: with WRITABLE armed the
-    /// kernel wakes the loop the moment the socket drains.
+    /// Tracked mirror of whether this connection's `mio` registration includes
+    /// [`mio::Interest::WRITABLE`], recorded by the worker at every
+    /// re-registration site. Powers the loop's "queued out-bytes ⇒ WRITABLE
+    /// armed" invariant, which is what makes an idle 50 ms poll safe for a
+    /// backpressured connection.
     writable_armed: bool,
     /// Bytes held by the worker's inbound reassembly buffer for this connection
     /// (RFC 6455 §5.4), maintained by
@@ -323,13 +319,21 @@ pub struct Connection {
     /// `out_bytes` in [`accounted_bytes`](Self::accounted_bytes) so memory a peer
     /// pins mid-message is visible to the worker's `inflight_bytes` total.
     reassembly_bytes: usize,
+    /// Bytes the worker's inbound frame buffer holds for this connection between
+    /// reads, maintained by
+    /// [`set_frame_buffer_bytes`](Self::set_frame_buffer_bytes). Its sibling
+    /// `reassembly_bytes` covers a partially-received MESSAGE; this covers a
+    /// partially-received FRAME, which a peer can hold at `max_payload` by
+    /// trickling a large frame it never completes.
+    frame_buffer_bytes: usize,
     /// Signed accumulator of every change to [`accounted_bytes`](Self::accounted_bytes)
     /// since the last [`take_inflight_delta`](Self::take_inflight_delta), so the
     /// worker can maintain its `inflight_bytes` total incrementally (O(work), not
     /// O(connections)) instead of re-summing every connection each loop. Every
     /// mutation site — the `queue` enqueue/drop-head eviction, the `flush` send,
-    /// the CoDel staleness drop, the TLS unflushed-plaintext billing, and
-    /// `set_reassembly_bytes` — folds its exact signed delta in here. Invariant:
+    /// the CoDel staleness drop, the TLS unflushed-plaintext billing,
+    /// `set_reassembly_bytes` and `set_frame_buffer_bytes` — folds its exact
+    /// signed delta in here. Invariant:
     /// across any sequence of operations the SUM of the deltas taken equals the
     /// net change in `accounted_bytes`.
     inflight_delta: i64,
@@ -356,6 +360,7 @@ impl Connection {
             tls_unflushed_bytes: 0,
             writable_armed: false,
             reassembly_bytes: 0,
+            frame_buffer_bytes: 0,
             inflight_delta: 0,
         }
     }
@@ -380,6 +385,7 @@ impl Connection {
             tls_unflushed_bytes: 0,
             writable_armed: false,
             reassembly_bytes: 0,
+            frame_buffer_bytes: 0,
             inflight_delta: 0,
         }
     }
@@ -731,11 +737,10 @@ impl Connection {
 
     /// Read whatever the socket has available and parse every complete frame.
     ///
-    /// `scratch` is the working buffer holding **this connection's** unparsed
-    /// remainder from a previous call; new bytes are appended to it and any new
-    /// partial-frame remainder is left in it for next time. (The worker owns the
-    /// policy of whether `scratch` is shared or per-connection; this method only
-    /// requires it to already contain *this* connection's remainder.)
+    /// `scratch` holds **this connection's** unparsed remainder from a previous
+    /// call; new bytes are appended to it and any new partial-frame remainder is
+    /// left in it for next time. Its size is what the caller bills through
+    /// [`set_frame_buffer_bytes`](Self::set_frame_buffer_bytes).
     ///
     /// Returns the complete frames parsed in this call (possibly empty). Errors:
     ///
@@ -822,16 +827,12 @@ impl Connection {
             }
         }
 
-        // F14: a cycle that ends fully drained shrinks the scratch back toward
-        // the 8 KiB floor — the buffer is per-connection state, and a single
-        // large frame must not leave every connection holding a burst-sized
-        // allocation for the rest of its (possibly hours-long) lifetime. A
-        // no-op at or below the floor, so the common small-frame path pays only
-        // a capacity compare (and keeps its capacity: no re-growth churn). A
-        // cycle ending with a partial-frame remainder keeps its capacity: those
-        // bytes belong to a large frame in flight and the completing read needs
-        // the space. (bytes 1.11 has no `BytesMut::shrink_to`; with the buffer
-        // provably empty, a fresh floor-sized buffer IS the shrink.)
+        // F14: one large frame must not leave every connection holding a
+        // burst-sized allocation for its whole lifetime, so a fully-drained
+        // cycle returns to the floor. A cycle ending with a partial-frame
+        // remainder keeps its capacity — the completing read needs the space.
+        // (bytes 1.11 has no `BytesMut::shrink_to`; on a provably empty buffer a
+        // fresh floor-sized one IS the shrink.)
         if scratch.is_empty() && scratch.capacity() > 8 * 1024 {
             *scratch = BytesMut::with_capacity(8 * 1024);
         }
@@ -908,11 +909,25 @@ impl Connection {
         self.reassembly_bytes = bytes;
     }
 
+    /// Bytes this connection's inbound frame buffer currently holds.
+    pub fn frame_buffer_bytes(&self) -> usize {
+        self.frame_buffer_bytes
+    }
+
+    /// Resize this connection's frame-buffer accounting to `bytes`, folding the
+    /// change into the inflight delta. The worker calls this after every read
+    /// that leaves a partial frame behind, so a peer that pins memory by opening
+    /// a large frame and trickling it is billed for it.
+    pub fn set_frame_buffer_bytes(&mut self, bytes: usize) {
+        self.inflight_delta += bytes as i64 - self.frame_buffer_bytes as i64;
+        self.frame_buffer_bytes = bytes;
+    }
+
     /// Every byte this connection contributes to the worker's `inflight_bytes`:
-    /// the queued out-frames, the inbound reassembly buffer, and the plaintext
-    /// rustls has taken but not yet put on the wire.
+    /// the queued out-frames, the inbound reassembly and frame buffers, and the
+    /// plaintext rustls has taken but not yet put on the wire.
     pub fn accounted_bytes(&self) -> usize {
-        self.out_bytes + self.reassembly_bytes + self.tls_unflushed_bytes
+        self.out_bytes + self.reassembly_bytes + self.frame_buffer_bytes + self.tls_unflushed_bytes
     }
 
     /// Take and reset this connection's accumulated [`accounted_bytes`](Self::accounted_bytes)

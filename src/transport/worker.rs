@@ -376,8 +376,11 @@ enum Fragment {
 /// that arrived mid-frame). During [`ConnState::Handshaking`] it doubles as the
 /// head-accumulation buffer until [`handshake::read_head`] returns something
 /// other than [`HeadResult::NeedMore`]. Its growth while Handshaking is
-/// bounded by `WorkerConfig::max_head_bytes` (G3): past the cap `read_head`
-/// returns `Bad` and the connection closes.
+/// bounded by `WorkerConfig::max_head_bytes` (G3) and by the handshake deadline;
+/// once the session is open its only bound is `WorkerConfig::max_payload`, so
+/// [`handle_frames`] bills what it holds to `conn` (`set_frame_buffer_bytes`)
+/// and the head-accumulation phase — separately bounded, and released by the
+/// `clear` at upgrade — is left unbilled.
 struct Entry {
     conn: Connection,
     inbuf: BytesMut,
@@ -536,17 +539,14 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     // a late resolution for a freed/recycled token is detected and dropped.
     let mut next_gen: u64 = 0;
 
-    // SP10 per-worker byte budget + inflight accounting. `inflight_bytes` is this
-    // worker's local (non-atomic) view of how many bytes its connections hold —
-    // queued out-frames plus inbound reassembly buffers — maintained
-    // INCREMENTALLY: every site that touches a connection folds in its exact
-    // signed `take_inflight_delta()` (queue/flush/drop-head/CoDel/fragment), and
-    // `remove` subtracts a closing connection's still-held bytes. So the
-    // byte-accounting invariant
-    // ("a byte enqueued is decremented exactly once, on send XOR drop") holds by
-    // construction and the hot loop is O(work), not O(connections). It is mirrored
-    // into the shared `inflight_slot` for the `percore_total_inflight_bytes()` test
-    // hook, and drives the graduated shed on the broadcast drain.
+    // SP10 per-worker byte budget. `inflight_bytes` is this worker's local view
+    // of `Connection::accounted_bytes` summed over its connections, maintained
+    // INCREMENTALLY: every site that touches a connection folds in that
+    // connection's exact signed `take_inflight_delta()`, and every teardown
+    // subtracts what it still held. So "a byte accounted for is released exactly
+    // once" holds by construction and the hot loop stays O(work). Mirrored into
+    // `inflight_slot` for the `percore_total_inflight_bytes()` test hook, and
+    // drives the graduated shed on the broadcast drain.
     let per_worker_budget = cfg.per_worker_budget;
     let inflight_slot = cfg.inflight_slot.clone();
     let accepted_slot = cfg.accepted_slot.clone();
@@ -1522,9 +1522,9 @@ fn drain_close_connection(
 enum Action {
     Keep,
     Close,
-    /// A plain-HTTP request head was detected: transfer the connection (and the
-    /// `Vec<u8>` of bytes already read off the socket, to be replayed) to the
-    /// REST handoff channel. Carries the bytes to replay.
+    /// A plain-HTTP request head was detected: transfer the connection to the
+    /// REST handoff channel, carrying the bytes already read off the socket for
+    /// the HTTP parser to replay.
     Handoff(Vec<u8>),
 }
 
@@ -1558,18 +1558,13 @@ fn accept_ready(
                     poll.registry()
                         .register(&mut stream, Token(key), Interest::READABLE)
                 {
-                    // Registration failed: drop the socket, leave the slab slot
-                    // unused (vacant_entry didn't consume it).
                     tracing::debug!(error = %e, "failed to register accepted socket");
                     continue;
                 }
-                // F3 (Nagle): disable Nagle on the accepted socket. Small
-                // latency-critical frames (pong, subscription_succeeded,
-                // member_added) queued right after a partial write would
-                // otherwise sit in the kernel's Nagle buffer waiting for the
-                // peer's delayed ACK — the classic 40ms stall. Best-effort: a
-                // failure to set a socket option must not break or spam the
-                // accept loop.
+                // F3: without this a small latency-critical frame queued right
+                // after a partial write waits on the peer's delayed ACK — the
+                // classic 40ms Nagle stall. Best-effort; a failed socket option
+                // must not break the accept loop.
                 let _ = stream.set_nodelay(true);
                 let mut conn = if let Some(tls_cfg) = &cfg.tls {
                     match rustls::server::ServerConnection::new(tls_cfg.clone()) {
@@ -1591,9 +1586,8 @@ fn accept_ready(
                     fragment: None,
                     pending_establish: None,
                 });
-                // G3: arm the handshake deadline AFTER the slot exists (the
-                // slab key is the wheel's ConnId). Cleared at session establish;
-                // fires (reap) otherwise.
+                // G3: the slab key is the wheel's ConnId, so the deadline can
+                // only be armed once the slot exists.
                 if let Some(deadline_ms) = handshake_deadline {
                     wheel.arm_handshake(key, deadline_ms);
                 }
@@ -1683,16 +1677,9 @@ fn handle_handshake(
     next_gen: &mut u64,
     wheel: &mut TimerWheel,
 ) -> Action {
-    // Pull all available bytes into the head-accumulation buffer (`inbuf`).
-    // G2: `NeedsWrite` means a TLS handshake flight could not be fully written
-    // (the peer's receive window filled mid-handshake). Nothing can be parsed
-    // out of it either — the plaintext pull inside `drain_head_bytes` is
-    // skipped when the flight write blocks — so fall through to the arm point
-    // below (`NeedMore ⇒ arm_handshake_interest`), which registers
-    // READABLE | WRITABLE so the next writable event completes the flight.
-    // A readable event arriving while the flight is still blocked is unaffected:
-    // it lands here first and processes any new TLS records before the write
-    // retry inside `drain_head_bytes`.
+    // G2: `NeedsWrite` means a TLS handshake flight blocked mid-write and no
+    // plaintext was pulled, so it falls through to `NeedMore ⇒
+    // arm_handshake_interest` below, which adds WRITABLE to finish the flight.
     match entry.conn.drain_head_bytes(&mut entry.inbuf) {
         DrainStatus::Closed => return Action::Close,
         DrainStatus::Ok | DrainStatus::NeedsWrite => {}
@@ -2122,18 +2109,17 @@ fn query_param(query: Option<&str>, name: &str) -> Option<String> {
 }
 
 /// Read and process every complete frame currently buffered, per [`Mode`].
+///
+/// The remainder `read_frames` leaves in `inbuf` is a partially-received frame,
+/// which a peer can hold at `max_payload` by trickling a large one it never
+/// completes, so it is billed to the connection before anything else happens.
 fn handle_frames(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig, now_ns: u64) -> Action {
-    let frames = {
-        // Split the borrow so `inbuf` (the read remainder) and `conn` can be
-        // borrowed at once via a temporary swap-out of the buffer.
-        let mut scratch = std::mem::take(&mut entry.inbuf);
-        let result = entry.conn.read_frames(&mut scratch, cfg.max_payload);
-        entry.inbuf = scratch;
-        match result {
-            Ok(frames) => frames,
-            // EOF or a fatal protocol violation: close.
-            Err(ConnError::Closed) | Err(ConnError::Protocol(_)) => return Action::Close,
-        }
+    let result = entry.conn.read_frames(&mut entry.inbuf, cfg.max_payload);
+    entry.conn.set_frame_buffer_bytes(entry.inbuf.len());
+    let frames = match result {
+        Ok(frames) => frames,
+        // EOF or a fatal protocol violation: close.
+        Err(ConnError::Closed) | Err(ConnError::Protocol(_)) => return Action::Close,
     };
 
     match &cfg.mode {
@@ -2193,16 +2179,12 @@ fn open_text_fragment(payload: &[u8], max_message_bytes: usize) -> Fragment {
 /// self-directed replies go out.
 ///
 /// Fragmented text messages (RFC 6455 §5.4) are reassembled in
-/// [`Entry::fragment`] before dispatch: a FIN=0 Text frame opens the
-/// accumulation, Continuation frames append, and the FIN=1 Continuation
-/// dispatches the assembled payload through the same path as an unfragmented
-/// Text frame. Every fragment — the first included — is checked against
-/// `max_message_bytes`, and a message that breaches it switches to
-/// [`Fragment::Oversize`]: dropped, unbuffered, connection intact. Fragmented
-/// BINARY messages are ignored frame-by-frame (binary is outside the Pusher
-/// protocol, like a lone Binary frame). Control frames interleaved mid-fragment
-/// are handled in frame order, so a Ping between fragments is answered before
-/// the message completes (RFC 6455 §5.5.2).
+/// [`Entry::fragment`] and dispatched on their FIN=1 Continuation, through the
+/// same path as an unfragmented Text frame. Every fragment — the first included
+/// — is checked against `max_message_bytes`, and a message that breaches it
+/// switches to [`Fragment::Oversize`]: dropped, unbuffered, connection intact.
+/// Control frames interleaved mid-fragment are handled in frame order, so a
+/// Ping between fragments is answered before the message completes (§5.5.2).
 fn dispatch_frames(
     poll: &Poll,
     entry: &mut Entry,
@@ -2447,21 +2429,12 @@ fn drain_session(poll: &Poll, entry: &mut Entry, now_ns: u64) -> DrainResult {
     let mut close_after = false;
     let mut wrote = false;
     let mut subs_changed = false;
-    // F6 / Task 6.4: ONE encode scratch for the whole drain, reused across
-    // every queued event (`clear()` keeps the capacity). Net effect vs a
-    // per-event `encode()`: one heap allocation REMOVED via scratch reuse;
-    // the memcpy count is UNCHANGED (the payload was already serialized once
-    // and copied once more into the WS frame buffer below). The no-copy win
-    // sits inside the codec for `Raw` events (relayed redis frames on the
-    // legacy registry fan-out path): `encode_into` appends the `Arc`-shared
-    // payload BY REFERENCE instead of `to_string()`-cloning it per
-    // subscriber, so the codec no longer re-materializes the relayed frame
-    // per connection. The one copy into the WS frame buffer is inherent —
-    // each connection's out-queue owns its `Bytes`, so per-connection WS
-    // framing must produce its own buffer. (Where text feeds `Bytes`
-    // directly the move is zero-copy: bytes 1.x `From<String>` — the percore
-    // SINK path, where `local.broadcast` encodes + frames ONCE and every
-    // worker enqueues refcount clones of one shared `Bytes`.)
+    // F6: ONE encode scratch for the whole drain, reused across every queued
+    // event (`clear()` keeps the capacity). The copy into the WS frame buffer
+    // below is inherent — each connection's out-queue owns its own `Bytes` — so
+    // the win is the allocation, plus `encode_into` appending a `Raw` event's
+    // `Arc`-shared payload by reference rather than re-materializing it per
+    // subscriber.
     let mut text = String::with_capacity(256);
     while let Ok(ev) = session.rx.try_recv() {
         match *ev {
@@ -2510,24 +2483,18 @@ fn drain_session(poll: &Poll, entry: &mut Entry, now_ns: u64) -> DrainResult {
     }
 }
 
-/// Waker-driven SELECTIVE mailbox drain: visit ONLY the connections whose mailbox
-/// actually received a cross-connection send this round, instead of scanning every
-/// Open connection. `dirty_rx` carries the slab tokens that `Mailbox::send` pushed
-/// (one per cross-connection delivery); they are drained into the reused, deduped
-/// `dirty_set` (a connection marked dirty several times is drained once) and only
-/// those connections' mailboxes are drained. Idle connections are never visited —
-/// O(dirty), not O(N); when no dirty tokens are pending this is an O(1) empty
-/// `try_recv`.
+/// Waker-driven SELECTIVE mailbox drain: visit ONLY the connections `dirty_rx`
+/// names — the slab tokens `Mailbox::send` pushed, deduped through the reused
+/// `dirty_set` — so the cost is O(dirty), not O(N), and an idle round is one
+/// empty `try_recv`.
 ///
-/// A token whose slab entry is gone, closed, or not yet a session is skipped (a
-/// reused slab slot is harmless: `drain_session` only delivers that connection's
-/// own queued events and is idempotent, so no generation guard is needed).
-/// Connections that request a close (or whose write fails) are torn down. A
-/// `subscribed` change during the drain (a `SubscriptionError` — e.g. the bridge's
-/// cluster-wide presence-capacity reject) is reconciled into the worker-local
-/// delivery index, exactly as the old per-iteration scan did, but only for the
-/// dirty connection. Returns `true` if any connection actually wrote a queued
-/// event (keeps the adaptive poll tight).
+/// A token whose slab entry is gone, closed, or not yet a session is skipped; a
+/// reused slab slot needs no generation guard, since `drain_session` only
+/// delivers that connection's own queued events and is idempotent. Connections
+/// that request a close (or whose write fails) are torn down, and a `subscribed`
+/// change during the drain is reconciled into the worker-local delivery index.
+/// Returns `true` if any connection wrote a queued event (keeps the adaptive
+/// poll tight).
 #[allow(clippy::too_many_arguments)]
 fn drain_dirty_sessions(
     poll: &Poll,
@@ -3061,22 +3028,11 @@ fn remove(
 /// indexed under.
 ///
 /// G5: walks the UNION of the session's last-reconciled baseline (`subs`) and
-/// the live protocol set (`ctx.subscribed`). The baseline alone covers every
-/// entry `reconcile_membership` inserted — but a readable batch containing
-/// [subscribe, Close] (or a protocol-error/backpressure close right after a
-/// subscribe in the same batch) returns `Action::Close` from `dispatch_frames`
-/// BEFORE the `Action::Keep` arm's post-dispatch reconcile runs, so a
-/// subscription that reached the index by any path the baseline missed would
-/// otherwise stay indexed forever (dead socket ids accumulate; the channel's
-/// subscriber set never empties). Deindexing the union makes the close path
-/// self-sufficient: it cleans whatever the connection could still be indexed
-/// under, without trusting the reconcile bookkeeping.
-///
-/// Dedup is free: iterating `ctx.subscribed` chained with the channels of
-/// `subs` that `ctx.subscribed` lacks visits every union member exactly once,
-/// and the removal itself is idempotent anyway — removing an absent
-/// `(key, socket_id)` is a no-op, so a second pass over an overlapping channel
-/// cannot double-subtract the test gauge or disturb another subscriber.
+/// the live protocol set (`ctx.subscribed`), because a readable batch of
+/// [subscribe, Close] returns `Action::Close` before the `Action::Keep` arm's
+/// post-dispatch reconcile ever runs. Deindexing the union makes the close path
+/// self-sufficient instead of trusting that bookkeeping, and costs nothing:
+/// removing an absent `(key, socket_id)` is a no-op.
 fn deindex_connection(session: &Session, local_subs: &mut LocalSubs) {
     let app: Arc<str> = Arc::from(session.ctx.app.id.as_str());
     let sid = &session.ctx.socket_id;
@@ -3268,25 +3224,19 @@ impl ConnIndex for slab::Slab<Entry> {
 /// subscribers, applying the SP10 graduated shed (§6) against this worker's
 /// byte budget.
 ///
-/// For each message: classify the current [`ShedBand`] from `inflight_bytes /
-/// effective_budget`; in `Saturated` (≥100%) the whole broadcast is dropped and
-/// `budget_saturated` — the caller's OWN bit — is raised; otherwise, for each
-/// subscriber (skipping `except`), the already-WS-framed frame for THAT
-/// subscriber's negotiated protocol version
-/// (U3: the message carries one frame per active version) is `queue`d (a
-/// `Bytes` refcount bump — never re-encoded) UNLESS the band says to skip a
-/// backed-up subscriber. `inflight_bytes` is kept live across the drain (each
-/// enqueue adds the net byte delta, accounting for any drop-head eviction) so
-/// the band tightens as the worker fills within a single drain. `touched`
-/// collects every connection queued onto (the caller's flush loop) and
-/// `to_close` the connections the caller already marked for teardown
-/// (backpressure-closed in a previous phase of this drain).
+/// Each message classifies a [`ShedBand`] from `inflight_bytes /
+/// effective_budget`: `Saturated` (≥100%) drops the whole broadcast and raises
+/// the caller's OWN `budget_saturated` bit; otherwise every subscriber but
+/// `except` is queued the frame already encoded for ITS negotiated version (a
+/// `Bytes` refcount bump — never re-encoded), unless the band says to skip a
+/// backed-up one. `inflight_bytes` stays live across the drain, so the band
+/// tightens as the worker fills within a single one. `touched` collects the
+/// connections queued onto, `to_close` the ones a previous phase of this drain
+/// already marked for teardown.
 ///
-/// This is the fan-out half of [`drain_broadcasts`], factored out verbatim
-/// (same statement order, same skip conditions) so `benches/fanout_sink.rs`
-/// can benchmark the REAL production loop — encode/hand-off once on the
-/// publish side, one shared `Bytes` refcount bump per subscriber on the drain
-/// side. `#[doc(hidden)]` for the same reason as [`ConnIndex`].
+/// This is the fan-out half of [`drain_broadcasts`], factored out verbatim so
+/// `benches/fanout_sink.rs` can benchmark the REAL production loop.
+/// `#[doc(hidden)]` for the same reason as [`ConnIndex`].
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn drain_broadcast_inbox<C: ConnIndex>(
@@ -4609,5 +4559,127 @@ mod tests {
 
         assert!(conns.is_empty(), "the entry left the slab");
         assert_eq!(t.inflight, 0, "and its bytes left the worker total with it");
+    }
+
+    // ---- #74: a partially-received frame is billed to the connection --------
+
+    /// A connected loopback pair: the server half as the worker sees it, plus
+    /// the client half for the test to trickle bytes down.
+    fn trickle_pair() -> (
+        mio::net::TcpStream,
+        std::net::TcpStream,
+        std::net::SocketAddr,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server.set_nonblocking(true).unwrap();
+        (mio::net::TcpStream::from_std(server), client, addr)
+    }
+
+    /// The header of a masked client TEXT frame (RFC 6455 §5.2) declaring
+    /// `payload_len` bytes, in the 16-bit extended-length form.
+    fn masked_text_header(payload_len: u16) -> Vec<u8> {
+        let mut head = vec![0x81, 0x80 | 126];
+        head.extend_from_slice(&payload_len.to_be_bytes());
+        head.extend_from_slice(&[0x37, 0xfa, 0x21, 0x3d]);
+        head
+    }
+
+    /// Drive the production read path until `done` holds, folding the worker's
+    /// `inflight_bytes` after every pass exactly as the event loop does.
+    fn read_until(
+        poll: &Poll,
+        conns: &mut slab::Slab<Entry>,
+        key: usize,
+        cfg: &WorkerConfig,
+        inflight: &mut u64,
+        done: impl Fn(&Entry) -> bool,
+    ) {
+        for _ in 0..1000 {
+            assert_eq!(handle_frames(poll, &mut conns[key], cfg, 0), Action::Keep);
+            fold_delta(conns, key, inflight);
+            if done(&conns[key]) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the peer's bytes never landed");
+    }
+
+    /// Issue #74: a peer that sends a large frame's header and then trickles the
+    /// payload parks it in `Entry::inbuf` until the frame completes. Pre-fix
+    /// those bytes were billed to nothing, so `inflight_bytes` — and the REST
+    /// 503 admission path, the `client-*` ingress drop and the graduated shed
+    /// bands that read it — could not see memory the peer was holding.
+    #[test]
+    fn a_partially_received_frame_is_billed_to_the_connection() {
+        use std::io::Write as _;
+
+        let poll = Poll::new().unwrap();
+        let (server, mut client, addr) = trickle_pair();
+        let (mut conns, key) = slab_with_conn(&poll, server);
+        let cfg = echo_worker_config(addr);
+
+        let mut partial = masked_text_header(32 * 1024);
+        partial.extend_from_slice(&vec![b'x'; 4096]);
+        client.write_all(&partial).unwrap();
+        client.flush().unwrap();
+
+        let mut inflight = 0u64;
+        let want = partial.len();
+        read_until(&poll, &mut conns, key, &cfg, &mut inflight, |e| {
+            e.inbuf.len() >= want
+        });
+
+        let conn = &conns[key].conn;
+        assert_eq!(
+            conn.out_bytes(),
+            0,
+            "an incomplete frame draws no reply, so every accounted byte is the buffer's"
+        );
+        assert_eq!(conn.frame_buffer_bytes(), want);
+        assert_eq!(conn.accounted_bytes(), want);
+        assert_eq!(inflight, want as u64, "and the worker total carries them");
+    }
+
+    /// The billing follows the buffer back down: completing the frame hands its
+    /// payload to the parser and returns those bytes to the worker's budget.
+    #[test]
+    fn completing_a_frame_returns_its_buffered_bytes() {
+        use std::io::Write as _;
+
+        let poll = Poll::new().unwrap();
+        let (server, mut client, addr) = trickle_pair();
+        let (mut conns, key) = slab_with_conn(&poll, server);
+        let cfg = echo_worker_config(addr);
+
+        let payload = vec![b'x'; 512];
+        let mut head = masked_text_header(payload.len() as u16);
+        head.extend_from_slice(&payload[..256]);
+        client.write_all(&head).unwrap();
+        client.flush().unwrap();
+
+        let mut inflight = 0u64;
+        let buffered = head.len();
+        read_until(&poll, &mut conns, key, &cfg, &mut inflight, |e| {
+            e.inbuf.len() >= buffered
+        });
+        assert_eq!(inflight, buffered as u64);
+
+        client.write_all(&payload[256..]).unwrap();
+        client.flush().unwrap();
+        read_until(&poll, &mut conns, key, &cfg, &mut inflight, |e| {
+            e.inbuf.is_empty()
+        });
+
+        let conn = &conns[key].conn;
+        assert_eq!(conn.frame_buffer_bytes(), 0);
+        assert_eq!(
+            inflight,
+            conn.out_bytes() as u64,
+            "only the echoed reply is still owed"
+        );
     }
 }
