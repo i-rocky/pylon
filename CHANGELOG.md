@@ -228,8 +228,37 @@ pre-1.0 and versions track `Cargo.toml`.
   can now change without the user set changing, the memoised
   `subscription_succeeded` frame is invalidated on that change too — a roster
   generation is everything its encoded bytes depend on, not just the set of ids.
-  The cluster (Redis) roster keeps first-writer-wins for now; only the node-local
-  roster is re-seated.
+  The clustered roster is re-seated by the entry below.
+- **The CLUSTERED presence roster is re-seated too, so a single-node and a
+  clustered deployment no longer disagree about `user_info`.** Redis `presinfo` is
+  written once, on the cluster-wide 0→1 user edge, and nothing re-derived it: a
+  clustered deployment kept advertising the seeding connection's metadata
+  cluster-wide and forever, reproducing the defect fixed node-locally above for
+  every clustered operator. The re-seat needs the surviving connections' own
+  `user_info` values to choose from and nothing in the keyspace held them, so this
+  is a **keyspace change**: a new per-channel hash `presseats` (`user_id` → that
+  user's connections in cluster join order, each a `member_token` line followed by
+  the `user_info` line it presented) shares the `{channel}` hash tag, so every
+  existing multi-key presence script stays same-slot. `PRESENCE_LEAVE` and the
+  sweeper's `REAP_MEMBER` now re-seat `presinfo` onto the user's oldest connection
+  still listed in `presmembers` *inside their own scripts*, so choosing the
+  survivor and installing it are one indivisible step — the same reason the
+  presence cap and the vacate verdict live in theirs. `VACATE` drains the new hash
+  with the other three; a clean last leave removes it as it already removed them.
+  **Sizing:** `presseats` holds one `user_info` copy per presence CONNECTION
+  rather than per user, each bounded by `PYLON_MAX_PRESENCE_USER_INFO_BYTES`
+  (default 1024 B), so a channel's presence residency now scales with connections
+  — budget roughly `connections × (user_info + ~60 B)` per presence channel.
+  **Rolling upgrade:** the new hash is purely additive and needs no flag, no
+  backfill and no coordinated restart. Nodes on the older build neither read nor
+  write it, and `presmembers` — which both builds maintain — stays the liveness
+  truth, so a seat orphaned by an older node's leave is never seated from and is
+  collected the next time a new node re-seats that user. A user whose oldest live
+  connection sits on a not-yet-upgraded node keeps the old first-writer value
+  until that node is upgraded; the roster is never worse than it was before, and
+  becomes exact once the whole fleet runs the new build. Rolling BACK leaves
+  `presseats` hashes that the older `VACATE` will not drain: they are inert, and
+  can be removed manually (`presseats:*`) once every node is downgraded.
 - **A presence join rejected by the cluster member cap no longer swallows the
   node's 0→1 Redis `SUBSCRIBE`, which left the node deaf to the channel it still
   held members of.** `node_first` is a one-shot token — exactly one in-flight

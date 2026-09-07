@@ -80,6 +80,14 @@ impl Keys {
         format!("{}:presmembers:{}:{{{}}}", self.prefix, app, channel)
     }
 
+    /// Presence: HASH user_id -> that user's connections in cluster JOIN order, each a
+    /// `member_token` line followed by the `user_info` line it presented. The user's
+    /// `presinfo` entry is seated on the first pair whose token is still in
+    /// `presmembers`, so the roster only ever advertises a live connection's value.
+    pub fn presseats(&self, app: &str, channel: &str) -> String {
+        format!("{}:presseats:{}:{{{}}}", self.prefix, app, channel)
+    }
+
     /// User binding: HASH member_token -> expireAt (HLEN = cluster connection count).
     pub fn usr(&self, app: &str, user_id: &str) -> String {
         format!("{}:usr:{}:{{{}}}", self.prefix, app, user_id)
@@ -159,6 +167,10 @@ mod tests {
         assert_eq!(
             k.presmembers("app1", "presence-room"),
             "pylon:presmembers:app1:{presence-room}"
+        );
+        assert_eq!(
+            k.presseats("app1", "presence-room"),
+            "pylon:presseats:app1:{presence-room}"
         );
         assert_eq!(k.usr("app1", "u7"), "pylon:usr:app1:{u7}");
         assert_eq!(k.users("app1"), "pylon:users:app1");

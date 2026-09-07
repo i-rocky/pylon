@@ -1187,6 +1187,73 @@ async fn cross_node_presence_member_removed_single_emit() {
     .expect("presence member_removed test must not hang (Redis up?)");
 }
 
+/// Issue #79: the CLUSTER roster follows the user's oldest LIVE connection, the way
+/// the node-local one has since #63. u1 opens a connection on A presenting one
+/// `user_info` and a second on B presenting another; when A's — the connection that
+/// seeded the roster — leaves, everything reading cluster truth must report B's
+/// value, not the departed one.
+///
+/// (RED before this: `presinfo` was written once, on the cluster 0→1 user edge, and
+/// nothing ever re-derived it — so a clustered deployment kept serving "Old" while a
+/// single-node one served "New", the divergence #79 exists to close.)
+#[tokio::test]
+async fn cross_node_presence_roster_reseats_when_the_seeding_connection_leaves() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let channel = "presence-reseat";
+        let adapter_a = connect_adapter_with_prefix(&prefix).await;
+        let adapter_b = connect_adapter_with_prefix(&prefix).await;
+
+        let (s_a, h_a, m_a) = presence_handle("u1", serde_json::json!({"name":"Old"}));
+        adapter_a.subscribe(TEST_APP, channel, h_a, Some(m_a)).await;
+        let (_s_b, h_b, m_b) = presence_handle("u1", serde_json::json!({"name":"New"}));
+        adapter_b.subscribe(TEST_APP, channel, h_b, Some(m_b)).await;
+
+        let seeded = adapter_b.presence_members(TEST_APP, channel).await;
+        assert_eq!(
+            seeded.first().map(|m| &m.user_info),
+            Some(&serde_json::json!({"name":"Old"})),
+            "the second connection must not displace the first's user_info"
+        );
+
+        let un_a = adapter_a.unsubscribe(TEST_APP, channel, &s_a).await;
+        assert!(
+            !un_a
+                .presence
+                .expect("presence leave on A must be Some")
+                .last_for_user,
+            "u1 still has a connection on B → NOT last_for_user"
+        );
+
+        let after = adapter_b.presence_members(TEST_APP, channel).await;
+        assert_eq!(
+            after.first().map(|m| &m.user_info),
+            Some(&serde_json::json!({"name":"New"})),
+            "the cluster roster must carry the surviving connection's user_info"
+        );
+
+        // The same value has to reach a joiner's `subscription_succeeded` roster —
+        // that frame is built from cluster truth, not from the REST view.
+        let (_s_c, h_c, m_c) = presence_handle("u2", serde_json::json!({"name":"Cleo"}));
+        let out_c = adapter_a.subscribe(TEST_APP, channel, h_c, Some(m_c)).await;
+        let frame = out_c
+            .presence
+            .expect("presence join for u2 must be Some")
+            .roster_frame;
+        let j: serde_json::Value = serde_json::from_str(&frame).expect("frame must be JSON");
+        let roster: serde_json::Value =
+            serde_json::from_str(j["data"].as_str().expect("data is a JSON string"))
+                .expect("roster data must be JSON");
+        assert_eq!(
+            roster["presence"]["hash"]["u1"],
+            serde_json::json!({"name":"New"}),
+            "a new subscriber's roster must carry the re-seated user_info"
+        );
+    })
+    .await
+    .expect("presence re-seat test must not hang (Redis up?)");
+}
+
 /// B2 (SP7b): `presence_members` and the presence `user_count` are CLUSTER-wide.
 /// With u1 on A and u2 on B, A's `channel().user_count`, `presence_members`, and the
 /// matching `channels()` entry must all reflect both users — not just A's local one.
@@ -2555,6 +2622,7 @@ async fn run_vacate(
                 keys.presusers(TEST_APP, channel),
                 keys.presinfo(TEST_APP, channel),
                 keys.presmembers(TEST_APP, channel),
+                keys.presseats(TEST_APP, channel),
             ],
             vec![channel.to_string()],
         )
@@ -2771,6 +2839,68 @@ async fn vacate_drains_presence_roster_left_by_a_dead_node() {
 // full-system straddle is not.
 // ---------------------------------------------------------------------------
 
+/// Run the bridge's PRESENCE_JOIN_LUA uncapped for `user_id`/`token` presenting
+/// `user_info`; returns the user's new cluster-wide connection refcount.
+async fn run_presence_join(
+    scripts: &Scripts,
+    pool: &fred::clients::Pool,
+    keys: &Keys,
+    channel: &str,
+    user_id: &str,
+    token: &str,
+    user_info: &str,
+) -> i64 {
+    scripts
+        .presence_join
+        .evalsha_with_reload::<i64, _, _>(
+            pool.next(),
+            vec![
+                keys.presusers(TEST_APP, channel),
+                keys.presinfo(TEST_APP, channel),
+                keys.presmembers(TEST_APP, channel),
+                keys.presseats(TEST_APP, channel),
+            ],
+            vec![
+                user_id.to_string(),
+                user_info.to_string(),
+                token.to_string(),
+                "-1".to_string(),
+            ],
+        )
+        .await
+        .expect("PRESENCE_JOIN_LUA must eval")
+}
+
+/// The `user_info` the cluster roster currently advertises for `user_id`.
+async fn roster_user_info(
+    clients: &RedisClients,
+    keys: &Keys,
+    channel: &str,
+    user_id: &str,
+) -> Option<String> {
+    clients
+        .pool
+        .next()
+        .hget(keys.presinfo(TEST_APP, channel), user_id)
+        .await
+        .expect("hget presinfo")
+}
+
+/// The seats recorded for `user_id`, as the packed `token\nuser_info\n` blob.
+async fn seats_of(
+    clients: &RedisClients,
+    keys: &Keys,
+    channel: &str,
+    user_id: &str,
+) -> Option<String> {
+    clients
+        .pool
+        .next()
+        .hget(keys.presseats(TEST_APP, channel), user_id)
+        .await
+        .expect("hget presseats")
+}
+
 /// Run the bridge's PRESENCE_LEAVE_LUA for `user_id`/`token`; returns the
 /// remaining refcount (the live path emits `member_removed` iff it is `== 0`).
 async fn run_presence_leave(
@@ -2789,6 +2919,7 @@ async fn run_presence_leave(
                 keys.presusers(TEST_APP, channel),
                 keys.presinfo(TEST_APP, channel),
                 keys.presmembers(TEST_APP, channel),
+                keys.presseats(TEST_APP, channel),
             ],
             vec![user_id.to_string(), token.to_string()],
         )
@@ -2814,6 +2945,7 @@ async fn run_reap_member(
                 keys.presusers(TEST_APP, channel),
                 keys.presinfo(TEST_APP, channel),
                 keys.presmembers(TEST_APP, channel),
+                keys.presseats(TEST_APP, channel),
             ],
             vec![token.to_string()],
         )
@@ -2822,8 +2954,9 @@ async fn run_reap_member(
 }
 
 /// Seed the presence state `user_id`'s connections produce: `presmembers`
-/// token→user_id for each token, `presusers` user_id→`count`, `presinfo`
-/// user_id→user_info (what PRESENCE_JOIN_LUA leaves behind).
+/// token→user_id for each token, `presseats` user_id→each token's seat in join
+/// order, `presusers` user_id→`count`, `presinfo` user_id→user_info (what
+/// PRESENCE_JOIN_LUA leaves behind).
 async fn seed_presence_user(
     clients: &RedisClients,
     keys: &Keys,
@@ -2833,6 +2966,8 @@ async fn seed_presence_user(
     count: i64,
 ) {
     let pool = clients.pool.next();
+    let info = format!(r#"{{"name":"{user_id}"}}"#);
+    let mut seats = String::new();
     for token in tokens {
         let _: () = pool
             .hset(
@@ -2841,7 +2976,15 @@ async fn seed_presence_user(
             )
             .await
             .expect("hset presmembers");
+        seats.push_str(&format!("{token}\n{info}\n"));
     }
+    let _: () = pool
+        .hset(
+            keys.presseats(TEST_APP, channel),
+            (user_id.to_string(), seats),
+        )
+        .await
+        .expect("hset presseats");
     let _: () = pool
         .hset(
             keys.presusers(TEST_APP, channel),
@@ -2852,7 +2995,7 @@ async fn seed_presence_user(
     let _: () = pool
         .hset(
             keys.presinfo(TEST_APP, channel),
-            (user_id.to_string(), format!(r#"{{"name":"{user_id}"}}"#)),
+            (user_id.to_string(), info),
         )
         .await
         .expect("hset presinfo");
@@ -2865,6 +3008,7 @@ async fn assert_presence_fully_reclaimed(clients: &RedisClients, keys: &Keys, ch
         keys.presusers(TEST_APP, channel),
         keys.presinfo(TEST_APP, channel),
         keys.presmembers(TEST_APP, channel),
+        keys.presseats(TEST_APP, channel),
     ] {
         let len: i64 = clients.pool.next().hlen(&key).await.expect("hlen");
         assert_eq!(len, 0, "presence hash {key} must be empty");
@@ -3048,6 +3192,237 @@ async fn reap_cas_ghost_token_reaped_without_emission() {
     })
     .await
     .expect("reap CAS ghost-token test must not hang (Redis up?)");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #79 — the cluster roster re-seat. `presinfo` kept whichever connection
+// wrote it first, cluster-wide, forever, so a clustered deployment advertised
+// metadata no live connection had presented while the node-local roster (#63)
+// re-seated. These drive the scripts directly, in the orderings the adapter
+// cannot make deterministic.
+// ---------------------------------------------------------------------------
+
+/// The roster entry follows the user's OLDEST LIVE connection, exactly as
+/// `ChannelState` does node-locally: a later connection never displaces the seat,
+/// removing a later connection leaves it alone, and the seeding connection's
+/// departure hands it to the next-oldest survivor — not to the newest, and not to
+/// the departed value.
+#[tokio::test]
+async fn presence_leave_reseats_the_roster_on_the_oldest_surviving_connection() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let scripts = Scripts::new();
+        let clients = RedisClients::connect(&test_redis_url(), 2)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let channel = format!("presence-reseat-{}", Uuid::new_v4());
+
+        for (token, info) in [
+            ("n1:s1", r#"{"name":"Old"}"#),
+            ("n2:s2", r#"{"name":"Middle"}"#),
+            ("n3:s3", r#"{"name":"New"}"#),
+        ] {
+            run_presence_join(&scripts, &clients.pool, &keys, &channel, "u1", token, info).await;
+        }
+        assert_eq!(
+            roster_user_info(&clients, &keys, &channel, "u1")
+                .await
+                .as_deref(),
+            Some(r#"{"name":"Old"}"#),
+            "a later connection must not displace the oldest connection's seat"
+        );
+
+        let left =
+            run_presence_leave(&scripts, &clients.pool, &keys, &channel, "u1", "n2:s2").await;
+        assert_eq!(left, 2, "a middle connection leaving is not the →0 edge");
+        assert_eq!(
+            roster_user_info(&clients, &keys, &channel, "u1")
+                .await
+                .as_deref(),
+            Some(r#"{"name":"Old"}"#),
+            "removing a connection that never held the seat must not move it"
+        );
+
+        let left =
+            run_presence_leave(&scripts, &clients.pool, &keys, &channel, "u1", "n1:s1").await;
+        assert_eq!(left, 1, "the user still holds its newest connection");
+        assert_eq!(
+            roster_user_info(&clients, &keys, &channel, "u1")
+                .await
+                .as_deref(),
+            Some(r#"{"name":"New"}"#),
+            "with the seeding connection gone the roster must carry the survivor's value"
+        );
+
+        let left =
+            run_presence_leave(&scripts, &clients.pool, &keys, &channel, "u1", "n3:s3").await;
+        assert_eq!(left, 0, "the last leave owns the member_removed edge");
+        assert_presence_fully_reclaimed(&clients, &keys, &channel).await;
+    })
+    .await
+    .expect("presence re-seat test must not hang (Redis up?)");
+}
+
+/// The seeding connection can also vanish without a leave — its node crashed and
+/// the sweeper reaps its token. That path re-seats the roster too, or a crash would
+/// pin the roster on the dead connection's value for as long as the user survives.
+#[tokio::test]
+async fn reap_member_reseats_the_roster_when_the_seeding_connection_crashed() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let scripts = Scripts::new();
+        let clients = RedisClients::connect(&test_redis_url(), 2)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let channel = format!("presence-reseat-{}", Uuid::new_v4());
+
+        run_presence_join(
+            &scripts,
+            &clients.pool,
+            &keys,
+            &channel,
+            "u1",
+            "deadnode:s1",
+            r#"{"name":"Old"}"#,
+        )
+        .await;
+        run_presence_join(
+            &scripts,
+            &clients.pool,
+            &keys,
+            &channel,
+            "u1",
+            "n2:s2",
+            r#"{"name":"New"}"#,
+        )
+        .await;
+
+        let (user_id, left, won) =
+            run_reap_member(&scripts, &clients.pool, &keys, &channel, "deadnode:s1").await;
+        assert_eq!(
+            (user_id.as_str(), left, won),
+            ("u1", 1, 0),
+            "reaping one connection of a still-present user is a plain decrement"
+        );
+        assert_eq!(
+            roster_user_info(&clients, &keys, &channel, "u1")
+                .await
+                .as_deref(),
+            Some(r#"{"name":"New"}"#),
+            "the reap must re-seat the roster on the surviving connection"
+        );
+    })
+    .await
+    .expect("presence reap re-seat test must not hang (Redis up?)");
+}
+
+/// Mixed fleet, old writer → new reader: a user whose connections were all recorded
+/// by a node that predates `presseats` has no seat to re-seat from. The leave must
+/// leave `presinfo` exactly as it found it — the pre-`presseats` behaviour — rather
+/// than blanking the roster entry of a user who is still present.
+#[tokio::test]
+async fn a_roster_with_no_recorded_seats_keeps_its_value_through_a_leave() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let scripts = Scripts::new();
+        let clients = RedisClients::connect(&test_redis_url(), 2)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let channel = format!("presence-reseat-{}", Uuid::new_v4());
+
+        seed_presence_user(&clients, &keys, &channel, "u1", &["n1:s1", "n2:s2"], 2).await;
+        let _: () = clients
+            .pool
+            .next()
+            .del(keys.presseats(TEST_APP, &channel))
+            .await
+            .expect("raw DEL presseats must succeed");
+
+        let left =
+            run_presence_leave(&scripts, &clients.pool, &keys, &channel, "u1", "n1:s1").await;
+        assert_eq!(left, 1, "the user still holds its other connection");
+        assert_eq!(
+            roster_user_info(&clients, &keys, &channel, "u1")
+                .await
+                .as_deref(),
+            Some(r#"{"name":"u1"}"#),
+            "with no seat recorded the roster value must be left untouched"
+        );
+        assert_eq!(
+            seats_of(&clients, &keys, &channel, "u1").await,
+            None,
+            "a leave must not invent a seat for a connection it never saw join"
+        );
+    })
+    .await
+    .expect("seatless roster test must not hang (Redis up?)");
+}
+
+/// Mixed fleet, new writer → old leaver: a node that predates `presseats` removes a
+/// connection from `presmembers` and decrements the refcount, leaving that
+/// connection's seat behind. `presmembers` is the liveness truth, so the orphaned
+/// seat must never be seated — and must be collected on the way past.
+#[tokio::test]
+async fn a_seat_orphaned_by_a_writer_that_records_none_is_pruned_not_seated() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let scripts = Scripts::new();
+        let clients = RedisClients::connect(&test_redis_url(), 2)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let channel = format!("presence-reseat-{}", Uuid::new_v4());
+
+        for (token, info) in [
+            ("n1:s1", r#"{"name":"Old"}"#),
+            ("n2:s2", r#"{"name":"New"}"#),
+        ] {
+            run_presence_join(&scripts, &clients.pool, &keys, &channel, "u1", token, info).await;
+        }
+
+        // The older node's leave of n1:s1, verbatim: its script's two writes, and
+        // no seat removal because its script knows of no seats.
+        let pool = clients.pool.next();
+        let _: () = pool
+            .hdel(keys.presmembers(TEST_APP, &channel), "n1:s1")
+            .await
+            .expect("raw HDEL presmembers must succeed");
+        let _: i64 = pool
+            .hincrby(keys.presusers(TEST_APP, &channel), "u1", -1)
+            .await
+            .expect("raw HINCRBY presusers must succeed");
+
+        run_presence_join(
+            &scripts,
+            &clients.pool,
+            &keys,
+            &channel,
+            "u1",
+            "n3:s3",
+            r#"{"name":"Third"}"#,
+        )
+        .await;
+        let left =
+            run_presence_leave(&scripts, &clients.pool, &keys, &channel, "u1", "n3:s3").await;
+        assert_eq!(left, 1, "only the departed node's connection is gone");
+        assert_eq!(
+            roster_user_info(&clients, &keys, &channel, "u1")
+                .await
+                .as_deref(),
+            Some(r#"{"name":"New"}"#),
+            "the orphaned seat must not be chosen over the oldest LIVE connection"
+        );
+        assert_eq!(
+            seats_of(&clients, &keys, &channel, "u1").await.as_deref(),
+            Some("n2:s2\n{\"name\":\"New\"}\n"),
+            "the orphaned seat must be collected, leaving only live connections"
+        );
+    })
+    .await
+    .expect("orphaned seat test must not hang (Redis up?)");
 }
 
 /// Poll `SISMEMBER key member` until Redis reports membership or `timeout` elapses.
