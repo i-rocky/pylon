@@ -57,3 +57,67 @@ pub async fn authenticate(
     .map_err(|e| RestError::unauthorized(e.message(state.config.rest_auth_window_secs)))?;
     Ok((*app).clone())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{AppLookupError, AppManager};
+    use crate::server::router::AppState;
+    use std::sync::Arc;
+
+    /// An app store that is reachable but broken — every lookup is a transient
+    /// backend error, never a verdict about the app.
+    struct BrokenStore;
+
+    #[async_trait::async_trait]
+    impl AppManager for BrokenStore {
+        async fn by_id(&self, _id: &str) -> Result<crate::app::AppLookup, AppLookupError> {
+            Err(AppLookupError::Backend("connection refused".into()))
+        }
+        async fn by_key(&self, _key: &str) -> Result<crate::app::AppLookup, AppLookupError> {
+            Err(AppLookupError::Backend("connection refused".into()))
+        }
+    }
+
+    fn state_over(apps: Arc<dyn AppManager>) -> AppState {
+        AppState {
+            config: crate::server::config::ServerConfig::default(),
+            apps,
+            adapter: Arc::new(crate::adapter::local::LocalAdapter::new(
+                Arc::new(crate::channel::registry::Registry::new()),
+                Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+            )),
+            conn_counts: Arc::new(dashmap::DashMap::new()),
+            webhooks: crate::webhook::WebhookHandle::null(),
+            saturated: None,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cluster_metrics: None,
+            invalidator: None,
+        }
+    }
+
+    /// A store OUTAGE must not be reported as an auth verdict. 401 would tell a
+    /// legitimate caller its credentials are wrong and 403 that its app is
+    /// disabled; both are lies that make an operator debug the wrong thing. The
+    /// documented answer is 503 — retry, the server is degraded.
+    #[tokio::test]
+    async fn a_transient_app_store_failure_is_503_not_an_auth_verdict() {
+        let state = state_over(Arc::new(BrokenStore));
+        let err = authenticate(
+            &state,
+            "app1",
+            "POST",
+            "/apps/app1/events",
+            &HashMap::new(),
+            b"",
+        )
+        .await
+        .expect_err("a broken app store must not authenticate the request");
+
+        assert_eq!(
+            err.status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "an app-store outage is a 503, never a 401/403 auth verdict"
+        );
+    }
+}
