@@ -1333,7 +1333,8 @@ async fn client_event_on_presence_includes_user_id_webhook() {
     assert_eq!(ev["name"], "client_event");
     assert_eq!(ev["channel"], "presence-room");
     assert_eq!(ev["event"], "client-msg");
-    assert_eq!(ev["data"], serde_json::json!({"hello":"world"}));
+    // pusher-http-node 5.3.4 index.d.ts declares `data: string`.
+    assert_eq!(ev["data"], "{\"hello\":\"world\"}");
     assert_eq!(ev["socket_id"], "9.9");
     assert_eq!(ev["user_id"], "u1", "presence sender carries user_id");
 }

@@ -109,7 +109,12 @@ impl WebhookEvent {
                 obj.insert("name".into(), Value::String("client_event".into()));
                 obj.insert("channel".into(), Value::String(channel.clone()));
                 obj.insert("event".into(), Value::String(event.clone()));
-                obj.insert("data".into(), data.clone());
+                // pusher-http-node 5.3.4 index.d.ts declares `data: string`; never double-encode.
+                let data_text = match data {
+                    Value::String(already_text) => already_text.clone(),
+                    value => value.to_string(),
+                };
+                obj.insert("data".into(), Value::String(data_text));
                 obj.insert("socket_id".into(), Value::String(socket_id.clone()));
                 if let Some(uid) = user_id {
                     obj.insert("user_id".into(), Value::String(uid.clone()));
@@ -226,7 +231,7 @@ mod tests {
                 "name": "client_event",
                 "channel": "private-c",
                 "event": "client-msg",
-                "data": {"k":"v"},
+                "data": "{\"k\":\"v\"}",
                 "socket_id": "123.456"
             })
         );
@@ -237,13 +242,12 @@ mod tests {
     }
 
     #[test]
-    fn client_event_includes_user_id_when_present_and_data_verbatim() {
+    fn client_event_includes_user_id_when_present() {
         let v = WebhookEvent::ClientEvent {
             app: "a".into(),
             channel: "presence-c".into(),
             event: "client-msg".into(),
-            // a JSON STRING payload must survive verbatim (not re-parsed).
-            data: Value::String("{\"raw\":1}".into()),
+            data: json!({"raw":1}),
             socket_id: "9.9".into(),
             user_id: Some("u7".into()),
         }
@@ -258,6 +262,61 @@ mod tests {
                 "socket_id": "9.9",
                 "user_id": "u7"
             })
+        );
+    }
+
+    fn client_event_data(data: Value) -> Value {
+        WebhookEvent::ClientEvent {
+            app: "a".into(),
+            channel: "private-c".into(),
+            event: "client-msg".into(),
+            data,
+            socket_id: "1.2".into(),
+            user_id: None,
+        }
+        .to_json()
+        .get("data")
+        .cloned()
+        .expect("client_event always carries data")
+    }
+
+    /// pusher-http-node 5.3.4 `index.d.ts` declares the webhook event's `data`
+    /// as `string`, and its `lib/webhook.js` never touches the field — so a
+    /// consumer receives text and parses it itself. Every shape a client can
+    /// put in a `client-*` frame must therefore arrive encoded, not as a value.
+    #[test]
+    fn client_event_data_is_encoded_text_for_every_payload_shape() {
+        for (payload, expected) in [
+            (json!({"msg":"hi"}), "{\"msg\":\"hi\"}"),
+            (json!([1, "two", null]), "[1,\"two\",null]"),
+            (json!(42), "42"),
+            (json!(1.5), "1.5"),
+            (json!(true), "true"),
+            (json!(false), "false"),
+            (Value::Null, "null"),
+        ] {
+            let got = client_event_data(payload.clone());
+            assert!(
+                got.is_string(),
+                "data must be a JSON string for payload {payload}, got {got}"
+            );
+            assert_eq!(got, Value::String(expected.into()), "payload {payload}");
+        }
+    }
+
+    #[test]
+    fn client_event_string_data_is_not_double_encoded() {
+        assert_eq!(
+            client_event_data(Value::String("{\"raw\":1}".into())),
+            Value::String("{\"raw\":1}".into())
+        );
+        assert_eq!(
+            client_event_data(Value::String("hi".into())),
+            Value::String("hi".into())
+        );
+        assert_eq!(
+            client_event_data(Value::String(String::new())),
+            Value::String(String::new())
         );
     }
 }

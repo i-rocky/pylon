@@ -594,8 +594,7 @@ const WEBHOOK_PROBE_MARKER = 'cf-s-webhook';
 const isNonEmptyString = (v) => typeof v === 'string' && v.length > 0;
 
 // https://pusher.com/docs/channels/server_api/webhooks/ — the payload keys
-// each `name` carries, and the shape of each key's value. `data` is the
-// client's own event payload, so only its presence is pinned.
+// each `name` carries, and the shape of each key's value.
 const WEBHOOK_PAYLOAD_KEYS = {
   channel_occupied: { required: ['channel'], optional: [] },
   channel_vacated: { required: ['channel'], optional: [] },
@@ -615,7 +614,10 @@ const WEBHOOK_FIELD_SHAPES = {
   event: isNonEmptyString,
   socket_id: (v) => typeof v === 'string' && /^\d+\.\d+$/.test(v),
   subscription_count: (v) => Number.isInteger(v) && v >= 0,
-  data: (v) => v !== undefined,
+  // pusher-http-node 5.3.4 index.d.ts declares the webhook event's `data` as
+  // `string`, and lib/webhook.js never touches it: the client's own payload
+  // arrives ENCODED, for the consumer to JSON.parse itself.
+  data: (v) => typeof v === 'string',
 };
 
 // Why this event does not match the documented shape for its `name`, or null.
