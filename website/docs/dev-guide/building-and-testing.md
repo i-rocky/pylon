@@ -10,7 +10,7 @@ installs the exact compiler, rustfmt, and clippy versions used by CI.
 
 ```toml
 [toolchain]
-channel = "1.96.0"
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
 ```

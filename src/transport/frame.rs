@@ -207,18 +207,14 @@ fn unmask(data: &mut [u8], key: [u8; 4]) {
         key[0], key[1], key[2], key[3], key[0], key[1], key[2], key[3],
     ]);
 
-    let mut chunks = data.chunks_exact_mut(8);
-    for chunk in &mut chunks {
-        let word = u64::from_le_bytes([
-            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-        ]);
-        let out = (word ^ key64).to_le_bytes();
-        chunk.copy_from_slice(&out);
+    let (chunks, tail) = data.as_chunks_mut::<8>();
+    for chunk in chunks {
+        *chunk = (u64::from_le_bytes(*chunk) ^ key64).to_le_bytes();
     }
 
     // Scalar tail (0..7 bytes). The tail starts at an offset that is a multiple
     // of 8, hence a multiple of 4, so byte i of the tail uses key[i % 4].
-    for (i, byte) in chunks.into_remainder().iter_mut().enumerate() {
+    for (i, byte) in tail.iter_mut().enumerate() {
         *byte ^= key[i % 4];
     }
 }

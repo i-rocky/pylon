@@ -3342,7 +3342,7 @@ mod tests {
         assert_eq!(msg.into_text().unwrap(), "hello");
 
         // A ping must be answered with a pong carrying the same payload.
-        ws.send(Message::Ping(b"ping-payload".to_vec()))
+        ws.send(Message::Ping(b"ping-payload".as_slice().into()))
             .await
             .expect("send ping");
         // tungstenite auto-responds to pongs at the protocol layer, so drive the

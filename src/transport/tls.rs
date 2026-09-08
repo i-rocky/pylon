@@ -1,19 +1,14 @@
 //! rustls `ServerConfig` loader for native TLS support (Part A foundation).
 //!
-//! This module is the **only** place in pylon that touches rustls directly.
+//! This module is the **only** place in pylon that builds a rustls `ServerConfig`.
 //! It exposes two public entry points:
 //!
 //! - [`load_server_config`]: build an `Arc<rustls::ServerConfig>` from PEM files.
 //! - [`resolve_tls`]: the high-level helper that interprets the three config knobs
 //!   (`tls_cert_path`, `tls_key_path`, `tls_ca_path`) and either returns a ready
 //!   `ServerConfig`, plain-mode `None`, or a fatal `Err` on misconfiguration.
-//!
-//! # CryptoProvider note
-//! rustls 0.23 requires a process-global `CryptoProvider` to be installed before
-//! any `ServerConfig` is built.  `load_server_config` calls
-//! `rustls::crypto::ring::default_provider().install_default()` and silently
-//! ignores the `Err(AlreadyInstalled)` return value, so the call is idempotent
-//! whether reqwest/fred have already installed a provider or not.
+//! - [`install_crypto_provider`]: pylon's one rustls backend, for any process
+//!   that reaches rustls without going through `load_server_config`.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -22,6 +17,18 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig as RustlsServerConfig;
+
+/// Install `ring` as this process's rustls `CryptoProvider`, pylon's one TLS
+/// backend. Idempotent — a provider installed earlier keeps its place.
+///
+/// rustls 0.23 needs a process-global provider before a `ServerConfig` is built,
+/// and reqwest (`rustls-no-provider`) reads the same slot and PANICS when it is
+/// empty. Anything that reaches rustls without going through
+/// [`load_server_config`] — a reqwest client, an embedder, a test harness — must
+/// call this first.
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
 
 /// Build a `rustls::ServerConfig` from PEM cert chain + private key files.
 ///
@@ -41,10 +48,7 @@ pub fn load_server_config(
     ca_path: Option<&str>,
 ) -> anyhow::Result<Arc<RustlsServerConfig>> {
     // ── 1. Ensure a CryptoProvider is installed ──────────────────────────────
-    // rustls 0.23 requires a process-default `CryptoProvider` before any
-    // `ServerConfig` can be built. `install_default()` is idempotent: it returns
-    // `Err(Arc<CryptoProvider>)` when one is already installed, which we ignore.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    install_crypto_provider();
 
     // ── 2. Load the certificate chain ────────────────────────────────────────
     let cert_file = File::open(cert_path)
@@ -187,7 +191,7 @@ mod tests {
 
         let mut key_file = File::create(&key_path).expect("create temp key file");
         key_file
-            .write_all(cert.key_pair.serialize_pem().as_bytes())
+            .write_all(cert.signing_key.serialize_pem().as_bytes())
             .expect("write key PEM");
 
         (cert_path, key_path)
@@ -295,19 +299,18 @@ mod tests {
         path
     }
 
-    /// Generate a CA cert + a server cert signed by that CA using rcgen 0.13.
+    /// Generate a CA cert + a server cert signed by that CA.
     /// Returns `(ca_cert_pem, server_cert_pem, server_key_pem)`.
     fn generate_ca_and_server_cert() -> (String, String, String) {
-        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 
         // CA key + cert
         let ca_key = KeyPair::generate().expect("rcgen: CA key");
         let mut ca_params =
             CertificateParams::new(vec!["pylon-test-ca".to_string()]).expect("rcgen: CA params");
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let ca_cert = ca_params
-            .self_signed(&ca_key)
-            .expect("rcgen: CA self-signed cert");
+        let ca =
+            CertifiedIssuer::self_signed(ca_params, ca_key).expect("rcgen: CA self-signed cert");
 
         // Server leaf key + cert signed by CA
         let server_key = KeyPair::generate().expect("rcgen: server key");
@@ -315,10 +318,10 @@ mod tests {
             CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
                 .expect("rcgen: server params");
         let server_cert = server_params
-            .signed_by(&server_key, &ca_cert, &ca_key)
+            .signed_by(&server_key, &ca)
             .expect("rcgen: server cert signed by CA");
 
-        (ca_cert.pem(), server_cert.pem(), server_key.serialize_pem())
+        (ca.pem(), server_cert.pem(), server_key.serialize_pem())
     }
 
     // ── mTLS tests ────────────────────────────────────────────────────────────

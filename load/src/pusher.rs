@@ -1,4 +1,4 @@
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest, Md5};
 use serde_json::{json, Value};
 use sha2::Sha256;
@@ -265,7 +265,7 @@ pub async fn run_client(
     } else {
         None
     };
-    ws.send(Message::Text(subscribe_frame(
+    ws.send(Message::text(subscribe_frame(
         &cfg.channel,
         auth.as_deref(),
         None,
@@ -284,7 +284,7 @@ pub async fn run_client(
                                 Counters::inc(&counters.subscribed);
                             }
                             "pusher:ping" => {
-                                ws.send(Message::Text(pong_frame())).await.ok();
+                                ws.send(Message::text(pong_frame())).await.ok();
                             }
                             _ => {
                                 if let Some(data) = f.data.as_deref() {

@@ -112,6 +112,9 @@ async fn spawn() -> Harness {
 /// Start a percore harness from an explicit `config` (so a test can set the SP10
 /// budget/cap knobs directly without touching process-global env).
 async fn spawn_with(config: ServerConfig) -> Harness {
+    // reqwest here is pylon's `rustls-no-provider` build: it panics unless the
+    // process already has a rustls provider.
+    pylon::transport::tls::install_crypto_provider();
     let port = config.port;
 
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
@@ -202,7 +205,7 @@ async fn next_json(ws: &mut Ws) -> Value {
 /// Subscribe `ws` to a PUBLIC channel (no auth) and drain its
 /// `subscription_succeeded`.
 async fn subscribe_public(ws: &mut Ws, channel: &str) {
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({
             "event": "pusher:subscribe",
             "data": { "channel": channel }
@@ -909,7 +912,7 @@ async fn backpressured_connection_does_not_spin_and_backlog_survives() {
         let mut slow = connect_plain(h.port).await;
         let est = next_json_raw(&mut slow).await;
         assert_eq!(est["event"], "pusher:connection_established");
-        slow.send(Message::Text(
+        slow.send(Message::text(
             json!({
                 "event": "pusher:subscribe",
                 "data": { "channel": channel }

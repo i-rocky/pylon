@@ -19,6 +19,9 @@ const APPS: &str = r#"[
 /// Spawn a full percore node (1 worker) with a live REST plane on a random port.
 /// Returns the bound `SocketAddr`.
 async fn spawn() -> SocketAddr {
+    // reqwest here is pylon's `rustls-no-provider` build: it panics unless the
+    // process already has a rustls provider.
+    pylon::transport::tls::install_crypto_provider();
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
     let local = Arc::new(LocalAdapter::new(
         Arc::new(Registry::new()),

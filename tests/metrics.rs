@@ -28,6 +28,9 @@ async fn spawn() -> SocketAddr {
 /// Spawn a server whose `ServerConfig.metrics_token` is optionally set (S1):
 /// `None` keeps today's open /metrics; `Some(t)` arms the bearer gate.
 async fn spawn_with_metrics_token(token: Option<&str>) -> SocketAddr {
+    // reqwest here is pylon's `rustls-no-provider` build: it panics unless the
+    // process already has a rustls provider.
+    pylon::transport::tls::install_crypto_provider();
     use std::sync::atomic::AtomicBool;
 
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
@@ -168,7 +171,7 @@ async fn metrics_per_app_gauges_reflect_subscription() {
     let _ = next_json(&mut ws).await; // connection_established
 
     // Subscribe to a channel.
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({"event":"pusher:subscribe","data":{"channel":"public-metrics-room"}}).to_string(),
     ))
     .await

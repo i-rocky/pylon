@@ -74,6 +74,9 @@ fn free_port() -> u16 {
 /// `LocalAdapter` (sharded sink installed by `run_percore`) and a REST plane
 /// served on the test's tokio runtime. Waits for the listeners to bind.
 async fn spawn() -> Harness {
+    // reqwest here is pylon's `rustls-no-provider` build: it panics unless the
+    // process already has a rustls provider.
+    pylon::transport::tls::install_crypto_provider();
     let port = free_port();
     let config = ServerConfig {
         bind: "127.0.0.1".to_string(),
@@ -218,7 +221,7 @@ async fn sharded_broadcast_reaches_all_workers_and_excludes_sender() {
     for _ in 0..N_SUBS {
         let mut ws = connect(h.port).await;
         let sid = established_socket_id(&mut ws).await;
-        ws.send(Message::Text(
+        ws.send(Message::text(
             json!({
                 "event": "pusher:subscribe",
                 "data": { "channel": channel, "auth": auth_token(&sid, channel) }
@@ -257,7 +260,7 @@ async fn sharded_broadcast_reaches_all_workers_and_excludes_sender() {
         assert_eq!(frame["data"], "{\"hi\":1}", "subscriber {i} wrong data");
         // Exactly once: no second copy should be queued. A ping round-trip proves
         // the next frame is the pong, not a duplicate delivery.
-        ws.send(Message::Text(
+        ws.send(Message::text(
             json!({"event":"pusher:ping","data":{}}).to_string(),
         ))
         .await
@@ -273,7 +276,7 @@ async fn sharded_broadcast_reaches_all_workers_and_excludes_sender() {
     // subs[0] emits; subs[1..] must receive; subs[0] must NOT (its next frame is
     // a pong, proving no self-echo).
     subs[0]
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "event": "client-foo",
                 "channel": channel,
@@ -296,7 +299,7 @@ async fn sharded_broadcast_reaches_all_workers_and_excludes_sender() {
 
     // The sender gets a pong, never its own client-foo echo.
     subs[0]
-        .send(Message::Text(
+        .send(Message::text(
             json!({"event":"pusher:ping","data":{}}).to_string(),
         ))
         .await

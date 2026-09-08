@@ -56,6 +56,9 @@ async fn spawn_with_apps(apps_json: &str) -> SocketAddr {
 /// [`spawn_with_apps`] plus a [`ServerConfig`] tuning hook — e.g. a short
 /// `cache_ttl_secs` for expired-cache tests.
 async fn spawn_configured(apps_json: &str, with: impl FnOnce(&mut ServerConfig)) -> SocketAddr {
+    // reqwest here is pylon's `rustls-no-provider` build: it panics unless the
+    // process already has a rustls provider.
+    pylon::transport::tls::install_crypto_provider();
     use std::sync::atomic::AtomicBool;
 
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(apps_json).unwrap());
@@ -221,7 +224,7 @@ async fn subscribe_presence(ws: &mut Ws, socket_id: &str, channel: &str, user_id
         "app-key:{}",
         channel_signature(SECRET, socket_id, channel, Some(&channel_data))
     );
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({"event":"pusher:subscribe","data":{
             "channel": channel, "auth": token, "channel_data": channel_data
         }})
@@ -234,7 +237,7 @@ async fn subscribe_presence(ws: &mut Ws, socket_id: &str, channel: &str, user_id
 
 /// Subscribe `ws` to a public channel and consume the success frame.
 async fn subscribe_public(ws: &mut Ws, channel: &str) {
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({"event":"pusher:subscribe","data":{"channel":channel}}).to_string(),
     ))
     .await
@@ -247,7 +250,7 @@ async fn rest_trigger_delivers_to_subscriber() {
     let addr = spawn().await;
     let mut ws = connect_ws(addr).await;
     let _ = next_json(&mut ws).await; // established
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({"event":"pusher:subscribe","data":{"channel":"public-room"}}).to_string(),
     ))
     .await
@@ -294,7 +297,7 @@ async fn rest_get_channel_reports_occupancy() {
     let addr = spawn().await;
     let mut ws = connect_ws(addr).await;
     let _ = next_json(&mut ws).await;
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({"event":"pusher:subscribe","data":{"channel":"public-room"}}).to_string(),
     ))
     .await
@@ -328,7 +331,7 @@ async fn rest_get_channel_subscription_count_enabled() {
     let addr = spawn().await;
     let mut ws = connect_ws2(addr).await;
     let _ = next_json(&mut ws).await;
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({"event":"pusher:subscribe","data":{"channel":"public-room"}}).to_string(),
     ))
     .await
@@ -966,7 +969,7 @@ async fn rest_get_users_lists_presence_members() {
         "app-key:{}",
         channel_signature(SECRET, &socket_id, channel, Some(&channel_data))
     );
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({"event":"pusher:subscribe","data":{
             "channel": channel, "auth": token, "channel_data": channel_data
         }})
@@ -1001,7 +1004,7 @@ async fn rest_trigger_relays_to_encrypted_subscriber() {
         "app-key:{}",
         channel_signature(SECRET, &socket_id, channel, None)
     );
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({"event":"pusher:subscribe","data":{"channel":channel,"auth":token}}).to_string(),
     ))
     .await
@@ -1145,7 +1148,7 @@ async fn rest_trigger_caches_event_for_later_subscriber() {
     // A new subscriber gets subscription_succeeded, then the replayed cached event.
     let mut ws = connect_ws(addr).await;
     let _ = next_json(&mut ws).await; // established
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({"event":"pusher:subscribe","data":{"channel":"cache-feed"}}).to_string(),
     ))
     .await
@@ -1163,7 +1166,7 @@ async fn cache_subscribe_with_no_cache_emits_cache_miss() {
     let addr = spawn().await;
     let mut ws = connect_ws(addr).await;
     let _ = next_json(&mut ws).await; // established
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({"event":"pusher:subscribe","data":{"channel":"cache-empty"}}).to_string(),
     ))
     .await
@@ -1198,7 +1201,7 @@ async fn private_cache_subscribe_replays_after_auth() {
         "app-key:{}",
         channel_signature(SECRET, &socket_id, "private-cache-x", None)
     );
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({"event":"pusher:subscribe","data":{"channel":"private-cache-x","auth":token}})
             .to_string(),
     ))

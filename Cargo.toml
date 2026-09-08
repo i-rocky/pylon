@@ -37,15 +37,15 @@ slab = "0.4"
 # tokio runtime (SP9 REST handoff): auto HTTP/1+2 server + tower→hyper glue.
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "service", "http1", "http2"] }
 # RFC 6455 Sec-WebSocket-Accept = base64(sha1(key + GUID)).
-sha1 = "0.10"
+sha1 = "0.11"
 base64 = "0.23.1"
 # JSON
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Pusher signature primitives
-hmac = "0.12"
-sha2 = "0.10"
-md-5 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
+md-5 = "0.11"
 hex = "0.4"
 subtle = "2.6"          # constant-time comparison
 # Misc
@@ -54,7 +54,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dashmap = "6"           # sharded concurrent map for the channel registry
 async-trait = "0.1"
-rand = "0.8"
+rand = "0.10"
 futures-util = "0.3"
 # Synchronous `block_on` to drive the async protocol dispatch from the
 # readiness-driven (non-async) per-core worker loop (SP9). LocalAdapter's async
@@ -65,7 +65,9 @@ thiserror = "2.0.20"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pemfile = "2"
 # Outbound HTTP for webhook delivery. rustls (no OpenSSL system dep) to reach https endpoints.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `rustls-no-provider`, NOT `rustls`: the latter links aws-lc-rs as a second crypto
+# backend alongside the ring provider this crate installs process-globally.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 # Redis client for the scaling adapter
 fred = { version = "10", default-features = false, features = ["subscriber-client", "i-pubsub", "i-scripts", "i-std", "sha-1", "enable-rustls"] }
 uuid = { version = "1", features = ["v4"] }
@@ -83,7 +85,7 @@ core_affinity = "0.8"
 # (SP9 fan-out): the single-threaded mailbox.send loop caps large-channel fan-out.
 rayon = "1"
 # SQL app store backend (sqlx Any driver: SQLite now, MySQL/Postgres later by DSN)
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "any", "sqlite", "mysql", "postgres", "macros"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "any", "sqlite", "mysql", "postgres", "macros"] }
 # Two-tier app-manager cache: bounded in-process L1 with async single-flight + TTL.
 moka = { version = "0.12", features = ["future", "sync"] }
 # MongoDB app store backend (rustls, no OpenSSL; bson-2 + compat markers required by 3.x)
@@ -95,11 +97,11 @@ mongodb = { version = "3", default-features = false, features = ["rustls-tls", "
 # debug accessors like `percore_total_inflight_bytes`.
 pylon = { path = ".", features = ["test-hooks"] }
 # Self-signed cert generation for the TLS integration tests (never in production).
-rcgen = "0.13"
+rcgen = "0.14"
 # Enables paused-time control (`start_paused`, `tokio::time::advance`) in tests.
 tokio = { version = "1", features = ["test-util"] }
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
-criterion = "0.5"
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+criterion = "0.8"
 futures-util = "0.3"
 # Used by transport::conn tests to shrink SO_SNDBUF and force partial writes.
 socket2 = "0.6.5"

@@ -2,7 +2,7 @@
 //! Known-answer tests below are computed directly from the documented signing
 //! strings, e.g. a private-channel token signs `"<socket_id>:<channel>"`.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest, Md5};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
