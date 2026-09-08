@@ -4,7 +4,10 @@
 # ── Image ─────────────────────────────────────────────────────────────────────
 image:
   repository: ghcr.io/i-rocky/pylon
-  tag: "latest"
+  # Empty defaults to the chart's own Chart.yaml appVersion, so a given chart
+  # revision deploys a known, reproducible image. Set to "latest" (or any tag)
+  # to opt out of that pin explicitly.
+  tag: ""
   pullPolicy: IfNotPresent
 
 # ── Replicas ─────────────────────────────────────────────────────────────────

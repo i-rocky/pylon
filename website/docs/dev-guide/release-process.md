@@ -14,13 +14,24 @@ release workflow, which builds native binaries and a multi-arch container image.
     version = "1.2.3"
     ```
 
-2. **Commit** the version bump:
+2. **Bump `appVersion`** in `deploy/helm/pylon/Chart.yaml` to match:
+
+    ```yaml
+    appVersion: "1.2.3"
+    ```
+
+    The chart's `deployment.yaml` defaults `image.tag` to `.Chart.AppVersion`
+    when a values file does not set one, so this is what makes a chart
+    revision deploy the image this release actually builds instead of
+    whatever `latest` happens to point at.
+
+3. **Commit** the version bump:
 
     ```bash
     git commit -am "chore: release v1.2.3"
     ```
 
-3. **Tag and push:**
+4. **Tag and push:**
 
     ```bash
     git tag v1.2.3
