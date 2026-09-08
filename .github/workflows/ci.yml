@@ -173,3 +173,64 @@ jobs:
       # return, which would otherwise still report "1 passed".
       - name: Test (redis failover)
         run: cargo test --locked --test redis_failover -- --test-threads=1 --nocapture
+
+  # Rot detector for deploy/docker/Dockerfile (the from-source image): only
+  # Dockerfile.release was exercised anywhere, by the release workflow, so a
+  # broken manifest/COPY path here went unnoticed. Cheap on purpose — a plain
+  # single-arch build plus a smoke run, not a performance gate.
+  #
+  # Dockerfile.release is NOT built here: it does no cargo compilation (it
+  # only COPYs a prebuilt binary + apps.example.json), so it cannot hit the
+  # manifest-parse failure class this job guards against, and Cargo.toml pins
+  # `lto = true, codegen-units = 1` for --release — building it on every PR
+  # would trade that low rot risk for a slow compile on every push. It stays
+  # release-time-only; `workflow_dispatch` already lets it be validated
+  # on demand without publishing.
+  docker:
+    name: docker build (deploy/docker/Dockerfile)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # GHA-backed layer cache: the dependency-compile layer only invalidates
+      # when Cargo.toml/Cargo.lock/rust-toolchain.toml change, so most runs
+      # only pay for the final `COPY src` + compile step.
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          load: true
+          tags: pylon:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Proves the image is usable, not merely compilable: run it against the
+      # example apps config and hit /health + /ready over the published port.
+      - name: Smoke test
+        run: |
+          docker run -d --name pylon-smoke -p 7000:7000 \
+            -e PYLON_BIND=0.0.0.0 -e PYLON_PORT=7000 -e PYLON_ADAPTER=local \
+            -e PYLON_APPS_PATH=/etc/pylon/apps.json \
+            -v "$PWD/apps.example.json:/etc/pylon/apps.json:ro" \
+            pylon:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:7000/health >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          # Fail loud if the server never came up within the bounded loop above.
+          curl -fsS http://127.0.0.1:7000/health
+          curl -fsS http://127.0.0.1:7000/ready
+
+      - name: Container logs
+        if: always()
+        run: docker logs pylon-smoke || true
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f pylon-smoke || true
