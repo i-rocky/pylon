@@ -335,8 +335,21 @@ mod tests {
         let (handle, mut rx) = conn();
         local.signin_user("app1", "u7", handle).await;
 
+        // A frame-less UserSend ahead of the real one is skipped, not delivered
+        // as an empty frame.
+        let mut frameless = envelope(EnvelopeKind::UserSend, "node-other", "u7", "");
+        frameless.event = serde_json::Value::Null;
+        assert!(
+            frameless.frame().is_none(),
+            "fixture precondition: this envelope must carry no frame"
+        );
         let env = envelope(EnvelopeKind::UserSend, "node-other", "u7", "USER-FRAME");
-        drive(local, 16, vec![envelope_message(&env)]).await;
+        drive(
+            local,
+            16,
+            vec![envelope_message(&frameless), envelope_message(&env)],
+        )
+        .await;
 
         assert_eq!(
             drained(&mut rx),

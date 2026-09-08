@@ -685,6 +685,219 @@ async fn cluster_edges_for_an_app_that_vanished_fire_no_webhooks() {
     .expect("vanished-app edge test must not hang (Redis up?)");
 }
 
+/// An app store that resolves the known app but ERRORS for `flaky` — a store
+/// outage on one lookup, not a verdict about the app.
+struct FlakyApps(Arc<dyn AppManager>);
+
+#[async_trait::async_trait]
+impl AppManager for FlakyApps {
+    async fn by_id(&self, id: &str) -> Result<pylon::app::AppLookup, pylon::app::AppLookupError> {
+        if id == "flaky" {
+            return Err(pylon::app::AppLookupError::Backend("store down".into()));
+        }
+        self.0.by_id(id).await
+    }
+    async fn by_key(&self, key: &str) -> Result<pylon::app::AppLookup, pylon::app::AppLookupError> {
+        self.0.by_key(key).await
+    }
+}
+
+/// A cluster edge whose app LOOKUP FAILS is dropped, exactly like one whose app
+/// has vanished: the drain loop cannot know which webhooks the operator
+/// configured, and guessing would either spam an endpoint or invent one. Ordered
+/// behind a known app's edges on the one FIFO drain loop, so the silence is
+/// observed rather than merely waited for.
+#[tokio::test]
+async fn cluster_edges_are_dropped_when_the_app_store_errors() {
+    assert!(
+        redis_reachable(),
+        "cluster_bridge requires Redis; set PYLON_TEST_REDIS_URL (default redis://127.0.0.1:6390) — refusing to silently pass"
+    );
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let cfg = redis_test_config(&random_prefix());
+        let local = Arc::new(LocalAdapter::new(
+            Arc::new(Registry::new()),
+            Arc::new(pylon::adapter::app_registry::AppRegistry::new()),
+        ));
+        let (webhooks, recorder) = recording_webhooks();
+        let apps: Arc<dyn AppManager> = Arc::new(FlakyApps(webhook_apps()));
+        let bridge = bridge::start(&cfg, local, apps, Arc::new(Default::default()))
+            .expect("ClusterBridge::start must connect to the test Redis");
+        bridge.attach_webhooks(webhooks);
+        let handle = bridge.handle();
+
+        let flaky_sid = SocketId::generate();
+        let (_flaky_rx, flaky_mailbox) = mailbox_pair();
+        handle.subscribe(
+            Arc::from("flaky"),
+            Arc::from("public-f"),
+            flaky_sid,
+            flaky_mailbox,
+            true,
+        );
+        handle.unsubscribe(Arc::from("flaky"), Arc::from("public-f"), flaky_sid, true);
+        let (_, _, flaky_member) = presence_conn("fu");
+        let (_flaky_pres_rx, flaky_pres_mailbox) = mailbox_pair();
+        handle.presence_subscribe(
+            Arc::from("flaky"),
+            Arc::from("presence-f"),
+            flaky_member,
+            flaky_sid,
+            flaky_pres_mailbox,
+            true,
+        );
+        handle.presence_leave(
+            Arc::from("flaky"),
+            Arc::from("presence-f"),
+            "fu".to_string(),
+            flaky_sid,
+            true,
+        );
+
+        let sid = SocketId::generate();
+        let (_rx, mailbox) = mailbox_pair();
+        handle.subscribe(Arc::from("app"), Arc::from("public-o"), sid, mailbox, true);
+        handle.unsubscribe(Arc::from("app"), Arc::from("public-o"), sid, true);
+
+        assert_eq!(
+            await_sorted_webhooks(&recorder, 2).await,
+            ["channel_occupied", "channel_vacated"],
+            "only the resolvable app's edges may fire; the failing lookups produced none"
+        );
+
+        drop(bridge);
+    })
+    .await
+    .expect("app-store-error edge test must not hang (Redis up?)");
+}
+
+/// A Redis error on the presence scripts must not reject the joiner. The cap
+/// fails OPEN — the connection is still acked, with the best-effort roster the
+/// error path can still read — and `first_for_user` / `last_for_user` degrade to
+/// false so no cross-node `member_added` / `member_removed` is invented from an
+/// outcome the node never actually learned. The occupancy edges, which run on
+/// UNCORRUPTED keys, still fire.
+///
+/// The error is injected, not waited for: a plain STRING at the channel's
+/// `presmembers` key makes the first `HSET` inside both presence scripts fail
+/// with WRONGTYPE, every time.
+#[tokio::test]
+async fn a_redis_error_on_the_presence_scripts_degrades_to_no_member_events() {
+    assert!(
+        redis_reachable(),
+        "cluster_bridge requires Redis; set PYLON_TEST_REDIS_URL (default redis://127.0.0.1:6390) — refusing to silently pass"
+    );
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        use fred::interfaces::KeysInterface;
+        let prefix = random_prefix();
+        let cfg = redis_test_config(&prefix);
+        let keys = Keys::new(&prefix);
+        let clients = RedisClients::connect(&test_redis_url(), 1)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let corrupt = keys.presmembers("app", "presence-broken");
+        let _: () = clients
+            .pool
+            .next()
+            .set(&corrupt, "not-a-hash", None, None, false)
+            .await
+            .expect("the WRONGTYPE injection must be written");
+
+        let local = Arc::new(LocalAdapter::new(
+            Arc::new(Registry::new()),
+            Arc::new(pylon::adapter::app_registry::AppRegistry::new()),
+        ));
+        let (webhooks, recorder) = recording_webhooks();
+        let bridge = bridge::start(&cfg, local, webhook_apps(), Arc::new(Default::default()))
+            .expect("ClusterBridge::start must connect to the test Redis");
+        bridge.attach_webhooks(webhooks);
+        let handle = bridge.handle();
+
+        let (broken_sid, _broken_handle, broken_member) = presence_conn("bu");
+        let (mut broken_rx, broken_mailbox) = mailbox_pair();
+        handle.presence_subscribe(
+            Arc::from("app"),
+            Arc::from("presence-broken"),
+            broken_member,
+            broken_sid,
+            broken_mailbox,
+            true,
+        );
+        let ack = tokio::time::timeout(Duration::from_secs(5), broken_rx.recv())
+            .await
+            .expect("a redis blip must still ack the joiner, not reject it")
+            .expect("the mailbox must stay open");
+        match *ack {
+            ServerEvent::SubscriptionSucceeded {
+                ref channel,
+                ref presence,
+            } => {
+                assert_eq!(channel, "presence-broken");
+                let roster = presence
+                    .as_ref()
+                    .expect("a presence ack always carries a roster");
+                assert_eq!(
+                    roster.count, 0,
+                    "the authoritative roster was unreadable, so the best-effort one is empty"
+                );
+            }
+            ref other => panic!("expected a best-effort subscription_succeeded, got {other:?}"),
+        }
+        handle.presence_leave(
+            Arc::from("app"),
+            Arc::from("presence-broken"),
+            "bu".to_string(),
+            broken_sid,
+            true,
+        );
+
+        // A healthy presence channel behind it: once ITS four edges are recorded,
+        // the broken channel's have been drained too.
+        let (ok_sid, _ok_handle, ok_member) = presence_conn("ou");
+        let (_ok_rx, ok_mailbox) = mailbox_pair();
+        handle.presence_subscribe(
+            Arc::from("app"),
+            Arc::from("presence-ok"),
+            ok_member,
+            ok_sid,
+            ok_mailbox,
+            true,
+        );
+        handle.presence_leave(
+            Arc::from("app"),
+            Arc::from("presence-ok"),
+            "ou".to_string(),
+            ok_sid,
+            true,
+        );
+
+        assert_eq!(
+            await_sorted_webhooks(&recorder, 6).await,
+            [
+                "channel_occupied",
+                "channel_occupied",
+                "channel_vacated",
+                "channel_vacated",
+                "member_added",
+                "member_removed",
+            ],
+            "the broken channel contributes its occupancy edges but NO member events"
+        );
+
+        let _: i64 = clients
+            .pool
+            .next()
+            .del(&corrupt)
+            .await
+            .expect("the injected key must be cleaned up");
+        drop(bridge);
+    })
+    .await
+    .expect("presence redis-error test must not hang (Redis up?)");
+}
+
 /// The cluster online/offline edge notifies THIS node's local watchers directly:
 /// the `WatchOnline` publish self-dedups on the origin node, so without this the
 /// signing-in user's own node would never tell its watchers.
