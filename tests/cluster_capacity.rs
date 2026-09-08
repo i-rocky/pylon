@@ -832,3 +832,68 @@ async fn heartbeat_reseed_restores_the_cluster_total_after_a_reclaim() {
     use fred::interfaces::ClientLike;
     let _ = client.quit().await;
 }
+
+/// A dead-node reclaim that FAILS must leave the node listed in `nodes`. That
+/// entry is the only thing that enumerates the node for a retry: pruning it
+/// anyway would strand the node's units in `appconns` forever, because the
+/// hash's TTL backstop removes the HASH, not the cluster-total residue.
+///
+/// The failure is injected rather than waited for — a plain STRING at
+/// `appconns` makes the reclaim script's `HINCRBY` fail with WRONGTYPE — and the
+/// restored pass afterwards proves the retry actually works on the state the
+/// failed pass preserved.
+#[tokio::test]
+async fn a_failed_dead_node_reclaim_keeps_the_node_listed_for_the_next_pass() {
+    let prefix = random_prefix();
+    let keys = Keys::new(&prefix);
+    let adapter = RedisAdapter::new(&redis_test_config(&prefix))
+        .await
+        .expect("adapter must connect to the test Redis");
+    let client = fred_client().await;
+
+    use fred::interfaces::{HashesInterface, KeysInterface, SetsInterface};
+    let _: () = client.sadd(keys.nodes(), "doomed").await.unwrap();
+    let _: () = client
+        .hset(keys.nodeconns("doomed"), ("t9", 2))
+        .await
+        .unwrap();
+    let _: () = client
+        .set(&keys.appconns(), "poisoned", None, None, false)
+        .await
+        .unwrap();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let _ = adapter.sweep_now(&WebhookHandle::null(), now_ms).await;
+
+    let members: Vec<String> = client.smembers(keys.nodes()).await.unwrap();
+    assert!(
+        members.contains(&"doomed".to_string()),
+        "a node whose reclaim failed must stay listed so the next pass retries it (got {members:?})"
+    );
+    assert!(
+        key_exists(&client, &keys.nodeconns("doomed")).await,
+        "its counts must survive too — there is nothing to retry without them"
+    );
+
+    // The retry, on exactly the state the failed pass left behind.
+    let _: i64 = client.del(&keys.appconns()).await.unwrap();
+    let _: () = client.hset(&keys.appconns(), ("t9", 2)).await.unwrap();
+    let _ = adapter.sweep_now(&WebhookHandle::null(), now_ms).await;
+
+    assert_eq!(
+        hget_i64(&client, &keys.appconns(), "t9").await,
+        0,
+        "the retry must reclaim the units the failed pass could not"
+    );
+    let members: Vec<String> = client.smembers(keys.nodes()).await.unwrap();
+    assert!(
+        !members.contains(&"doomed".to_string()),
+        "and prune the node once its counts are reclaimed (got {members:?})"
+    );
+
+    use fred::interfaces::ClientLike;
+    let _ = client.quit().await;
+}

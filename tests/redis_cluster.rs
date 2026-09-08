@@ -4011,3 +4011,455 @@ async fn user_reap_cannot_wipe_a_signin_it_straddles() {
     .await
     .expect("user reap CAS race test must not hang (Redis up?)");
 }
+
+/// A member whose `expireAt` stamp is not a number can never be re-stamped into
+/// a valid future value by a live node, so the sweeper must treat it as STALE
+/// and reap it. Left alone it would pin the channel occupied forever.
+///
+/// No waiting and no TTL: the sweep runs with `now = 0`, at which instant every
+/// well-formed stamp is in the future and therefore fresh. The corrupt stamp is
+/// the ONLY thing that can be reaped, so a pass that reaps it proves the
+/// unparseable branch ran — and the surviving member proves the sweep did not
+/// simply reap everything.
+#[tokio::test]
+async fn sweeper_reaps_a_member_whose_expire_at_stamp_is_corrupt() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let prefix = random_prefix();
+        let adapter = connect_adapter_with_prefix(&prefix).await;
+        let keys = Keys::new(&prefix);
+
+        let (corrupt_sock, corrupt_handle) = fake_handle();
+        adapter
+            .subscribe(TEST_APP, "public-corrupt", corrupt_handle, None)
+            .await;
+        let (_live_sock, live_handle) = fake_handle();
+        let out = adapter
+            .subscribe(TEST_APP, "public-corrupt", live_handle, None)
+            .await;
+        assert_eq!(out.subscription_count, 2, "both members must be recorded");
+
+        // Corrupt exactly one member's stamp, in place.
+        let clients = RedisClients::connect(&test_redis_url(), 1)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let occ = keys.occ(TEST_APP, "public-corrupt");
+        let token =
+            pylon::adapter::redis::keys::member_token(adapter.node_id(), corrupt_sock.as_str());
+        let _: i64 = clients
+            .pool
+            .next()
+            .hset(&occ, (token.clone(), "not-a-timestamp"))
+            .await
+            .expect("the corrupt stamp must be written");
+
+        let webhooks = pylon::webhook::WebhookHandle::null();
+        let (acquired, reaped, vacated) = adapter.sweep_now(&webhooks, 0).await;
+        assert!(acquired, "this node must hold the sweep lease");
+        assert_eq!(
+            reaped, 1,
+            "only the corrupt stamp is stale at now=0; every parseable stamp is in the future"
+        );
+        assert!(
+            !vacated.contains(&(TEST_APP.to_string(), "public-corrupt".to_string())),
+            "the channel still has a live member and must not be vacated: {vacated:?}"
+        );
+        assert_eq!(
+            adapter
+                .channel(TEST_APP, "public-corrupt")
+                .await
+                .subscription_count,
+            1,
+            "the reap must remove the corrupt member and only the corrupt member"
+        );
+
+        let _: i64 = clients.pool.next().del(&occ).await.expect("del occ");
+    })
+    .await
+    .expect("corrupt-stamp reap test must not hang (Redis up?)");
+}
+
+/// `unwatch` on the node's `RedisAdapter` drops the connection's node-local watch
+/// state AND — once no local watcher of that user remains — UNSUBSCRIBEs the
+/// per-user Redis watch channel. Without the second half the node keeps
+/// receiving cross-node transitions for a user nobody here is watching, forever.
+#[tokio::test]
+async fn unwatch_drops_the_local_watcher_and_unsubscribes_the_watch_channel() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let adapter = connect_adapter_with_prefix(&prefix).await;
+        let watch_key = keys.watch(TEST_APP, "u7");
+
+        let (socket_id, watcher, _rx) = recording_handle();
+        adapter.watch(TEST_APP, watcher, vec!["u7".into()]).await;
+        assert!(
+            await_tracked(&adapter, &watch_key, Duration::from_secs(2)).await,
+            "precondition: the 0→1 watcher edge must SUBSCRIBE the watch channel"
+        );
+        assert_eq!(
+            adapter.watchers_of(TEST_APP, "u7").await.len(),
+            1,
+            "precondition: the watcher must be recorded node-locally"
+        );
+
+        adapter.unwatch(TEST_APP, &socket_id).await;
+
+        assert!(
+            adapter.watchers_of(TEST_APP, "u7").await.is_empty(),
+            "the connection's watch state must be dropped"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if !tracked_contains(&adapter, &watch_key) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the 1→0 watcher edge must UNSUBSCRIBE {watch_key}");
+    })
+    .await
+    .expect("unwatch test must not hang (Redis up?)");
+}
+
+/// The BACKGROUND sweeper — the loop `start_sweeper` spawns, not the `sweep_now`
+/// test seam — reaps on its own timer and fires `channel_vacated` through the
+/// dispatcher it was handed. Everything else in this file drives `sweep_once`
+/// directly, so nothing else proves the loop is really wired to it.
+///
+/// The stale member is MADE stale by stamping its `expireAt` into the past
+/// rather than by waiting out a TTL, and the wait is on the webhook actually
+/// being delivered — never on a fixed sleep.
+#[tokio::test]
+async fn the_background_sweeper_vacates_an_orphaned_channel_and_fires_the_webhook() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let prefix = random_prefix();
+        let cfg = ServerConfig {
+            adapter: "redis".into(),
+            redis_url: test_redis_url(),
+            redis_prefix: prefix.clone(),
+            redis_sweep_interval_secs: 1,
+            ..ServerConfig::default()
+        };
+        let adapter = RedisAdapter::new(&cfg)
+            .await
+            .expect("RedisAdapter::new must connect to the test Redis");
+        let keys = Keys::new(&prefix);
+
+        let (socket_id, handle) = fake_handle();
+        adapter
+            .subscribe(TEST_APP, "public-orphan", handle, None)
+            .await;
+
+        // Stamp the member as long expired — the state a node that stopped
+        // heartbeating leaves behind. The membership heartbeat's next tick is a
+        // full `redis_presence_heartbeat_secs` away, so this stamp stands.
+        let clients = RedisClients::connect(&test_redis_url(), 1)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let occ = keys.occ(TEST_APP, "public-orphan");
+        let token =
+            pylon::adapter::redis::keys::member_token(adapter.node_id(), socket_id.as_str());
+        let _: i64 = clients
+            .pool
+            .next()
+            .hset(&occ, (token, "1"))
+            .await
+            .expect("the expired stamp must be written");
+
+        let (webhooks, transport) = recording_webhooks();
+        adapter.start_sweeper(webhooks);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+        while tokio::time::Instant::now() < deadline {
+            let vacated = transport.recorded().await.iter().any(|d| {
+                let v: serde_json::Value =
+                    serde_json::from_str(&d.body).expect("webhook body must be JSON");
+                v["events"].as_array().is_some_and(|events| {
+                    events
+                        .iter()
+                        .any(|e| e["name"] == "channel_vacated" && e["channel"] == "public-orphan")
+                })
+            });
+            if vacated {
+                assert_eq!(
+                    adapter
+                        .channel(TEST_APP, "public-orphan")
+                        .await
+                        .subscription_count,
+                    0,
+                    "the vacate must have cleared the channel's members, not just fired a webhook"
+                );
+                let _: i64 = clients.pool.next().del(&occ).await.expect("del occ");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the background sweeper never vacated the orphaned channel");
+    })
+    .await
+    .expect("background sweeper test must not hang (Redis up?)");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sweeper fault injection.
+//
+// `sweeper.rs` states a contract: "Every Redis error is logged and skipped; one
+// failure must never abort the whole sweep. Nothing here panics or unwraps."
+// The tests below hold it to that WITHOUT mocking Redis: overwriting a key with
+// a plain STRING makes the exact command the sweeper issues against it fail with
+// WRONGTYPE, deterministically and on demand. Each test then shows the pass
+// degraded in the documented way — and, where the degradation is a no-op, that
+// the SAME state sweeps successfully once the key is restored, so the negative
+// cannot pass for the wrong reason.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A fresh prefix holding one channel whose only member is stamped long expired
+/// — the state a crashed node leaves behind, and exactly what a healthy sweep
+/// reaps and vacates. Returns the adapter, its key builder, and a raw client.
+async fn orphaned_channel(channel: &str) -> (RedisAdapter, Keys, RedisClients) {
+    let prefix = random_prefix();
+    let adapter = connect_adapter_with_prefix(&prefix).await;
+    let keys = Keys::new(&prefix);
+    let (socket_id, handle) = fake_handle();
+    adapter.subscribe(TEST_APP, channel, handle, None).await;
+    let clients = RedisClients::connect(&test_redis_url(), 1)
+        .await
+        .expect("fred clients must connect to the test Redis");
+    let token = pylon::adapter::redis::keys::member_token(adapter.node_id(), socket_id.as_str());
+    let _: i64 = clients
+        .pool
+        .next()
+        .hset(&keys.occ(TEST_APP, channel), (token, "1"))
+        .await
+        .expect("the expired stamp must be written");
+    (adapter, keys, clients)
+}
+
+/// Overwrite `key` with a plain STRING, so the hash/set command the sweeper
+/// issues against it fails with WRONGTYPE.
+async fn poison(clients: &RedisClients, key: &str) {
+    let _: () = clients
+        .pool
+        .next()
+        .set(key, "poisoned", None, None, false)
+        .await
+        .expect("the poison must be written");
+}
+
+/// An unreadable `apps` index costs the pass its enumeration source, so nothing
+/// is reaped — but the pass still completes and holds the lease. Restoring the
+/// index and sweeping again reaps the very member the poisoned pass left alone,
+/// which is what makes the first assertion mean something.
+#[tokio::test]
+async fn a_corrupt_apps_index_makes_the_sweep_a_safe_no_op() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (adapter, keys, clients) = orphaned_channel("public-noapps").await;
+        let webhooks = pylon::webhook::WebhookHandle::null();
+
+        poison(&clients, &keys.apps()).await;
+        let (acquired, reaped, vacated) = adapter.sweep_now(&webhooks, now_ms()).await;
+        assert!(acquired, "a broken index must not cost the node the lease");
+        assert_eq!(reaped, 0, "nothing is enumerable, so nothing is reaped");
+        assert!(
+            vacated.is_empty(),
+            "and nothing may be vacated: {vacated:?}"
+        );
+
+        let _: i64 = clients
+            .pool
+            .next()
+            .del(&keys.apps())
+            .await
+            .expect("del poisoned apps");
+        let _: i64 = clients
+            .pool
+            .next()
+            .sadd(&keys.apps(), TEST_APP)
+            .await
+            .expect("restore apps");
+        let (_, reaped, vacated) = adapter.sweep_now(&webhooks, now_ms()).await;
+        assert_eq!(
+            reaped, 1,
+            "the restored pass reaps the member the poisoned pass skipped"
+        );
+        assert!(
+            vacated.contains(&(TEST_APP.to_string(), "public-noapps".to_string())),
+            "and vacates the channel it emptied: {vacated:?}"
+        );
+    })
+    .await
+    .expect("corrupt-apps sweep test must not hang (Redis up?)");
+}
+
+/// An unreadable per-app `chans` index skips THAT app and moves on. Same
+/// before/after shape: restore the index and the identical state sweeps clean.
+#[tokio::test]
+async fn a_corrupt_channel_index_skips_the_app_and_the_pass_continues() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (adapter, keys, clients) = orphaned_channel("public-nochans").await;
+        let webhooks = pylon::webhook::WebhookHandle::null();
+        let chans = keys.chans(TEST_APP);
+
+        poison(&clients, &chans).await;
+        let (acquired, reaped, vacated) = adapter.sweep_now(&webhooks, now_ms()).await;
+        assert!(acquired, "the pass still holds the lease");
+        assert_eq!(
+            reaped, 0,
+            "the app whose channel index is unreadable is skipped"
+        );
+        assert!(vacated.is_empty(), "{vacated:?}");
+
+        let _: i64 = clients
+            .pool
+            .next()
+            .del(&chans)
+            .await
+            .expect("del poisoned chans");
+        let _: i64 = clients
+            .pool
+            .next()
+            .sadd(&chans, "public-nochans")
+            .await
+            .expect("restore chans");
+        let (_, reaped, _) = adapter.sweep_now(&webhooks, now_ms()).await;
+        assert_eq!(reaped, 1, "the restored pass reaps the skipped member");
+    })
+    .await
+    .expect("corrupt-chans sweep test must not hang (Redis up?)");
+}
+
+/// An unreadable occupancy hash must SKIP the channel, never vacate it. This is
+/// the dangerous one: a sweep that treated the unreadable hash as "no members"
+/// would de-index a channel that is, for all it knows, still occupied — and fire
+/// a `channel_vacated` for it.
+#[tokio::test]
+async fn a_corrupt_occupancy_hash_skips_the_channel_instead_of_vacating_it() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (adapter, keys, clients) = orphaned_channel("public-noocc").await;
+        let webhooks = pylon::webhook::WebhookHandle::null();
+
+        poison(&clients, &keys.occ(TEST_APP, "public-noocc")).await;
+        let (acquired, reaped, vacated) = adapter.sweep_now(&webhooks, now_ms()).await;
+        assert!(acquired);
+        assert_eq!(reaped, 0);
+        assert!(
+            vacated.is_empty(),
+            "a channel whose membership cannot be read must not be declared vacant: {vacated:?}"
+        );
+        let still_indexed: bool = clients
+            .pool
+            .next()
+            .sismember(keys.chans(TEST_APP), "public-noocc")
+            .await
+            .expect("sismember chans");
+        assert!(
+            still_indexed,
+            "the channel must stay indexed so a later pass can retry it"
+        );
+    })
+    .await
+    .expect("corrupt-occ sweep test must not hang (Redis up?)");
+}
+
+/// A vacate whose CAS script errors claims NO emission right: the sweep reports
+/// no vacated channel, so no `channel_vacated` webhook is fired off the back of
+/// a script that did not return a verdict.
+#[tokio::test]
+async fn a_failing_vacate_script_claims_no_emission_right() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (adapter, keys, clients) = orphaned_channel("presence-novacate").await;
+        let webhooks = pylon::webhook::WebhookHandle::null();
+
+        // VACATE_LUA reads the presence roster with HKEYS; a STRING there makes
+        // the script fail after the member reap has already happened, so the
+        // pass reaches the vacate and then loses it.
+        poison(&clients, &keys.presusers(TEST_APP, "presence-novacate")).await;
+        let (acquired, reaped, vacated) = adapter.sweep_now(&webhooks, now_ms()).await;
+        assert!(acquired);
+        assert_eq!(
+            reaped, 1,
+            "the stale member is still reaped before the vacate"
+        );
+        assert!(
+            vacated.is_empty(),
+            "a failed vacate must claim no emission right: {vacated:?}"
+        );
+    })
+    .await
+    .expect("failing-vacate sweep test must not hang (Redis up?)");
+}
+
+/// A failure in the user-binding half or the dead-node half must not abort the
+/// pass: the channel half, which ran first, still did its work.
+#[tokio::test]
+async fn a_failure_in_a_later_sweep_phase_does_not_abort_the_earlier_one() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for poisoned in ["users", "nodes"] {
+            let channel = format!("public-late-{poisoned}");
+            let (adapter, keys, clients) = orphaned_channel(&channel).await;
+            let webhooks = pylon::webhook::WebhookHandle::null();
+            let key = match poisoned {
+                "users" => keys.users(TEST_APP),
+                _ => keys.nodes(),
+            };
+            poison(&clients, &key).await;
+
+            let (acquired, reaped, vacated) = adapter.sweep_now(&webhooks, now_ms()).await;
+            assert!(acquired, "the {poisoned} failure must not cost the lease");
+            assert_eq!(
+                reaped, 1,
+                "the channel phase runs before the {poisoned} phase and must still complete"
+            );
+            assert!(
+                vacated.contains(&(TEST_APP.to_string(), channel.clone())),
+                "and must still vacate the channel it emptied: {vacated:?}"
+            );
+        }
+    })
+    .await
+    .expect("late-phase failure sweep test must not hang (Redis up?)");
+}
+
+/// A sweep lock that exists but cannot be READ is not this node's to claim, so
+/// the pass yields rather than sweeping on an unknown lease. The contrast makes
+/// it concrete: with the lock removed, the identical state sweeps.
+#[tokio::test]
+async fn an_unreadable_sweep_lock_yields_the_pass() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (adapter, keys, clients) = orphaned_channel("public-nolock").await;
+        let webhooks = pylon::webhook::WebhookHandle::null();
+        let lock = keys.sweeplock();
+
+        // A LIST at the lock key: `SET … NX` finds the key present and declines,
+        // and the ownership `GET` that follows fails with WRONGTYPE.
+        let _: i64 = clients
+            .pool
+            .next()
+            .lpush(&lock, "not-a-node-id")
+            .await
+            .expect("the lock poison must be written");
+
+        let (acquired, reaped, vacated) = adapter.sweep_now(&webhooks, now_ms()).await;
+        assert!(
+            !acquired,
+            "a lock whose owner cannot be read must not be swept under"
+        );
+        assert_eq!(reaped, 0);
+        assert!(vacated.is_empty(), "{vacated:?}");
+
+        let _: i64 = clients
+            .pool
+            .next()
+            .del(&lock)
+            .await
+            .expect("del poisoned lock");
+        let (acquired, reaped, _) = adapter.sweep_now(&webhooks, now_ms()).await;
+        assert!(acquired, "with the lock gone the node takes it");
+        assert_eq!(
+            reaped, 1,
+            "and reaps the member the yielded pass left alone"
+        );
+    })
+    .await
+    .expect("unreadable-lock sweep test must not hang (Redis up?)");
+}

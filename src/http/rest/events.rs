@@ -682,4 +682,154 @@ mod tests {
         deliver(&state, "app1", "plain-x", "ev", "\"payload\"", None).await;
         assert_eq!(adapter.writes.lock().unwrap().as_slice(), ["broadcast"]);
     }
+
+    /// A `#server-to-user-` trigger is routed to the user registry, never
+    /// broadcast to a channel — and it is NEVER cached, because a user channel
+    /// has no subscribers to replay it to.
+    #[tokio::test]
+    async fn server_to_user_trigger_is_routed_to_the_user_never_broadcast() {
+        let adapter = write_order_adapter();
+        let state = write_order_state(adapter.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let socket_id = SocketId::generate();
+        adapter
+            .inner
+            .signin_user(
+                "app1",
+                "u7",
+                ConnectionHandle {
+                    socket_id,
+                    mailbox: Mailbox::new(tx, None, None),
+                },
+            )
+            .await;
+
+        deliver(
+            &state,
+            "app1",
+            "#server-to-user-u7",
+            "ev",
+            "\"payload\"",
+            None,
+        )
+        .await;
+
+        assert!(
+            adapter.writes.lock().unwrap().is_empty(),
+            "a server-to-user trigger must neither broadcast nor cache"
+        );
+        // The frame is byte-identical to a normal channel event so pusher-js's
+        // `#server-to-user-<id>` handler processes it unchanged.
+        let expected = crate::protocol::wire::encode(
+            7,
+            &ServerEvent::ChannelEvent {
+                channel: "#server-to-user-u7".to_string(),
+                event: "ev".to_string(),
+                data: Value::String("\"payload\"".to_string()),
+                user_id: None,
+            },
+        );
+        match rx.try_recv().map(|b| *b) {
+            Ok(ServerEvent::Raw(frame)) => assert_eq!(&*frame, &expected),
+            other => panic!("the user's connection must receive the event, got {other:?}"),
+        }
+    }
+
+    /// An empty user id (`#server-to-user-` and nothing else) names nobody: the
+    /// trigger is dropped rather than broadcast onto a channel by that literal
+    /// name, which no client can subscribe to anyway.
+    #[tokio::test]
+    async fn server_to_user_trigger_with_an_empty_user_id_writes_nothing() {
+        let adapter = write_order_adapter();
+        let state = write_order_state(adapter.clone());
+        deliver(&state, "app1", "#server-to-user-", "ev", "\"p\"", None).await;
+        assert!(
+            adapter.writes.lock().unwrap().is_empty(),
+            "an empty user id must produce neither a broadcast nor a cache write"
+        );
+    }
+
+    /// Sign `params` for `path` the way a Pusher SDK does, so a handler test can
+    /// get past `authenticate` to the behaviour it is actually pinning.
+    fn signed_params(secret: &str, key: &str, path: &str, body: &[u8]) -> HashMap<String, String> {
+        use crate::auth::signature::{hmac_sha256_hex, md5_hex};
+        let mut p: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+        p.insert("auth_key".into(), key.to_string());
+        p.insert(
+            "auth_timestamp".into(),
+            crate::http::rest::auth::now_unix().to_string(),
+        );
+        p.insert("auth_version".into(), "1.0".into());
+        if !body.is_empty() {
+            p.insert("body_md5".into(), md5_hex(body));
+        }
+        let canon = p
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let sig = hmac_sha256_hex(secret, &format!("POST\n{path}\n{canon}"));
+        let mut out: HashMap<String, String> = p.into_iter().collect();
+        out.insert("auth_signature".into(), sig);
+        out
+    }
+
+    const SATURATION_APPS: &str = r#"[{"name":"T","id":"app1","key":"k","secret":"s"}]"#;
+
+    fn saturable_state(flag: crate::transport::fanout::SaturationFlag) -> AppState {
+        AppState {
+            config: crate::server::config::ServerConfig::default(),
+            apps: Arc::new(
+                crate::app::static_file::StaticFileAppManager::from_json(SATURATION_APPS).unwrap(),
+            ),
+            adapter: write_order_adapter(),
+            conn_counts: Arc::new(dashmap::DashMap::new()),
+            webhooks: crate::webhook::WebhookHandle::null(),
+            saturated: Some(flag),
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cluster_metrics: None,
+            invalidator: None,
+        }
+    }
+
+    /// SP10 admission control on the BATCH endpoint: a saturated broadcast
+    /// pipeline rejects the publish with 503 instead of piling more fan-out on a
+    /// pipeline that is already behind. Driven at the handler because the flag is
+    /// cleared by the worker loop on every pass, so a live server cannot be held
+    /// in the saturated state long enough to assert on.
+    #[tokio::test]
+    async fn a_saturated_node_rejects_batch_publishes_with_503() {
+        let flag = crate::transport::fanout::SaturationFlag::default();
+        let state = saturable_state(flag.clone());
+        let path = "/apps/app1/batch_events";
+        let body = br#"{"batch":[{"name":"ev","data":"1","channel":"room-a"}]}"#;
+        let params = signed_params("s", "k", path, body);
+
+        let call = |state: AppState, params: HashMap<String, String>| async move {
+            post_batch(
+                axum::extract::State(state),
+                Path("app1".to_string()),
+                OriginalUri(path.parse().unwrap()),
+                Ok(Query(params)),
+                Ok(Bytes::from_static(body)),
+            )
+            .await
+        };
+
+        let _ = call(state.clone(), params.clone())
+            .await
+            .expect("fixture precondition: the signed batch is accepted when healthy");
+
+        flag.set_inbox_full();
+        let err = call(state.clone(), params.clone())
+            .await
+            .expect_err("a saturated node must reject the publish");
+        assert_eq!(err.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.message, "Server overloaded");
+
+        flag.clear_inbox_full();
+        let _ = call(state, params)
+            .await
+            .expect("the gate must lift as soon as the pipeline drains");
+    }
 }

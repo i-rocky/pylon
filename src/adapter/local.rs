@@ -82,12 +82,6 @@ impl LocalAdapter {
         self.saturated.clone()
     }
 
-    /// Cheap admission-control check (SP10): whether the percore broadcast
-    /// pipeline is currently saturated. Off-percore this stays `false`.
-    pub fn is_saturated(&self) -> bool {
-        self.saturated.is_saturated()
-    }
-
     /// The installed per-core broadcast sink, if any (percore active).
     fn broadcast_sink(&self) -> Option<&crate::transport::fanout::BroadcastSink> {
         self.bcast_sink.get()

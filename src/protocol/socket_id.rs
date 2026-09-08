@@ -66,4 +66,13 @@ mod tests {
         let s = SocketId::from_raw("123.456");
         assert_eq!(s.as_str(), "123.456");
     }
+
+    /// A socket id renders as its wire form everywhere it is interpolated — log
+    /// lines, error messages, the `except` field — never as its inner buffer.
+    #[test]
+    fn display_renders_the_wire_form() {
+        let s = SocketId::from_raw("123.456");
+        assert_eq!(s.to_string(), "123.456");
+        assert_eq!(format!("{s}"), s.as_str());
+    }
 }
