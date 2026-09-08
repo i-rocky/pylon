@@ -11,15 +11,21 @@ pub struct OpenLoopResult {
     pub inflight_saturated_pct: f64,
 }
 
+/// Workload recipe for a single open-loop publish run: target app, channels to
+/// spread across, and the rate/concurrency/duration shape of the run.
+pub struct OpenLoopConfig {
+    pub rest: String,
+    pub app_id: String,
+    pub key: String,
+    pub secret: String,
+    pub channels: Vec<String>,
+    pub target_rate: u64,
+    pub max_inflight: usize,
+    pub secs: u64,
+}
+
 pub async fn publish_openloop(
-    rest: String,
-    app_id: String,
-    key: String,
-    secret: String,
-    channels: Vec<String>,
-    target_rate: u64,
-    max_inflight: usize,
-    secs: u64,
+    cfg: OpenLoopConfig,
     counters: Arc<Counters>,
     // SHARED epoch — must be the SAME `Instant` the subscriber clients measure latency
     // against (the Harness epoch). Stamping payloads with a publisher-local epoch
@@ -27,6 +33,16 @@ pub async fn publish_openloop(
     // latency by the subscribe duration, which falsely trips the latency budget.
     epoch: Instant,
 ) -> OpenLoopResult {
+    let OpenLoopConfig {
+        rest,
+        app_id,
+        key,
+        secret,
+        channels,
+        target_rate,
+        max_inflight,
+        secs,
+    } = cfg;
     let pubr = Arc::new(Publisher::new(rest, app_id, key, secret));
     let sem = Arc::new(Semaphore::new(max_inflight));
     let attempted = Arc::new(AtomicU64::new(0));

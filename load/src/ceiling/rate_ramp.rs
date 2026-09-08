@@ -66,7 +66,7 @@ pub struct RateRampOpts {
 /// 2. p99_ms > p99_budget → LatencyBudget
 /// 3. cpu_busy_pct >= 95.0 → CpuSaturated
 /// 4. max_rate > 0 && rate >= max_rate → MaxRate
-/// else None
+/// 5. else → None
 pub fn tput_should_stop(
     drop_pct: f64,
     p99_ms: u64,
@@ -149,14 +149,16 @@ pub async fn run(child: &PylonChild, opts: &RateRampOpts) -> TputCeiling {
         let mpstat_fut = super::mpstat::sample(1, opts.step_secs.max(1));
         let (r, cpu_sample) = tokio::join!(
             publish_openloop(
-                opts.rest.clone(),
-                "app".into(),
-                opts.key.clone(),
-                opts.secret.clone(),
-                channels_vec.clone(),
-                rate,
-                opts.max_inflight,
-                opts.step_secs,
+                super::openloop::OpenLoopConfig {
+                    rest: opts.rest.clone(),
+                    app_id: "app".into(),
+                    key: opts.key.clone(),
+                    secret: opts.secret.clone(),
+                    channels: channels_vec.clone(),
+                    target_rate: rate,
+                    max_inflight: opts.max_inflight,
+                    secs: opts.step_secs,
+                },
                 h.counters.clone(),
                 epoch, // SHARED epoch (same one the clients measure latency against)
             ),
