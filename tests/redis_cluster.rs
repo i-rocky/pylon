@@ -4011,3 +4011,112 @@ async fn user_reap_cannot_wipe_a_signin_it_straddles() {
     .await
     .expect("user reap CAS race test must not hang (Redis up?)");
 }
+
+/// A member whose `expireAt` stamp is not a number can never be re-stamped into
+/// a valid future value by a live node, so the sweeper must treat it as STALE
+/// and reap it. Left alone it would pin the channel occupied forever.
+///
+/// No waiting and no TTL: the sweep runs with `now = 0`, at which instant every
+/// well-formed stamp is in the future and therefore fresh. The corrupt stamp is
+/// the ONLY thing that can be reaped, so a pass that reaps it proves the
+/// unparseable branch ran — and the surviving member proves the sweep did not
+/// simply reap everything.
+#[tokio::test]
+async fn sweeper_reaps_a_member_whose_expire_at_stamp_is_corrupt() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let prefix = random_prefix();
+        let adapter = connect_adapter_with_prefix(&prefix).await;
+        let keys = Keys::new(&prefix);
+
+        let (corrupt_sock, corrupt_handle) = fake_handle();
+        adapter
+            .subscribe(TEST_APP, "public-corrupt", corrupt_handle, None)
+            .await;
+        let (_live_sock, live_handle) = fake_handle();
+        let out = adapter
+            .subscribe(TEST_APP, "public-corrupt", live_handle, None)
+            .await;
+        assert_eq!(out.subscription_count, 2, "both members must be recorded");
+
+        // Corrupt exactly one member's stamp, in place.
+        let clients = RedisClients::connect(&test_redis_url(), 1)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let occ = keys.occ(TEST_APP, "public-corrupt");
+        let token =
+            pylon::adapter::redis::keys::member_token(adapter.node_id(), corrupt_sock.as_str());
+        let _: i64 = clients
+            .pool
+            .next()
+            .hset(&occ, (token.clone(), "not-a-timestamp"))
+            .await
+            .expect("the corrupt stamp must be written");
+
+        let webhooks = pylon::webhook::WebhookHandle::null();
+        let (acquired, reaped, vacated) = adapter.sweep_now(&webhooks, 0).await;
+        assert!(acquired, "this node must hold the sweep lease");
+        assert_eq!(
+            reaped, 1,
+            "only the corrupt stamp is stale at now=0; every parseable stamp is in the future"
+        );
+        assert!(
+            !vacated.contains(&(TEST_APP.to_string(), "public-corrupt".to_string())),
+            "the channel still has a live member and must not be vacated: {vacated:?}"
+        );
+        assert_eq!(
+            adapter
+                .channel(TEST_APP, "public-corrupt")
+                .await
+                .subscription_count,
+            1,
+            "the reap must remove the corrupt member and only the corrupt member"
+        );
+
+        let _: i64 = clients.pool.next().del(&occ).await.expect("del occ");
+    })
+    .await
+    .expect("corrupt-stamp reap test must not hang (Redis up?)");
+}
+
+/// `unwatch` on the node's `RedisAdapter` drops the connection's node-local watch
+/// state AND — once no local watcher of that user remains — UNSUBSCRIBEs the
+/// per-user Redis watch channel. Without the second half the node keeps
+/// receiving cross-node transitions for a user nobody here is watching, forever.
+#[tokio::test]
+async fn unwatch_drops_the_local_watcher_and_unsubscribes_the_watch_channel() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let adapter = connect_adapter_with_prefix(&prefix).await;
+        let watch_key = keys.watch(TEST_APP, "u7");
+
+        let (socket_id, watcher, _rx) = recording_handle();
+        adapter.watch(TEST_APP, watcher, vec!["u7".into()]).await;
+        assert!(
+            await_tracked(&adapter, &watch_key, Duration::from_secs(2)).await,
+            "precondition: the 0→1 watcher edge must SUBSCRIBE the watch channel"
+        );
+        assert_eq!(
+            adapter.watchers_of(TEST_APP, "u7").await.len(),
+            1,
+            "precondition: the watcher must be recorded node-locally"
+        );
+
+        adapter.unwatch(TEST_APP, &socket_id).await;
+
+        assert!(
+            adapter.watchers_of(TEST_APP, "u7").await.is_empty(),
+            "the connection's watch state must be dropped"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if !tracked_contains(&adapter, &watch_key) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the 1→0 watcher edge must UNSUBSCRIBE {watch_key}");
+    })
+    .await
+    .expect("unwatch test must not hang (Redis up?)");
+}
