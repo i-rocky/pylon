@@ -252,6 +252,239 @@ mod tests {
         let _ = result.unwrap();
     }
 
+    /// Write `body` to a uniquely named temp file and return its path.
+    fn write_temp(tag: &str, body: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("pylon-tls-{}-{tag}", std::process::id()));
+        let mut f = File::create(&path).expect("create temp file");
+        f.write_all(body).expect("write temp file");
+        path
+    }
+
+    /// A readable cert file that holds no certificate is a *different* failure
+    /// from a missing file, and must be reported as such rather than silently
+    /// producing a certificate-less `ServerConfig`.
+    #[test]
+    fn load_server_config_certless_cert_file_returns_err() {
+        let cert = write_temp("empty-cert.pem", b"# nothing here\n");
+        let (spare_cert, key_path) = generate_self_signed_cert_files("empty-cert-key");
+
+        let result = load_server_config(cert.to_str().unwrap(), key_path.to_str().unwrap(), None);
+
+        let _ = std::fs::remove_file(&cert);
+        let _ = std::fs::remove_file(&spare_cert);
+        let _ = std::fs::remove_file(&key_path);
+
+        let msg = format!("{}", result.expect_err("certless cert file must fail"));
+        assert!(
+            msg.contains("no certificates found"),
+            "error should name the empty-cert case: {msg}"
+        );
+        assert!(
+            msg.contains("PYLON_TLS_CERT"),
+            "error should name the knob: {msg}"
+        );
+    }
+
+    /// A cert file whose PEM block is corrupt fails at PARSE time (before the
+    /// emptiness check), and the error must still point at `PYLON_TLS_CERT`.
+    #[test]
+    fn load_server_config_malformed_cert_pem_returns_err() {
+        let cert = write_temp(
+            "bad-cert.pem",
+            b"-----BEGIN CERTIFICATE-----\n!!! not base64 !!!\n-----END CERTIFICATE-----\n",
+        );
+        let (spare_cert, key_path) = generate_self_signed_cert_files("bad-cert-key");
+
+        let result = load_server_config(cert.to_str().unwrap(), key_path.to_str().unwrap(), None);
+
+        let _ = std::fs::remove_file(&cert);
+        let _ = std::fs::remove_file(&spare_cert);
+        let _ = std::fs::remove_file(&key_path);
+
+        let msg = format!("{}", result.expect_err("malformed cert PEM must fail"));
+        assert!(
+            msg.contains("PYLON_TLS_CERT"),
+            "error should name the knob: {msg}"
+        );
+    }
+
+    /// A valid cert with a missing KEY file must blame `PYLON_TLS_KEY` — the
+    /// cert-side context would send the operator to the wrong file.
+    #[test]
+    fn load_server_config_missing_key_blames_the_key_knob() {
+        let (cert_path, key_path) = generate_self_signed_cert_files("missing-key");
+        let _ = std::fs::remove_file(&key_path);
+
+        let result = load_server_config(
+            cert_path.to_str().unwrap(),
+            "/nonexistent/path/key.pem",
+            None,
+        );
+
+        let _ = std::fs::remove_file(&cert_path);
+
+        let msg = format!("{}", result.expect_err("missing key file must fail"));
+        assert!(
+            msg.contains("PYLON_TLS_KEY"),
+            "error should name the key knob, not the cert one: {msg}"
+        );
+    }
+
+    /// A readable key file with no private key in it is its own failure mode.
+    #[test]
+    fn load_server_config_keyless_key_file_returns_err() {
+        let (cert_path, key_path) = generate_self_signed_cert_files("keyless");
+        let empty_key = write_temp("empty-key.pem", b"# no key here\n");
+
+        let result = load_server_config(
+            cert_path.to_str().unwrap(),
+            empty_key.to_str().unwrap(),
+            None,
+        );
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&empty_key);
+
+        let msg = format!("{}", result.expect_err("keyless key file must fail"));
+        assert!(
+            msg.contains("no private key found"),
+            "error should name the keyless case: {msg}"
+        );
+    }
+
+    /// A key file whose PEM block is corrupt fails at PARSE time, before the
+    /// "no key found" check, and must still blame `PYLON_TLS_KEY`.
+    #[test]
+    fn load_server_config_malformed_key_pem_returns_err() {
+        let (cert_path, key_path) = generate_self_signed_cert_files("bad-key");
+        let bad_key = write_temp(
+            "bad-key.pem",
+            b"-----BEGIN PRIVATE KEY-----\n!!! not base64 !!!\n-----END PRIVATE KEY-----\n",
+        );
+
+        let result =
+            load_server_config(cert_path.to_str().unwrap(), bad_key.to_str().unwrap(), None);
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&bad_key);
+
+        let msg = format!("{}", result.expect_err("malformed key PEM must fail"));
+        assert!(
+            msg.contains("PYLON_TLS_KEY"),
+            "error should name the key knob: {msg}"
+        );
+    }
+
+    /// Same for the CA bundle: a corrupt PEM block is a parse failure, distinct
+    /// from a well-formed block holding a bad certificate.
+    #[test]
+    fn load_server_config_mtls_malformed_ca_pem_returns_err() {
+        let (cert_path, key_path) = generate_self_signed_cert_files("malformed-ca");
+        let ca = write_temp(
+            "malformed-ca.pem",
+            b"-----BEGIN CERTIFICATE-----\n!!! not base64 !!!\n-----END CERTIFICATE-----\n",
+        );
+
+        let result = load_server_config(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+            Some(ca.to_str().unwrap()),
+        );
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&ca);
+
+        let msg = format!("{}", result.expect_err("malformed CA PEM must fail"));
+        assert!(
+            msg.contains("PYLON_TLS_CA"),
+            "error should name the CA knob: {msg}"
+        );
+    }
+
+    /// The mTLS branch builds its own `ServerConfig`, so a cert/key mismatch has
+    /// to be caught there too — a valid CA must not paper over it.
+    #[test]
+    fn load_server_config_mtls_mismatched_cert_and_key_returns_err() {
+        let (ca_pem, _server_cert_pem, _server_key_pem) = generate_ca_and_server_cert();
+        let ca_path = write_pem_cert("mtls-mismatch", &ca_pem);
+        let (cert_path, _) = generate_self_signed_cert_files("mtls-mismatch-a");
+        let (other_cert, key_path) = generate_self_signed_cert_files("mtls-mismatch-b");
+
+        let result = load_server_config(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+            Some(ca_path.to_str().unwrap()),
+        );
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&other_cert);
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&ca_path);
+
+        let msg = format!("{}", result.expect_err("cert/key mismatch must fail"));
+        assert!(
+            msg.contains("failed to build rustls mTLS ServerConfig"),
+            "error should name the mTLS build step: {msg}"
+        );
+    }
+
+    /// A CA bundle whose PEM decodes but is not a certificate must fail with
+    /// the CA knob named — `RootCertStore::add` is the only thing that catches
+    /// it, since `rustls_pemfile` happily base64-decodes any payload.
+    #[test]
+    fn load_server_config_mtls_undecodable_ca_cert_returns_err() {
+        let (cert_path, key_path) = generate_self_signed_cert_files("bad-ca");
+        // base64 of "not a certificate" — well-formed PEM, invalid X.509 DER.
+        let ca = write_temp(
+            "bad-ca.pem",
+            b"-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydGlmaWNhdGU=\n-----END CERTIFICATE-----\n",
+        );
+
+        let result = load_server_config(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+            Some(ca.to_str().unwrap()),
+        );
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&ca);
+
+        let msg = format!("{}", result.expect_err("undecodable CA cert must fail"));
+        assert!(
+            msg.contains("PYLON_TLS_CA"),
+            "error should name the CA knob: {msg}"
+        );
+    }
+
+    /// A cert and a key that are individually valid but belong to DIFFERENT
+    /// key pairs must be rejected at config-build time, not accepted into a
+    /// `ServerConfig` that fails every handshake at runtime.
+    #[test]
+    fn load_server_config_mismatched_cert_and_key_returns_err() {
+        let (cert_path, _) = generate_self_signed_cert_files("mismatch-a");
+        let (other_cert, key_path) = generate_self_signed_cert_files("mismatch-b");
+
+        let result = load_server_config(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+            None,
+        );
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&other_cert);
+        let _ = std::fs::remove_file(&key_path);
+
+        let msg = format!("{}", result.expect_err("cert/key mismatch must fail"));
+        assert!(
+            msg.contains("failed to build rustls ServerConfig"),
+            "error should name the build step: {msg}"
+        );
+    }
+
     /// `load_server_config` with a nonexistent cert path returns `Err`, no panic.
     #[test]
     fn load_server_config_missing_cert_returns_err() {

@@ -631,7 +631,7 @@ mod tests {
     /// ciphertext. Follows the conn.rs `tls_test_support` conventions (raw
     /// client/server pairs driven by hand) but stays fully in memory — no
     /// sockets, so record boundaries are exactly what the test writes.
-    fn tls_pair() -> (TlsConn, ClientConnection) {
+    pub(super) fn tls_pair() -> (TlsConn, ClientConnection) {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
             .expect("rcgen: generate self-signed cert");
@@ -697,7 +697,7 @@ mod tests {
     /// exactly one record on the wire (payloads stay under the 16 KiB max
     /// fragment). Consecutive calls append, so one buffer ends up holding
     /// several complete records back-to-back — like one big TCP read.
-    fn emit_record(client: &mut ClientConnection, wire: &mut Vec<u8>, payload: &[u8]) {
+    pub(super) fn emit_record(client: &mut ClientConnection, wire: &mut Vec<u8>, payload: &[u8]) {
         client
             .writer()
             .write_all(payload)
@@ -810,5 +810,368 @@ mod tests {
         drain_tls_records(&mut server, &mut io::Cursor::new(&[]), &mut plaintext)
             .expect("empty drain");
         assert_eq!(plaintext, vec![1, 2, 3]);
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::tests::{emit_record, tls_pair};
+    use super::*;
+    use rustls::ClientConnection;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A connected TCP pair: the async server end the adapters drive, and a
+    /// blocking client end the test drives by hand. The client gets a read
+    /// timeout so a broken expectation fails the test instead of hanging it.
+    fn tcp_pair() -> (tokio::net::TcpStream, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("listener addr");
+        let client = std::net::TcpStream::connect(addr).expect("connect loopback");
+        let (server, _) = listener.accept().expect("accept loopback");
+        server
+            .set_nonblocking(true)
+            .expect("nonblocking server end");
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("client read timeout");
+        (
+            tokio::net::TcpStream::from_std(server).expect("adopt into tokio"),
+            client,
+        )
+    }
+
+    fn tls_rest_stream(tcp: tokio::net::TcpStream, tls: TlsConn, prefix: &[u8]) -> TlsRestStream {
+        TlsRestStream {
+            tcp,
+            tls: Box::new(tls),
+            prefix: prefix.to_vec(),
+            prefix_pos: 0,
+            out_ct: Vec::new(),
+            out_pos: 0,
+            in_pt: Vec::new(),
+            in_pos: 0,
+        }
+    }
+
+    /// Encrypt `payload` as one record and put it on the wire.
+    fn client_send(client: &mut ClientConnection, sock: &mut std::net::TcpStream, payload: &[u8]) {
+        let mut wire = Vec::new();
+        emit_record(client, &mut wire, payload);
+        sock.write_all(&wire).expect("client writes ciphertext");
+    }
+
+    /// Read from the socket until the client has `want` plaintext bytes or the
+    /// peer closes. Returns `(plaintext, saw_close_notify)`.
+    fn client_recv(
+        client: &mut ClientConnection,
+        sock: &mut std::net::TcpStream,
+        want: usize,
+    ) -> (Vec<u8>, bool) {
+        let mut out = Vec::new();
+        let mut ct = [0u8; 16 * 1024];
+        let mut pt = [0u8; 16 * 1024];
+        let mut closed = false;
+        while out.len() < want && !closed {
+            let n = match sock.read(&mut ct) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => panic!("client socket read: {e}"),
+            };
+            let mut cursor = io::Cursor::new(&ct[..n]);
+            while cursor.position() < n as u64 {
+                client.read_tls(&mut cursor).expect("client read_tls");
+                client.process_new_packets().expect("client TLS state");
+            }
+            loop {
+                match client.reader().read(&mut pt) {
+                    Ok(0) => {
+                        closed = true;
+                        break;
+                    }
+                    Ok(k) => out.extend_from_slice(&pt[..k]),
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("client plaintext read: {e}"),
+                }
+            }
+        }
+        (out, closed)
+    }
+
+    // ── Rewind (plain handoff) ────────────────────────────────────────────────
+
+    /// The worker has already consumed the request head off the socket, so the
+    /// HTTP parser must see those bytes FIRST and then continue seamlessly into
+    /// whatever the client sends next — otherwise every handed-off request
+    /// arrives truncated.
+    #[tokio::test]
+    async fn rewind_replays_the_prefix_before_the_sockets_own_bytes() {
+        let (server, mut client) = tcp_pair();
+        let mut rewind = Rewind::new(b"POST /apps/x/events HTTP/1.1\r\n".to_vec(), server);
+
+        client
+            .write_all(b"Host: pylon\r\n\r\n")
+            .expect("client head tail");
+
+        let want = b"POST /apps/x/events HTTP/1.1\r\nHost: pylon\r\n\r\n";
+        let mut got = Vec::new();
+        while got.len() < want.len() {
+            let mut buf = [0u8; 8];
+            let n = rewind.read(&mut buf).await.expect("rewind read");
+            assert_ne!(n, 0, "unexpected EOF after {} bytes", got.len());
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(
+            got,
+            want.to_vec(),
+            "the prefix must precede the live socket bytes, with nothing lost at the seam"
+        );
+    }
+
+    /// Writes are prefix-free: they go straight to the socket. hyper reaches
+    /// `poll_write` (not only the vectored path) whenever it has a single
+    /// buffer to send.
+    #[tokio::test]
+    async fn rewind_writes_and_shuts_down_through_to_the_socket() {
+        let (server, mut client) = tcp_pair();
+        let mut rewind = Rewind::new(Vec::new(), server);
+
+        rewind
+            .write_all(b"HTTP/1.1 200 OK\r\n\r\n")
+            .await
+            .expect("write");
+        rewind.flush().await.expect("flush");
+        rewind.shutdown().await.expect("shutdown");
+
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).expect("client reads to EOF");
+        assert_eq!(
+            got,
+            b"HTTP/1.1 200 OK\r\n\r\n".to_vec(),
+            "the response must reach the peer, and shutdown must close the write side"
+        );
+    }
+
+    // ── TlsRestStream ─────────────────────────────────────────────────────────
+
+    /// Same contract as `Rewind`, but the prefix was decrypted by the worker
+    /// and everything after it has to come through the live TLS session.
+    #[tokio::test]
+    async fn tls_stream_replays_the_decrypted_prefix_then_reads_through_the_session() {
+        let (server_tls, mut client_tls) = tls_pair();
+        let (tcp, mut sock) = tcp_pair();
+        let mut stream = tls_rest_stream(tcp, server_tls, b"GET /health HTTP/1.1\r\n");
+
+        client_send(&mut client_tls, &mut sock, b"Host: pylon\r\n\r\n");
+
+        let want = b"GET /health HTTP/1.1\r\nHost: pylon\r\n\r\n";
+        let mut got = Vec::new();
+        while got.len() < want.len() {
+            let mut buf = [0u8; 16];
+            let n = stream.read(&mut buf).await.expect("tls read");
+            assert_ne!(n, 0, "unexpected EOF after {} bytes", got.len());
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, want.to_vec());
+    }
+
+    /// One TLS record can decrypt to far more plaintext than the caller's
+    /// buffer accepts. The overflow has to be stashed and handed over across
+    /// later reads — `ReadBuf::put_slice` panics past `remaining()`, and
+    /// dropping the excess would corrupt the request body.
+    #[tokio::test]
+    async fn tls_stream_hands_over_plaintext_larger_than_the_callers_buffer() {
+        let (server_tls, mut client_tls) = tls_pair();
+        let (tcp, mut sock) = tcp_pair();
+        let mut stream = tls_rest_stream(tcp, server_tls, &[]);
+
+        let payload: Vec<u8> = (0..8000u32).map(|i| (i % 251) as u8).collect();
+        client_send(&mut client_tls, &mut sock, &payload);
+
+        let mut got = Vec::new();
+        while got.len() < payload.len() {
+            // Deliberately tiny: forces many partial hand-overs out of `in_pt`.
+            let mut buf = [0u8; 97];
+            let n = stream.read(&mut buf).await.expect("tls read");
+            assert_ne!(
+                n,
+                0,
+                "unexpected EOF after {} of {} bytes",
+                got.len(),
+                payload.len()
+            );
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(
+            got, payload,
+            "every decrypted byte must survive the hand-over"
+        );
+    }
+
+    /// The response path: plaintext written to the adapter must come out of the
+    /// peer's TLS session intact, and `shutdown` must queue a `close_notify` the
+    /// peer can see (a bare TCP FIN would look like a truncation attack).
+    #[tokio::test]
+    async fn tls_stream_writes_are_decryptable_and_shutdown_sends_close_notify() {
+        let (server_tls, mut client_tls) = tls_pair();
+        let (tcp, mut sock) = tcp_pair();
+        let mut stream = tls_rest_stream(tcp, server_tls, &[]);
+
+        let body = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        stream.write_all(body).await.expect("tls write");
+        stream.flush().await.expect("tls flush");
+        let (plaintext, _) = client_recv(&mut client_tls, &mut sock, body.len());
+        assert_eq!(
+            plaintext,
+            body.to_vec(),
+            "the peer must decrypt the response"
+        );
+
+        stream.shutdown().await.expect("tls shutdown");
+        let (extra, closed) = client_recv(&mut client_tls, &mut sock, 1);
+        assert!(extra.is_empty(), "no plaintext may follow the response");
+        assert!(
+            closed,
+            "shutdown must send a TLS close_notify, not just a FIN"
+        );
+    }
+
+    /// A peer that vanishes mid-session is a clean EOF for the reader, not an
+    /// error and not a hang.
+    #[tokio::test]
+    async fn tls_stream_read_reports_eof_when_the_peer_disconnects() {
+        let (server_tls, _client_tls) = tls_pair();
+        let (tcp, sock) = tcp_pair();
+        let mut stream = tls_rest_stream(tcp, server_tls, &[]);
+        drop(sock);
+
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).await.expect("EOF is not an error");
+        assert_eq!(n, 0, "a closed peer must read as EOF");
+    }
+
+    /// Corrupt ciphertext must surface as an I/O error rather than being
+    /// skipped: silently dropping an undecryptable record would splice
+    /// unrelated bytes into the HTTP stream.
+    #[tokio::test]
+    async fn tls_stream_surfaces_a_corrupt_record_as_an_error() {
+        let (server_tls, mut client_tls) = tls_pair();
+        let (tcp, mut sock) = tcp_pair();
+        let mut stream = tls_rest_stream(tcp, server_tls, &[]);
+
+        let mut wire = Vec::new();
+        emit_record(&mut client_tls, &mut wire, b"GET / HTTP/1.1\r\n\r\n");
+        let last = wire.len() - 1;
+        wire[last] ^= 0xff;
+        sock.write_all(&wire)
+            .expect("client writes a corrupt record");
+
+        let mut buf = [0u8; 64];
+        let err = stream
+            .read(&mut buf)
+            .await
+            .expect_err("a record that fails to decrypt must not read as data");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "got: {err}");
+    }
+
+    /// `drain_tls_records` maps a decryption failure to `InvalidData` — the
+    /// mapping `poll_read` depends on to distinguish "bad peer" from "need more
+    /// bytes".
+    #[test]
+    fn drain_tls_records_maps_a_decrypt_failure_to_invalid_data() {
+        let (mut server, mut client) = tls_pair();
+        let mut wire = Vec::new();
+        emit_record(&mut client, &mut wire, b"hello");
+        let last = wire.len() - 1;
+        wire[last] ^= 0xff;
+
+        let mut plaintext = Vec::new();
+        let err = drain_tls_records(&mut server, &mut io::Cursor::new(&wire), &mut plaintext)
+            .expect_err("a corrupt record must not drain silently");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "got: {err}");
+    }
+
+    /// RFC 8446 §6.1: bytes after `close_notify` are ignored. The drain must
+    /// stop cleanly on them rather than erroring or looping.
+    #[test]
+    fn drain_tls_records_ignores_data_after_close_notify() {
+        let (mut server, mut client) = tls_pair();
+
+        let mut goodbye = Vec::new();
+        client.send_close_notify();
+        client.write_tls(&mut goodbye).expect("client close_notify");
+        let mut drained = Vec::new();
+        drain_tls_records(&mut server, &mut io::Cursor::new(&goodbye), &mut drained)
+            .expect("close_notify is a clean end");
+        assert!(drained.is_empty(), "close_notify carries no plaintext");
+
+        let mut trailing = Vec::new();
+        emit_record(&mut client, &mut trailing, b"ignored");
+        let mut after = Vec::new();
+        drain_tls_records(&mut server, &mut io::Cursor::new(&trailing), &mut after)
+            .expect("post-close_notify bytes are ignored, not an error");
+        assert!(after.is_empty(), "nothing may surface after close_notify");
+    }
+
+    // ── serve (the handoff loop) ──────────────────────────────────────────────
+
+    /// Hand off a connected socket to the REST plane; the returned client end
+    /// is the "browser".
+    fn handoff(
+        tx: &tokio::sync::mpsc::UnboundedSender<RestConn>,
+        prefix: &[u8],
+    ) -> std::net::TcpStream {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("listener addr");
+        let client = std::net::TcpStream::connect(addr).expect("connect loopback");
+        let (server, _) = listener.accept().expect("accept loopback");
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("client read timeout");
+        tx.send(RestConn {
+            fd_stream: server,
+            prefix: prefix.to_vec(),
+            tls: None,
+        })
+        .expect("handoff accepted");
+        client
+    }
+
+    /// One malformed handed-off connection must not take the handoff loop with
+    /// it: each connection is served on its own task, so the NEXT connection
+    /// still gets a response. Multi-threaded because the client ends here are
+    /// blocking sockets — on a current-thread runtime they would starve the
+    /// very tasks whose output they are waiting for, and both assertions would
+    /// then pass on an empty read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_survives_a_failed_connection_and_keeps_serving_the_next() {
+        let router = Router::new().route("/ping", axum::routing::get(|| async { "pong" }));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<RestConn>();
+        let task = tokio::spawn(serve(rx, router));
+
+        let mut bad = handoff(&tx, b"\x16\x03\x01 this is not HTTP\r\n\r\n");
+        let mut junk = Vec::new();
+        bad.read_to_end(&mut junk)
+            .expect("the server must close a connection it cannot parse");
+        let junk = String::from_utf8_lossy(&junk).into_owned();
+        assert!(
+            !junk.starts_with("HTTP/1.1 200"),
+            "a malformed request must not be answered 200: {junk:?}"
+        );
+
+        let mut good = handoff(
+            &tx,
+            b"GET /ping HTTP/1.1\r\nHost: pylon\r\nConnection: close\r\n\r\n",
+        );
+        let mut answer = Vec::new();
+        good.read_to_end(&mut answer).expect("read the response");
+        let answer = String::from_utf8_lossy(&answer).into_owned();
+        assert!(
+            answer.starts_with("HTTP/1.1 200 OK") && answer.ends_with("pong"),
+            "the handoff loop must still serve after a failed connection: {answer}"
+        );
+
+        drop(tx);
+        task.await
+            .expect("serve exits when the handoff channel closes");
     }
 }
