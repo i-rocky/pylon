@@ -137,3 +137,294 @@ pub async fn receive_loop(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::app_registry::AppRegistry;
+    use crate::channel::registry::Registry;
+    use crate::connection::handle::{ConnectionHandle, Mailbox};
+    use crate::protocol::error::PusherError;
+    use fred::prelude::Server;
+    use fred::types::{MessageKind, Value};
+
+    /// This node's id in every test below; an envelope stamped with it is the
+    /// node's own echo.
+    const SELF_NODE: &str = "node-self";
+
+    fn local_adapter() -> Arc<LocalAdapter> {
+        Arc::new(LocalAdapter::new(
+            Arc::new(Registry::new()),
+            Arc::new(AppRegistry::new()),
+        ))
+    }
+
+    /// A connection whose mailbox the test can read.
+    fn conn() -> (
+        ConnectionHandle,
+        tokio::sync::mpsc::Receiver<Box<ServerEvent>>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        (
+            ConnectionHandle {
+                socket_id: SocketId::generate(),
+                mailbox: Mailbox::new(tx, None, None),
+            },
+            rx,
+        )
+    }
+
+    /// A pub/sub message carrying `value`, shaped exactly as fred hands one to
+    /// the receive loop.
+    fn message(value: Value) -> Message {
+        Message {
+            channel: "pylon:relay".into(),
+            value,
+            kind: MessageKind::Message,
+            server: Server::new("127.0.0.1", 6390),
+        }
+    }
+
+    /// A message carrying `env`'s JSON, as the publishing node PUBLISHes it.
+    fn envelope_message(env: &Envelope) -> Message {
+        let json = String::from_utf8(env.encode()).expect("envelope JSON is UTF-8");
+        message(Value::String(json.into()))
+    }
+
+    fn envelope(kind: EnvelopeKind, node_id: &str, channel: &str, frame: &str) -> Envelope {
+        Envelope {
+            node_id: node_id.to_string(),
+            app: "app1".to_string(),
+            kind,
+            channel: channel.to_string(),
+            event: serde_json::Value::String(frame.to_string()),
+            except: None,
+            frame_b64: None,
+        }
+    }
+
+    /// Feed `msgs` through a fresh receive loop and return once the loop has
+    /// consumed every one of them: the sender is dropped up front, so the loop
+    /// ends on `Closed` after the last message rather than on a timer.
+    async fn drive(local: Arc<LocalAdapter>, capacity: usize, msgs: Vec<Message>) {
+        let (tx, rx) = broadcast::channel(capacity);
+        for m in msgs {
+            tx.send(m).expect("the loop's receiver must still be live");
+        }
+        drop(tx);
+        receive_loop(rx, local, SELF_NODE.to_string()).await;
+    }
+
+    fn drained(rx: &mut tokio::sync::mpsc::Receiver<Box<ServerEvent>>) -> Vec<ServerEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(*ev);
+        }
+        out
+    }
+
+    /// A remote broadcast reaches this node's local subscribers as the exact
+    /// pre-encoded frame the publisher put on the wire.
+    #[tokio::test]
+    async fn remote_broadcast_is_redelivered_verbatim_to_local_subscribers() {
+        let local = local_adapter();
+        let (handle, mut rx) = conn();
+        local.subscribe("app1", "public-c", handle, None).await;
+
+        let env = envelope(EnvelopeKind::Broadcast, "node-other", "public-c", "FRAME-1");
+        drive(local, 16, vec![envelope_message(&env)]).await;
+
+        assert_eq!(
+            drained(&mut rx),
+            vec![ServerEvent::Raw(Arc::from("FRAME-1"))],
+            "a remote broadcast must arrive as the publisher's exact frame"
+        );
+    }
+
+    /// The node's OWN echo is dropped: it already delivered locally before
+    /// publishing, so re-delivering here would double every broadcast.
+    #[tokio::test]
+    async fn own_echo_is_dropped_before_local_delivery() {
+        let local = local_adapter();
+        let (handle, mut rx) = conn();
+        local.subscribe("app1", "public-c", handle, None).await;
+
+        let mine = envelope(EnvelopeKind::Broadcast, SELF_NODE, "public-c", "ECHO");
+        let theirs = envelope(EnvelopeKind::Broadcast, "node-other", "public-c", "REMOTE");
+        drive(
+            local,
+            16,
+            vec![envelope_message(&mine), envelope_message(&theirs)],
+        )
+        .await;
+
+        assert_eq!(
+            drained(&mut rx),
+            vec![ServerEvent::Raw(Arc::from("REMOTE"))],
+            "only the remote frame may be delivered; the node's own echo is deduped"
+        );
+    }
+
+    /// `except` is honoured on the RELAYING node too, so a socket the publisher
+    /// excluded stays excluded even when it lives here.
+    #[tokio::test]
+    async fn except_excludes_a_local_socket_on_the_relaying_node() {
+        let local = local_adapter();
+        let (excluded, mut excluded_rx) = conn();
+        let (other, mut other_rx) = conn();
+        let excluded_id = excluded.socket_id;
+        local.subscribe("app1", "public-c", excluded, None).await;
+        local.subscribe("app1", "public-c", other, None).await;
+
+        let mut env = envelope(EnvelopeKind::Broadcast, "node-other", "public-c", "FRAME");
+        env.except = Some(excluded_id.to_string());
+        drive(local, 16, vec![envelope_message(&env)]).await;
+
+        assert!(
+            drained(&mut excluded_rx).is_empty(),
+            "the excepted socket must receive nothing"
+        );
+        assert_eq!(
+            drained(&mut other_rx).len(),
+            1,
+            "every other local subscriber still receives the frame"
+        );
+    }
+
+    /// A payload that is not UTF-8 text, an envelope that is not valid JSON, and
+    /// a frame-kind envelope carrying no frame are all skipped — and the loop
+    /// keeps going, proven by the good message behind them still landing.
+    #[tokio::test]
+    async fn malformed_payloads_are_skipped_without_stopping_the_loop() {
+        let local = local_adapter();
+        let (handle, mut rx) = conn();
+        local.subscribe("app1", "public-c", handle, None).await;
+
+        let mut frameless = envelope(EnvelopeKind::Broadcast, "node-other", "public-c", "");
+        frameless.event = serde_json::Value::Null;
+        assert!(
+            frameless.frame().is_none(),
+            "fixture precondition: this envelope must carry no frame"
+        );
+        let good = envelope(EnvelopeKind::Broadcast, "node-other", "public-c", "GOOD");
+
+        drive(
+            local,
+            16,
+            vec![
+                message(Value::Bytes(bytes::Bytes::from_static(&[0xff, 0xfe]))),
+                message(Value::String("not json at all".into())),
+                envelope_message(&frameless),
+                envelope_message(&good),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            drained(&mut rx),
+            vec![ServerEvent::Raw(Arc::from("GOOD"))],
+            "only the well-formed envelope may be delivered"
+        );
+    }
+
+    /// A `UserSend` envelope routes by `channel` as a USER id, reaching that
+    /// user's signed-in connections rather than a channel's subscribers.
+    #[tokio::test]
+    async fn user_send_reaches_the_users_signed_in_connections() {
+        let local = local_adapter();
+        let (handle, mut rx) = conn();
+        local.signin_user("app1", "u7", handle).await;
+
+        let env = envelope(EnvelopeKind::UserSend, "node-other", "u7", "USER-FRAME");
+        drive(local, 16, vec![envelope_message(&env)]).await;
+
+        assert_eq!(
+            drained(&mut rx),
+            vec![ServerEvent::Raw(Arc::from("USER-FRAME"))],
+            "a UserSend envelope must reach the named user's connections"
+        );
+    }
+
+    /// A `UserTerminate` envelope evicts the user's local connections with the
+    /// documented 4009 error + close pair.
+    #[tokio::test]
+    async fn user_terminate_evicts_the_users_local_connections_with_4009() {
+        let local = local_adapter();
+        let (handle, mut rx) = conn();
+        local.signin_user("app1", "u7", handle).await;
+
+        let env = envelope(EnvelopeKind::UserTerminate, "node-other", "u7", "");
+        drive(local, 16, vec![envelope_message(&env)]).await;
+
+        assert_eq!(
+            drained(&mut rx),
+            vec![
+                ServerEvent::Error(PusherError::new(4009, "You got disconnected by the app.")),
+                ServerEvent::Close {
+                    code: 4009,
+                    reason: "You got disconnected by the app.".to_string(),
+                },
+            ],
+            "a remote terminate must close the user's local sockets with 4009"
+        );
+    }
+
+    /// The two watch kinds map to the `online` / `offline` watchlist changes for
+    /// the user named in `channel`, delivered to this node's local watchers.
+    #[tokio::test]
+    async fn watch_kinds_notify_local_watchers_with_the_matching_change_name() {
+        for (kind, name) in [
+            (EnvelopeKind::WatchOnline, "online"),
+            (EnvelopeKind::WatchOffline, "offline"),
+        ] {
+            let local = local_adapter();
+            let (watcher, mut rx) = conn();
+            local.watch_edges("app1", watcher, vec!["u9".to_string()]);
+
+            let env = envelope(kind, "node-other", "u9", "");
+            drive(local, 16, vec![envelope_message(&env)]).await;
+
+            assert_eq!(
+                drained(&mut rx),
+                vec![ServerEvent::WatchlistEvents {
+                    events: vec![WatchlistChange {
+                        name: name.to_string(),
+                        user_ids: vec!["u9".to_string()],
+                    }],
+                }],
+                "a remote {name} transition must reach this node's local watchers"
+            );
+        }
+    }
+
+    /// A lagged receiver loses the skipped messages but the loop survives: the
+    /// newest message still in the ring is delivered.
+    #[tokio::test]
+    async fn a_lagged_stream_drops_the_skipped_messages_and_keeps_going() {
+        let local = local_adapter();
+        let (handle, mut rx) = conn();
+        local.subscribe("app1", "public-c", handle, None).await;
+
+        // Capacity 1 with three sends before the loop reads: the receiver is two
+        // behind, so its first `recv` is `Lagged(2)` and only the last message
+        // is still in the ring.
+        let msgs = ["A", "B", "C"]
+            .iter()
+            .map(|f| {
+                envelope_message(&envelope(
+                    EnvelopeKind::Broadcast,
+                    "node-other",
+                    "public-c",
+                    f,
+                ))
+            })
+            .collect();
+        drive(local, 1, msgs).await;
+
+        assert_eq!(
+            drained(&mut rx),
+            vec![ServerEvent::Raw(Arc::from("C"))],
+            "only the message still in the ring survives a lag"
+        );
+    }
+}
