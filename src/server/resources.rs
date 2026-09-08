@@ -9,11 +9,13 @@
 //!
 //! The cgroup parsing + budget arithmetic are split into **pure** functions
 //! (`effective_cores_from_cpu_max`, `mem_limit_v2`, `mem_limit_v1`,
-//! `memory_budget`, `per_conn_cap`) that are exhaustively unit-tested on
-//! synthetic file contents, and **impure** detectors (`detect_workers`,
-//! `detect_effective_mem`) that read real sysfs/procfs and fall back to the host
-//! on any read failure. The detectors are only smoke-tested (they read live
-//! files); the formulas carry the real test coverage.
+//! `memory_budget`, `per_conn_cap`, `meminfo_memtotal`, `psi_full_avg10`,
+//! `pick_psi_path`) plus `cgroup_mem_limit`, which reads a caller-supplied
+//! cgroup root so a synthetic tree can stand in for `/sys/fs/cgroup`. Those
+//! carry the real test coverage. The **impure** detectors (`detect_workers`,
+//! `detect_effective_mem`, `psi_pressure_path`) only bind those to the live
+//! sysfs/procfs paths, falling back to the host on any read failure, and are
+//! smoke-tested.
 //!
 //! Safe Rust — the crate root sets `#![deny(unsafe_code)]`; this module adds no
 //! `unsafe`.
@@ -120,12 +122,23 @@ pub fn psi_full_avg10(s: &str) -> Option<f64> {
 /// is unavailable on this host (kernel < 4.20 or `CONFIG_PSI` off) — the backstop
 /// then no-ops, leaving the budget factor pinned at full.
 pub fn psi_pressure_path() -> Option<&'static str> {
-    const CGROUP_V2: &str = "/sys/fs/cgroup/memory.pressure";
-    const HOST: &str = "/proc/pressure/memory";
-    if std::path::Path::new(CGROUP_V2).exists() {
-        Some(CGROUP_V2)
-    } else if std::path::Path::new(HOST).exists() {
-        Some(HOST)
+    pick_psi_path(
+        std::path::Path::new(PSI_CGROUP_V2).exists(),
+        std::path::Path::new(PSI_HOST).exists(),
+    )
+}
+
+const PSI_CGROUP_V2: &str = "/sys/fs/cgroup/memory.pressure";
+const PSI_HOST: &str = "/proc/pressure/memory";
+
+/// Pure preference order behind [`psi_pressure_path`]: the cgroup v2 file wins
+/// when present (it scopes pressure to *this* container), the host file is the
+/// fallback, and neither means PSI is unavailable.
+fn pick_psi_path(cgroup_v2_exists: bool, host_exists: bool) -> Option<&'static str> {
+    if cgroup_v2_exists {
+        Some(PSI_CGROUP_V2)
+    } else if host_exists {
+        Some(PSI_HOST)
     } else {
         None
     }
@@ -150,16 +163,20 @@ pub fn detect_workers() -> usize {
 /// Any read/parse failure falls back to the host figure alone; if even the host
 /// figure is unavailable, returns a conservative 1 GiB so sizing never yields 0.
 pub fn detect_effective_mem() -> u64 {
-    let host = meminfo_memtotal().unwrap_or(1u64 << 30);
-    match cgroup_mem_limit() {
+    let host = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| meminfo_memtotal(&s))
+        .unwrap_or(1u64 << 30);
+    match cgroup_mem_limit(std::path::Path::new(CGROUP_ROOT)) {
         Some(cg) => host.min(cg),
         None => host,
     }
 }
 
-/// Parse `MemTotal` (in kB) from `/proc/meminfo` → bytes.
-fn meminfo_memtotal() -> Option<u64> {
-    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// Parse `MemTotal` (in kB) out of `/proc/meminfo`'s contents → bytes.
+fn meminfo_memtotal(s: &str) -> Option<u64> {
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("MemTotal:") {
             // "MemTotal:       16318864 kB"
@@ -170,17 +187,19 @@ fn meminfo_memtotal() -> Option<u64> {
     None
 }
 
-/// The cgroup memory limit, or `None` if unlimited / unreadable. cgroup **v2**
-/// is detected by the presence of `/sys/fs/cgroup/cgroup.controllers` and takes
-/// `min(memory.max, memory.high)`; otherwise the cgroup **v1**
-/// `memory/memory.limit_in_bytes` (huge sentinel = unlimited) is consulted.
-fn cgroup_mem_limit() -> Option<u64> {
-    if std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+/// The cgroup memory limit under `root` (the real mount is
+/// [`CGROUP_ROOT`]; tests pass a synthetic tree), or `None` if unlimited /
+/// unreadable. cgroup **v2** is detected by the presence of
+/// `<root>/cgroup.controllers` and takes `min(memory.max, memory.high)`;
+/// otherwise the cgroup **v1** `<root>/memory/memory.limit_in_bytes` (huge
+/// sentinel = unlimited) is consulted.
+fn cgroup_mem_limit(root: &std::path::Path) -> Option<u64> {
+    if root.join("cgroup.controllers").exists() {
         // cgroup v2: min of memory.max and memory.high (each `max` = no limit).
-        let max = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+        let max = std::fs::read_to_string(root.join("memory.max"))
             .ok()
             .and_then(|s| mem_limit_v2(&s));
-        let high = std::fs::read_to_string("/sys/fs/cgroup/memory.high")
+        let high = std::fs::read_to_string(root.join("memory.high"))
             .ok()
             .and_then(|s| mem_limit_v2(&s));
         match (max, high) {
@@ -191,7 +210,7 @@ fn cgroup_mem_limit() -> Option<u64> {
         }
     } else {
         // cgroup v1.
-        std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        std::fs::read_to_string(root.join("memory/memory.limit_in_bytes"))
             .ok()
             .and_then(|s| mem_limit_v1(&s))
     }
@@ -207,6 +226,12 @@ mod tests {
         assert_eq!(effective_cores_from_cpu_max("150000 100000"), Some(2)); // 1.5 -> 2 (round up)
         assert_eq!(effective_cores_from_cpu_max("max 100000"), None); // unlimited
         assert_eq!(effective_cores_from_cpu_max("50000 100000"), Some(1)); // floor 1
+                                                                           // A zero period must yield None (fall back to the host count) rather
+                                                                           // than dividing by zero.
+        assert_eq!(effective_cores_from_cpu_max("100000 0"), None);
+        assert_eq!(effective_cores_from_cpu_max(""), None);
+        assert_eq!(effective_cores_from_cpu_max("nonsense 100000"), None);
+        assert_eq!(effective_cores_from_cpu_max("100000 nonsense"), None);
     }
 
     #[test]
@@ -265,6 +290,119 @@ mod tests {
         // These read real files; only assert the sane-floor invariants.
         assert!(detect_workers() >= 1);
         assert!(detect_effective_mem() >= 1u64 << 30);
+    }
+
+    #[test]
+    fn meminfo_memtotal_reads_kb_and_converts_to_bytes() {
+        let block = "MemTotal:       16318864 kB\nMemFree:         1234567 kB\n";
+        assert_eq!(meminfo_memtotal(block), Some(16318864 * 1024));
+    }
+
+    #[test]
+    fn meminfo_memtotal_is_none_when_the_field_is_absent_or_unparseable() {
+        // `MemFree` must not be mistaken for `MemTotal`.
+        assert_eq!(meminfo_memtotal("MemFree: 1024 kB\n"), None);
+        assert_eq!(meminfo_memtotal(""), None);
+        // Present but not a number, and present but with no value at all.
+        assert_eq!(meminfo_memtotal("MemTotal:       lots kB\n"), None);
+        assert_eq!(meminfo_memtotal("MemTotal:\n"), None);
+    }
+
+    /// Build a synthetic cgroup tree: `files` are `(relative path, contents)`.
+    fn cgroup_tree(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp cgroup root");
+        for (rel, body) in files {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().expect("relative path has a parent"))
+                .expect("create cgroup subdir");
+            std::fs::write(&path, body).expect("write cgroup file");
+        }
+        dir
+    }
+
+    /// The container bug this module exists to avoid: a cgroup v2 tree caps the
+    /// process below the host, and BOTH knobs count — the tighter of
+    /// `memory.max` / `memory.high` wins, and `max` in either means "no limit
+    /// from this one" rather than "no limit at all".
+    #[test]
+    fn cgroup_v2_takes_the_tighter_of_memory_max_and_memory_high() {
+        let both = cgroup_tree(&[
+            ("cgroup.controllers", "memory cpu\n"),
+            ("memory.max", "4294967296\n"),
+            ("memory.high", "2147483648\n"),
+        ]);
+        assert_eq!(
+            cgroup_mem_limit(both.path()),
+            Some(2 << 30),
+            "high is lower"
+        );
+
+        let high_unlimited = cgroup_tree(&[
+            ("cgroup.controllers", "memory\n"),
+            ("memory.max", "4294967296\n"),
+            ("memory.high", "max\n"),
+        ]);
+        assert_eq!(
+            cgroup_mem_limit(high_unlimited.path()),
+            Some(4 << 30),
+            "an unlimited memory.high must not erase memory.max"
+        );
+
+        let max_unlimited = cgroup_tree(&[
+            ("cgroup.controllers", "memory\n"),
+            ("memory.max", "max\n"),
+            ("memory.high", "2147483648\n"),
+        ]);
+        assert_eq!(
+            cgroup_mem_limit(max_unlimited.path()),
+            Some(2 << 30),
+            "an unlimited memory.max must not erase memory.high"
+        );
+
+        let unlimited = cgroup_tree(&[
+            ("cgroup.controllers", "memory\n"),
+            ("memory.max", "max\n"),
+            ("memory.high", "max\n"),
+        ]);
+        assert_eq!(
+            cgroup_mem_limit(unlimited.path()),
+            None,
+            "both unlimited ⇒ fall back to the host figure"
+        );
+    }
+
+    /// Without `cgroup.controllers` the tree is cgroup v1, read from a
+    /// different file whose "unlimited" is a huge sentinel, not the word `max`.
+    #[test]
+    fn cgroup_v1_reads_limit_in_bytes_and_honours_the_huge_sentinel() {
+        let limited = cgroup_tree(&[("memory/memory.limit_in_bytes", "2147483648\n")]);
+        assert_eq!(cgroup_mem_limit(limited.path()), Some(2 << 30));
+
+        let sentinel = cgroup_tree(&[("memory/memory.limit_in_bytes", "9223372036854771712\n")]);
+        assert_eq!(cgroup_mem_limit(sentinel.path()), None);
+    }
+
+    /// A tree with neither layout (no controllers file, no v1 memory file) is
+    /// "no cgroup limit" — the detector then sizes off the host alone.
+    #[test]
+    fn cgroup_limit_is_none_when_no_limit_file_is_readable() {
+        let empty = cgroup_tree(&[]);
+        assert_eq!(cgroup_mem_limit(empty.path()), None);
+        // A v2 tree whose memory files are missing entirely is unlimited too.
+        let controllers_only = cgroup_tree(&[("cgroup.controllers", "cpu\n")]);
+        assert_eq!(cgroup_mem_limit(controllers_only.path()), None);
+    }
+
+    #[test]
+    fn psi_path_prefers_the_cgroup_file_over_the_host_file() {
+        assert_eq!(pick_psi_path(true, true), Some(PSI_CGROUP_V2));
+        assert_eq!(pick_psi_path(true, false), Some(PSI_CGROUP_V2));
+        assert_eq!(pick_psi_path(false, true), Some(PSI_HOST));
+        assert_eq!(
+            pick_psi_path(false, false),
+            None,
+            "no PSI on this kernel ⇒ the backstop must no-op"
+        );
     }
 
     #[test]
