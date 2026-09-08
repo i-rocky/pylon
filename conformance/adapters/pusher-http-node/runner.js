@@ -55,9 +55,16 @@
 //
 //   node runner.js --version    Print the SDK's package version.
 //   node runner.js --list       Print implemented scenario ids, one per line.
+//
+// Occupied-server fixtures: the query scenarios (S-CHANNELS/S-CHANNEL/S-USERS)
+// and S-WEBHOOK-VERIFY establish the client state they assert on through the
+// sibling pusher-js runner's `--hold` mode, so each observes a server IT
+// populated instead of whatever an earlier scenario left behind — no scenario
+// depends on another's leftovers or on catalog order.
 
 const fs = require('fs');
 const path = require('path');
+const { spawn } = require('child_process');
 
 // The SDK: `module.exports` IS the Pusher class (no named export).
 const Pusher = require('pusher');
@@ -169,6 +176,78 @@ const assertOk = (cond, msg) => {
   if (!cond) throw new Error(msg);
 };
 
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+
+// ---------------------------------------------------------------------------
+// Occupied-server fixture: a real client connection, established through the
+// official CLIENT SDK (the sibling pusher-js runner's `--hold` mode), holding
+// the channels a server-plane scenario is about to query. The spec rides the
+// child's STDIN and closing that STDIN is the release signal, so neither a
+// thrown scenario nor a dead parent can leak a held connection.
+// ---------------------------------------------------------------------------
+
+const JS_ADAPTER_DIR = path.join(__dirname, '..', 'pusher-js');
+const HOLD_READY_TIMEOUT_MS = 8000;
+const HOLD_RELEASE_TIMEOUT_MS = 4000;
+
+const holdChannels = (spec) =>
+  new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      ['runner.js', '--hold', '--env', '--', arg('--env')],
+      { cwd: JS_ADAPTER_DIR, stdio: ['pipe', 'pipe', 'inherit'] }
+    );
+    const exited = new Promise((res) => child.on('exit', res));
+    let settled = false;
+    const abandon = (why) => {
+      if (settled) return;
+      settled = true;
+      child.kill('SIGKILL');
+      reject(new Error(why));
+    };
+    const release = async () => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      child.stdin.end();
+      const killer = setTimeout(() => child.kill('SIGKILL'), HOLD_RELEASE_TIMEOUT_MS);
+      await exited;
+      clearTimeout(killer);
+    };
+
+    const readyTimer = setTimeout(
+      () => abandon(`hold not ready within ${HOLD_READY_TIMEOUT_MS}ms: ${spec.channels}`),
+      HOLD_READY_TIMEOUT_MS
+    );
+    child.on('error', (e) => {
+      clearTimeout(readyTimer);
+      abandon(`hold spawn failed: ${(e && e.message) || String(e)}`);
+    });
+    child.on('exit', (code, signal) => {
+      clearTimeout(readyTimer);
+      abandon(`hold exited before it was ready (code ${code}, signal ${signal})`);
+    });
+    child.stdin.on('error', () => {});
+    child.stdout.setEncoding('utf8');
+    let buffered = '';
+    child.stdout.on('data', (chunk) => {
+      if (settled) return;
+      buffered += chunk;
+      const newline = buffered.indexOf('\n');
+      if (newline < 0) return;
+      clearTimeout(readyTimer);
+      const line = buffered.slice(0, newline);
+      let ready;
+      try {
+        ready = JSON.parse(line);
+      } catch (e) {
+        return abandon(`hold ready line is not JSON: ${line.slice(0, 120)}`);
+      }
+      settled = true;
+      log('holding', (ready.held || []).join(', '));
+      resolve({ held: ready.held || [], release });
+    });
+    child.stdin.write(JSON.stringify(spec) + '\n');
+  });
+
 // ---------------------------------------------------------------------------
 // Scenarios (verdict: pass | fail | skip).
 // ---------------------------------------------------------------------------
@@ -194,60 +273,167 @@ const SCENARIOS = {
     return { batches: '<10x10-ok>' };
   },
 
-  // Both shapes are valid observations: `{"channels":{}}` in a server-only
-  // scoped run (triggering does not occupy channels) vs occupied channels in
-  // a full run where the client plane subscribed first (catalog order puts
-  // every C-*/U-*/E-* before S-*).
+  // The index must distinguish occupied from unoccupied: the two channels this
+  // scenario holds are named in the response with their real attribute values,
+  // and a never-subscribed sibling name is absent. An implementation returning
+  // an unconditionally empty (or unconditionally full) index fails both ways.
   'S-CHANNELS': async () => {
-    const p = client();
-    const r = await p.get({ path: '/channels', params: { filter_by_prefix: 'cf-' } });
-    assertOk(r.status === 200, `status ${r.status}`);
-    const body = await r.json();
-    const ids = Object.keys((body && body.channels) || {});
-    // info-attribute leg: user_count is only legal filtered to presence-.
-    const r2 = await p.get({
-      path: '/channels',
-      params: { filter_by_prefix: 'presence-cf-', info: 'user_count' },
+    const held = await holdChannels({
+      user_id: 'u-s-channels',
+      channels: ['cf-s-channels', 'presence-cf-s-channels'],
     });
-    assertOk(r2.status === 200, `attrs status ${r2.status}`);
-    const body2 = await r2.json();
-    const presenceIds = Object.keys((body2 && body2.channels) || {});
-    return {
-      status: '200',
-      channel_count: ids.length,
-      channel_keys: ids.map(() => '<name>'),
-      presence_attrs_status: '200',
-      presence_channel_count: presenceIds.length,
-    };
-  },
-
-  'S-CHANNEL': async () => {
-    const r = await client().get({ path: '/channels/cf-test-channel' });
-    assertOk(r.status === 200, `status ${r.status}`);
-    const body = await r.json();
-    assertOk(body && body.occupied !== undefined, 'occupied field present');
-    return { occupied: Boolean(body.occupied) };
-  },
-
-  // Query the presence channel C-PRES-SUB occupies (`presence-cf-pres`), so a
-  // full run observes the 200/users shape. Both shapes stay valid: 200 with a
-  // users array (occupied, or empty-but-present before Task 8 lands), 400 when
-  // the server refuses the query (unoccupied).
-  'S-USERS': async () => {
-    let status;
-    let users = null;
     try {
-      const r = await client().get({ path: '/channels/presence-cf-pres/users' });
-      status = r.status;
+      const p = client();
+      const r = await p.get({
+        path: '/channels',
+        params: { filter_by_prefix: 'cf-', info: 'subscription_count' },
+      });
+      assertOk(r.status === 200, `status ${r.status}`);
+      const listed = (await r.json()).channels || {};
+      const names = Object.keys(listed).join(',') || 'none';
+      const occupied = listed['cf-s-channels'];
+      assertOk(occupied !== undefined, `held channel missing from the index (listed: ${names})`);
+      assertOk(
+        occupied.subscription_count === 1,
+        `held channel subscription_count: ${JSON.stringify(occupied)}`
+      );
+      assertOk(
+        listed['cf-s-channels-never-subscribed'] === undefined,
+        `a never-subscribed channel is listed in the index (listed: ${names})`
+      );
+
+      // user_count is only legal filtered to presence-.
+      const r2 = await p.get({
+        path: '/channels',
+        params: { filter_by_prefix: 'presence-cf-', info: 'user_count' },
+      });
+      assertOk(r2.status === 200, `attrs status ${r2.status}`);
+      const presence = (await r2.json()).channels || {};
+      const roster = presence['presence-cf-s-channels'];
+      assertOk(
+        roster !== undefined,
+        `held presence channel missing from the index (listed: ${Object.keys(presence).join(',') || 'none'})`
+      );
+      assertOk(roster.user_count === 1, `held presence channel user_count: ${JSON.stringify(roster)}`);
+
+      return {
+        status: '200',
+        held_channel_listed: true,
+        held_channel_subscription_count: 1,
+        never_subscribed_channel_listed: false,
+        presence_attrs_status: '200',
+        held_presence_channel_listed: true,
+        held_presence_user_count: 1,
+      };
+    } finally {
+      await held.release();
+    }
+  },
+
+  // occupied must track reality in BOTH directions — true for the channel this
+  // scenario holds, false for a never-subscribed one — and the cache attribute
+  // must read back the event this scenario published (null when nothing was).
+  'S-CHANNEL': async () => {
+    const held = await holdChannels({ channels: ['cf-s-channel'] });
+    try {
+      const p = client();
+      const r = await p.get({
+        path: '/channels/cf-s-channel',
+        params: { info: 'subscription_count' },
+      });
+      assertOk(r.status === 200, `status ${r.status}`);
       const body = await r.json();
-      users = Array.isArray(body && body.users) ? body.users.map(() => '<id>') : null;
-    } catch (e) {
-      status = statusOf(e); // RequestError carries the HTTP status
+      assertOk(body.occupied === true, `held channel not occupied: ${JSON.stringify(body)}`);
+      assertOk(
+        body.subscription_count === 1,
+        `held channel subscription_count: ${JSON.stringify(body)}`
+      );
+
+      const vacantResp = await p.get({ path: '/channels/cf-s-channel-never-subscribed' });
+      assertOk(vacantResp.status === 200, `never-subscribed status ${vacantResp.status}`);
+      const vacant = await vacantResp.json();
+      assertOk(
+        vacant.occupied === false,
+        `never-subscribed channel reports occupied: ${JSON.stringify(vacant)}`
+      );
+
+      const payload = { v: 'cf-s-channel-cached' };
+      const cacheTrigger = await p.trigger('cache-cf-s-channel', 'cached-event', payload);
+      assertOk(cacheTrigger.status === 200, `cache trigger status ${cacheTrigger.status}`);
+      const cacheResp = await p.get({
+        path: '/channels/cache-cf-s-channel',
+        params: { info: 'cache' },
+      });
+      assertOk(cacheResp.status === 200, `cache attr status ${cacheResp.status}`);
+      const cache = (await cacheResp.json()).cache;
+      assertOk(cache !== null && typeof cache === 'object', `cache attr: ${JSON.stringify(cache)}`);
+      assertOk(
+        cache.data === JSON.stringify(payload),
+        `cached data is not the published payload: ${JSON.stringify(cache.data)}`
+      );
+      assertOk(
+        typeof cache.ttl === 'number' && cache.ttl > 0,
+        `cache ttl: ${JSON.stringify(cache.ttl)}`
+      );
+
+      const emptyResp = await p.get({
+        path: '/channels/cache-cf-s-channel-never-published',
+        params: { info: 'cache' },
+      });
+      assertOk(emptyResp.status === 200, `empty cache attr status ${emptyResp.status}`);
+      const empty = (await emptyResp.json()).cache;
+      assertOk(empty === null, `never-published cache attr is not null: ${JSON.stringify(empty)}`);
+
+      return {
+        occupied: true,
+        subscription_count: 1,
+        never_subscribed_occupied: false,
+        cache_attr: '<data+ttl>',
+        never_published_cache_attr: null,
+      };
+    } finally {
+      await held.release();
     }
-    if (status !== 200 && status !== 400) {
-      throw new Error(`users status ${status}`);
+  },
+
+  // The roster must name the member this scenario put there, and an unoccupied
+  // presence channel must answer with an EMPTY roster — not the same roster,
+  // and not an error.
+  'S-USERS': async () => {
+    const held = await holdChannels({
+      user_id: 'u-s-users',
+      channels: ['presence-cf-s-users'],
+    });
+    try {
+      const p = client();
+      const r = await p.get({ path: '/channels/presence-cf-s-users/users' });
+      assertOk(r.status === 200, `status ${r.status}`);
+      const users = (await r.json()).users;
+      assertOk(Array.isArray(users), `users is not an array: ${JSON.stringify(users)}`);
+      const ids = users.map((u) => u && u.id);
+      assertOk(
+        ids.length === 1 && ids[0] === 'u-s-users',
+        `roster does not name the held member: ${JSON.stringify(users)}`
+      );
+
+      const emptyResp = await p.get({
+        path: '/channels/presence-cf-s-users-never-subscribed/users',
+      });
+      assertOk(emptyResp.status === 200, `unoccupied roster status ${emptyResp.status}`);
+      const emptyUsers = (await emptyResp.json()).users;
+      assertOk(
+        Array.isArray(emptyUsers) && emptyUsers.length === 0,
+        `unoccupied presence roster is not empty: ${JSON.stringify(emptyUsers)}`
+      );
+
+      return {
+        status: '200',
+        users: ['u-s-users'],
+        unoccupied_roster: [],
+      };
+    } finally {
+      await held.release();
     }
-    return { status: String(status), users: users === null ? '<opaque>' : users };
   },
 
   // Self-test of the signing mode: private + presence channelData + user auth.
@@ -277,21 +463,62 @@ const SCENARIOS = {
     return { private: '<key:sig>', presence: '<key:sig>', user: '<token>' };
   },
 
-  // Verify the most recent webhook envelope captured by the harness receiver.
-  // In a server-only scoped run nothing has fired a webhook yet: /last is 404
-  // and the verdict is skip, not fail.
+  // EVERY envelope the receiver captured this run is verified — the signing
+  // headers, the SDK's own HMAC verifier, the envelope frame, and each event's
+  // documented payload shape — and the observed event-type set must cover all
+  // seven types, so a silently missing webhook type fails instead of passing
+  // unnoticed. The provocation is this scenario's own, so the requirement
+  // holds whether or not the client plane ran ahead of it.
   'S-WEBHOOK-VERIFY': async () => {
     const e = loadEnv();
-    const resp = await fetch(e.webhook_receiver + '/last');
-    if (resp.status === 404) {
-      return { skip: 'no webhook envelope recorded yet' };
+    const held = await holdChannels({
+      user_id: 'u-s-webhook',
+      channels: [
+        'cf-s-webhook',
+        'cache-cf-s-webhook-never-published',
+        'presence-cf-s-webhook',
+        'private-cf-s-webhook',
+      ],
+      client_event: {
+        channel: 'private-cf-s-webhook',
+        event: 'client-s-webhook',
+        data: { probe: 'cf-s-webhook' },
+      },
+    });
+    try {
+      // Synchronizes on effect, never on elapsed time: the client event is
+      // only known to have reached pylon once its webhook lands, and releasing
+      // the hold sooner would race the socket close against the frame.
+      await captureUntilProbeTypes(e.webhook_receiver, WEBHOOK_TYPES_WHILE_HELD);
+    } finally {
+      // The vacate-side types only fire once the hold is gone and pylon's
+      // reconnect grace has elapsed.
+      await held.release();
     }
-    assertOk(resp.status === 200, `webhook receiver status ${resp.status}`);
-    const envelope = await resp.json();
-    assertOk(envelope && typeof envelope.body === 'string', 'envelope shape');
-    const result = verifyWebhookEnvelope(envelope);
-    assertOk(result.valid, result.error || 'SDK webhook verification failed');
-    return { verified: true, events: result.events };
+
+    const envelopes = await captureUntilProbeTypes(e.webhook_receiver, WEBHOOK_EVENT_TYPES);
+    const names = new Set();
+    envelopes.forEach((envelope, i) => {
+      assertOk(
+        envelope && typeof envelope.body === 'string',
+        `envelope ${i} shape: ${JSON.stringify(envelope)}`
+      );
+      try {
+        for (const name of verifyWebhookEnvelope(envelope, e.app_key)) names.add(name);
+      } catch (err) {
+        throw new Error(
+          `envelope ${i + 1} of ${envelopes.length}: ${(err && err.message) || String(err)}`
+        );
+      }
+    });
+    const missing = WEBHOOK_EVENT_TYPES.filter((name) => !names.has(name));
+    assertOk(missing.length === 0, `webhook types never observed: ${missing.join(',')}`);
+    log(`verified ${envelopes.length} captured envelope(s)`);
+    return {
+      verified: '<every captured envelope>',
+      headers_verified: ['content-type', 'x-pusher-key', 'x-pusher-signature'],
+      event_types_verified: [...names].sort(),
+    };
   },
 
   // A bad secret and an unknown app must BOTH be rejected by the server (401)
@@ -344,30 +571,153 @@ const SCENARIOS = {
 const isSkip = (o) => o !== null && typeof o === 'object' && typeof o.skip === 'string';
 
 // ---------------------------------------------------------------------------
-// Webhook verification (used by the S-WEBHOOK-VERIFY scenario, which fetches
-// the envelope from the harness receiver's /last endpoint directly).
+// Webhook verification (S-WEBHOOK-VERIFY, over the receiver's /all capture).
 // ---------------------------------------------------------------------------
 
-// Build the SDK webhook object from a receiver envelope {headers, body}:
-// header names lowercased (the SDK reads x-pusher-key / x-pusher-signature /
-// content-type), content-type application/json added when absent (the SDK
-// refuses to even parse the body without it), rawBody = the body string.
-function verifyWebhookEnvelope(envelope) {
+// The seven types the harness app subscribes to (server.rs ALL_EVENT_TYPES),
+// split by the edge that produces them: S-WEBHOOK-VERIFY provokes one of each
+// and requires all seven to arrive.
+const WEBHOOK_TYPES_WHILE_HELD = [
+  'cache_miss',
+  'channel_occupied',
+  'client_event',
+  'member_added',
+  'subscription_count',
+];
+const WEBHOOK_TYPES_AFTER_RELEASE = ['channel_vacated', 'member_removed'];
+const WEBHOOK_EVENT_TYPES = [...WEBHOOK_TYPES_WHILE_HELD, ...WEBHOOK_TYPES_AFTER_RELEASE].sort();
+
+// Substring every channel S-WEBHOOK-VERIFY provokes on carries, and no other
+// scenario's channel does — the coverage assertion counts only these.
+const WEBHOOK_PROBE_MARKER = 'cf-s-webhook';
+
+const isNonEmptyString = (v) => typeof v === 'string' && v.length > 0;
+
+// https://pusher.com/docs/channels/server_api/webhooks/ — the payload keys
+// each `name` carries, and the shape of each key's value. `data` is the
+// client's own event payload, so only its presence is pinned.
+const WEBHOOK_PAYLOAD_KEYS = {
+  channel_occupied: { required: ['channel'], optional: [] },
+  channel_vacated: { required: ['channel'], optional: [] },
+  cache_miss: { required: ['channel'], optional: [] },
+  member_added: { required: ['channel', 'user_id'], optional: [] },
+  member_removed: { required: ['channel', 'user_id'], optional: [] },
+  subscription_count: { required: ['channel', 'subscription_count'], optional: [] },
+  client_event: {
+    required: ['channel', 'event', 'data', 'socket_id'],
+    optional: ['user_id'],
+  },
+};
+
+const WEBHOOK_FIELD_SHAPES = {
+  channel: isNonEmptyString,
+  user_id: isNonEmptyString,
+  event: isNonEmptyString,
+  socket_id: (v) => typeof v === 'string' && /^\d+\.\d+$/.test(v),
+  subscription_count: (v) => Number.isInteger(v) && v >= 0,
+  data: (v) => v !== undefined,
+};
+
+// Why this event does not match the documented shape for its `name`, or null.
+function payloadProblem(ev) {
+  if (ev === null || typeof ev !== 'object') return `event is not an object: ${JSON.stringify(ev)}`;
+  const shape = WEBHOOK_PAYLOAD_KEYS[ev.name];
+  if (shape === undefined) return `undocumented webhook name ${JSON.stringify(ev.name)}`;
+  const allowed = new Set(['name', ...shape.required, ...shape.optional]);
+  const extra = Object.keys(ev).filter((k) => !allowed.has(k));
+  if (extra.length > 0) return `${ev.name} carries undocumented key(s): ${extra.join(',')}`;
+  for (const key of shape.required) {
+    if (!(key in ev)) return `${ev.name} is missing ${key}`;
+  }
+  for (const key of [...shape.required, ...shape.optional]) {
+    if (key in ev && !WEBHOOK_FIELD_SHAPES[key](ev[key])) {
+      return `${ev.name}.${key}: ${JSON.stringify(ev[key])}`;
+    }
+  }
+  return null;
+}
+
+// Verify ONE captured envelope {headers, body} end to end and return its event
+// names. The signature is checked by the SDK's own verifier — never by this
+// runner — so the harness stays blind to pylon's signing implementation.
+// Header names arrive lowercased from the receiver, which is what the SDK
+// reads; nothing is filled in on pylon's behalf.
+function verifyWebhookEnvelope(envelope, appKey) {
   const headers = {};
   for (const [k, v] of Object.entries(envelope.headers || {})) {
     headers[String(k).toLowerCase()] = v;
   }
-  if (!headers['content-type']) headers['content-type'] = 'application/json';
+  assertOk(
+    headers['content-type'] === 'application/json',
+    `content-type: ${JSON.stringify(headers['content-type'])}`
+  );
+  assertOk(
+    headers['x-pusher-key'] === appKey,
+    `X-Pusher-Key: ${JSON.stringify(headers['x-pusher-key'])}`
+  );
+  assertOk(
+    /^[0-9a-f]{64}$/.test(headers['x-pusher-signature'] || ''),
+    `X-Pusher-Signature: ${JSON.stringify(headers['x-pusher-signature'])}`
+  );
 
-  try {
-    const wh = client().webhook({ headers, rawBody: envelope.body });
-    const valid = wh.isValid();
-    if (!valid) {
-      return { valid: false, events: [], error: 'SDK webhook verification failed (key/signature/body mismatch)' };
+  const wh = client().webhook({ headers, rawBody: envelope.body });
+  assertOk(wh.isValid(), 'SDK webhook verification failed (key/signature/body mismatch)');
+
+  const data = wh.getData();
+  const frame = Object.keys(data).sort().join(',');
+  assertOk(frame === 'events,time_ms', `envelope keys: ${frame}`);
+  assertOk(
+    Number.isInteger(data.time_ms) && data.time_ms > 0,
+    `time_ms: ${JSON.stringify(data.time_ms)}`
+  );
+  const events = wh.getEvents();
+  assertOk(Array.isArray(events) && events.length > 0, `events: ${JSON.stringify(events)}`);
+  for (const ev of events) {
+    const problem = payloadProblem(ev);
+    assertOk(problem === null, `payload shape — ${problem}`);
+  }
+  return events.map((ev) => ev.name);
+}
+
+// Poll the receiver's whole capture until every `required` type has landed FROM
+// S-WEBHOOK-VERIFY'S OWN probe channels — delivery is asynchronous and pylon
+// debounces the vacate-side events behind a reconnect grace window. Counting
+// only the probe's own channels is what keeps the coverage assertion
+// self-contained: an envelope another scenario left behind can neither satisfy
+// it nor hide a type this scenario provoked and never received. Returns the
+// whole capture; the timeout names what is still missing, which is the
+// diagnosis a bare "verified nothing" would not give.
+const WEBHOOK_SETTLE_TIMEOUT_MS = 8000;
+const WEBHOOK_POLL_INTERVAL_MS = 250;
+
+async function captureUntilProbeTypes(receiver, required) {
+  const deadline = Date.now() + WEBHOOK_SETTLE_TIMEOUT_MS;
+  for (;;) {
+    const resp = await fetch(receiver + '/all');
+    assertOk(resp.status === 200, `webhook receiver /all status ${resp.status}`);
+    const envelopes = await resp.json();
+    const seen = new Set();
+    for (const envelope of envelopes) {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(envelope && envelope.body);
+      } catch (e) {
+        continue; // a malformed body is the verification pass's failure to report
+      }
+      for (const ev of (parsed && parsed.events) || []) {
+        if (typeof ev.channel === 'string' && ev.channel.includes(WEBHOOK_PROBE_MARKER)) {
+          seen.add(ev.name);
+        }
+      }
     }
-    return { valid: true, events: wh.getEvents().map((ev) => ev.name), error: null };
-  } catch (e) {
-    return { valid: false, events: [], error: (e && e.message) || String(e) };
+    const missing = required.filter((name) => !seen.has(name));
+    if (missing.length === 0) return envelopes;
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `probe webhook types not delivered within ${WEBHOOK_SETTLE_TIMEOUT_MS}ms: ${missing.join(',')}`
+      );
+    }
+    await sleep(WEBHOOK_POLL_INTERVAL_MS);
   }
 }
 

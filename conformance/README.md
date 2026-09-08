@@ -21,13 +21,35 @@ produced or verified by the official `pusher-http-node` SDK:
 - the harness's auth endpoint receives an SDK auth request and shells out to
   the pusher-http-node runner's `--sign` mode (request on stdin, signed
   response on stdout);
-- webhook envelopes are verified with the SDK's webhook verifier, not a
-  hand-rolled HMAC check.
+- **every** webhook envelope captured in a run is verified with the SDK's
+  webhook verifier, not a hand-rolled HMAC check.
 
 This is deliberate: if the harness re-implemented the crypto, it could
 re-implement pylon's bugs and call them conformant. Delegating to the SDKs
 means the harness is blind to implementation details and honest about
 interoperability.
+
+## No scenario reads another scenario's leftovers
+
+Every scenario establishes the state it asserts on. The server-plane query
+scenarios (`S-CHANNELS`, `S-CHANNEL`, `S-USERS`) and `S-WEBHOOK-VERIFY` hold
+their own client connection for the duration — through the official *client*
+SDK, via the pusher-js runner's `--hold` mode (spec on stdin, the channels
+released when that stdin closes, so a dead parent cannot leak a connection) —
+and then assert real values: a named channel present in the index with its
+real `subscription_count`/`user_count`, `occupied` true for the held channel
+and false for a never-subscribed one, the known `user_id` in the presence
+roster, the cached payload read back through the `cache` attribute.
+
+`S-WEBHOOK-VERIFY` provokes one of each of the seven webhook types on its own
+probe channels, verifies **every** envelope the receiver captured this run
+(signing headers, SDK signature check, envelope frame, and the documented
+payload shape for each event's `name`), and requires all seven types to have
+arrived from those probe channels — so a silently missing webhook type fails
+instead of passing unnoticed.
+
+Verdicts therefore do not depend on catalog order, and a `--scenario`-scoped
+run of any one of them is as meaningful as a full run.
 
 ## Prerequisites
 
@@ -56,8 +78,8 @@ All commands run from `conformance/`:
 ```sh
 cargo run                       # full suite: 26 scenarios, catalog order
 cargo run -- --smoke            # 3-scenario subset: C-PUB-SUB, S-TRIGGER, S-WEBHOOK-VERIFY
-                                # (all three scenarios exercise in the smoke subset:
-                                # C-PUB-SUB's occupied/vacated envelopes feed S-WEBHOOK-VERIFY)
+                                # (one per surface: WebSocket, HTTP, webhooks —
+                                # each stands alone, in any order)
 cargo run -- --list             # print the catalog (id, sdk, plane, budget, summary)
 cargo run -- --audit            # binding-table honesty gate (see below)
 cargo run -- --sdk pusher-js    # only one SDK's scenarios

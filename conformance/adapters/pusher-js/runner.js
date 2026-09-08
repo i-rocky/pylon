@@ -13,6 +13,16 @@
 //       {scenario, verdict: pass|fail|skip, observations, error, duration_ms}.
 //       All logs go to stderr; stdout carries only the verdict.
 //
+//   node runner.js --hold --env -- <env.json>       (spec JSON line on STDIN)
+//       Occupy channels on behalf of a server-plane scenario, so that
+//       scenario queries a server IT populated rather than whatever an
+//       earlier scenario happened to leave behind. Spec:
+//       {channels: [...], user_id?, client_event?: {channel, event, data}}.
+//       Connects, subscribes to every channel, optionally sends one client
+//       event, prints ONE `{"held":[...]}` line on stdout, then keeps the
+//       connection open until STDIN CLOSES — the release signal, so a parent
+//       that dies releases the hold with it.
+//
 //   node runner.js --version    Print the SDK's package version.
 //   node runner.js --list       Print implemented scenario ids, one per line.
 //
@@ -994,6 +1004,76 @@ async function rejectedConnectScenario(key, expectedCode) {
 // A scenario may return {skip: reason} to request a skip verdict.
 const isSkip = (o) => o !== null && typeof o === 'object' && typeof o.skip === 'string';
 
+// ---------------------------------------------------------------------------
+// --hold: occupy channels for a server-plane scenario until STDIN closes.
+// ---------------------------------------------------------------------------
+
+// Last-resort ceiling on a hold: the parent releases by closing STDIN, and the
+// harness budget kill reaches this whole process group, so a hold only reaches
+// the ceiling if BOTH were somehow missed.
+const HOLD_CEILING_MS = 60000;
+
+// Latch STDIN's first line (the spec) while leaving the stream flowing, so the
+// later EOF still arrives as the release signal.
+const stdinSpecThenClose = () => {
+  let resolveSpec;
+  let resolveClosed;
+  const spec = new Promise((res) => (resolveSpec = res));
+  const closed = new Promise((res) => (resolveClosed = res));
+  let buffered = '';
+  let latched = false;
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => {
+    if (latched) return;
+    buffered += chunk;
+    const newline = buffered.indexOf('\n');
+    if (newline >= 0) {
+      latched = true;
+      resolveSpec(buffered.slice(0, newline));
+    }
+  });
+  process.stdin.on('end', resolveClosed);
+  process.stdin.on('close', resolveClosed);
+  return { spec, closed };
+};
+
+async function holdMode() {
+  const stdin = stdinSpecThenClose();
+  const spec = JSON.parse(await stdin.spec);
+  const channels = Array.isArray(spec.channels) ? spec.channels : [];
+  assertOk(channels.length > 0, '--hold spec needs a non-empty channels array');
+  const p = spec.user_id === undefined ? connect() : connectAs(String(spec.user_id));
+  try {
+    await waitConnected(p);
+    // Every subscribe and its wait are bound in the SAME tick: the server's
+    // replies ride one connection but carry no ordering guarantee, and a
+    // pusher-js channel does not buffer (the C-EVENT-ECHO lesson).
+    const acked = channels.map((name) => {
+      const ch = p.subscribe(name);
+      return waitEvent(ch, 'pusher:subscription_succeeded').then(() => [name, ch]);
+    });
+    const held = new Map(await Promise.all(acked));
+    if (spec.client_event) {
+      const { channel, event, data } = spec.client_event;
+      const ch = held.get(channel);
+      assertOk(ch !== undefined, `--hold client_event channel ${channel} is not held`);
+      assertOk(ch.trigger(event, data) === true, `--hold client event ${event} was not sent`);
+      log('client event sent on', channel);
+    }
+    log('holding', channels.join(', '));
+    process.stdout.write(JSON.stringify({ held: channels }) + '\n');
+    let ceiling;
+    await Promise.race([
+      stdin.closed,
+      new Promise((res) => (ceiling = setTimeout(res, HOLD_CEILING_MS))),
+    ]);
+    clearTimeout(ceiling);
+  } finally {
+    p.disconnect();
+    process.stdin.pause();
+  }
+}
+
 // --version: the SDK's own package version.
 function sdkVersion() {
   return require('pusher-js/package.json').version;
@@ -1045,11 +1125,15 @@ async function scenarioMode() {
     console.log(sdkVersion());
     return;
   }
+  if (has('--hold')) {
+    await holdMode();
+    return;
+  }
   if (has('--scenario')) {
     await scenarioMode();
     return;
   }
-  console.error('usage: runner.js --scenario <id> --env -- <env.json> | --version | --list');
+  console.error('usage: runner.js --scenario <id> --env -- <env.json> | --hold --env -- <env.json> (spec on stdin) | --version | --list');
   process.exit(2);
 })().catch((e) => {
   console.error((e && e.stack) || String(e));
