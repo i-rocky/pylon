@@ -105,11 +105,16 @@ pylon delivers every count change through its normal batch window and does not t
   "name": "client_event",
   "channel": "private-chat",
   "event": "client-typing",
-  "data": { "user": "alice" },
+  "data": "{\"user\":\"alice\"}",
   "socket_id": "123.456",
   "user_id": "user-42"
 }
 ```
+
+`data` is the sender's payload as a **JSON-encoded string**, matching the type the official
+`pusher-http-node` SDK declares (`data: string`) — parse it yourself (`JSON.parse(event.data)`).
+A payload that the client already sent as a JSON string is passed through unchanged, never
+double-encoded.
 
 `user_id` is only present on `client_event` when the sender is a member of a presence channel;
 it is omitted otherwise.

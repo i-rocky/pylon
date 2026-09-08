@@ -179,6 +179,19 @@ pre-1.0 and versions track `Cargo.toml`.
   to drop the arm.
 
 ### Fixed
+- **The `client_event` webhook now sends `data` as a string, not as the raw JSON
+  value.** `pusher-http-node` 5.3.4's `index.d.ts` declares the webhook event as
+  `{name, channel, event, data: string, socket_id}`, and its `lib/webhook.js`
+  parses only the envelope body — never `event.data` — so a receiver is expected
+  to get text and parse it itself; hosted Pusher's docs agree. Pylon emitted the
+  decoded value instead, so a client event carrying `{"msg":"hi"}` produced
+  `"data": {"msg":"hi"}` where hosted produces `"data": "{\"msg\":\"hi\"}"`,
+  and a consumer following the declared type threw on `JSON.parse(event.data)`.
+  Receivers now see `data` as a JSON-encoded string for every payload shape a
+  client can send (object, array, number, boolean, null); a payload that was
+  already a JSON string is passed through unchanged rather than double-encoded.
+  **A receiver that was reading `client_event`'s `data` as an object must now
+  `JSON.parse` it** — no other webhook type's payload changes.
 - **A clustered node no longer goes deaf to a channel it still has subscribers
   on when a leave and a re-join are applied out of order.** The percore worker
   computes the node-local 1→0 teardown edge under the shared registry lock but
