@@ -34,8 +34,10 @@ RUN touch src/main.rs && \
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
 
-# ca-certificates: TLS to Redis (rediss://). wget: the container HEALTHCHECK /
-# compose healthcheck probes GET /health (debian-slim ships neither curl nor wget).
+# ca-certificates: the trust store behind TLS to Redis (rediss://) and outbound
+# webhook HTTPS — pylon verifies against it, not a bundled root set. wget: the
+# container HEALTHCHECK / compose healthcheck probes GET /health (debian-slim
+# ships neither curl nor wget).
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates wget && \
     rm -rf /var/lib/apt/lists/*
