@@ -648,6 +648,107 @@ mod psi_tests {
 }
 
 #[cfg(test)]
+mod psi_loop_tests {
+    use super::{psi_backstop_loop, Arc, AtomicBool, AtomicU32};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    /// A kernel PSI block whose `full avg10` is `p`.
+    fn block(p: f64) -> String {
+        format!(
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n\
+             full avg10={p:.2} avg60=0.00 avg300=0.00 total=1\n"
+        )
+    }
+
+    /// Step the paused clock one poll period at a time until `pred` holds or
+    /// `max_ticks` elapse. Time is paused, so this is deterministic sequencing,
+    /// not a wall-clock wait: each sleep lets the loop's 1 Hz interval fire
+    /// exactly once.
+    async fn advance_until(max_ticks: u32, mut pred: impl FnMut() -> bool) -> bool {
+        for _ in 0..max_ticks {
+            if pred() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+        }
+        pred()
+    }
+
+    /// The backstop's whole job: walk the shared budget factor down while the
+    /// kernel reports sustained memory stalls, hold it no lower than the 0.8×
+    /// floor, and give the budget back once pressure clears. `psi_backstop_loop`
+    /// takes a `&'static str` because production passes a compile-time constant;
+    /// a test path has to be leaked to match (a few bytes, once).
+    #[tokio::test(start_paused = true)]
+    async fn psi_backstop_shrinks_the_budget_under_pressure_and_restores_it_when_clear() {
+        let dir = tempfile::tempdir().expect("temp dir for the pressure file");
+        let path = dir.path().join("memory.pressure");
+        std::fs::write(&path, block(40.0)).expect("write a high-pressure block");
+        let leaked: &'static str = Box::leak(path.to_string_lossy().into_owned().into_boxed_str());
+
+        let factor = Arc::new(AtomicU32::new(1000));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(psi_backstop_loop(
+            leaked,
+            15.0,
+            factor.clone(),
+            shutdown.clone(),
+        ));
+
+        assert!(
+            advance_until(40, || factor.load(Ordering::Relaxed) == 800).await,
+            "sustained pressure must walk the factor down to the 0.8x floor, stalled at {}",
+            factor.load(Ordering::Relaxed)
+        );
+
+        std::fs::write(&path, block(0.0)).expect("write a cleared-pressure block");
+        assert!(
+            advance_until(40, || factor.load(Ordering::Relaxed) == 1000).await,
+            "cleared pressure must ramp the factor back to full, stalled at {}",
+            factor.load(Ordering::Relaxed)
+        );
+
+        shutdown.store(true, Ordering::SeqCst);
+        assert!(
+            advance_until(10, || task.is_finished()).await,
+            "the backstop must exit once the shutdown flag is set"
+        );
+        task.await.expect("the backstop task must not panic");
+    }
+
+    /// A pressure file that cannot be read is "no new signal", not "no
+    /// pressure": the factor must stay exactly where it was rather than
+    /// silently ramping the budget back up while the machine is thrashing.
+    #[tokio::test(start_paused = true)]
+    async fn psi_backstop_holds_the_factor_when_the_pressure_file_is_unreadable() {
+        let factor = Arc::new(AtomicU32::new(880));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(psi_backstop_loop(
+            "/nonexistent/pylon-test/memory.pressure",
+            15.0,
+            factor.clone(),
+            shutdown.clone(),
+        ));
+
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+        }
+        assert_eq!(
+            factor.load(Ordering::Relaxed),
+            880,
+            "an unreadable pressure file must leave the factor untouched"
+        );
+
+        shutdown.store(true, Ordering::SeqCst);
+        assert!(
+            advance_until(10, || task.is_finished()).await,
+            "the backstop must exit once the shutdown flag is set"
+        );
+    }
+}
+
+#[cfg(test)]
 mod registry_tests {
     use super::{lock_percore_registry_for_write, percore_metrics_snapshot, PERCORE_REGISTRY};
     use std::panic::{catch_unwind, AssertUnwindSafe};
