@@ -6,6 +6,8 @@ pre-1.0 and versions track `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-14
+
 ### Added
 - `PYLON_CLUSTER_ENVELOPE_COMPAT` (default `true`) — retire the Redis cluster
   envelope's legacy `event` double-carry. The default keeps emitting both the
