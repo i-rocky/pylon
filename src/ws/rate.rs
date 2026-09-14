@@ -1,67 +1,32 @@
 //! Per-connection token-bucket rate limiter for client events (Pusher: 10
 //! client events/sec/connection). `limit == 0` means unlimited.
 //!
-//! The bucket holds at most `limit` tokens (the bounded burst) and refills
-//! continuously at `limit` tokens/sec, computed from the elapsed time at each
-//! check — O(1), no background refill task. Unlike the fixed 1-second window
-//! this replaces, a client cannot double-spend at a window edge (10 events
-//! late in one window + 10 more early in the next): after the burst the
-//! bucket is empty and only the elapsed-time refill is spendable.
+//! The bucket is a `crate::rate::TokenBucket` whose capacity and refill rate
+//! are both `limit`.
 
+use crate::rate::TokenBucket;
 use std::time::Instant;
 
-/// Token bucket: capacity `limit` tokens, refill rate `limit` tokens/sec.
-/// The bucket is born full at the first check (lazy initialization — no
-/// retroactive penalty for the connection's idle lifetime).
 #[derive(Debug)]
 pub struct RateWindow {
-    limit: u32,
-    /// Fractional tokens currently available. Accurate for this purpose:
-    /// refills are `elapsed_secs * limit` with f64, clamped to capacity on
-    /// every check, so rounding error cannot accumulate past the clamp.
-    tokens: f64,
-    /// Instant of the last check (when refill was last accrued).
-    last: Option<Instant>,
+    bucket: TokenBucket,
+    origin: Option<Instant>,
 }
 
 impl RateWindow {
     pub fn new(limit: u32) -> Self {
         Self {
-            limit,
-            tokens: limit as f64,
-            last: None,
+            bucket: TokenBucket::new(limit, limit),
+            origin: None,
         }
     }
 
-    /// Record one event observed at `now`. Returns true if ALLOWED (one token
-    /// was available and is spent), false if the bucket is short of a token.
     pub fn check_at(&mut self, now: Instant) -> bool {
-        if self.limit == 0 {
-            return true; // unlimited / disabled
-        }
-        let cap = f64::from(self.limit);
-        match self.last {
-            // First event ever: the bucket starts full and spends one token.
-            None => {
-                self.last = Some(now);
-                self.tokens = cap - 1.0;
-                true
-            }
-            Some(prev) => {
-                let elapsed = now.saturating_duration_since(prev).as_secs_f64();
-                self.tokens = (self.tokens + elapsed * cap).min(cap);
-                self.last = Some(now);
-                if self.tokens >= 1.0 {
-                    self.tokens -= 1.0;
-                    true
-                } else {
-                    false
-                }
-            }
-        }
+        let origin = *self.origin.get_or_insert(now);
+        let now_ns = now.saturating_duration_since(origin).as_nanos() as u64;
+        self.bucket.take_at_ns(now_ns, 1)
     }
 
-    /// Production entry point: checks against the real clock.
     pub fn check(&mut self) -> bool {
         self.check_at(Instant::now())
     }
