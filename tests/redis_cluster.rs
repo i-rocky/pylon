@@ -4359,6 +4359,12 @@ async fn an_unreadable_occupancy_hash_is_neither_reaped_nor_vacated_and_stays_in
             still_indexed,
             "the channel must stay indexed so a later pass can retry it"
         );
+        let _: i64 = clients
+            .pool
+            .next()
+            .del(&keys.occ(TEST_APP, "public-noocc"))
+            .await
+            .expect("del poisoned occ");
     })
     .await
     .expect("corrupt-occ sweep test must not hang (Redis up?)");
@@ -4387,6 +4393,12 @@ async fn a_failing_vacate_script_claims_no_emission_right() {
             vacated.is_empty(),
             "a failed vacate must claim no emission right: {vacated:?}"
         );
+        let _: i64 = clients
+            .pool
+            .next()
+            .del(&keys.presusers(TEST_APP, "presence-novacate"))
+            .await
+            .expect("del poisoned presusers");
     })
     .await
     .expect("failing-vacate sweep test must not hang (Redis up?)");
@@ -4476,6 +4488,12 @@ async fn a_failure_in_a_later_sweep_phase_does_not_abort_the_earlier_one() {
                 vacated.contains(&(TEST_APP.to_string(), channel.clone())),
                 "and must still vacate the channel it emptied: {vacated:?}"
             );
+            let _: i64 = clients
+                .pool
+                .next()
+                .del(&key)
+                .await
+                .expect("del poisoned key");
         }
     })
     .await

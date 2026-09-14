@@ -507,11 +507,12 @@ async fn cluster_subscribe_on_a_cache_channel_replays_or_signals_a_miss() {
         let handle = bridge.handle();
 
         // MISS: nothing in the cluster cache yet.
+        let miss_sid = SocketId::generate();
         let (mut miss_rx, miss_mailbox) = mailbox_pair();
         handle.subscribe(
             Arc::from("app"),
             Arc::from("cache-room"),
-            SocketId::generate(),
+            miss_sid,
             miss_mailbox,
             true,
         );
@@ -538,11 +539,12 @@ async fn cluster_subscribe_on_a_cache_channel_replays_or_signals_a_miss() {
                 Duration::from_secs(60),
             )
             .await;
+        let hit_sid = SocketId::generate();
         let (mut hit_rx, hit_mailbox) = mailbox_pair();
         handle.subscribe(
             Arc::from("app"),
             Arc::from("cache-room"),
-            SocketId::generate(),
+            hit_sid,
             hit_mailbox,
             false,
         );
@@ -564,11 +566,12 @@ async fn cluster_subscribe_on_a_cache_channel_replays_or_signals_a_miss() {
             ref other => panic!("a populated cluster cache must replay the event, got {other:?}"),
         }
 
-        // The miss — and only the miss — produced a webhook, alongside the single
-        // cluster-wide channel_occupied for the 0→1 edge.
+        handle.unsubscribe(Arc::from("app"), Arc::from("cache-room"), miss_sid, false);
+        handle.unsubscribe(Arc::from("app"), Arc::from("cache-room"), hit_sid, true);
+
         assert_eq!(
-            await_sorted_webhooks(&recorder, 2).await,
-            ["cache_miss", "channel_occupied"],
+            await_sorted_webhooks(&recorder, 3).await,
+            ["cache_miss", "channel_occupied", "channel_vacated"],
             "the cache HIT must not fire a second cache_miss"
         );
 
