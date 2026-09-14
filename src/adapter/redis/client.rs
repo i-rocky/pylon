@@ -173,8 +173,8 @@ return {count, won}
 ///
 /// That same winner DRAINS the channel's presence side-tables in the same script,
 /// returning every user still on the roster — each owed one `member_removed`. The
-/// roster is read BEFORE the de-index, since `chans` is the only index without a TTL
-/// and a channel out of it is unreachable. Doing both under one script is what stops
+/// roster is read BEFORE the de-index, since a channel removed from `chans` is
+/// unreachable by the sweeper from then on. Doing both under one script is what stops
 /// the side-tables outliving the membership they describe, and keeps the drain on the
 /// single winner rather than every racing sweeper.
 ///
