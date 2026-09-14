@@ -31,7 +31,7 @@
 //! node-local per the per-method notes.
 
 use crate::adapter::local::LocalAdapter;
-use crate::adapter::Adapter;
+use crate::adapter::{Adapter, BroadcastError};
 use crate::channel::cache::CachedEvent;
 use crate::channel::outcome::{ChannelSummary, SubscribeOutcome, UnsubscribeOutcome};
 use crate::cluster::bridge::ClusterHandle;
@@ -140,7 +140,7 @@ impl Adapter for ClusterAdapter {
         channel: &str,
         event: ServerEvent,
         except: Option<SocketId>,
-    ) {
+    ) -> Result<(), BroadcastError> {
         // F17: encode the frame ONCE (reusing the payload verbatim when the
         // caller already encoded it as `Raw`) and feed the SAME bytes to BOTH
         // halves: the local delivery runs as a `Raw` frame — so neither the
@@ -160,15 +160,15 @@ impl Adapter for ClusterAdapter {
                     .as_str(),
             ),
         };
-        self.local
-            .broadcast(app, channel, ServerEvent::Raw(frame.clone()), except)
-            .await;
         self.handle.publish(
             Arc::from(app),
             Arc::from(channel),
             frame.to_string(),
             except,
-        );
+        )?;
+        self.local
+            .broadcast(app, channel, ServerEvent::Raw(frame.clone()), except)
+            .await
     }
 
     async fn channels(&self, app: &str, prefix: Option<&str>) -> Vec<ChannelSummary> {
@@ -360,7 +360,7 @@ mod tests {
             user_id: None,
         };
         let expected = crate::protocol::wire::encode(7, &event);
-        adapter.broadcast("app", "c", event, None).await;
+        adapter.broadcast("app", "c", event, None).await.unwrap();
 
         // LOCAL half: the subscriber receives exactly the expected wire bytes.
         match mrx.try_recv().map(|b| *b) {
@@ -418,7 +418,8 @@ mod tests {
         let raw: Arc<str> = Arc::from(r#"{"event":"x","channel":"c","data":"{}"}"#);
         adapter
             .broadcast("app", "c", ServerEvent::Raw(raw.clone()), None)
-            .await;
+            .await
+            .unwrap();
 
         match mrx.try_recv().map(|b| *b) {
             Ok(ServerEvent::Raw(f)) => assert_eq!(&*f, &*raw),
@@ -690,5 +691,48 @@ mod tests {
             }
             _ => panic!("a presence re-ack must reach the bridge, not the local registry"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_closed_bridge_fails_the_broadcast_and_skips_local_delivery() {
+        let local = Arc::new(LocalAdapter::new(
+            Arc::new(Registry::new()),
+            Arc::new(AppRegistry::new()),
+        ));
+        let (tx, rx) = mpsc::channel::<ClusterCmd>(1);
+        let handle = crate::cluster::bridge::ClusterHandle::test_handle(tx);
+        let metrics = handle.metrics();
+        drop(rx);
+        let adapter = ClusterAdapter::new(local.clone(), handle);
+        let (mailbox_tx, mut mailbox_rx) = mpsc::channel(4);
+        local
+            .subscribe(
+                "app",
+                "c",
+                ConnectionHandle {
+                    socket_id: SocketId::generate(),
+                    mailbox: crate::connection::handle::Mailbox::new(mailbox_tx, None, None),
+                },
+                None,
+            )
+            .await;
+
+        let err = adapter
+            .broadcast("app", "c", ServerEvent::Pong, None)
+            .await
+            .expect_err("a closed bridge must fail the broadcast");
+
+        assert!(matches!(err, crate::adapter::BroadcastError::Publish(_)));
+        assert_eq!(
+            metrics
+                .publish_failed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a failed publish must be counted"
+        );
+        assert!(
+            mailbox_rx.try_recv().is_err(),
+            "local delivery must not run when the cluster publish failed"
+        );
     }
 }

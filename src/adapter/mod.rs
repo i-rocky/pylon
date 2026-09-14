@@ -2,6 +2,8 @@
 //! impl sit behind this same trait — no handler changes.
 
 pub mod app_registry;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod failing;
 pub mod local;
 pub mod redis;
 
@@ -14,6 +16,12 @@ use crate::protocol::socket_id::SocketId;
 use crate::user::{UserJoinOutcome, UserLeaveOutcome};
 use async_trait::async_trait;
 use std::time::Duration;
+
+#[derive(Debug, thiserror::Error)]
+pub enum BroadcastError {
+    #[error("cluster publish failed: {0}")]
+    Publish(String),
+}
 
 #[async_trait]
 pub trait Adapter: Send + Sync {
@@ -38,7 +46,7 @@ pub trait Adapter: Send + Sync {
         channel: &str,
         event: ServerEvent,
         except: Option<SocketId>,
-    );
+    ) -> Result<(), BroadcastError>;
 
     async fn channels(&self, app: &str, prefix: Option<&str>) -> Vec<ChannelSummary>;
 

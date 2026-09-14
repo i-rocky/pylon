@@ -224,7 +224,8 @@ async fn broadcasts_reach_subscribers_without_the_sharded_sink() {
             },
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
     let delivered = tokio::time::timeout(Duration::from_secs(5), async {
         loop {

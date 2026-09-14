@@ -145,7 +145,7 @@ async fn deliver(
     name: &str,
     data: &str,
     socket_id: Option<&str>,
-) {
+) -> Result<(), RestError> {
     // Server-to-user: a `sendToUser` REST trigger targets `#server-to-user-<id>`,
     // which is never a registry channel. Route it to the user's live connections
     // via the user registry instead of broadcasting (and never cache it). The
@@ -155,7 +155,7 @@ async fn deliver(
         // Reject a malformed empty user id (e.g. exactly "#server-to-user-"):
         // deliver to nobody rather than returning a misleading 200-with-no-effect.
         if user_id.is_empty() {
-            return;
+            return Ok(());
         }
         // NB: `socket_id` exclusion is intentionally NOT applied to server-to-user
         // delivery — there is no "originating socket" among the user's connections
@@ -173,7 +173,7 @@ async fn deliver(
                 },
             )
             .await;
-        return;
+        return Ok(());
     }
     // Cache channels retain their last event for replay to new subscribers. Written
     // BEFORE the broadcast: a subscriber joining concurrently replays from this cache
@@ -207,7 +207,15 @@ async fn deliver(
             },
             except,
         )
-        .await;
+        .await
+        .map_err(|e| {
+            if let Some(m) = state.cluster_metrics.as_ref() {
+                m.publish_failed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            tracing::warn!(app = %app_id, channel, error = %e, "rest publish failed");
+            RestError::service_unavailable("cluster publish failed")
+        })
 }
 
 /// Build the per-channel `info` attributes object (empty if nothing requested).
@@ -307,7 +315,7 @@ pub async fn post_events(
             &t.data,
             t.socket_id.as_deref(),
         )
-        .await;
+        .await?;
     }
     let mut out = Map::new();
     if t.info.is_some() {
@@ -398,7 +406,7 @@ pub async fn post_batch(
             &item.data,
             item.socket_id.as_deref(),
         )
-        .await;
+        .await?;
     }
     let any_info = b.batch.iter().any(|i| i.info.is_some());
     let mut out = Map::new();
@@ -549,7 +557,7 @@ mod tests {
             channel: &str,
             event: ServerEvent,
             except: Option<SocketId>,
-        ) {
+        ) -> Result<(), crate::adapter::BroadcastError> {
             self.writes.lock().unwrap().push("broadcast");
             self.inner.broadcast(app, channel, event, except).await
         }
@@ -665,7 +673,9 @@ mod tests {
     async fn cache_channel_publish_stores_before_it_broadcasts() {
         let adapter = write_order_adapter();
         let state = write_order_state(adapter.clone());
-        deliver(&state, "app1", "cache-x", "ev", "\"payload\"", None).await;
+        deliver(&state, "app1", "cache-x", "ev", "\"payload\"", None)
+            .await
+            .unwrap();
         assert_eq!(
             adapter.writes.lock().unwrap().as_slice(),
             ["cache_set", "broadcast"],
@@ -679,7 +689,9 @@ mod tests {
     async fn ordinary_channel_publish_only_broadcasts() {
         let adapter = write_order_adapter();
         let state = write_order_state(adapter.clone());
-        deliver(&state, "app1", "plain-x", "ev", "\"payload\"", None).await;
+        deliver(&state, "app1", "plain-x", "ev", "\"payload\"", None)
+            .await
+            .unwrap();
         assert_eq!(adapter.writes.lock().unwrap().as_slice(), ["broadcast"]);
     }
 
@@ -712,7 +724,8 @@ mod tests {
             "\"payload\"",
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(
             adapter.writes.lock().unwrap().is_empty(),
@@ -742,7 +755,9 @@ mod tests {
     async fn server_to_user_trigger_with_an_empty_user_id_writes_nothing() {
         let adapter = write_order_adapter();
         let state = write_order_state(adapter.clone());
-        deliver(&state, "app1", "#server-to-user-", "ev", "\"p\"", None).await;
+        deliver(&state, "app1", "#server-to-user-", "ev", "\"p\"", None)
+            .await
+            .unwrap();
         assert!(
             adapter.writes.lock().unwrap().is_empty(),
             "an empty user id must produce neither a broadcast nor a cache write"

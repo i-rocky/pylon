@@ -2753,7 +2753,7 @@ mod presence_tracking_is_independent_of_the_presence_outcome {
             channel: &str,
             event: ServerEvent,
             except: Option<SocketId>,
-        ) {
+        ) -> Result<(), crate::adapter::BroadcastError> {
             self.0.broadcast(app, channel, event, except).await
         }
         async fn channels(&self, app: &str, prefix: Option<&str>) -> Vec<ChannelSummary> {

@@ -491,7 +491,8 @@ async fn graceful_drain_with_backpressured_client() {
                     },
                     None,
                 )
-                .await;
+                .await
+                .unwrap();
         }
     });
 
@@ -665,7 +666,8 @@ async fn graceful_drain_delays_for_backpressured_outbound_bytes() {
                         },
                         None,
                     )
-                    .await;
+                    .await
+                    .unwrap();
                 // Let the worker move its mailbox into the out-queue: an
                 // unyielding flood just overruns the bounded mailbox, and
                 // frames dropped there never become queued outbound bytes.

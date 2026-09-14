@@ -126,12 +126,14 @@ async fn cluster_bridge_starts_clones_publishes_and_drops_cleanly() {
         let node_id_from_thread = std::thread::spawn(move || {
             let id = worker_handle.node_id().to_string();
             // 3. Smoke publish: `try_send`s and returns immediately — must not panic.
-            worker_handle.publish(
-                Arc::from("app"),
-                Arc::from("chan"),
-                "{\"event\":\"x\"}".to_string(),
-                None,
-            );
+            worker_handle
+                .publish(
+                    Arc::from("app"),
+                    Arc::from("chan"),
+                    "{\"event\":\"x\"}".to_string(),
+                    None,
+                )
+                .expect("the smoke publish must reach the live bridge");
             id
         })
         .join()
@@ -144,12 +146,15 @@ async fn cluster_bridge_starts_clones_publishes_and_drops_cleanly() {
         );
 
         // 4. A publish on THIS task's clone is likewise immediate and panic-free.
-        bridge.handle().publish(
-            Arc::from("app"),
-            Arc::from("chan2"),
-            "{\"event\":\"y\"}".to_string(),
-            None,
-        );
+        bridge
+            .handle()
+            .publish(
+                Arc::from("app"),
+                Arc::from("chan2"),
+                "{\"event\":\"y\"}".to_string(),
+                None,
+            )
+            .expect("the smoke publish must reach the live bridge");
 
         // 5. Dropping the bridge signals shutdown and joins the runtime thread — it must
         //    not hang (the surrounding timeout would catch a hang and fail the test).

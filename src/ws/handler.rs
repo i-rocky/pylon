@@ -58,6 +58,16 @@ pub struct ConnectionContext {
     pub capabilities: crate::protocol::codec::Capabilities,
 }
 
+pub(in crate::ws) fn note_broadcast_drop(
+    result: Result<(), crate::adapter::BroadcastError>,
+    app: &str,
+    channel: &str,
+) {
+    if let Err(e) = result {
+        tracing::warn!(app, channel, error = %e, "cluster publish failed; broadcast dropped");
+    }
+}
+
 impl ConnectionContext {
     /// Whether the percore broadcast pipeline is currently saturated (SP10).
     /// `false` when no flag is wired (off-percore).
@@ -150,17 +160,21 @@ impl ConnectionContext {
                 if let Some(leave) = out.presence {
                     if leave.last_for_user {
                         let uid = leave.user_id.clone();
-                        self.adapter
-                            .broadcast(
-                                &self.app.id,
-                                &channel,
-                                ServerEvent::MemberRemoved {
-                                    channel: channel.clone(),
-                                    user_id: leave.user_id,
-                                },
-                                None,
-                            )
-                            .await;
+                        note_broadcast_drop(
+                            self.adapter
+                                .broadcast(
+                                    &self.app.id,
+                                    &channel,
+                                    ServerEvent::MemberRemoved {
+                                        channel: channel.clone(),
+                                        user_id: leave.user_id,
+                                    },
+                                    None,
+                                )
+                                .await,
+                            &self.app.id,
+                            &channel,
+                        );
                         if self.app.has_member_removed_webhooks {
                             self.emit_webhook(crate::webhook::event::WebhookEvent::MemberRemoved {
                                 app: self.app.id.clone(),
@@ -199,17 +213,21 @@ impl ConnectionContext {
             return;
         }
         if self.app.subscription_count_enabled {
-            self.adapter
-                .broadcast(
-                    &self.app.id,
-                    channel,
-                    ServerEvent::SubscriptionCount {
-                        channel: channel.to_string(),
-                        count,
-                    },
-                    None,
-                )
-                .await;
+            note_broadcast_drop(
+                self.adapter
+                    .broadcast(
+                        &self.app.id,
+                        channel,
+                        ServerEvent::SubscriptionCount {
+                            channel: channel.to_string(),
+                            count,
+                        },
+                        None,
+                    )
+                    .await,
+                &self.app.id,
+                channel,
+            );
             // `subscription_count` WEBHOOK — same edge as the broadcast above,
             // additionally requiring the operator's per-endpoint opt-in. Verified
             // against https://pusher.com/docs/channels/server_api/webhooks/

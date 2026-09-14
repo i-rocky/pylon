@@ -96,9 +96,12 @@ pub async fn receive_loop(
                         // Honour `except` even on the relaying node (usually a no-op:
                         // the excepted socket lives on the originating node).
                         let except = env.except.as_deref().map(SocketId::from_raw);
-                        local
+                        if let Err(e) = local
                             .broadcast(&env.app, &env.channel, ServerEvent::Raw(frame), except)
-                            .await;
+                            .await
+                        {
+                            tracing::warn!(error = %e, app = %env.app, channel = %env.channel, "local delivery of a remote frame failed");
+                        }
                     }
                     EnvelopeKind::UserSend => {
                         let frame = match env.frame() {
