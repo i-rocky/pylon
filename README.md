@@ -99,7 +99,8 @@ Tags: `latest`, `X.Y.Z`, and `X.Y`. A 2-node clustered example (with Redis) is i
 
 ### Prebuilt binaries
 
-Each tagged release attaches Linux binaries for `x86_64` and `aarch64` (glibc 2.35+) to the
+Each tagged release attaches Linux binaries for `x86_64` and `aarch64` (statically linked against
+musl — no glibc or distro requirement) to the
 [Releases page](https://github.com/i-rocky/pylon/releases), each as a `.tar.gz` with a matching
 `.sha256` checksum.
 

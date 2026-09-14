@@ -12,6 +12,14 @@ pre-1.0 and versions track `Cargo.toml`.
   with `existingSecret` — and the apps ConfigMap template is removed. The
   chart also renders a `PodDisruptionBudget` (`minAvailable: 1`, disable with
   `podDisruptionBudget.enabled=false`).
+- **Release binaries are statically linked against musl and the container
+  image is `FROM scratch`.** Release targets move from
+  `*-unknown-linux-gnu` to `*-unknown-linux-musl` (so the tarballs carry no
+  glibc requirement), `[profile.release]` gains `strip = true`, and both
+  images drop `debian:bookworm-slim` for a scratch runtime carrying the
+  binary, a CA bundle and a one-line `/etc/passwd` running as uid 65534. The
+  image has no shell: probe `/health` and `/ready` over HTTP from outside the
+  container, and the compose in-container `wget` healthchecks are removed.
 
 ## [0.4.1] - 2026-09-14
 

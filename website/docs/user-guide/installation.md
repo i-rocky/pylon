@@ -2,7 +2,8 @@
 
 ## Requirements
 
-- **OS:** Linux (amd64 or arm64). The Docker image and prebuilt binaries target `glibc 2.35+`.
+- **OS:** Linux (amd64 or arm64). The Docker image and prebuilt binaries are statically linked
+  against musl — no glibc or distro requirement.
 - **Clustering:** A Redis instance is required only when running multiple Pylon nodes. Single-node
   deployments have no external dependencies.
 
@@ -37,15 +38,16 @@
 === "Binary"
 
     Each tagged release on the [GitHub Releases page](https://github.com/i-rocky/pylon/releases)
-    includes prebuilt Linux binaries for `x86_64` and `aarch64` (glibc 2.35+), each packaged as a
-    `.tar.gz` with a matching `.sha256` checksum file.
+    includes prebuilt Linux binaries for `x86_64` and `aarch64` (statically linked against musl —
+    no glibc or distro requirement), each packaged as a `.tar.gz` with a matching `.sha256`
+    checksum file.
 
     Download, verify, and extract:
 
     ```sh
     # Replace X.Y.Z and ARCH (x86_64 or aarch64) as appropriate.
     # Note the asset name carries the leading "v" of the tag.
-    ASSET=pylon-vX.Y.Z-ARCH-unknown-linux-gnu
+    ASSET=pylon-vX.Y.Z-ARCH-unknown-linux-musl
 
     curl -LO "https://github.com/i-rocky/pylon/releases/download/vX.Y.Z/${ASSET}.tar.gz"
     curl -LO "https://github.com/i-rocky/pylon/releases/download/vX.Y.Z/${ASSET}.tar.gz.sha256"

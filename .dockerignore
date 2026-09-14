@@ -27,6 +27,7 @@ docs/
 
 # Deploy artifacts (not needed inside the image)
 deploy/
+!deploy/docker/passwd.nobody
 
 # CI/CD / tooling configs
 .github/
