@@ -1,0 +1,13 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "pylon.fullname" . }}
+  labels:
+    {{- include "pylon.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "pylon.selectorLabels" . | nindent 6 }}
+{{- end }}

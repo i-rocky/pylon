@@ -44,9 +44,12 @@ spec:
               value: "7000"
             - name: PYLON_ADAPTER
               value: {{ .Values.config.adapter | quote }}
-            {{- if .Values.config.redisUrl }}
+            {{- if or .Values.config.redisUrl .Values.existingSecret }}
             - name: PYLON_REDIS_URL
-              value: {{ .Values.config.redisUrl | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pylon.secretName" . }}
+                  key: redisUrl
             {{- end }}
             {{- if .Values.config.redisPrefix }}
             - name: PYLON_REDIS_PREFIX
@@ -91,5 +94,8 @@ spec:
 
       volumes:
         - name: apps-config
-          configMap:
-            name: {{ include "pylon.fullname" . }}-apps
+          secret:
+            secretName: {{ include "pylon.secretName" . }}
+            items:
+              - key: apps.json
+                path: apps.json

@@ -48,3 +48,11 @@ Selector labels.
 app.kubernetes.io/name: {{ include "pylon.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
+
+{{- define "pylon.secretName" -}}
+{{- if .Values.existingSecret }}
+{{- .Values.existingSecret }}
+{{- else }}
+{{- printf "%s-apps" (include "pylon.fullname" .) }}
+{{- end }}
+{{- end }}

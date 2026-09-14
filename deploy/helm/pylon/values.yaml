@@ -43,10 +43,15 @@ config:
   shutdownGraceMs: 10000
 
 # ── Apps configuration (apps.json) ──────────────────────────────────────────
-# The apps list is mounted into the pod as a ConfigMap.
-# IMPORTANT: secrets (the "secret" field) are stored in this ConfigMap in
-# plain text. For production, use a Kubernetes Secret or an external secret
-# manager and mount it as a file instead.
+# The apps list is rendered into a Kubernetes Secret (never a ConfigMap) and
+# mounted at /etc/pylon/apps.json. `config.redisUrl` goes into the same Secret
+# and reaches the container through a secretKeyRef, so a URL carrying
+# credentials is never a literal env value in the pod spec.
+#
+# Set `existingSecret` to the name of a Secret you manage yourself (from an
+# external secret manager, sealed-secrets, or anything else) and the chart
+# creates none. It must carry the keys `apps.json` and `redisUrl`.
+existingSecret: ""
 apps:
   - name: my-app
     id: app
@@ -105,6 +110,14 @@ autoscaling:
   maxReplicas: 10
   targetCPUUtilizationPercentage: 70
   # targetMemoryUtilizationPercentage: 80
+
+# ── Disruption budget ────────────────────────────────────────────────────────
+# Keeps at least one pylon pod serving through a voluntary disruption (node
+# drain, cluster autoscaler scale-down). The Deployment's maxUnavailable: 0
+# only covers rolling updates; this covers evictions.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
 
 # ── Node tuning NOTE ─────────────────────────────────────────────────────────
 # Kubernetes cannot fully set per-pod sysctl values for most network settings.

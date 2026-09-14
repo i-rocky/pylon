@@ -6,6 +6,13 @@ pre-1.0 and versions track `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+- **The Helm chart no longer writes credentials to a ConfigMap.** `apps.json`
+  and the Redis URL move into a `Secret` — chart-created, or supply your own
+  with `existingSecret` — and the apps ConfigMap template is removed. The
+  chart also renders a `PodDisruptionBudget` (`minAvailable: 1`, disable with
+  `podDisruptionBudget.enabled=false`).
+
 ## [0.4.1] - 2026-09-14
 
 ### Fixed
