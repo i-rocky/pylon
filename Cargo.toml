@@ -61,9 +61,9 @@ futures-util = "0.3"
 # methods never await real I/O, so this completes without parking a runtime.
 futures-executor = "0.3"
 thiserror = "2.0.20"
-# TLS: rustls (direct dep — already transitively present at 0.23 via reqwest/fred) + PEM loader.
+# TLS: rustls (direct dep — already transitively present at 0.23 via reqwest/fred) + rustls-pki-types for PEM parsing.
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-rustls-pemfile = "2"
+rustls-pki-types = { version = "1.14", features = ["std"] }
 # Outbound HTTP for webhook delivery. rustls (no OpenSSL system dep) to reach https endpoints.
 # `rustls-no-provider`, NOT `rustls`: the latter links aws-lc-rs as a second crypto
 # backend alongside the ring provider this crate installs process-globally.

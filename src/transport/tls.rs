@@ -10,13 +10,12 @@
 //! - [`install_crypto_provider`]: pylon's one rustls backend, for any process
 //!   that reaches rustls without going through `load_server_config`.
 
-use std::fs::File;
-use std::io::BufReader;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig as RustlsServerConfig;
+use rustls_pki_types::pem::{Error as PemError, PemObject};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 /// Install `ring` as this process's rustls `CryptoProvider`, pylon's one TLS
 /// backend. Idempotent — a provider installed earlier keeps its place.
@@ -51,9 +50,8 @@ pub fn load_server_config(
     install_crypto_provider();
 
     // ── 2. Load the certificate chain ────────────────────────────────────────
-    let cert_file = File::open(cert_path)
-        .with_context(|| format!("PYLON_TLS_CERT: cannot open certificate file '{cert_path}'"))?;
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
+        .with_context(|| format!("PYLON_TLS_CERT: cannot open certificate file '{cert_path}'"))?
         .collect::<Result<Vec<_>, _>>()
         .with_context(|| {
             format!("PYLON_TLS_CERT: failed to parse PEM certificates from '{cert_path}'")
@@ -65,22 +63,33 @@ pub fn load_server_config(
     }
 
     // ── 3. Load the private key ───────────────────────────────────────────────
-    let key_file = File::open(key_path)
-        .with_context(|| format!("PYLON_TLS_KEY: cannot open private key file '{key_path}'"))?;
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut BufReader::new(key_file))
-        .with_context(|| {
-            format!("PYLON_TLS_KEY: failed to parse PEM private key from '{key_path}'")
-        })?
-        .ok_or_else(|| anyhow!("PYLON_TLS_KEY: no private key found in '{key_path}'"))?;
+    let key: PrivateKeyDer<'static> = match PrivateKeyDer::from_pem_file(key_path) {
+        Ok(key) => key,
+        Err(PemError::Io(_)) => {
+            return Err(anyhow!(
+                "PYLON_TLS_KEY: cannot open private key file '{key_path}'"
+            ));
+        }
+        Err(PemError::NoItemsFound) => {
+            return Err(anyhow!(
+                "PYLON_TLS_KEY: no private key found in '{key_path}'"
+            ));
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!(
+                "PYLON_TLS_KEY: failed to parse PEM private key from '{key_path}'"
+            )));
+        }
+    };
 
     // ── 4. mTLS path: require + verify client certificates ───────────────────
     if let Some(ca) = ca_path {
         // 4a. Load CA cert(s) into a RootCertStore.
-        let ca_file = File::open(ca)
-            .with_context(|| format!("PYLON_TLS_CA: cannot open CA certificate file '{ca}'"))?;
         let mut roots = rustls::RootCertStore::empty();
         let mut added = 0usize;
-        for cert_result in rustls_pemfile::certs(&mut BufReader::new(ca_file)) {
+        for cert_result in CertificateDer::pem_file_iter(ca)
+            .with_context(|| format!("PYLON_TLS_CA: cannot open CA certificate file '{ca}'"))?
+        {
             let cert = cert_result.with_context(|| {
                 format!("PYLON_TLS_CA: failed to parse PEM certificate from '{ca}'")
             })?;
@@ -166,6 +175,7 @@ pub fn resolve_tls(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::io::Write;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -252,6 +262,48 @@ mod tests {
         let _ = result.unwrap();
     }
 
+    const RSA_PKCS1_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIDDTCCAfWgAwIBAgIUabW0uuL2tFtQ5LoSD7QvalMa0nYwDQYJKoZIhvcNAQEL\nBQAwFTETMBEGA1UEAwwKcHlsb24tdGVzdDAgFw0yNjA5MTQxNzUxMDlaGA8yMTI2\nMDgyMTE3NTEwOVowFTETMBEGA1UEAwwKcHlsb24tdGVzdDCCASIwDQYJKoZIhvcN\nAQEBBQADggEPADCCAQoCggEBALNcqGcxErbXGbXqccmXI1vh4Zxxt08k7Jg2XQm3\nf2unL0yd0++Q8HjIAjon1QuGZdvkXCGGPuDbGA6YdpzR1gR0z5HjB0DZI651VIDN\nTRC38lXthxL+r3+V0rBHMjDv84lHTEksISc7v4ED+ICVattseA3y8Ngl4GTyVzNn\nmba6ObzjC94T+BGDEEJtOF9msnFfx5xFEErb1yes9CgDlklX+zhzlti0ClWvZ2K5\nppEFQ7H8Chy1wKFwucwgbfqM67v18Ujo7WwxwGpwhouvCexs+tw5znrsp6ru1wCk\nFzCwFVrgPLysFLsQKNzdxpHhQGAXer6peHJGRq+U/P1HfLECAwEAAaNTMFEwHQYD\nVR0OBBYEFKbJbK3nq8lDHMPxSFUcnwBLzSStMB8GA1UdIwQYMBaAFKbJbK3nq8lD\nHMPxSFUcnwBLzSStMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEB\nAE7so9g8rpkvmhv+uvCqsXiYmGcFYZ0qt3Rhk2CgtBdme6+ntZqDc78fA6VTWfCE\nbITc8v0kYESD8EZCP0Sc8EjMKgoabWr5juwgCQKKvlgqSdyYX1CfDDSTOlrJilXZ\nsIRKHCowNNKucFpygl6y2ZvGyKxhn2JZfn2Yimb139zdKgvYCWPDv/1bPlJDLdXl\nT+JMa/+U/spEc7RdadZkmqyYWS34bQEPMGJpyBK3UDbDVHM0d9RM+Y1RxhsFnBRJ\nwxLbYwPONkx+ph72fCvTi0w2Dh6fTMZ8KWnFJpD4mpiUvtmClTqKDBw31+ZKb6Zx\nKUgIcF2+w5w2r/byzQm5I68=\n-----END CERTIFICATE-----\n";
+
+    const RSA_PKCS1_KEY_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----\nMIIEogIBAAKCAQEAs1yoZzESttcZtepxyZcjW+HhnHG3TyTsmDZdCbd/a6cvTJ3T\n75DweMgCOifVC4Zl2+RcIYY+4NsYDph2nNHWBHTPkeMHQNkjrnVUgM1NELfyVe2H\nEv6vf5XSsEcyMO/ziUdMSSwhJzu/gQP4gJVq22x4DfLw2CXgZPJXM2eZtro5vOML\n3hP4EYMQQm04X2aycV/HnEUQStvXJ6z0KAOWSVf7OHOW2LQKVa9nYrmmkQVDsfwK\nHLXAoXC5zCBt+ozru/XxSOjtbDHAanCGi68J7Gz63DnOeuynqu7XAKQXMLAVWuA8\nvKwUuxAo3N3GkeFAYBd6vql4ckZGr5T8/Ud8sQIDAQABAoIBABCu68uDBFKCFuMI\nz+Ibgk9cgKYS6vH1vvurg6NQ1to2S09NMOm/XN0tl9nXKAxlFgCXMNcKpYeej97J\nR+MihRpiz4aqcnUrai1WJL2N5+V7Tqzqcp5A/ViY0+ecph3O+/A6QKDGKSR8/L05\n5GzFbF9exM37WaapSai25LokOhqFkItSapXvqdUbTDwBwE9bR1wEvPK0iv4xHAzF\nlv908/DONX/atHdI6dPKExkKAdsG/g7ytGG99DbBRGz0/OZf1SSMJI8OjcavbfXs\nsl2vUDlSX0KdGVZN3rDSSTQInnpfTecJhTFjHkVGFYj1Ywvc2fcQ6tXcIcjY/0Lo\nt93o+U8CgYEA+sMchTMD1ZonxIuwCeksHav9wGLrwI7QASsd0j7h6OroXcMke7+h\nGa4mMqew1fr/2b6DzG5uKeTqoOg9pGb7GYi93O0b4MDSgyVFNG4nx526Og3MvBt2\nbPNMSSEGr1rEwNUIV5yLEC+2X9XEJRcE0Qn5DlgdBpwQdSa3IVAIwxsCgYEAtxvA\nX5bZOyo+Sr9riIMnzvoQ+WbIu9zqfE1H9KZ1HBMnI55QK/N+PfnweBc4/Oxg6PGN\nU1pIdtPyCfbHcRkL6vyTQFlNPTs27iCktGxZuALA/YhIZR/xhREAk6Wkt24Qthwu\njjhGoF5mlLZUUbdFiBIrw+yahzAnEtILZza7cCMCgYALgmkMtAq5AxpQKxkpW0pr\nEjnTWrb3X5asdw4nWDuGNUH1C7/g7iq2wwd9y7SSHbMgi14BRBBKW/do6z/pC9D6\nmwwb18Yvyqne2xcSEPxCbTre70M2XwxQc9pMgPeNlNzy/NQlMUows//q5iTajvPp\npEuKHQE4DHG07tH49XNxgQKBgHK5I3WAiMgl9nNUrWYRbo6iZKIuANSbXBrXPJ8O\n787QPTR2yxpOa6kfAMftHNpyq2Enfnlb1o0Ey9/sSxcUL0BiUUv+54LWp9rYfvk/\n7ZJ5vzrZ+SnKssLBXVAkdygqALRowc5/ediebLz946RzJFBVui/9/O94fvKuwVBA\nnX1rAoGARozPL+GT1ds3/8amucvSK0cBoe+X5VUf0EbmVDzbqhIfo3VvCjly5/r8\nvVIAZJEh8CdhHdOgGRywiKuxEv4WL8Pjr2cx5u1GY3T2SXWXammfqc/fEo82wuyn\n9Lb5NW4E4WGB6GPwJiPeV1TIgVbFXNMz/ssg+uf11CorYBniSE4=\n-----END RSA PRIVATE KEY-----\n";
+
+    const EC_SEC1_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIBgTCCASegAwIBAgIUC+Uz8LH8xnLZkIULZo98TyuIVk4wCgYIKoZIzj0EAwIw\nFTETMBEGA1UEAwwKcHlsb24tdGVzdDAgFw0yNjA5MTQxNzUxMDlaGA8yMTI2MDgy\nMTE3NTEwOVowFTETMBEGA1UEAwwKcHlsb24tdGVzdDBZMBMGByqGSM49AgEGCCqG\nSM49AwEHA0IABEQQgd780W2IQEDWNGbA1YgYsdeCrAC/3Nx59+ZhiiBeiVTIlZTo\nzr2KGeeiHA5xx3mJQd1aLHzTgWSfgbxyzYyjUzBRMB0GA1UdDgQWBBTYzgiy1Jz6\nzs9Y1SoIm3itfeVgBzAfBgNVHSMEGDAWgBTYzgiy1Jz6zs9Y1SoIm3itfeVgBzAP\nBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gAMEUCIQDJXblVpK5TOgWFNKg/\nJs7klfeHM/9i2vqUX/6q5JPn9AIgEft2Za6OdCuqUTwE0YaZWQFueUdWwg4/ka9i\nCsHEbpg=\n-----END CERTIFICATE-----\n";
+
+    const EC_SEC1_KEY_PEM: &str = "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIBzh6004BWtnRlabqKDXKqHnOZH5tH1exz5tY8u8RTyBoAoGCCqGSM49\nAwEHoUQDQgAERBCB3vzRbYhAQNY0ZsDViBix14KsAL/c3Hn35mGKIF6JVMiVlOjO\nvYoZ56IcDnHHeYlB3VosfNOBZJ+BvHLNjA==\n-----END EC PRIVATE KEY-----\n";
+
+    #[test]
+    fn load_server_config_pkcs1_rsa_key_returns_ok() {
+        let cert_path = write_temp("pkcs1-cert.pem", RSA_PKCS1_CERT_PEM.as_bytes());
+        let key_path = write_temp("pkcs1-key.pem", RSA_PKCS1_KEY_PEM.as_bytes());
+
+        let result = load_server_config(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+            None,
+        );
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+
+        assert!(result.is_ok(), "PKCS#1 RSA key must load: {result:?}");
+    }
+
+    #[test]
+    fn load_server_config_sec1_ec_key_returns_ok() {
+        let cert_path = write_temp("sec1-cert.pem", EC_SEC1_CERT_PEM.as_bytes());
+        let key_path = write_temp("sec1-key.pem", EC_SEC1_KEY_PEM.as_bytes());
+
+        let result = load_server_config(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+            None,
+        );
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+
+        assert!(result.is_ok(), "SEC1 EC key must load: {result:?}");
+    }
+
     /// Write `body` to a uniquely named temp file and return its path.
     fn write_temp(tag: &str, body: &[u8]) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("pylon-tls-{}-{tag}", std::process::id()));
@@ -327,6 +379,26 @@ mod tests {
         assert!(
             msg.contains("PYLON_TLS_KEY"),
             "error should name the key knob, not the cert one: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_server_config_missing_key_file_cannot_open_returns_err() {
+        let (cert_path, key_path) = generate_self_signed_cert_files("missing-key-open");
+        let _ = std::fs::remove_file(&key_path);
+
+        let result = load_server_config(
+            cert_path.to_str().unwrap(),
+            "/nonexistent/path/key.pem",
+            None,
+        );
+
+        let _ = std::fs::remove_file(&cert_path);
+
+        let msg = format!("{}", result.expect_err("missing key file must fail"));
+        assert!(
+            msg.contains("cannot open private key file"),
+            "error should name the open failure, not a parse failure: {msg}"
         );
     }
 
@@ -433,7 +505,7 @@ mod tests {
 
     /// A CA bundle whose PEM decodes but is not a certificate must fail with
     /// the CA knob named — `RootCertStore::add` is the only thing that catches
-    /// it, since `rustls_pemfile` happily base64-decodes any payload.
+    /// it, since `CertificateDer::pem_file_iter` happily base64-decodes any payload.
     #[test]
     fn load_server_config_mtls_undecodable_ca_cert_returns_err() {
         let (cert_path, key_path) = generate_self_signed_cert_files("bad-ca");

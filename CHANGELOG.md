@@ -42,6 +42,13 @@ pre-1.0 and versions track `Cargo.toml`.
   sockets before TLS or the HTTP upgrade. New counters
   `pylon_frame_limited_total{worker}` and `pylon_accept_limited_total{worker}`.
 
+### Fixed
+- Cleared three `cargo deny` advisories: `rustls` moved 0.23.40 → 0.23.45
+  (RUSTSEC-2026-0285, TLS 1.3 handshake messages accepted across encryption
+  level boundaries), `spin` moved 0.9.8 → 0.9.9 (yanked release), and
+  `rustls-pemfile` (RUSTSEC-2025-0134, unmaintained) is replaced by
+  `rustls-pki-types`'s own `PemObject` PEM loader.
+
 ## [0.4.1] - 2026-09-14
 
 ### Fixed
