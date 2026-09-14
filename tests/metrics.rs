@@ -63,6 +63,7 @@ async fn spawn_with_metrics_token(token: Option<&str>) -> SocketAddr {
         webhooks: webhooks.clone(),
         saturated: Some(local.saturation_flag()),
         draining: Arc::new(AtomicBool::new(false)),
+        app_store_up: Arc::new(AtomicBool::new(true)),
         cluster_metrics: None,
         invalidator: None,
         rest_limits: Arc::new(pylon::http::rest::ratelimit::RestRateLimits::new(&config)),

@@ -156,3 +156,22 @@ async fn mongo_document_failing_validation_surfaces_as_a_decode_error() {
         }
     }
 }
+
+#[tokio::test]
+async fn probe_reaches_the_real_database() {
+    let m = MongoAppManager::connect(&uri()).await.unwrap();
+    m.probe().await.expect("a reachable mongo must probe Ok");
+}
+
+#[tokio::test]
+async fn a_manager_pointed_at_a_closed_port_probes_err() {
+    let m = pylon::app::mongo::MongoAppManager::connect(
+        "mongodb://127.0.0.1:1/pylon_test?serverSelectionTimeoutMS=200",
+    )
+    .await
+    .expect("with_uri_str does not connect, so construction succeeds");
+    assert!(
+        m.probe().await.is_err(),
+        "a store on a closed port must probe Err"
+    );
+}

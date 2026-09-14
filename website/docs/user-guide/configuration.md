@@ -74,6 +74,8 @@ per-connection and per-publish lookups stay fast. See
 | `PYLON_ADMIN_TOKEN` | _(none)_ | Bearer token for the admin API (`POST /admin/apps/{id}/invalidate`). When unset, the admin API is **disabled** (returns 404). |
 | `PYLON_METRICS_TOKEN` | _(none)_ | Bearer token for `GET /metrics`. When unset, metrics are open (default). When set, a scrape must carry `Authorization: Bearer <token>`; anything else returns **404** (not 401 — no existence disclosure). `/health` and `/ready` are never gated. Empty string is treated as unset. See [Deployment: Protecting /metrics](deployment.md#protecting-metrics). |
 | `PYLON_APP_SWEEP_INTERVAL` | `0` | Interval (seconds) for the app-purge sweep backstop. `0` disables it. When set, the sweep periodically reconciles connected apps against the database and force-closes any that have been removed/disabled. |
+| `PYLON_APP_STORE_PROBE_INTERVAL_SECS` | `15` | Seconds between app-store health probes. The probe is `SELECT 1` (SQL), `{ping: 1}` (Mongo), or a no-op (static file); its result is exported as `pylon_app_store_up`. It never affects `/ready`. Minimum 1; `0` fails startup. |
+| `PYLON_APP_STORE_PROBE_TIMEOUT_MS` | `2000` | Milliseconds a single app-store probe may take before it is recorded as down. Minimum 1; `0` fails startup. |
 
 ---
 

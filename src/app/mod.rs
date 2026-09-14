@@ -4,6 +4,7 @@ pub mod cache;
 pub mod invalidation;
 pub mod l2;
 pub mod mongo;
+pub mod probe;
 pub mod purger;
 pub mod sql;
 pub mod static_file;
@@ -235,6 +236,10 @@ pub trait AppManager: Send + Sync {
     /// [`Self::by_key_cached`].
     fn known_app_ids(&self) -> Option<Vec<String>> {
         None
+    }
+
+    async fn probe(&self) -> Result<(), AppLookupError> {
+        Ok(())
     }
 }
 

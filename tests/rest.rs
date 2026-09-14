@@ -111,6 +111,7 @@ async fn spawn_configured_with(
         webhooks: webhooks.clone(),
         saturated: Some(local.saturation_flag()),
         draining: Arc::new(AtomicBool::new(false)),
+        app_store_up: Arc::new(AtomicBool::new(true)),
         cluster_metrics,
         invalidator: None,
         rest_limits: Arc::new(pylon::http::rest::ratelimit::RestRateLimits::new(&config)),

@@ -285,6 +285,13 @@ async fn main() -> anyhow::Result<()> {
     let draining = Arc::new(AtomicBool::new(false));
     // Clone for use in the shutdown sequence — the original is moved into AppState.
     let draining_for_shutdown = draining.clone();
+    let app_store_up = Arc::new(AtomicBool::new(true));
+    pylon::app::probe::spawn_probe(
+        apps.clone(),
+        app_store_up.clone(),
+        config.app_store_probe_interval_secs,
+        config.app_store_probe_timeout_ms,
+    );
     let rest_state = AppState {
         config: config.clone(),
         apps: apps.clone(),
@@ -295,6 +302,7 @@ async fn main() -> anyhow::Result<()> {
         // LocalAdapter's, shared with the sink).
         saturated: Some(local.saturation_flag()),
         draining,
+        app_store_up,
         cluster_metrics: None,
         invalidator: invalidator.clone(),
         rest_limits: Arc::new(pylon::http::rest::ratelimit::RestRateLimits::new(&config)),
@@ -480,6 +488,13 @@ async fn run_redis_percore(
     let draining = Arc::new(AtomicBool::new(false));
     // Clone for use in the shutdown sequence — the original is moved into AppState.
     let draining_for_shutdown = draining.clone();
+    let app_store_up = Arc::new(AtomicBool::new(true));
+    pylon::app::probe::spawn_probe(
+        apps.clone(),
+        app_store_up.clone(),
+        config.app_store_probe_interval_secs,
+        config.app_store_probe_timeout_ms,
+    );
     let rest_state = AppState {
         config: config.clone(),
         apps: apps.clone(),
@@ -488,6 +503,7 @@ async fn run_redis_percore(
         webhooks: webhooks.clone(),
         saturated: Some(local.saturation_flag()),
         draining,
+        app_store_up,
         cluster_metrics: Some(bridge.metrics()),
         invalidator,
         rest_limits: Arc::new(pylon::http::rest::ratelimit::RestRateLimits::new(&config)),

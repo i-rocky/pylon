@@ -327,6 +327,23 @@ before its existing connections are closed.
     `PYLON_MEMORY_BUDGET_BYTES` to cap memory consumption — see
     [Configuration](configuration.md) for the full variable reference.
 
+### Readiness and shared dependencies
+
+`GET /ready` answers on this node's own state alone: the per-core worker fleet
+is up and the node is not draining. It deliberately does **not** probe Redis or
+the app store.
+
+Those are shared by every replica. If readiness included them, a single Redis
+or database outage would fail every pod's readiness at the same moment, the
+endpoint controller would remove every pod from the Service, and a degraded
+cluster would become an unreachable one — with no node left to serve the
+connections that still work. A node that has lost a shared dependency is
+degraded, not dead: existing WebSocket connections keep flowing, node-local
+delivery keeps working, and recovery needs no restart.
+
+Alert on `pylon_redis_connected == 0` and `pylon_app_store_up == 0` instead —
+see [Observability](observability.md#alerting) for the rules.
+
 ---
 
 ## Protecting /metrics

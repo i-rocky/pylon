@@ -35,6 +35,7 @@ labels**.
 |---|---|---|---|
 | `pylon_up` | gauge | — | Always `1`; confirms the process is alive and the scrape succeeded |
 | `pylon_rest_rate_limited_total` | counter | `scope` | REST requests rejected with `429`; `scope="node"`, `"app_events"` or `"app_reads"`. Always emitted, reading `0` while the matching limit is off |
+| `pylon_app_store_up` | gauge | — | `1` = the app store answered its last probe; `0` = it failed or timed out. Always present. |
 
 #### Per-App
 
@@ -174,6 +175,33 @@ Import the series above into Grafana dashboards. Useful panel ideas:
   client events while it reads high. Pair it with
   `pylon_inflight_bytes / on() group_left pylon_worker_budget_bytes` to see how
   close each worker is to its 100 % raise / 80 % release band.
+
+### Alerting
+
+```yaml
+groups:
+  - name: pylon
+    rules:
+      - alert: PylonRedisDown
+        expr: pylon_redis_connected == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "pylon {{ $labels.instance }} has lost Redis"
+          description: "Cross-node delivery is degraded on this node. /ready stays 200 by design; see Deployment."
+      - alert: PylonAppStoreDown
+        expr: pylon_app_store_up == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "pylon {{ $labels.instance }} cannot reach its app store"
+          description: "REST auth answers 503 and new connections cannot resolve their app. /ready stays 200 by design; see Deployment."
+```
+
+The SQL probe shares the app manager's own connection pool with every other
+lookup, so a burst of cache-missing queries can make a single probe time out
+without the store actually being down — the reason `PylonAppStoreDown` carries
+`for: 2m` rather than firing on the first missed probe.
 
 ---
 

@@ -93,6 +93,7 @@ mod tests {
             webhooks: crate::webhook::WebhookHandle::null(),
             saturated: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            app_store_up: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             cluster_metrics: None,
             invalidator: None,
         }

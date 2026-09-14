@@ -7,6 +7,11 @@ pre-1.0 and versions track `Cargo.toml`.
 ## [Unreleased]
 
 ### Added
+- **`pylon_app_store_up` gauge** — a background task probes the app store
+  (`SELECT 1` on SQL, `ping` on Mongo, a no-op for the static file) every
+  `PYLON_APP_STORE_PROBE_INTERVAL_SECS` (default 15) under
+  `PYLON_APP_STORE_PROBE_TIMEOUT_MS` (default 2000) and exports the verdict.
+  `/ready` is unchanged and still ignores shared dependencies on purpose.
 - **`PYLON_LOG_FORMAT=json`** emits one JSON object per log line
   (`timestamp`, `level`, `target`, and the event's structured fields under
   `fields`) instead of the human-readable text format, which stays the
