@@ -323,6 +323,33 @@ async fn rest_batch_events_stops_at_the_first_failing_publish() {
 }
 
 #[tokio::test]
+async fn metrics_render_the_cluster_publish_failure_counter() {
+    let (addr, _metrics) = spawn_failing_publish().await;
+    let resp = post_app1(
+        addr,
+        "/events",
+        &json!({"name": "e", "channels": ["my-channel"], "data": "{}"}),
+    )
+    .await;
+    assert_eq!(resp.status(), 503);
+
+    let text = reqwest::get(format!("http://{addr}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        text.contains("# TYPE pylon_cluster_publish_failed_total counter"),
+        "{text}"
+    );
+    assert!(
+        text.contains("pylon_cluster_publish_failed_total 1\n"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
 async fn rest_trigger_delivers_to_subscriber() {
     let addr = spawn().await;
     let mut ws = connect_ws(addr).await;
