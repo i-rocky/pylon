@@ -18,9 +18,9 @@
 #   Liveness:   GET /health
 #   Readiness:  GET /ready  (503 during drain)
 #
-# Note: the healthcheck uses wget, which the Dockerfile installs into the
-# debian:bookworm-slim runtime stage for exactly this purpose (slim ships
-# neither curl nor wget by default).
+# Note: the pylon image is FROM scratch — no shell, no curl, no wget — so
+# there is no in-container healthcheck. Probe GET /health and GET /ready over
+# HTTP from outside the container (the CI job and any orchestrator already do).
 
 services:
 
@@ -62,12 +62,6 @@ services:
         soft: 2000000
         hard: 2000000
     stop_grace_period: 20s
-    healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:7000/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 5s
 
   pylon-2:
     image: pylon:latest
@@ -96,9 +90,3 @@ services:
         soft: 2000000
         hard: 2000000
     stop_grace_period: 20s
-    healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:7000/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 5s

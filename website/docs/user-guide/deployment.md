@@ -202,10 +202,12 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
     Each node's `stop_grace_period: 20s` in the compose file ensures the full
     drain cycle completes before Docker kills the container.
 
-    !!! note "Health check uses wget"
-        The healthcheck in `docker-compose.yml` uses `wget --spider` because
-        `debian:bookworm-slim` (the runtime base image) does not include `curl`.
-        The `Dockerfile` installs `wget` into the runtime stage for exactly this purpose.
+    !!! note "No in-container health check"
+        The pylon image is `FROM scratch`: a static binary, a CA bundle and a
+        one-line `/etc/passwd`, with no shell, curl or wget to probe with. Probe
+        `GET /health` and `GET /ready` over HTTP from outside the container —
+        which is what Kubernetes `httpGet` probes, load balancers and the CI smoke
+        test already do.
 
 === "Kubernetes / Helm"
 

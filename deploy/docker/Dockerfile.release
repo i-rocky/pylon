@@ -1,27 +1,27 @@
 # syntax=docker/dockerfile:1
 #
-# deploy/docker/Dockerfile.release — packages a PREBUILT pylon binary into a
-# minimal runtime image. Used by .github/workflows/release.yml, which builds
-# native binaries per-arch and stages them under dist/<arch>/pylon, then runs
-# a single multi-platform `buildx` build (so no compilation happens here).
+# deploy/docker/Dockerfile.release — packages a PREBUILT static musl pylon
+# binary into a scratch image. Used by .github/workflows/release.yml, which
+# builds native musl binaries per-arch and stages them under dist/<arch>/pylon,
+# then runs a single multi-platform `buildx` build (so no compilation happens
+# here).
 #
 # For a from-source image instead, use deploy/docker/Dockerfile.
 #
-# Health probes (for orchestrators / docker run --health-cmd):
+# Health probes: probe over HTTP from OUTSIDE the container — a scratch image
+# carries no shell, curl or wget.
 #   Liveness:   GET /health  → 200 "ok"
 #   Readiness:  GET /ready   → 200 "ready" / 503 "draining"
 
-FROM debian:bookworm-slim
-
-# ca-certificates: outbound TLS (webhook delivery over https, rediss://).
-# wget: used by the docker-compose / HEALTHCHECK probe of GET /health
-# (debian-slim ships neither curl nor wget).
+FROM --platform=$BUILDPLATFORM debian:trixie-20260824-slim AS certs
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates wget && \
+    apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Non-root runtime user.
-RUN useradd --system --no-create-home --shell /usr/sbin/nologin pylon
+FROM scratch
+
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY deploy/docker/passwd.nobody /etc/passwd
 
 # TARGETARCH is set by buildx per target platform (amd64 | arm64); the release
 # workflow stages the matching native binary at dist/<arch>/pylon.
@@ -31,6 +31,6 @@ COPY apps.example.json /etc/pylon/apps.example.json
 
 EXPOSE 7000
 
-USER pylon
+USER 65534:65534
 
 ENTRYPOINT ["/usr/local/bin/pylon"]

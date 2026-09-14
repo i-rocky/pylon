@@ -199,9 +199,9 @@ docker compose up -d --no-deps pylon-2
 Each node's `stop_grace_period: 20s` ensures the full drain completes before
 Docker kills the container.
 
-**Note on `wget` in the healthcheck:** `debian:bookworm-slim` does not include
-`curl`. The healthcheck uses `wget --spider`. If your image build omits `wget`,
-add `wget` to the `apt-get install` line in the Dockerfile runtime stage.
+**No in-container health check:** the pylon image is `FROM scratch` — no
+shell, curl or wget to probe with. Probe `GET /health` and `GET /ready` over
+HTTP from outside the container.
 
 ---
 
@@ -378,7 +378,7 @@ deploy/
 │   ├── 99-pylon.sysctl.conf         Kernel tuning drop-in (/etc/sysctl.d/)
 │   └── apps.example.json            Sample apps.json (change the secret!)
 ├── docker/
-│   ├── Dockerfile                   Multi-stage build (rust:bookworm → debian-slim)
+│   ├── Dockerfile                   Multi-stage build (rust:alpine musl builder → scratch)
 │   ├── Dockerfile.release           Runtime-only image over a prebuilt binary (CI)
 │   ├── .dockerignore
 │   ├── docker-compose.yml           2-node cluster + Redis
