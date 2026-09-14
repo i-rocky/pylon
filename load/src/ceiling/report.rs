@@ -48,7 +48,7 @@ pub fn recommend(
 
     // Cores: ceil(target_rate × 1.5 / per_core), min 1.
     let need = target_rate.saturating_mul(15) / 10;
-    let cores = ((need + per_core.max(1) - 1) / per_core.max(1)).max(1);
+    let cores = need.div_ceil(per_core.max(1)).max(1);
 
     // Compare RAM pressure per core vs what the box provides per core.
     let box_ram_per_core = box_ram_bytes / (physical_cores.max(1) as u64);

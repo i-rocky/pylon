@@ -75,5 +75,7 @@ async fn fanout_smoke_delivers_to_all() {
     for t in tasks {
         let _ = t.await;
     }
-    // child drops here → process group torn down
+    // Explicit teardown, after fanout is confirmed, instead of leaving it to
+    // the implicit end-of-scope drop.
+    drop(child);
 }

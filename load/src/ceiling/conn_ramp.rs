@@ -139,16 +139,11 @@ pub async fn run(child: &PylonChild, spec: &BoxSpec, opts: &ConnRampOpts) -> Con
 
     let max_conns = h.counters.subscribed.load(Ordering::Relaxed);
     let rss_bytes_at_max = rss;
-    let bytes_per_conn = if max_conns > 0 {
-        rss_bytes_at_max.saturating_sub(rss_idle) / max_conns
-    } else {
-        0
-    };
-    let conns_per_gb = if bytes_per_conn > 0 {
-        (1u64 << 30) / bytes_per_conn
-    } else {
-        0
-    };
+    let bytes_per_conn = rss_bytes_at_max
+        .saturating_sub(rss_idle)
+        .checked_div(max_conns)
+        .unwrap_or(0);
+    let conns_per_gb = (1u64 << 30).checked_div(bytes_per_conn).unwrap_or(0);
 
     h.drain().await;
 
