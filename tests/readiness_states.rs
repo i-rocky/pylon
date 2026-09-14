@@ -48,6 +48,7 @@ fn state() -> (AppState, Arc<AtomicBool>) {
             webhooks: pylon::webhook::WebhookHandle::null(),
             saturated: None,
             draining: draining.clone(),
+            app_store_up: Arc::new(AtomicBool::new(true)),
             cluster_metrics: None,
             invalidator: None,
         },

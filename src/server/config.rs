@@ -280,6 +280,8 @@ pub struct ServerConfig {
     /// connected apps and purges any the authoritative (uncached) driver reports
     /// as absent/disabled — closing the gap if a `remove` signal is ever missed.
     pub app_sweep_interval_secs: u64,
+    pub app_store_probe_interval_secs: u64,
+    pub app_store_probe_timeout_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -361,6 +363,8 @@ impl Default for ServerConfig {
             app_admin_token: None,
             metrics_token: None,
             app_sweep_interval_secs: 0,
+            app_store_probe_interval_secs: 15,
+            app_store_probe_timeout_ms: 2_000,
         }
     }
 }
@@ -461,6 +465,22 @@ impl ServerConfig {
             }
         }
         env_parse("PYLON_APP_SWEEP_INTERVAL", &mut c.app_sweep_interval_secs);
+        env_parse(
+            "PYLON_APP_STORE_PROBE_INTERVAL_SECS",
+            &mut c.app_store_probe_interval_secs,
+        );
+        env_parse(
+            "PYLON_APP_STORE_PROBE_TIMEOUT_MS",
+            &mut c.app_store_probe_timeout_ms,
+        );
+        if c.app_store_probe_interval_secs == 0 {
+            tracing::error!("invalid PYLON_APP_STORE_PROBE_INTERVAL_SECS=0: minimum is 1");
+            std::process::exit(1);
+        }
+        if c.app_store_probe_timeout_ms == 0 {
+            tracing::error!("invalid PYLON_APP_STORE_PROBE_TIMEOUT_MS=0: minimum is 1");
+            std::process::exit(1);
+        }
         env_parse("PYLON_MAX_PRESENCE_MEMBERS", &mut c.max_presence_members);
         env_parse(
             "PYLON_MAX_EVENT_PAYLOAD_BYTES",
@@ -803,6 +823,8 @@ mod tests {
         assert!(c.tls_cert_path.is_none());
         assert!(c.tls_key_path.is_none());
         assert!(c.tls_ca_path.is_none());
+        assert_eq!(c.app_store_probe_interval_secs, 15);
+        assert_eq!(c.app_store_probe_timeout_ms, 2_000);
         // codel_params() folds ms → ns with the folly defaults.
         let p = c.codel_params();
         assert_eq!(p.target_ns, 5_000_000);
@@ -1236,6 +1258,24 @@ mod tests {
     #[test]
     fn app_sweep_interval_defaults_to_zero() {
         assert_eq!(ServerConfig::default().app_sweep_interval_secs, 0);
+    }
+
+    #[test]
+    fn app_store_probe_interval_secs_parses_from_env() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("PYLON_APP_STORE_PROBE_INTERVAL_SECS", "30");
+        let c = ServerConfig::from_env();
+        assert_eq!(c.app_store_probe_interval_secs, 30);
+        std::env::remove_var("PYLON_APP_STORE_PROBE_INTERVAL_SECS");
+    }
+
+    #[test]
+    fn app_store_probe_timeout_ms_parses_from_env() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("PYLON_APP_STORE_PROBE_TIMEOUT_MS", "5000");
+        let c = ServerConfig::from_env();
+        assert_eq!(c.app_store_probe_timeout_ms, 5000);
+        std::env::remove_var("PYLON_APP_STORE_PROBE_TIMEOUT_MS");
     }
 
     #[test]

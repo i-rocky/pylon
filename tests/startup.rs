@@ -171,6 +171,27 @@ async fn await_healthy(server: &mut Server, budget: Duration) {
     }
 }
 
+async fn await_metrics_line(server: &mut Server, target: &str, budget: Duration) {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if let Some((200, body)) = http(server.port, "GET", "/metrics", None).await {
+            if body.contains(target) {
+                return;
+            }
+        }
+        if let Some(status) = server.child.try_wait().expect("try_wait") {
+            panic!(
+                "pylon exited while polling /metrics for {target:?}: {status}: {}",
+                drain(server)
+            );
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("pylon did not render {target:?} on /metrics within the budget");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// Best-effort capture of whatever the child wrote to stderr, for assertion
 /// messages. Only called on a failure path or after the child has exited.
 fn drain(server: &mut Server) -> String {
@@ -1001,4 +1022,120 @@ async fn rediss_app_cache_url_does_not_panic_on_missing_crypto_provider() {
          127.0.0.1:1), not die before it: {stderr}"
     );
     assert!(!status.success(), "expected a non-zero exit: {status}");
+}
+
+#[tokio::test]
+async fn app_store_probe_renders_down_when_the_store_is_unreachable() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let port = free_port();
+    let mut cmd = Command::new(binary());
+    cmd.env("PYLON_BIND", "127.0.0.1")
+        .env("PYLON_PORT", port.to_string())
+        .env("PYLON_WORKERS", "1")
+        .env("PYLON_APP_MANAGER", "mongo")
+        .env(
+            "PYLON_APP_DSN",
+            "mongodb://127.0.0.1:1/pylon?serverSelectionTimeoutMS=200",
+        )
+        .env("PYLON_APP_STORE_PROBE_INTERVAL_SECS", "1")
+        .env("PYLON_APP_STORE_PROBE_TIMEOUT_MS", "300")
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut server = Server {
+        child: cmd.spawn().expect("spawn pylon"),
+        port,
+        _dir: dir,
+    };
+
+    await_healthy(&mut server, Duration::from_secs(30)).await;
+    await_metrics_line(
+        &mut server,
+        "pylon_app_store_up 0\n",
+        Duration::from_secs(10),
+    )
+    .await;
+
+    server.sigterm();
+    let status = server
+        .wait_exit(Duration::from_secs(20))
+        .expect("pylon must exit after SIGTERM");
+    assert!(status.success(), "expected a clean exit, got {status}");
+}
+
+#[tokio::test]
+async fn app_store_probe_renders_up_on_a_healthy_static_store() {
+    let (dir, apps_path) = apps_file();
+    let port = free_port();
+    let mut cmd = server_command(port, &apps_path);
+    cmd.env("PYLON_APP_STORE_PROBE_INTERVAL_SECS", "1")
+        .env("PYLON_APP_STORE_PROBE_TIMEOUT_MS", "300")
+        .env("RUST_LOG", "warn");
+    let mut server = Server {
+        child: cmd.spawn().expect("spawn pylon"),
+        port,
+        _dir: dir,
+    };
+
+    await_healthy(&mut server, Duration::from_secs(30)).await;
+    await_metrics_line(
+        &mut server,
+        "pylon_app_store_up 1\n",
+        Duration::from_secs(10),
+    )
+    .await;
+
+    server.sigterm();
+    let status = server
+        .wait_exit(Duration::from_secs(20))
+        .expect("pylon must exit after SIGTERM");
+    assert!(status.success(), "expected a clean exit, got {status}");
+}
+
+#[test]
+fn a_zero_app_store_probe_interval_fails_startup() {
+    let (dir, apps_path) = apps_file();
+    let port = free_port();
+    let child = server_command(port, &apps_path)
+        .env("PYLON_APP_STORE_PROBE_INTERVAL_SECS", "0")
+        .spawn()
+        .expect("spawn pylon");
+    let mut server = Server {
+        child,
+        port,
+        _dir: dir,
+    };
+    let status = server
+        .wait_exit(Duration::from_secs(30))
+        .expect("a zero probe interval must refuse to boot");
+    assert_eq!(status.code(), Some(1), "the refusal must exit 1");
+    let logs = format!("{}{}", drain_stdout(&mut server), drain(&mut server));
+    assert!(
+        logs.contains("PYLON_APP_STORE_PROBE_INTERVAL_SECS"),
+        "must name the invalid variable: {logs}"
+    );
+}
+
+#[test]
+fn a_zero_app_store_probe_timeout_fails_startup() {
+    let (dir, apps_path) = apps_file();
+    let port = free_port();
+    let child = server_command(port, &apps_path)
+        .env("PYLON_APP_STORE_PROBE_TIMEOUT_MS", "0")
+        .spawn()
+        .expect("spawn pylon");
+    let mut server = Server {
+        child,
+        port,
+        _dir: dir,
+    };
+    let status = server
+        .wait_exit(Duration::from_secs(30))
+        .expect("a zero probe timeout must refuse to boot");
+    assert_eq!(status.code(), Some(1), "the refusal must exit 1");
+    let logs = format!("{}{}", drain_stdout(&mut server), drain(&mut server));
+    assert!(
+        logs.contains("PYLON_APP_STORE_PROBE_TIMEOUT_MS"),
+        "must name the invalid variable: {logs}"
+    );
 }

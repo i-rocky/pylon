@@ -47,6 +47,7 @@ pub struct MetricsSnapshot {
     /// Phase-2 B3: cluster bridge counters (only present on the Redis path).
     pub cluster: Option<Arc<ClusterMetrics>>,
     pub rest_rate_limited: RestRateLimitedCounts,
+    pub app_store_up: bool,
 }
 
 /// Pure encoder: given a snapshot, return the Prometheus text body.
@@ -57,6 +58,16 @@ pub fn encode(snapshot: &MetricsSnapshot) -> String {
     out.push_str("# HELP pylon_up Pylon process is up (liveness/scrape check)\n");
     out.push_str("# TYPE pylon_up gauge\n");
     out.push_str("pylon_up 1\n");
+
+    out.push_str(
+        "# HELP pylon_app_store_up App store reachable at the last probe (1 = up, 0 = down)\n",
+    );
+    out.push_str("# TYPE pylon_app_store_up gauge\n");
+    let _ = writeln!(
+        out,
+        "pylon_app_store_up {}",
+        if snapshot.app_store_up { 1 } else { 0 }
+    );
 
     // pylon_saturation_flag (omit if None)
     if let Some(sat) = snapshot.saturation {
@@ -378,6 +389,7 @@ pub async fn get_metrics(
         webhook_queue_depth,
         cluster,
         rest_rate_limited: state.rest_limits.counts(),
+        app_store_up: state.app_store_up.load(Ordering::Relaxed),
     });
 
     let mut response = axum::response::Response::new(axum::body::Body::from(body));
@@ -415,6 +427,7 @@ mod tests {
             webhook_queue_depth: None,
             cluster: None,
             rest_rate_limited: RestRateLimitedCounts::default(),
+            app_store_up: false,
         }
     }
 
@@ -520,6 +533,7 @@ mod tests {
             webhook_queue_depth: None,
             cluster: None,
             rest_rate_limited: RestRateLimitedCounts::default(),
+            app_store_up: false,
         };
         let text = encode(&s);
         assert!(
@@ -535,6 +549,7 @@ mod tests {
             webhook_queue_depth: None,
             cluster: None,
             rest_rate_limited: RestRateLimitedCounts::default(),
+            app_store_up: false,
         };
         let text2 = encode(&s2);
         assert!(
@@ -553,6 +568,7 @@ mod tests {
             webhook_queue_depth: None,
             cluster: None,
             rest_rate_limited: RestRateLimitedCounts::default(),
+            app_store_up: false,
         };
         let text = encode(&s);
         assert!(
@@ -598,6 +614,7 @@ mod tests {
             webhook_queue_depth: None,
             cluster: None,
             rest_rate_limited: RestRateLimitedCounts::default(),
+            app_store_up: false,
         };
         let text = encode(&s);
         assert!(
@@ -651,6 +668,7 @@ mod tests {
             webhook_queue_depth: None,
             cluster: None,
             rest_rate_limited: RestRateLimitedCounts::default(),
+            app_store_up: false,
         };
         let text = encode(&s);
         assert!(
@@ -698,6 +716,7 @@ mod tests {
             webhook_queue_depth: None,
             cluster: None,
             rest_rate_limited: RestRateLimitedCounts::default(),
+            app_store_up: false,
         };
         let text = encode(&s);
         assert!(
@@ -750,6 +769,7 @@ mod tests {
             webhook_queue_depth: None,
             cluster: None,
             rest_rate_limited: RestRateLimitedCounts::default(),
+            app_store_up: false,
         };
         let text = encode(&s);
         assert!(
@@ -799,6 +819,7 @@ mod tests {
             webhook_queue_depth: None,
             cluster: None,
             rest_rate_limited: RestRateLimitedCounts::default(),
+            app_store_up: false,
         };
         let text = encode(&s);
         assert!(
@@ -844,6 +865,7 @@ mod tests {
             webhook_queue_depth: Some(3),
             cluster: None,
             rest_rate_limited: RestRateLimitedCounts::default(),
+            app_store_up: false,
         };
         let text = encode(&s);
         assert!(
@@ -886,6 +908,7 @@ mod tests {
             webhook_queue_depth: None,
             cluster: None,
             rest_rate_limited: RestRateLimitedCounts::default(),
+            app_store_up: false,
         };
         let text = encode(&s);
         assert!(
@@ -949,6 +972,7 @@ mod tests {
             webhook_queue_depth: None,
             cluster: Some(cm),
             rest_rate_limited: RestRateLimitedCounts::default(),
+            app_store_up: false,
         };
         let text = encode(&s);
         assert!(
@@ -979,6 +1003,7 @@ mod tests {
             webhook_queue_depth: None,
             cluster: None,
             rest_rate_limited: RestRateLimitedCounts::default(),
+            app_store_up: false,
         };
         let text = encode(&s);
         assert!(
@@ -1012,6 +1037,7 @@ mod tests {
             webhooks: crate::webhook::WebhookHandle::null(),
             saturated: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            app_store_up: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             cluster_metrics: None,
             invalidator: None,
         }
@@ -1155,5 +1181,17 @@ mod tests {
         assert!(!token_matches("sekrit", ""));
         assert!(!token_matches("sekrit-with-a-much-longer-length", "sekrit"));
         assert!(!token_matches("s", "sekrit"));
+    }
+
+    #[test]
+    fn encode_renders_the_app_store_gauge_in_both_states() {
+        let mut s = snapshot_with_one_app("app1", 0, 0, 0);
+        s.app_store_up = true;
+        let up = encode(&s);
+        assert!(up.contains("# TYPE pylon_app_store_up gauge"));
+        assert!(up.contains("pylon_app_store_up 1\n"), "{up}");
+        s.app_store_up = false;
+        let down = encode(&s);
+        assert!(down.contains("pylon_app_store_up 0\n"), "{down}");
     }
 }
