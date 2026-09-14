@@ -297,6 +297,7 @@ async fn main() -> anyhow::Result<()> {
         draining,
         cluster_metrics: None,
         invalidator: invalidator.clone(),
+        rest_limits: Arc::new(pylon::http::rest::ratelimit::RestRateLimits::new(&config)),
     };
     let rest_router = build_router(rest_state);
     tokio::spawn(pylon::transport::rest::serve(rest_rx, rest_router));
@@ -489,6 +490,7 @@ async fn run_redis_percore(
         draining,
         cluster_metrics: Some(bridge.metrics()),
         invalidator,
+        rest_limits: Arc::new(pylon::http::rest::ratelimit::RestRateLimits::new(&config)),
     };
     tokio::spawn(pylon::transport::rest::serve(
         rest_rx,

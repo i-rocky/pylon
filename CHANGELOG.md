@@ -41,6 +41,15 @@ pre-1.0 and versions track `Cargo.toml`.
   `pylon_cluster_publish_failed_total`.
 
 ### Added
+- **REST rate limits.** A node-wide pre-auth cap
+  (`PYLON_MAX_REST_REQUESTS_PER_SECOND`) plus per-app event and read caps
+  (`PYLON_MAX_BACKEND_EVENTS_PER_SECOND`,
+  `PYLON_MAX_READ_REQUESTS_PER_SECOND`), each overridable per app via the new
+  `max_backend_events_per_second` / `max_read_requests_per_second` fields
+  (absent = server default, `0` = unlimited). Over the limit: `429` with
+  `Retry-After`, `X-RateLimit-Limit` and `X-RateLimit-Remaining`. New counter
+  `pylon_rest_rate_limited_total{scope}`. Existing SQL `apps` tables without
+  the two new columns keep working unchanged.
 - **Transport flood protection.** Every inbound WebSocket frame — data and
   control — now counts against a per-connection token bucket
   (`PYLON_MAX_FRAMES_PER_SECOND`, default 100; `PYLON_MAX_FRAMES_BURST`,

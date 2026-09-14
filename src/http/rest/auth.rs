@@ -80,8 +80,10 @@ mod tests {
     }
 
     fn state_over(apps: Arc<dyn AppManager>) -> AppState {
+        let config = crate::server::config::ServerConfig::default();
         AppState {
-            config: crate::server::config::ServerConfig::default(),
+            rest_limits: Arc::new(crate::http::rest::ratelimit::RestRateLimits::new(&config)),
+            config,
             apps,
             adapter: Arc::new(crate::adapter::local::LocalAdapter::new(
                 Arc::new(crate::channel::registry::Registry::new()),

@@ -157,6 +157,7 @@ mod tests {
             ..crate::server::config::ServerConfig::default()
         };
         AppState {
+            rest_limits: Arc::new(crate::http::rest::ratelimit::RestRateLimits::new(&config)),
             config,
             apps: Arc::new(crate::app::static_file::StaticFileAppManager::from_json("[]").unwrap()),
             adapter: Arc::new(crate::adapter::local::LocalAdapter::new(

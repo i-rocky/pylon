@@ -156,6 +156,7 @@ pub async fn spawn_percore(spec: SpawnSpec) -> SocketAddr {
         draining: Arc::new(AtomicBool::new(false)),
         cluster_metrics: None,
         invalidator: None,
+        rest_limits: Arc::new(pylon::http::rest::ratelimit::RestRateLimits::new(&config)),
     };
     let rest_router = build_router(rest_state);
     tokio::spawn(pylon::transport::rest::serve(rest_rx, rest_router));
@@ -343,6 +344,7 @@ pub async fn spawn_percore_cluster_with_apps(
         draining: Arc::new(AtomicBool::new(false)),
         cluster_metrics: None,
         invalidator: None,
+        rest_limits: Arc::new(pylon::http::rest::ratelimit::RestRateLimits::new(&config)),
     };
     tokio::spawn(pylon::transport::rest::serve(
         rest_rx,

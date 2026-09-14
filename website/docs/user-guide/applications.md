@@ -50,6 +50,8 @@ default `apps.json` (configurable via [`PYLON_APPS_PATH`](configuration.md)).
 | `client_messages_enabled` | boolean | When `true`, clients may publish events to channels via `client_event`. Defaults to `false`. |
 | `subscription_count_enabled` | boolean | When `true`, the server emits `pusher_internal:subscription_count` events as a channel's subscriber count changes, and the `subscription_count` webhook (if the endpoint also lists it in `event_types`). Defaults to `false`. |
 | `capacity` | integer | Maximum concurrent WebSocket connections for this app (`0` = unlimited). Connections beyond this limit are refused with WebSocket close code **4004**. |
+| `max_backend_events_per_second` | integer or null | Per-app override for `PYLON_MAX_BACKEND_EVENTS_PER_SECOND`. **Absent or `null` = use the server default**; `0` = unlimited for this app. The two are different states, so omitting the field is not the same as setting it to `0`. |
+| `max_read_requests_per_second` | integer or null | Per-app override for `PYLON_MAX_READ_REQUESTS_PER_SECOND`, with the same absent/`0` distinction. |
 | `webhooks` | array | Zero or more webhook targets. Each entry has a `url`, an `event_types` list, and an optional `headers` map. See the [Webhooks](webhooks.md) page for the full event-type reference. |
 
 !!! note
@@ -104,6 +106,8 @@ CREATE TABLE IF NOT EXISTS apps (
     secret      VARCHAR(255) NOT NULL,
     name        VARCHAR(255) NOT NULL DEFAULT '',
     capacity    BIGINT NOT NULL DEFAULT 0,
+    max_backend_events_per_second  BIGINT NULL,              -- NULL = server default
+    max_read_requests_per_second   BIGINT NULL,              -- NULL = server default
     client_messages_enabled     BIGINT NOT NULL DEFAULT 0,   -- 0/1
     subscription_count_enabled  BIGINT NOT NULL DEFAULT 0,   -- 0/1
     enabled     BIGINT NOT NULL DEFAULT 1,                   -- 0/1
@@ -260,6 +264,42 @@ Two operational notes for clustered deployments:
 Set `capacity` to `0` to disable the limit (unrestricted). For most production deployments,
 sizing capacity to match your expected peak concurrent users plus a comfortable headroom is
 recommended.
+
+---
+
+## Per-app REST rate limits
+
+`max_backend_events_per_second` and `max_read_requests_per_second` override the node-wide
+defaults (`PYLON_MAX_BACKEND_EVENTS_PER_SECOND`, `PYLON_MAX_READ_REQUESTS_PER_SECOND`) for one
+app, so a single tenant cannot spend the whole node's publish budget. A request over the app's
+limit is answered `429` with `Retry-After`, `X-RateLimit-Limit` and `X-RateLimit-Remaining`, and
+`pylon_rest_rate_limited_total{scope="app_events"}` / `{scope="app_reads"}` increments. See
+[Production Tuning](production-tuning.md) for how to pick the numbers.
+
+An **absent** value (the JSON field omitted, or a `NULL` column) means "use the server default";
+an explicit **`0`** means unlimited for this app. Those are different states — omitting the field
+is not the same as writing `0`.
+
+A `POST /batch_events` costs its event count against `max_backend_events_per_second`, so a value
+below `PYLON_MAX_BATCH_EVENTS` makes a full-size batch permanently unaffordable.
+
+Every limit is enforced **per node**, with no cluster coordination: unlike `capacity`, which the
+Redis adapter enforces cluster-wide, N nodes behind a load balancer jointly allow
+`N × max_backend_events_per_second`. Divide by your node count if you need a cluster-wide
+ceiling.
+
+!!! note "Relational stores: the columns are optional"
+    The two columns are read only when the `apps` table has them. Pylon probes for them once, at
+    startup, and an `apps` table predating this release keeps working unchanged — every app simply
+    resolves both overrides as absent and uses the server defaults. Because the probe runs once,
+    adding the columns to a live database takes effect at the next restart, not immediately.
+
+A changed value takes effect on that app's next REST request — a node notices that its cached
+bucket was built for a different limit and replaces it — so no restart is needed. The replacement
+bucket starts full, so lowering a limit does not retroactively charge traffic already served.
+
+A negative value is an invalid app, not "unlimited": the app fails to load and the failure names
+the field. Use `0` for unlimited.
 
 ---
 

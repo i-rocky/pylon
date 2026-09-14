@@ -43,6 +43,7 @@ pub struct AppState {
     /// is set and caching is enabled, `None` otherwise. Required by the admin
     /// `POST /admin/apps/{id}/invalidate` endpoint to publish cross-node evictions.
     pub invalidator: Option<Arc<crate::app::invalidation::AppInvalidator>>,
+    pub rest_limits: Arc<crate::http::rest::ratelimit::RestRateLimits>,
 }
 
 impl AppState {
@@ -97,7 +98,7 @@ pub fn build_router(state: AppState) -> Router {
         .saturating_mul(state.config.max_event_payload_bytes)
         .saturating_add(64 * 1024);
     let router = Router::new().route("/", get(crate::http::root));
-    crate::http::rest::merge(router, body_limit)
+    crate::http::rest::merge(router, body_limit, state.clone())
         .fallback(not_found_fallback)
         .method_not_allowed_fallback(method_not_allowed_fallback)
         .with_state(state)
