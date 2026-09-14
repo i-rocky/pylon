@@ -467,6 +467,7 @@ async fn spawn_tls_server_large(
         // channels to build a large REST response body; the subscription cap must
         // not limit it.
         max_subscriptions_per_connection: 0,
+        max_frames_per_second: 0,
         ..ServerConfig::default()
     };
     let tls = pylon::transport::tls::resolve_tls(

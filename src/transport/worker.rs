@@ -276,6 +276,11 @@ pub struct WorkerConfig {
     /// Shared (via `Arc` clone) with every `Mailbox` created by this worker's
     /// connections. `None` for echo/test workers without mailbox drop tracking.
     pub mailbox_dropped_slot: Option<Arc<AtomicU64>>,
+    pub frame_limited_slot: Option<Arc<AtomicU64>>,
+    pub accept_limited_slot: Option<Arc<AtomicU64>>,
+    pub max_frames_per_second: u32,
+    pub max_frames_burst: u32,
+    pub max_accepts_per_second: u32,
     /// SP10 §7: CoDel time-in-queue freshness parameters, stamped onto every
     /// connection at accept. `target_ns == 0` disables CoDel (pure drop-head).
     pub codel: crate::transport::conn::CodelParams,
@@ -392,6 +397,7 @@ struct Entry {
     /// dropped wholesale when the connection closes mid-park (leaking nothing —
     /// no counter was taken). A park holds the slab slot but no app resources.
     pending_establish: Option<PendingEstablish>,
+    frames: crate::rate::TokenBucket,
 }
 
 impl Entry {
@@ -530,6 +536,8 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     let budget_factor = cfg.budget_factor.clone();
     // SP10 §7: CoDel parameters stamped onto every accepted connection.
     let codel = cfg.codel;
+    let mut accepts =
+        crate::rate::TokenBucket::new(cfg.max_accepts_per_second, cfg.max_accepts_per_second);
     let mut inflight_bytes: u64 = 0;
     // Queued out-frames plus unflushed TLS plaintext only. The shutdown drain
     // reads this rather than `inflight_bytes`, whose inbound buffers never
@@ -779,6 +787,8 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         codel,
                         &mut wheel,
                         handshake_deadline,
+                        now_ns,
+                        &mut accepts,
                     );
                     accepted_total += n;
                     if n > 0 {
@@ -1425,6 +1435,7 @@ enum Action {
 /// is reaped by the `Due::HandshakeTimeout` arm of the liveness loop — the fd
 /// and slab slot no longer leak. Inbound dribble arms only the liveness timer
 /// (`touch`), never this deadline. `None` disables the arming.
+#[allow(clippy::too_many_arguments)]
 fn accept_ready(
     poll: &Poll,
     listener: &mut TcpListener,
@@ -1433,11 +1444,20 @@ fn accept_ready(
     codel: crate::transport::conn::CodelParams,
     wheel: &mut TimerWheel,
     handshake_deadline: Option<u64>,
+    now_ns: u64,
+    accepts: &mut crate::rate::TokenBucket,
 ) -> u64 {
     let mut accepted = 0;
     loop {
         match listener.accept() {
             Ok((mut stream, _peer)) => {
+                if !accepts.take_at_ns(now_ns, 1) {
+                    if let Some(slot) = &cfg.accept_limited_slot {
+                        slot.fetch_add(1, Ordering::Relaxed);
+                    }
+                    drop(stream);
+                    continue;
+                }
                 let entry = conns.vacant_entry();
                 let key = entry.key();
                 if let Err(e) =
@@ -1470,6 +1490,10 @@ fn accept_ready(
                     session: None,
                     fragment: None,
                     pending_establish: None,
+                    frames: crate::rate::TokenBucket::new(
+                        cfg.max_frames_per_second,
+                        cfg.max_frames_burst,
+                    ),
                 });
                 // G3: the slab key is the wheel's ConnId, so the deadline can
                 // only be armed once the slot exists.
@@ -1950,6 +1974,15 @@ fn handle_frames(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig, now_ns: u64
         Err(ConnError::Closed) | Err(ConnError::Protocol(_)) => return Action::Close,
     };
 
+    let count = frames.len() as u32;
+    if count > 0 && !entry.frames.take_at_ns(now_ns, count) {
+        if let Some(slot) = &cfg.frame_limited_slot {
+            slot.fetch_add(1, Ordering::Relaxed);
+        }
+        tracing::debug!(count, "inbound frame rate limit exceeded; closing 4100");
+        return close_frame_flood(poll, entry, now_ns);
+    }
+
     match &cfg.mode {
         Mode::Echo => echo_frames(poll, entry, frames, now_ns),
         Mode::Dispatch(_) => dispatch_frames(poll, entry, frames, cfg.max_message_bytes, now_ns),
@@ -2179,6 +2212,13 @@ fn close_fragment_violation(poll: &Poll, entry: &mut Entry, now_ns: u64, reason:
 fn close_invalid_utf8(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action {
     entry.set_fragment(None);
     queue_close_frame(entry, 1007, "invalid UTF-8 in a text message", now_ns);
+    let _ = flush_and_arm(poll, entry, now_ns);
+    Action::Close
+}
+
+fn close_frame_flood(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action {
+    entry.set_fragment(None);
+    queue_close_frame(entry, 4100, "Inbound frame rate limit exceeded", now_ns);
     let _ = flush_and_arm(poll, entry, now_ns);
     Action::Close
 }
@@ -3236,6 +3276,11 @@ mod tests {
             codel_dropped_slot: None,
             drophead_dropped_slot: None,
             mailbox_dropped_slot: None,
+            frame_limited_slot: None,
+            accept_limited_slot: None,
+            max_frames_per_second: 0,
+            max_frames_burst: 0,
+            max_accepts_per_second: 0,
             codel: crate::transport::conn::CodelParams::DISABLED,
             budget_factor: None,
             shutdown_grace_ms: 0,
@@ -3304,6 +3349,8 @@ mod tests {
             crate::transport::conn::CodelParams::DISABLED,
             &mut wheel,
             None,
+            0,
+            &mut crate::rate::TokenBucket::new(0, 0),
         );
         assert_eq!(accepted, 1);
         assert_eq!(conns.len(), 1);
@@ -3512,6 +3559,7 @@ mod tests {
             session: None,
             fragment: None,
             pending_establish: None,
+            frames: crate::rate::TokenBucket::new(0, 0),
         });
 
         // Echo-mode worker config + the notifier plumbing handle_handshake
@@ -3533,6 +3581,11 @@ mod tests {
             codel_dropped_slot: None,
             drophead_dropped_slot: None,
             mailbox_dropped_slot: None,
+            frame_limited_slot: None,
+            accept_limited_slot: None,
+            max_frames_per_second: 0,
+            max_frames_burst: 0,
+            max_accepts_per_second: 0,
             codel: crate::transport::conn::CodelParams::DISABLED,
             budget_factor: None,
             shutdown_grace_ms: 0,
@@ -4075,6 +4128,7 @@ mod tests {
                 session: None,
                 fragment: None,
                 pending_establish: None,
+                frames: crate::rate::TokenBucket::new(0, 0),
             },
             _client: client,
         }
@@ -4287,6 +4341,7 @@ mod tests {
             session: None,
             fragment: None,
             pending_establish: None,
+            frames: crate::rate::TokenBucket::new(0, 0),
         });
         let entry = &mut conns[key];
         entry.token = Token(key);

@@ -65,7 +65,7 @@ impl TokenBucket {
         }
         let deficit = f64::from(cost) - self.refilled_at_ns(now_ns);
         if deficit <= 0.0 {
-            return 1;
+            return 0;
         }
         ((deficit / self.rate).ceil() as u64).max(1)
     }
@@ -132,6 +132,32 @@ mod tests {
             slow.retry_after_secs_at_ns(0, 4),
             4,
             "4 tokens at 1/s is 4s"
+        );
+    }
+
+    #[test]
+    fn retry_after_is_zero_while_the_cost_is_already_payable() {
+        let mut b = TokenBucket::new(10, 10);
+        assert_eq!(
+            b.retry_after_secs_at_ns(0, 10),
+            0,
+            "a full bucket can pay 10 right now and owes no wait"
+        );
+        assert!(b.take_at_ns(0, 10));
+        assert_eq!(
+            b.retry_after_secs_at_ns(0, 1),
+            1,
+            "an emptied bucket owes the ceiling of 0.1s, never a zero wait"
+        );
+        assert_eq!(
+            b.retry_after_secs_at_ns(500 * MS, 9),
+            1,
+            "4 tokens short at 10/s is 0.4s, which rounds up to one whole second"
+        );
+        assert_eq!(
+            b.retry_after_secs_at_ns(500 * MS, 5),
+            0,
+            "the 5 tokens refilled by 500ms cover a cost of 5 with no wait"
         );
     }
 

@@ -125,6 +125,8 @@ TLS configuration is covered in detail on the [TLS / SSL](tls.md) page.
 | `PYLON_MAX_PRESENCE_USER_ID_LENGTH` | `128` | Maximum length of a presence member's `user_id` in bytes. |
 | `PYLON_MAX_PRESENCE_USER_INFO_BYTES` | `1024` | Maximum size of a presence member's `user_info` JSON in bytes. |
 | `PYLON_MAX_CLIENT_EVENTS_PER_SECOND` | `10` | Maximum client events a single connection may send per second. |
+| `PYLON_MAX_FRAMES_PER_SECOND` | `100` | Sustained inbound WebSocket frame rate a single connection may send, counting **every** frame — data, Ping, Pong and Close. A connection over the limit is closed with WebSocket code `4100` (reconnect after backoff) and `pylon_frame_limited_total` increments. Set `0` to disable. |
+| `PYLON_MAX_FRAMES_BURST` | `max(250, PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION + 50)` | Burst allowance for `PYLON_MAX_FRAMES_PER_SECOND`: the most frames one connection may send back-to-back before the sustained rate applies. Left unset, it is derived so a client can subscribe to its full channel allowance in one burst without tripping the limiter — `250` at the default 200-subscription cap, `350` at a cap of `300`, and `250` when the cap is `0` (unlimited). An explicit value is used exactly as given, with two guards: a value below `PYLON_MAX_FRAMES_PER_SECOND` is raised to it (the bucket's capacity is never smaller than one second of refill), and a value below a non-zero `PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION` refuses to start — it would close every client that used its full subscription allowance. |
 | `PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION` | `200` | Maximum simultaneous channel subscriptions per connection. Excess subscribes get a non-fatal `pusher:subscription_error` (`LimitReached`, `4004`). A pylon-specific guard — hosted Pusher documents no such limit. Set `0` for unlimited. |
 | `PYLON_MAX_WATCHLIST_SIZE` | `100` | Maximum number of channels a single connection may watch simultaneously. |
 | `PYLON_CACHE_TTL_SECS` | `1800` | TTL (seconds) for cached channel and presence state (30 minutes). |
@@ -170,6 +172,7 @@ a specific workload.
 | `PYLON_PSI_THRESHOLD` | `15.0` | PSI `full avg10` memory-pressure threshold (percent). When exceeded, the memory budget factor is shrunk. |
 | `PYLON_PSI_BACKSTOP` | _(auto)_ | PSI memory-pressure backstop. Auto-enabled when the kernel pressure file is readable. Set `1`/`true` to force on, `0`/`false` to force off. |
 | `PYLON_BROADCAST_HANDOFF_CAP` | `1024` | Capacity (frames) of each worker's bounded broadcast hand-off channel. |
+| `PYLON_MAX_ACCEPTS_PER_SECOND` | `0` | Node-wide cap on newly accepted TCP connections per second, divided evenly across workers (`ceil(N / workers)` each, with an equal burst). An excess socket is closed the instant it is accepted — before TLS and before the HTTP upgrade — and `pylon_accept_limited_total` increments. `0` = unlimited. The limiter fires before the request head is read, so it counts **every** socket accepted on the listener — WebSocket upgrades, REST calls and `/metrics` scrapes alike; set it high enough that monitoring is not competing with connection arrivals. Distinct from `PYLON_MAX_CONNECTIONS`, which bounds the standing population rather than the arrival rate. |
 
 ### Graceful shutdown
 

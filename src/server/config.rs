@@ -109,6 +109,9 @@ pub struct ServerConfig {
     pub max_channel_name_length: usize,
     pub max_event_name_length: usize,
     pub max_client_events_per_second: u32,
+    pub max_frames_per_second: u32,
+    pub max_frames_burst: u32,
+    pub max_accepts_per_second: u32,
     pub max_presence_user_id_length: usize,
     pub max_presence_user_info_bytes: usize,
     pub max_subscriptions_per_connection: usize,
@@ -285,6 +288,9 @@ impl Default for ServerConfig {
             max_channel_name_length: 200,
             max_event_name_length: 200,
             max_client_events_per_second: 10,
+            max_frames_per_second: 100,
+            max_frames_burst: 250,
+            max_accepts_per_second: 0,
             max_presence_user_id_length: 128,
             max_presence_user_info_bytes: 1024,
             max_subscriptions_per_connection: 200,
@@ -471,6 +477,12 @@ impl ServerConfig {
             "PYLON_MAX_CLIENT_EVENTS_PER_SECOND",
             &mut c.max_client_events_per_second,
         );
+        env_parse("PYLON_MAX_FRAMES_PER_SECOND", &mut c.max_frames_per_second);
+        env_parse("PYLON_MAX_FRAMES_BURST", &mut c.max_frames_burst);
+        env_parse(
+            "PYLON_MAX_ACCEPTS_PER_SECOND",
+            &mut c.max_accepts_per_second,
+        );
         env_parse(
             "PYLON_MAX_PRESENCE_USER_ID_LENGTH",
             &mut c.max_presence_user_id_length,
@@ -582,6 +594,26 @@ impl ServerConfig {
         if mailbox_capacity > 0 {
             c.mailbox_capacity = mailbox_capacity;
         }
+        let burst_was_set = std::env::var("PYLON_MAX_FRAMES_BURST").is_ok();
+        if !burst_was_set && c.max_subscriptions_per_connection > 0 {
+            let subscribe_storm =
+                u32::try_from(c.max_subscriptions_per_connection.saturating_add(50))
+                    .unwrap_or(u32::MAX);
+            c.max_frames_burst = c.max_frames_burst.max(subscribe_storm);
+        }
+        if burst_was_set
+            && c.max_frames_burst > 0
+            && c.max_subscriptions_per_connection > 0
+            && u64::from(c.max_frames_burst) < c.max_subscriptions_per_connection as u64
+        {
+            tracing::error!(
+                "invalid PYLON_MAX_FRAMES_BURST={}: below PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION={}, \
+                 so a client subscribing to its full channel allowance would be closed with 4100",
+                c.max_frames_burst,
+                c.max_subscriptions_per_connection
+            );
+            std::process::exit(1);
+        }
         c
     }
 
@@ -682,6 +714,9 @@ mod tests {
         assert_eq!(c.max_channel_name_length, 200);
         assert_eq!(c.max_event_name_length, 200);
         assert_eq!(c.max_client_events_per_second, 10);
+        assert_eq!(c.max_frames_per_second, 100);
+        assert_eq!(c.max_frames_burst, 250);
+        assert_eq!(c.max_accepts_per_second, 0);
         assert_eq!(c.max_presence_user_id_length, 128);
         assert_eq!(c.max_presence_user_info_bytes, 1024);
         // webhook tunables (spec §6 + Pusher retry parity: exponential backoff
@@ -734,6 +769,43 @@ mod tests {
         let mut off = c.clone();
         off.codel_target_ms = 0;
         assert_eq!(off.codel_params().target_ns, 0);
+    }
+
+    #[test]
+    fn frames_burst_default_tracks_the_subscription_cap() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("PYLON_MAX_FRAMES_BURST");
+        std::env::remove_var("PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION");
+        assert_eq!(
+            ServerConfig::from_env().max_frames_burst,
+            250,
+            "the 200-subscription default cap leaves the 250 floor in charge"
+        );
+
+        std::env::set_var("PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION", "300");
+        assert_eq!(
+            ServerConfig::from_env().max_frames_burst,
+            350,
+            "a 300-subscription cap must buy a burst of cap + 50"
+        );
+
+        std::env::set_var("PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION", "0");
+        assert_eq!(
+            ServerConfig::from_env().max_frames_burst,
+            250,
+            "an unlimited subscription cap keeps the 250 floor"
+        );
+
+        std::env::set_var("PYLON_MAX_FRAMES_BURST", "64");
+        std::env::set_var("PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION", "50");
+        assert_eq!(
+            ServerConfig::from_env().max_frames_burst,
+            64,
+            "an explicit burst wins over the derived default it is below"
+        );
+
+        std::env::remove_var("PYLON_MAX_FRAMES_BURST");
+        std::env::remove_var("PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION");
     }
 
     #[test]

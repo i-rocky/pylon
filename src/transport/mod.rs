@@ -54,6 +54,8 @@ struct PercoreRegistry {
     drophead_dropped_slots: Vec<Arc<AtomicU64>>,
     /// Task 4: per-worker cumulative mailbox-full-drop counter.
     mailbox_dropped_slots: Vec<Arc<AtomicU64>>,
+    frame_limited_slots: Vec<Arc<AtomicU64>>,
+    accept_limited_slots: Vec<Arc<AtomicU64>>,
     budget_factor: Arc<AtomicU32>,
     worker_budget_bytes: u64,
 }
@@ -74,6 +76,8 @@ pub struct PercoreMetricsSnapshot {
     pub drophead_dropped: Vec<u64>,
     /// Task 4: per-worker cumulative mailbox-full-drop count.
     pub mailbox_dropped: Vec<u64>,
+    pub frame_limited: Vec<u64>,
+    pub accept_limited: Vec<u64>,
     /// Sum of all workers' inflight bytes.
     pub inflight_total: u64,
     /// Budget factor as a fraction (×1000 fixed-point → 0.0–1.0).
@@ -122,6 +126,16 @@ pub fn percore_metrics_snapshot() -> Option<PercoreMetricsSnapshot> {
         .iter()
         .map(|s| s.load(Ordering::Relaxed))
         .collect();
+    let frame_limited: Vec<u64> = guard
+        .frame_limited_slots
+        .iter()
+        .map(|s| s.load(Ordering::Relaxed))
+        .collect();
+    let accept_limited: Vec<u64> = guard
+        .accept_limited_slots
+        .iter()
+        .map(|s| s.load(Ordering::Relaxed))
+        .collect();
     let inflight_total = inflight.iter().sum();
     let budget_factor = guard.budget_factor.load(Ordering::Relaxed) as f64 / 1000.0;
     let worker_budget_bytes = guard.worker_budget_bytes;
@@ -132,6 +146,8 @@ pub fn percore_metrics_snapshot() -> Option<PercoreMetricsSnapshot> {
         codel_dropped,
         drophead_dropped,
         mailbox_dropped,
+        frame_limited,
+        accept_limited,
         inflight_total,
         budget_factor,
         worker_budget_bytes,
@@ -164,6 +180,8 @@ fn lock_percore_registry_for_write() -> std::sync::MutexGuard<'static, PercoreRe
                 codel_dropped_slots: Vec::new(),
                 drophead_dropped_slots: Vec::new(),
                 mailbox_dropped_slots: Vec::new(),
+                frame_limited_slots: Vec::new(),
+                accept_limited_slots: Vec::new(),
                 budget_factor: Arc::new(AtomicU32::new(1000)),
                 worker_budget_bytes: 0,
             })
@@ -361,6 +379,12 @@ pub fn run_percore(
     let mailbox_dropped_slots: Vec<Arc<AtomicU64>> = (0..worker_count)
         .map(|_| Arc::new(AtomicU64::new(0)))
         .collect();
+    let frame_limited_slots: Vec<Arc<AtomicU64>> = (0..worker_count)
+        .map(|_| Arc::new(AtomicU64::new(0)))
+        .collect();
+    let accept_limited_slots: Vec<Arc<AtomicU64>> = (0..worker_count)
+        .map(|_| Arc::new(AtomicU64::new(0)))
+        .collect();
 
     // Build the per-core sharded broadcast plumbing: one `(Sender, Receiver)`
     // pair + `WorkerSlot` per worker. The `Sender`s live in the sink (installed
@@ -478,6 +502,12 @@ pub fn run_percore(
         g.mailbox_dropped_slots.clear();
         g.mailbox_dropped_slots
             .extend(mailbox_dropped_slots.iter().cloned());
+        g.frame_limited_slots.clear();
+        g.frame_limited_slots
+            .extend(frame_limited_slots.iter().cloned());
+        g.accept_limited_slots.clear();
+        g.accept_limited_slots
+            .extend(accept_limited_slots.iter().cloned());
         g.budget_factor = budget_factor.clone();
         g.worker_budget_bytes = per_worker_budget;
     }
@@ -504,6 +534,15 @@ pub fn run_percore(
             codel_dropped_slot: Some(codel_dropped_slots[i].clone()),
             drophead_dropped_slot: Some(drophead_dropped_slots[i].clone()),
             mailbox_dropped_slot: Some(mailbox_dropped_slots[i].clone()),
+            frame_limited_slot: Some(frame_limited_slots[i].clone()),
+            accept_limited_slot: Some(accept_limited_slots[i].clone()),
+            max_frames_per_second: config.max_frames_per_second,
+            max_frames_burst: config.max_frames_burst,
+            max_accepts_per_second: if config.max_accepts_per_second == 0 {
+                0
+            } else {
+                config.max_accepts_per_second.div_ceil(worker_count as u32)
+            },
             codel,
             budget_factor: Some(budget_factor.clone()),
             shutdown_grace_ms: config.shutdown_grace_ms,
