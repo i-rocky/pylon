@@ -244,6 +244,21 @@ mod tests {
         a
     }
 
+    /// The two lookup failures read differently in a log line: an operator
+    /// seeing "backend error" reaches for the store's health, one seeing "row
+    /// decode error" reaches for the row. Both must name the underlying cause.
+    #[test]
+    fn lookup_errors_render_their_kind_and_cause() {
+        assert_eq!(
+            AppLookupError::Backend("connection refused".into()).to_string(),
+            "app store backend error: connection refused"
+        );
+        assert_eq!(
+            AppLookupError::Decode("app 'x': secret is empty".into()).to_string(),
+            "app row decode error: app 'x': secret is empty"
+        );
+    }
+
     #[test]
     fn app_without_webhooks_has_all_flags_false() {
         let a = parse(serde_json::json!({

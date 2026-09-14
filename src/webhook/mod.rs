@@ -156,26 +156,23 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
+    use crate::app::static_file::StaticFileAppManager;
 
-    /// Minimal AppManager double: nothing is ever found (the dispatcher on the
-    /// error path is never even constructed).
-    struct NoApps;
+    /// The single app the dispatcher tests below resolve, with one endpoint
+    /// subscribed to `channel_occupied`.
+    const APPS: &str = r#"[
+        {"name":"T","id":"app1","key":"k","secret":"s",
+         "webhooks":[{"url":"https://hook.test","event_types":["channel_occupied"]}]}
+    ]"#;
 
-    #[async_trait]
-    impl AppManager for NoApps {
-        async fn by_key(
-            &self,
-            _key: &str,
-        ) -> Result<crate::app::AppLookup, crate::app::AppLookupError> {
-            Ok(crate::app::AppLookup::NotFound)
-        }
+    fn apps() -> Arc<dyn AppManager> {
+        Arc::new(StaticFileAppManager::from_json(APPS).expect("apps json must parse"))
+    }
 
-        async fn by_id(
-            &self,
-            _id: &str,
-        ) -> Result<crate::app::AppLookup, crate::app::AppLookupError> {
-            Ok(crate::app::AppLookup::NotFound)
+    fn occupied(app: &str, channel: &str) -> WebhookEvent {
+        WebhookEvent::ChannelOccupied {
+            app: app.to_string(),
+            channel: channel.to_string(),
         }
     }
 
@@ -189,7 +186,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_propagates_transport_factory_error() {
         let result: Result<WebhookHandle, ()> = spawn(
-            Arc::new(NoApps),
+            apps(),
             |_metrics| Err(()),
             Arc::new(dispatcher::FixedClock(0)),
             10,
@@ -198,5 +195,110 @@ mod tests {
             None,
         );
         assert!(result.is_err(), "factory failure must surface from spawn");
+    }
+
+    /// §8 backpressure: the WS path must never block on a lagging webhook
+    /// dispatcher. A full mailbox DROPS the trigger and counts it, and — the
+    /// part that matters — the events already queued are untouched, so the
+    /// dispatcher still delivers everything it accepted.
+    #[tokio::test]
+    async fn a_full_mailbox_drops_the_trigger_and_counts_it() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let handle = WebhookHandle {
+            tx,
+            metrics: Arc::new(WebhookMetrics::new(1)),
+        };
+
+        handle.enqueue(occupied("app1", "first"));
+        assert_eq!(handle.queue_depth(), 1, "the accepted event is queued");
+        assert_eq!(handle.metrics().enqueued.load(Ordering::Relaxed), 1);
+        assert_eq!(handle.metrics().dropped.load(Ordering::Relaxed), 0);
+
+        handle.enqueue(occupied("app1", "overflow"));
+        assert_eq!(
+            handle.metrics().dropped.load(Ordering::Relaxed),
+            1,
+            "the trigger that did not fit must be counted as dropped"
+        );
+        assert_eq!(
+            handle.metrics().enqueued.load(Ordering::Relaxed),
+            1,
+            "a dropped trigger must NOT be counted as enqueued"
+        );
+
+        assert_eq!(
+            rx.try_recv().map(|e| e.name()).ok(),
+            Some("channel_occupied"),
+            "the queued event must survive the overflow"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the dropped trigger must not have been queued"
+        );
+    }
+
+    /// A trigger naming an app the store does not know has no endpoints to go
+    /// to, so it is discarded rather than posted somewhere arbitrary.
+    ///
+    /// The negative is gated, not timed: both triggers are enqueued before the
+    /// test's first `.await`, so on the current-thread runtime the spawned
+    /// dispatcher cannot run until both are in the mailbox and they share one
+    /// batch. Mailbox order proves nothing beyond that — `flush` re-partitions
+    /// the batch into an unordered `HashMap` keyed by app — so the verdict is
+    /// read off the delivered envelope: the one delivery the known app earns
+    /// must carry its own channel and no other.
+    #[tokio::test]
+    async fn a_trigger_for_an_unknown_app_delivers_nowhere() {
+        let recorder = Arc::new(transport::RecordingTransport::new());
+        let sink = recorder.clone();
+        let handle: WebhookHandle = spawn::<_, std::convert::Infallible>(
+            apps(),
+            move |_metrics| Ok(sink as Arc<dyn WebhookTransport>),
+            Arc::new(dispatcher::FixedClock(0)),
+            1,
+            16,
+            0,
+            None,
+        )
+        .expect("the recording transport factory cannot fail");
+
+        handle.enqueue(occupied("no-such-app", "public-unknown"));
+        handle.enqueue(occupied("app1", "public-known"));
+
+        let recorded = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let recorded = recorder.recorded().await;
+                if !recorded.is_empty() {
+                    return recorded;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the known app's webhook must be delivered");
+
+        assert_eq!(
+            recorded.len(),
+            1,
+            "exactly one delivery — the unknown app's trigger produced none"
+        );
+        assert_eq!(recorded[0].url, "https://hook.test");
+        let envelope: serde_json::Value = serde_json::from_str(&recorded[0].body)
+            .expect("the delivered body must be a JSON envelope");
+        let channels: Vec<&str> = envelope["events"]
+            .as_array()
+            .expect("the envelope must carry an events array")
+            .iter()
+            .map(|e| {
+                e["channel"]
+                    .as_str()
+                    .expect("every event names its channel")
+            })
+            .collect();
+        assert_eq!(
+            channels,
+            ["public-known"],
+            "the known app's envelope must carry its own trigger and nothing else"
+        );
     }
 }

@@ -1390,3 +1390,230 @@ fn roster_payload(members: Vec<PresenceMember>) -> crate::protocol::event::Prese
     let count = ids.len();
     crate::protocol::event::PresencePayload { ids, hash, count }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn member(user_id: &str) -> PresenceMember {
+        PresenceMember {
+            user_id: user_id.to_string(),
+            user_info: serde_json::json!({ "name": user_id }),
+        }
+    }
+
+    /// A mailbox plus the receiver that keeps it open. These tests assert on the
+    /// commands that reach the bridge, never on mailbox traffic, but the receiver
+    /// must outlive the command or the mailbox reports itself closed.
+    fn mailbox() -> (tokio::sync::mpsc::Receiver<Box<ServerEvent>>, Mailbox) {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        (rx, Mailbox::new(tx, None, None))
+    }
+
+    /// Fire one of each fire-and-forget command at `handle`, in the order the
+    /// connection lifecycle produces them. Returns how many were fired, so a
+    /// caller can assert the drop counter accounts for every one.
+    fn fire_every_fire_and_forget_command(handle: &ClusterHandle) -> u64 {
+        let app: Arc<str> = Arc::from("app1");
+        let channel: Arc<str> = Arc::from("presence-room");
+        let sid = SocketId::generate();
+        let (_sub_rx, sub_mailbox) = mailbox();
+        let (_pres_rx, pres_mailbox) = mailbox();
+        let (_watch_rx, watch_mailbox) = mailbox();
+        let (_ack_rx, ack_mailbox) = mailbox();
+        handle.publish(app.clone(), channel.clone(), "FRAME".to_string(), None);
+        handle.subscribe(app.clone(), channel.clone(), sid, sub_mailbox, true);
+        handle.unsubscribe(app.clone(), channel.clone(), sid, true);
+        handle.presence_subscribe(
+            app.clone(),
+            channel.clone(),
+            member("u1"),
+            sid,
+            pres_mailbox,
+            true,
+        );
+        handle.presence_leave(app.clone(), channel.clone(), "u1".to_string(), sid, true);
+        handle.signin(app.clone(), "u1".to_string(), sid, true);
+        handle.signout(app.clone(), "u1".to_string(), sid, true);
+        handle.watch(
+            app.clone(),
+            sid,
+            vec!["u2".to_string()],
+            vec!["u2".to_string()],
+            watch_mailbox,
+        );
+        handle.unwatch(app.clone(), sid, vec!["u2".to_string()]);
+        handle.presence_ack(app.clone(), channel, ack_mailbox);
+        handle.release_app(&app);
+        11
+    }
+
+    /// A worker must NEVER block on a behind bridge: when the bounded control
+    /// channel is full every command is dropped and counted, and the commands
+    /// already queued are left untouched.
+    #[test]
+    fn a_full_bridge_channel_drops_and_counts_every_command_instead_of_blocking() {
+        let (tx, mut rx) = mpsc::channel::<ClusterCmd>(1);
+        let handle = ClusterHandle::test_handle(tx);
+
+        // Precondition: occupy the channel's single slot so every send below is
+        // genuinely rejected as Full rather than quietly succeeding.
+        handle.publish(
+            Arc::from("app1"),
+            Arc::from("public-c"),
+            "OCCUPANT".to_string(),
+            None,
+        );
+        assert_eq!(
+            handle.metrics.cmd_dropped.load(Ordering::Relaxed),
+            0,
+            "the first command fits in the channel and must not be counted as dropped"
+        );
+
+        let fired = fire_every_fire_and_forget_command(&handle);
+        assert_eq!(
+            handle.metrics.cmd_dropped.load(Ordering::Relaxed),
+            fired,
+            "every command fired at a full channel must be dropped and counted"
+        );
+        assert_eq!(
+            handle.admit_app("app1", 7),
+            None,
+            "a capacity admission that cannot reach a full bridge must fail OPEN"
+        );
+        assert_eq!(
+            handle.metrics.cmd_dropped.load(Ordering::Relaxed),
+            fired + 1,
+            "the dropped admission is counted like any other dropped command"
+        );
+
+        match rx.try_recv() {
+            Ok(ClusterCmd::Publish { frame, .. }) => assert_eq!(frame, "OCCUPANT"),
+            _ => panic!("the command queued before the overflow must still be there"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing fired at the full channel may have been queued"
+        );
+    }
+
+    /// A bridge that is gone (its receiver dropped) is the same story: drop and
+    /// count, never panic, never block.
+    #[test]
+    fn a_gone_bridge_drops_and_counts_every_command() {
+        let (tx, rx) = mpsc::channel::<ClusterCmd>(64);
+        let handle = ClusterHandle::test_handle(tx);
+        drop(rx);
+
+        let fired = fire_every_fire_and_forget_command(&handle);
+        assert_eq!(
+            handle.admit_app("app1", 7),
+            None,
+            "admission against a gone bridge must fail OPEN"
+        );
+        assert_eq!(
+            handle.metrics.cmd_dropped.load(Ordering::Relaxed),
+            fired + 1,
+            "every command fired at a closed channel must be dropped and counted"
+        );
+    }
+
+    /// The one request-response command: the caller blocks until the bridge's
+    /// verdict arrives and returns it verbatim.
+    #[tokio::test]
+    async fn admit_app_returns_the_bridges_verdict_verbatim() {
+        for verdict in [Some(true), Some(false), None] {
+            let (tx, mut rx) = mpsc::channel::<ClusterCmd>(4);
+            let handle = ClusterHandle::test_handle(tx);
+            let caller = tokio::task::spawn_blocking(move || handle.admit_app("app1", 9));
+
+            let cmd = rx
+                .recv()
+                .await
+                .expect("the admission command must reach the bridge");
+            let ClusterCmd::AdmitApp {
+                app,
+                capacity,
+                reply,
+            } = cmd
+            else {
+                panic!("expected an AdmitApp command");
+            };
+            assert_eq!(&*app, "app1");
+            assert_eq!(capacity, 9);
+            reply
+                .send(verdict)
+                .expect("the caller must still be waiting");
+
+            assert_eq!(
+                caller.await.expect("the calling thread must not panic"),
+                verdict,
+                "admit_app must return the bridge's verdict unchanged"
+            );
+        }
+    }
+
+    /// A bridge that takes the command but never answers must not wedge the
+    /// establish: the caller fails OPEN.
+    #[tokio::test]
+    async fn admit_app_fails_open_when_the_bridge_never_answers() {
+        let (tx, mut rx) = mpsc::channel::<ClusterCmd>(4);
+        let handle = ClusterHandle::test_handle(tx);
+        let caller = tokio::task::spawn_blocking(move || handle.admit_app("app1", 3));
+
+        let cmd = rx
+            .recv()
+            .await
+            .expect("the admission command must reach the bridge");
+        assert!(
+            matches!(cmd, ClusterCmd::AdmitApp { .. }),
+            "the command the bridge dropped must be the admission"
+        );
+        // Dropping the command drops its reply sender — the shape of a bridge
+        // that dies (or gives up) mid-verdict.
+        drop(cmd);
+
+        assert_eq!(
+            caller.await.expect("the calling thread must not panic"),
+            None,
+            "an unanswered admission must fail OPEN, never reject the connection"
+        );
+    }
+
+    /// The best-effort roster the presence error path falls back to reports each
+    /// distinct user ONCE, in sorted order, with its info — the same shape the
+    /// authoritative Redis roster has, so a degraded join is not a different
+    /// protocol.
+    #[test]
+    fn roster_payload_reports_each_distinct_user_once_sorted() {
+        let payload = roster_payload(vec![
+            member("zoe"),
+            member("amir"),
+            member("zoe"),
+            member("mo"),
+        ]);
+        assert_eq!(payload.ids, ["amir", "mo", "zoe"]);
+        assert_eq!(
+            payload.count, 3,
+            "count is distinct USERS, not connections — zoe's two connections are one member"
+        );
+        assert_eq!(
+            payload.hash.get("zoe"),
+            Some(&serde_json::json!({ "name": "zoe" })),
+            "each member's user_info must be carried through"
+        );
+        assert_eq!(payload.hash.len(), 3);
+    }
+
+    /// The `/metrics` gauges start from a truthful zero: nothing dropped, and
+    /// Redis NOT reported healthy before the first heartbeat tick says so.
+    #[test]
+    fn fresh_metrics_report_no_drops_and_redis_not_yet_connected() {
+        let m = ClusterMetrics::default();
+        assert_eq!(m.cmd_dropped.load(Ordering::Relaxed), 0);
+        assert!(
+            !m.redis_connected.load(Ordering::Relaxed),
+            "redis_connected must not read healthy before a heartbeat tick has proven it"
+        );
+    }
+}

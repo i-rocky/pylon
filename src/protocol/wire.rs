@@ -102,4 +102,35 @@ mod tests {
         assert!(buf.starts_with("<sentinel>"));
         assert_eq!(&buf["<sentinel>".len()..], &encode(7, &ev));
     }
+
+    /// A version outside `MIN..=MAX` must PANIC rather than silently encode
+    /// something a client cannot read: `negotiate` validated the range before
+    /// any connection reached an encode, so reaching here is a broken invariant,
+    /// not a runtime condition to paper over.
+    #[test]
+    #[should_panic(expected = "outside MIN..=MAX")]
+    fn an_unnegotiable_version_panics_rather_than_encoding_silently() {
+        let ev = ServerEvent::SubscriptionSucceeded {
+            channel: "c".into(),
+            presence: None,
+        };
+        let _ = encode(MAX_PROTOCOL + 2, &ev);
+    }
+
+    /// Every version the sink builds frames for must actually be encodable —
+    /// `ACTIVE_VERSIONS` and `encode_into`'s arms cannot drift apart without the
+    /// fan-out panicking on a live broadcast.
+    #[test]
+    fn every_active_version_is_encodable() {
+        let ev = ServerEvent::SubscriptionSucceeded {
+            channel: "c".into(),
+            presence: None,
+        };
+        for &v in ACTIVE_VERSIONS {
+            assert!(
+                !encode(v, &ev).is_empty(),
+                "ACTIVE_VERSIONS lists {v}, which encode_into cannot encode"
+            );
+        }
+    }
 }

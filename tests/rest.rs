@@ -2221,3 +2221,208 @@ async fn head_over_the_header_limit_is_answered_with_json_431() {
         Ok(_) => panic!("an over-limit upgrade must not complete the 101"),
     }
 }
+
+/// POST a signed body to `path` on `addr` and return the response.
+async fn post_signed(addr: SocketAddr, path: &str, body: String) -> reqwest::Response {
+    let q = signed_query("POST", path, body.as_bytes(), &[]);
+    reqwest::Client::new()
+        .post(format!("http://{addr}{path}?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// A trigger naming no destination at all is a 400 — not a silent 200 that
+/// publishes nowhere and leaves the caller believing it delivered.
+#[tokio::test]
+async fn rest_trigger_without_channel_or_channels_is_400() {
+    let addr = spawn().await;
+    let body = json!({"name":"ev","data":"{}"}).to_string();
+    let resp = post_signed(addr, "/apps/app1/events", body).await;
+    assert_eq!(resp.status(), 400);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["error"],
+        "must provide channel or channels"
+    );
+}
+
+/// An explicitly EMPTY channel list is likewise a 400: the caller asked for a
+/// publish and must not be told it succeeded.
+#[tokio::test]
+async fn rest_trigger_empty_channels_list_is_400() {
+    let addr = spawn().await;
+    let body = json!({"name":"ev","data":"{}","channels":[]}).to_string();
+    let resp = post_signed(addr, "/apps/app1/events", body).await;
+    assert_eq!(resp.status(), 400);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["error"],
+        "invalid channel count"
+    );
+}
+
+/// The same contract on the batch endpoint: an empty batch is a 400.
+#[tokio::test]
+async fn rest_batch_events_empty_batch_is_400() {
+    let addr = spawn().await;
+    let body = json!({ "batch": [] }).to_string();
+    let resp = post_signed(addr, "/apps/app1/batch_events", body).await;
+    assert_eq!(resp.status(), 400);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["error"],
+        "invalid batch size"
+    );
+}
+
+/// P8 on the batch endpoint: one item with an illegal channel name rejects the
+/// WHOLE batch, and it does so before any item is delivered.
+#[tokio::test]
+async fn rest_batch_event_invalid_channel_name_rejects_the_whole_batch() {
+    let addr = spawn().await;
+    let mut ws = connect_ws(addr).await;
+    let _ = next_json(&mut ws).await;
+    subscribe_public(&mut ws, "room-ok").await;
+
+    let body = json!({"batch":[
+        {"name":"ev-a","data":"1","channel":"room-ok"},
+        {"name":"ev-b","data":"2","channel":"bad channel"}
+    ]})
+    .to_string();
+    let resp = post_signed(addr, "/apps/app1/batch_events", body).await;
+    assert_eq!(resp.status(), 400);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["error"],
+        "Invalid channel name"
+    );
+
+    // Nothing was delivered: the next frame the subscriber sees is a LATER,
+    // valid publish, not the rejected batch's first item.
+    let ok = json!({"name":"after","data":"3","channels":["room-ok"]}).to_string();
+    assert_eq!(
+        post_signed(addr, "/apps/app1/events", ok).await.status(),
+        200
+    );
+    let frame = next_json(&mut ws).await;
+    assert_eq!(
+        frame["event"], "after",
+        "a rejected batch must not have delivered its earlier items"
+    );
+}
+
+/// The same all-or-nothing rule for a malformed `socket_id` on any item.
+#[tokio::test]
+async fn rest_batch_event_invalid_socket_id_rejects_the_whole_batch() {
+    let addr = spawn().await;
+    let mut ws = connect_ws(addr).await;
+    let _ = next_json(&mut ws).await;
+    subscribe_public(&mut ws, "room-ok").await;
+
+    let body = json!({"batch":[
+        {"name":"ev-a","data":"1","channel":"room-ok"},
+        {"name":"ev-b","data":"2","channel":"room-ok","socket_id":"not-a-socket-id"}
+    ]})
+    .to_string();
+    let resp = post_signed(addr, "/apps/app1/batch_events", body).await;
+    assert_eq!(resp.status(), 400);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["error"],
+        "Invalid socket id"
+    );
+
+    let ok = json!({"name":"after","data":"3","channels":["room-ok"]}).to_string();
+    assert_eq!(
+        post_signed(addr, "/apps/app1/events", ok).await.status(),
+        200
+    );
+    let frame = next_json(&mut ws).await;
+    assert_eq!(
+        frame["event"], "after",
+        "a batch rejected on a later item's socket_id must deliver nothing"
+    );
+}
+
+/// `info` on a batch returns one attributes object PER ITEM, positionally — the
+/// batch response has no channel keys to disambiguate, so the order is the
+/// contract.
+#[tokio::test]
+async fn rest_batch_events_info_returns_one_attribute_object_per_item() {
+    let addr = spawn().await;
+    let mut ws = connect_ws2(addr).await;
+    let _ = next_json(&mut ws).await;
+    subscribe_public(&mut ws, "room-counted").await;
+
+    let body = json!({"batch":[
+        {"name":"ev-a","data":"1","channel":"room-counted","info":"subscription_count"},
+        {"name":"ev-b","data":"2","channel":"room-empty"}
+    ]})
+    .to_string();
+    let q = signed_query2("POST", "/apps/app2/batch_events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app2/batch_events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    let batch = v["batch"].as_array().expect("info requests a batch array");
+    assert_eq!(batch.len(), 2, "one attributes object per item, got: {v}");
+    assert_eq!(
+        batch[0]["subscription_count"], 1,
+        "the item that asked for it gets the count, got: {v}"
+    );
+    assert!(
+        batch[1].as_object().unwrap().is_empty(),
+        "an item that asked for nothing gets an empty object, got: {v}"
+    );
+}
+
+/// `info=user_count` on a presence channel returns the DISTINCT-user count —
+/// the attribute is presence-only, so this is the only shape that produces it.
+#[tokio::test]
+async fn rest_trigger_info_user_count_on_presence_channel() {
+    let addr = spawn().await;
+    let mut ws = connect_ws(addr).await;
+    let socket_id = established_socket_id(&mut ws).await;
+    subscribe_presence(&mut ws, &socket_id, "presence-counted", "u1").await;
+
+    let body = json!({"name":"ev","data":"{}","channels":["presence-counted"],"info":"user_count"})
+        .to_string();
+    let resp = post_signed(addr, "/apps/app1/events", body).await;
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(
+        v["channels"]["presence-counted"]["user_count"], 1,
+        "a presence channel with one member reports user_count 1, got: {v}"
+    );
+}
+
+/// `#server-to-user-` with an EMPTY user id names nobody. It is answered 200
+/// (the request itself is well-formed) but must deliver to no one — proven by a
+/// later publish being the first frame the subscriber sees.
+#[tokio::test]
+async fn rest_server_to_user_trigger_with_empty_user_id_delivers_nothing() {
+    let addr = spawn().await;
+    let mut ws = connect_ws(addr).await;
+    let _ = next_json(&mut ws).await;
+    subscribe_public(&mut ws, "room-ok").await;
+
+    let body = json!({"name":"ev","data":"{}","channels":["#server-to-user-"]}).to_string();
+    let resp = post_signed(addr, "/apps/app1/events", body).await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "the request is well-formed; only its destination is empty"
+    );
+
+    let ok = json!({"name":"after","data":"3","channels":["room-ok"]}).to_string();
+    assert_eq!(
+        post_signed(addr, "/apps/app1/events", ok).await.status(),
+        200
+    );
+    let frame = next_json(&mut ws).await;
+    assert_eq!(
+        frame["event"], "after",
+        "an empty server-to-user id must deliver to nobody"
+    );
+}

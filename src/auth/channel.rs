@@ -129,4 +129,27 @@ mod tests {
             Err(ChannelAuthError::Malformed)
         );
     }
+
+    /// Each rejection reason keeps its OWN client-visible message: these reach
+    /// the browser as the `pusher:subscription_error` text, and collapsing them
+    /// would leave an integrator unable to tell a malformed token from a wrong
+    /// app key from a bad signature.
+    #[test]
+    fn each_rejection_reason_has_its_own_message() {
+        let messages = [
+            ChannelAuthError::Malformed.message(),
+            ChannelAuthError::KeyMismatch.message(),
+            ChannelAuthError::BadSignature.message(),
+        ];
+        assert_eq!(
+            messages,
+            ["Bad auth token", "Auth key mismatch", "Invalid signature"]
+        );
+        let distinct: std::collections::BTreeSet<_> = messages.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "the three reasons must stay tellable apart"
+        );
+    }
 }

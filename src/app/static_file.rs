@@ -77,6 +77,31 @@ mod tests {
          "capacity":2,"client_messages_enabled":true,"subscription_count_enabled":true}
     ]"#;
 
+    /// The production entry point is a PATH — `apps.json` on disk — so the file
+    /// read and the parse must be exercised together: a manager built from a
+    /// file resolves exactly what the same JSON resolves inline, and a missing
+    /// file is an error at startup rather than an empty app list that would 401
+    /// every request.
+    #[tokio::test]
+    async fn from_file_loads_the_same_apps_and_reports_a_missing_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("apps.json");
+        std::fs::write(&path, SAMPLE).expect("write apps.json");
+
+        let m = StaticFileAppManager::from_file(path.to_str().unwrap())
+            .expect("a readable apps.json must load");
+        let AppLookup::Found(app) = m.by_key("app-key").await.unwrap() else {
+            panic!("the file-loaded manager must resolve the same app");
+        };
+        assert_eq!(app.id, "app-id");
+
+        assert!(
+            StaticFileAppManager::from_file(dir.path().join("missing.json").to_str().unwrap())
+                .is_err(),
+            "a missing apps file must fail loudly, not load zero apps"
+        );
+    }
+
     #[tokio::test]
     async fn looks_up_by_key_and_id() {
         let m = StaticFileAppManager::from_json(SAMPLE).unwrap();
