@@ -6,6 +6,17 @@ pre-1.0 and versions track `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+- **A `rediss://` app-cache or invalidation Redis URL no longer aborts startup
+  with a missing-crypto-provider panic.** fred's `enable-rustls` feature named
+  `tokio-rustls/aws_lc_rs` explicitly, compiling the `aws-lc-rs` backend
+  alongside the `ring` provider pylon installs everywhere else; with both
+  compiled in, rustls cannot pick a process-default `CryptoProvider` and
+  panics the moment fred builds a TLS config, which `RedisAppCache::connect`
+  does before pylon installs one. Switching to fred's `enable-rustls-ring`
+  feature drops `aws-lc-rs` from the build entirely — it was never selected at
+  runtime — so pylon now reaches the real connection attempt instead.
+
 ## [0.4.0] - 2026-09-14
 
 ### Added

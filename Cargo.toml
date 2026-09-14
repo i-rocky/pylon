@@ -69,7 +69,7 @@ rustls-pemfile = "2"
 # backend alongside the ring provider this crate installs process-globally.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 # Redis client for the scaling adapter
-fred = { version = "10", default-features = false, features = ["subscriber-client", "i-pubsub", "i-scripts", "i-std", "sha-1", "enable-rustls"] }
+fred = { version = "10", default-features = false, features = ["subscriber-client", "i-pubsub", "i-scripts", "i-std", "sha-1", "enable-rustls-ring"] }
 uuid = { version = "1", features = ["v4"] }
 # Global allocator: faster + better cross-thread alloc/free for the cross-core fan-out pattern.
 mimalloc = { version = "0.1", default-features = false }
