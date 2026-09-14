@@ -210,8 +210,9 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
 === "Kubernetes / Helm"
 
     The Helm chart is at `deploy/helm/pylon`. It packages a `Deployment`,
-    `Service`, apps `ConfigMap`, liveness/readiness probes, a
-    `HorizontalPodAutoscaler` (opt-in), and security contexts.
+    `Service`, an apps `Secret`, liveness/readiness probes, a
+    `HorizontalPodAutoscaler` (opt-in), a `PodDisruptionBudget`, and security
+    contexts.
 
     ### Node-level prerequisites
 
@@ -249,6 +250,9 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
     | `autoscaling.maxReplicas` | `10` | Maximum replicas when HPA is active. |
     | `resources.requests.memory` | `512Mi` | Pod memory request. |
     | `resources.limits.memory` | `8Gi` | Pod memory limit. |
+    | `existingSecret` | `""` | Name of a Secret you manage yourself (keys `apps.json`, `redisUrl`). When set, the chart creates no Secret. |
+    | `podDisruptionBudget.enabled` | `true` | Render a `PodDisruptionBudget`. |
+    | `podDisruptionBudget.minAvailable` | `1` | Minimum pods that must stay up during a voluntary disruption. |
 
     ### Autoscaling
 
@@ -272,12 +276,30 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
     Service stay on plain HTTP. See [TLS / SSL](tls.md) for the full Ingress
     manifest with the required WebSocket and timeout annotations.
 
-    ### Apps config security
+    ### Apps config and credentials
 
-    The `apps` list in `values.yaml` is rendered into a ConfigMap in plain text.
-    **Change the `secret` field from `CHANGE_ME` before deploying.** For production,
-    use a Kubernetes Secret or an external secret manager and mount `apps.json` as a
-    file rather than embedding credentials in the ConfigMap.
+    App secrets and the Redis URL are rendered into a Kubernetes `Secret`, never a
+    ConfigMap, and reach the pod as a mounted file (`/etc/pylon/apps.json`) and a
+    `secretKeyRef` (`PYLON_REDIS_URL`). **Change the `secret` field from
+    `CHANGE_ME` before deploying** — it is the HMAC key behind every REST
+    signature, channel-auth token and `pusher:signin` for that app.
+
+    If you manage secrets outside Helm — an external secret manager,
+    sealed-secrets, or a CI-created Secret — set `existingSecret` to its name and
+    the chart creates none:
+
+    ```bash
+    helm install pylon ./deploy/helm/pylon --set existingSecret=pylon-apps
+    ```
+
+    The Secret must carry two keys: `apps.json` (the app registry) and `redisUrl`.
+
+    ### Disruption budget
+
+    The chart renders a `PodDisruptionBudget` with `minAvailable: 1` by default, so
+    a node drain or an autoscaler scale-down can never take every pylon pod at
+    once. The Deployment's `maxUnavailable: 0` covers only rolling updates; a
+    voluntary eviction is a different path and needs its own budget.
 
     For the full Helm values reference see `deploy/helm/pylon/values.yaml` and
     `deploy/README.md`.
