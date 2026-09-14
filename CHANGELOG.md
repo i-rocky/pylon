@@ -6,6 +6,8 @@ pre-1.0 and versions track `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-14
+
 ### Fixed
 - **A `rediss://` app-cache or invalidation Redis URL no longer aborts startup
   with a missing-crypto-provider panic.** fred's `enable-rustls` feature named
