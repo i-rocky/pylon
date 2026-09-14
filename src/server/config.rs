@@ -22,6 +22,26 @@ pub fn parse_app_manager(kind: Option<&str>) -> AppManagerKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+impl std::str::FromStr for LogFormat {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "text" => Ok(LogFormat::Text),
+            "json" => Ok(LogFormat::Json),
+            other => Err(format!(
+                "unknown log format '{other}' (expected text or json)"
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub max_presence_members: usize,
@@ -382,12 +402,13 @@ where
 /// process with status `1` — the same exit code `main.rs` uses for a bad CLI
 /// flag (`unknown_arg_text`'s path). A malformed `PYLON_*` value is a startup
 /// error either way, so the convention matches.
-fn env_parse<T>(name: &str, slot: &mut T)
+pub(crate) fn env_parse<T>(name: &str, slot: &mut T)
 where
     T: std::str::FromStr,
     T::Err: std::fmt::Display,
 {
     if let Err(msg) = try_env_parse(name, slot) {
+        eprintln!("{msg}");
         tracing::error!("{msg}");
         std::process::exit(1);
     }
@@ -1222,5 +1243,20 @@ mod tests {
         std::env::set_var("PYLON_CLUSTER_ENVELOPE_COMPAT", "true");
         assert!(ServerConfig::from_env().cluster_envelope_compat);
         std::env::remove_var("PYLON_CLUSTER_ENVELOPE_COMPAT");
+    }
+
+    #[test]
+    fn log_format_parses_its_two_documented_values_case_insensitively() {
+        assert_eq!("text".parse::<LogFormat>().unwrap(), LogFormat::Text);
+        assert_eq!("json".parse::<LogFormat>().unwrap(), LogFormat::Json);
+        assert_eq!("JSON".parse::<LogFormat>().unwrap(), LogFormat::Json);
+        assert_eq!(LogFormat::default(), LogFormat::Text);
+    }
+
+    #[test]
+    fn an_unknown_log_format_is_a_parse_error_naming_the_valid_values() {
+        let err = "nope".parse::<LogFormat>().unwrap_err();
+        assert!(err.contains("text"), "got: {err}");
+        assert!(err.contains("json"), "got: {err}");
     }
 }

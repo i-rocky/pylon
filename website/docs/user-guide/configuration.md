@@ -47,6 +47,7 @@ All variables are optional. Unset variables fall back to the defaults shown belo
 | `PYLON_PORT` | `7000` | TCP port for the WebSocket listener and HTTP REST API. |
 | `PYLON_APPS_PATH` | `apps.json` | Path to the JSON file that defines the application registry (used when `PYLON_APP_MANAGER=static`). |
 | `PYLON_WORKERS` | `0` | Number of per-core worker threads. `0` = auto (one per available CPU). |
+| `PYLON_LOG_FORMAT` | `text` | Log output format: `text` (human-readable, the default) or `json` (one JSON object per line: `timestamp`, `level`, `target`, and the event's structured fields under `fields`, with the log message at `fields.message`). Any other value is a startup error. Verbosity is still `RUST_LOG`. |
 
 ---
 

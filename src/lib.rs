@@ -28,10 +28,22 @@ pub mod ws;
 
 pub mod auth;
 
-/// Initialize tracing from `RUST_LOG` (defaults to `info`).
+/// Initialize tracing from `RUST_LOG` (defaults to `info`), in the format
+/// `PYLON_LOG_FORMAT` selects (`text` by default, or `json`).
 pub fn init_tracing() {
     use tracing_subscriber::EnvFilter;
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .try_init();
+    let mut format = crate::server::config::LogFormat::default();
+    crate::server::config::env_parse("PYLON_LOG_FORMAT", &mut format);
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    match format {
+        crate::server::config::LogFormat::Text => {
+            let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+        }
+        crate::server::config::LogFormat::Json => {
+            let _ = tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(filter)
+                .try_init();
+        }
+    }
 }

@@ -352,6 +352,52 @@ fn a_frames_burst_below_the_subscription_cap_refuses_to_boot() {
     );
 }
 
+#[test]
+fn json_log_format_emits_parseable_lines() {
+    let (dir, apps) = apps_file();
+    let port = free_port();
+    let mut child = Command::new(binary())
+        .env("PYLON_BIND", "127.0.0.1")
+        .env("PYLON_PORT", port.to_string())
+        .env("PYLON_ADAPTER", "local")
+        .env("PYLON_APPS_PATH", apps.to_str().unwrap())
+        .env("PYLON_LOG_FORMAT", "json")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn pylon");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut reader, &mut line).expect("read the first log line");
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(dir);
+    let v: Value = serde_json::from_str(line.trim())
+        .unwrap_or_else(|e| panic!("the first log line must be JSON: {e}; line was {line:?}"));
+    assert!(v["level"].as_str().is_some(), "missing `level`: {v}");
+    assert!(
+        v["fields"]["message"].as_str().is_some(),
+        "missing `fields.message`: {v}"
+    );
+}
+
+#[test]
+fn an_invalid_log_format_exits_one() {
+    let (dir, apps) = apps_file();
+    let status = Command::new(binary())
+        .env("PYLON_BIND", "127.0.0.1")
+        .env("PYLON_PORT", free_port().to_string())
+        .env("PYLON_ADAPTER", "local")
+        .env("PYLON_APPS_PATH", apps.to_str().unwrap())
+        .env("PYLON_LOG_FORMAT", "nope")
+        .stderr(Stdio::piped())
+        .status()
+        .expect("run pylon");
+    drop(dir);
+    assert_eq!(status.code(), Some(1), "an invalid log format must exit 1");
+}
+
 /// Half-configured TLS is a fatal misconfiguration, not a silent fall back to
 /// plain mode — a server the operator believes is encrypted must never boot
 /// unencrypted.

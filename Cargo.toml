@@ -51,7 +51,7 @@ subtle = "2.6"          # constant-time comparison
 # Misc
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 dashmap = "6"           # sharded concurrent map for the channel registry
 async-trait = "0.1"
 rand = "0.10"

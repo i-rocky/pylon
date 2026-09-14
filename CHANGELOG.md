@@ -6,6 +6,15 @@ pre-1.0 and versions track `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+- **`PYLON_LOG_FORMAT=json`** emits one JSON object per log line
+  (`timestamp`, `level`, `target`, and the event's structured fields under
+  `fields`) instead of the human-readable text format, which stays the
+  default. An unrecognised value is a startup error, like every other typed
+  `PYLON_*` knob. Enables the `json` feature of `tracing-subscriber`, which
+  pulls in its `tracing-serde` adapter as a transitive dependency; no new
+  direct dependency.
+
 ### Changed
 - **The Helm chart no longer writes credentials to a ConfigMap.** `apps.json`
   and the Redis URL move into a `Secret` — chart-created, or supply your own

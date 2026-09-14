@@ -238,3 +238,20 @@ Also available at `/readyz`.
     Point your load balancer's health check at `/ready` (not `/health`). This
     ensures that draining nodes are removed from the rotation before their
     connections are closed with [Pusher code 4200](troubleshooting.md#close-codes).
+
+## Logs
+
+Verbosity comes from `RUST_LOG` (default `info`); the format comes from
+`PYLON_LOG_FORMAT`.
+
+`text` (the default) is the human-readable formatter. `json` emits one JSON
+object per line, which is what a log pipeline wants:
+
+```json
+{"timestamp":"2026-09-14T09:12:04.118273Z","level":"WARN","fields":{"message":"cluster publish failed; broadcast dropped","app":"app1","channel":"presence-room","error":"cluster publish failed: cluster bridge channel full or closed"},"target":"pylon::ws::handler"}
+```
+
+The message is at `fields.message`; every structured field pylon attaches —
+`app`, `channel`, `worker`, `error` — is a sibling key under `fields` rather
+than being flattened into prose. An unrecognised `PYLON_LOG_FORMAT` is a
+startup error, not a silent fallback.
