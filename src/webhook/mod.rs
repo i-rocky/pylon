@@ -240,11 +240,13 @@ mod tests {
     /// A trigger naming an app the store does not know has no endpoints to go
     /// to, so it is discarded rather than posted somewhere arbitrary.
     ///
-    /// The negative is gated, not timed: the unknown-app trigger is enqueued
-    /// FIRST and a known-app trigger behind it. The dispatcher is one actor
-    /// draining one mailbox in order, so once the known app's delivery is
-    /// recorded the unknown one has demonstrably already been processed — and
-    /// the recording must hold that one delivery and nothing else.
+    /// The negative is gated, not timed: both triggers are enqueued before the
+    /// test's first `.await`, so on the current-thread runtime the spawned
+    /// dispatcher cannot run until both are in the mailbox and they share one
+    /// batch. Mailbox order proves nothing beyond that — `flush` re-partitions
+    /// the batch into an unordered `HashMap` keyed by app — so the verdict is
+    /// read off the delivered envelope: the one delivery the known app earns
+    /// must carry its own channel and no other.
     #[tokio::test]
     async fn a_trigger_for_an_unknown_app_delivers_nowhere() {
         let recorder = Arc::new(transport::RecordingTransport::new());
@@ -260,8 +262,8 @@ mod tests {
         )
         .expect("the recording transport factory cannot fail");
 
-        handle.enqueue(occupied("no-such-app", "public-c"));
-        handle.enqueue(occupied("app1", "public-c"));
+        handle.enqueue(occupied("no-such-app", "public-unknown"));
+        handle.enqueue(occupied("app1", "public-known"));
 
         let recorded = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -278,8 +280,25 @@ mod tests {
         assert_eq!(
             recorded.len(),
             1,
-            "exactly one delivery — the unknown app's trigger, drained first, produced none"
+            "exactly one delivery — the unknown app's trigger produced none"
         );
         assert_eq!(recorded[0].url, "https://hook.test");
+        let envelope: serde_json::Value = serde_json::from_str(&recorded[0].body)
+            .expect("the delivered body must be a JSON envelope");
+        let channels: Vec<&str> = envelope["events"]
+            .as_array()
+            .expect("the envelope must carry an events array")
+            .iter()
+            .map(|e| {
+                e["channel"]
+                    .as_str()
+                    .expect("every event names its channel")
+            })
+            .collect();
+        assert_eq!(
+            channels,
+            ["public-known"],
+            "the known app's envelope must carry its own trigger and nothing else"
+        );
     }
 }

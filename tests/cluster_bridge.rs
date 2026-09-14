@@ -308,6 +308,28 @@ fn mailbox_pair() -> (tokio::sync::mpsc::Receiver<Box<ServerEvent>>, Mailbox) {
 /// so this gates on it rather than sleeping. Polled from a plain command connection —
 /// RESP2 forbids ordinary commands on a connection in subscribe context.
 async fn require_numsub(channel: &str, want: i64, bound: Duration) {
+    if let Err(seen) = settle_numsub(channel, bound, |seen| seen >= want).await {
+        panic!(
+            "Redis never reported >= {want} subscriber(s) on {channel} within {bound:?} \
+             (last saw {seen}) — the node is deaf to a channel it holds members for"
+        );
+    }
+}
+
+async fn require_no_numsub(channel: &str, bound: Duration) {
+    if let Err(seen) = settle_numsub(channel, bound, |seen| seen == 0).await {
+        panic!(
+            "Redis still reported {seen} subscriber(s) on {channel} after {bound:?} — \
+             a node with no members of the channel must not stay subscribed to it"
+        );
+    }
+}
+
+async fn settle_numsub(
+    channel: &str,
+    bound: Duration,
+    settled: impl Fn(i64) -> bool,
+) -> Result<(), i64> {
     use fred::interfaces::PubsubInterface;
     let clients = RedisClients::connect(&test_redis_url(), 1)
         .await
@@ -322,30 +344,12 @@ async fn require_numsub(channel: &str, want: i64, bound: Duration) {
             .await
             .unwrap_or_default();
         seen = counts.get(channel).copied().unwrap_or(0);
-        if seen >= want {
-            return;
+        if settled(seen) {
+            return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!(
-        "Redis never reported >= {want} subscriber(s) on {channel} within {bound:?} \
-         (last saw {seen}) — the node is deaf to a channel it holds members for"
-    );
-}
-
-/// How many subscribers Redis currently reports on `channel`.
-async fn numsub(channel: &str) -> i64 {
-    use fred::interfaces::PubsubInterface;
-    let clients = RedisClients::connect(&test_redis_url(), 1)
-        .await
-        .expect("fred clients must connect to the test Redis");
-    let counts: std::collections::HashMap<String, i64> = clients
-        .pool
-        .next()
-        .pubsub_numsub(channel)
-        .await
-        .unwrap_or_default();
-    counts.get(channel).copied().unwrap_or(0)
+    Err(seen)
 }
 
 /// The app the webhook-bearing tests below resolve, subscribed to every cluster
@@ -1060,11 +1064,7 @@ async fn a_rejected_presence_join_hands_back_the_pubsub_edge_when_the_node_empti
             ref other => panic!("expected a 4004 subscription_error, got {other:?}"),
         }
 
-        assert_eq!(
-            numsub(&rejected_key).await,
-            0,
-            "a node with no members of the channel must not stay subscribed to it"
-        );
+        require_no_numsub(&rejected_key, Duration::from_secs(5)).await;
 
         drop(bridge);
     })

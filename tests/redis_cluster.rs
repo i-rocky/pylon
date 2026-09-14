@@ -4328,12 +4328,15 @@ async fn a_corrupt_channel_index_skips_the_app_and_the_pass_continues() {
     .expect("corrupt-chans sweep test must not hang (Redis up?)");
 }
 
-/// An unreadable occupancy hash must SKIP the channel, never vacate it. This is
-/// the dangerous one: a sweep that treated the unreadable hash as "no members"
-/// would de-index a channel that is, for all it knows, still occupied — and fire
-/// a `channel_vacated` for it.
+/// An unreadable occupancy hash costs the pass the channel and nothing else:
+/// nothing is reaped, nothing is vacated, and the channel stays indexed so a
+/// later pass can retry it. Two guards can produce that outcome — the `HGETALL`
+/// arm and, if a regression let the pass fall through to a vacate it cannot
+/// read either, the `VACATE` arm — and poisoning `occ` arms both, because
+/// `VACATE_LUA` opens with `HLEN` against that same key. So this pins the
+/// outcome, not which arm delivered it.
 #[tokio::test]
-async fn a_corrupt_occupancy_hash_skips_the_channel_instead_of_vacating_it() {
+async fn an_unreadable_occupancy_hash_is_neither_reaped_nor_vacated_and_stays_indexed() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let (adapter, keys, clients) = orphaned_channel("public-noocc").await;
         let webhooks = pylon::webhook::WebhookHandle::null();
