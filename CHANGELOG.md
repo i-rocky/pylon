@@ -189,6 +189,11 @@ pre-1.0 and versions track `Cargo.toml`.
   no intermediate draining state; the variant described a lifecycle step that
   does not exist. Library consumers matching on `ConnState` exhaustively need
   to drop the arm.
+- **`LocalAdapter::is_saturated` removed** — it had no remaining caller. The
+  REST 503 gate now reads `AppState::saturated`, and the WS ingress and the
+  broadcast worker each read their own `saturated` field instead of asking the
+  adapter directly. Library consumers calling `LocalAdapter::is_saturated()`
+  need `LocalAdapter::saturation_flag().is_saturated()`.
 
 ### Fixed
 - **A sweeper vacate that faults part-way no longer loses the channel's
