@@ -254,4 +254,10 @@ mod tests {
             "disabled app probes as Disabled (WS maps it to the same 4001)"
         );
     }
+
+    #[tokio::test]
+    async fn static_store_probes_ok() {
+        let m = StaticFileAppManager::from_json(SAMPLE).unwrap();
+        assert!(m.probe().await.is_ok());
+    }
 }

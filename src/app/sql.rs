@@ -216,6 +216,14 @@ impl AppManager for SqlAppManager {
     async fn by_id(&self, id: &str) -> Result<AppLookup, AppLookupError> {
         self.fetch(LookupCol::Id, id).await
     }
+
+    async fn probe(&self) -> Result<(), AppLookupError> {
+        sqlx::query(AssertSqlSafe("SELECT 1".to_string()))
+            .fetch_one(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| AppLookupError::Backend(e.to_string()))
+    }
 }
 
 #[cfg(test)]

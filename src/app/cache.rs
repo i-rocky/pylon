@@ -193,6 +193,10 @@ impl AppManager for CachingAppManager {
         }
         futures_executor::block_on(self.pos.get(&pkey)).map(|app| Ok(AppLookup::Found(app)))
     }
+
+    async fn probe(&self) -> Result<(), AppLookupError> {
+        self.inner.probe().await
+    }
 }
 
 #[cfg(test)]

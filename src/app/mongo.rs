@@ -6,6 +6,7 @@ use std::sync::Arc;
 /// (e.g. `mongodb://host:port/dbname`). Reads the `apps` collection.
 #[derive(Clone)]
 pub struct MongoAppManager {
+    db: mongodb::Database,
     apps: Collection<App>,
 }
 
@@ -16,6 +17,7 @@ impl MongoAppManager {
             anyhow::anyhow!("mongo URI must include a database name (mongodb://host/dbname)")
         })?;
         Ok(Self {
+            db: db.clone(),
             apps: db.collection::<App>("apps"),
         })
     }
@@ -52,5 +54,13 @@ impl AppManager for MongoAppManager {
     }
     async fn by_key(&self, key: &str) -> Result<AppLookup, AppLookupError> {
         self.find("key", key).await
+    }
+
+    async fn probe(&self) -> Result<(), AppLookupError> {
+        self.db
+            .run_command(doc! { "ping": 1 })
+            .await
+            .map(|_| ())
+            .map_err(|e| AppLookupError::Backend(e.to_string()))
     }
 }

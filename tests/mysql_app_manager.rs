@@ -168,3 +168,9 @@ fn swap_database(url: &str, name: &str) -> String {
         .expect("the test URL carries a database name to swap");
     format!("{prefix}/{name}")
 }
+
+#[tokio::test]
+async fn probe_reaches_the_real_database() {
+    let m = SqlAppManager::connect(&url()).await.unwrap();
+    m.probe().await.expect("a reachable database must probe Ok");
+}
