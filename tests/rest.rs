@@ -56,6 +56,15 @@ async fn spawn_with_apps(apps_json: &str) -> SocketAddr {
 /// [`spawn_with_apps`] plus a [`ServerConfig`] tuning hook — e.g. a short
 /// `cache_ttl_secs` for expired-cache tests.
 async fn spawn_configured(apps_json: &str, with: impl FnOnce(&mut ServerConfig)) -> SocketAddr {
+    spawn_configured_with(apps_json, with, None, false).await
+}
+
+async fn spawn_configured_with(
+    apps_json: &str,
+    with: impl FnOnce(&mut ServerConfig),
+    cluster_metrics: Option<Arc<pylon::cluster::bridge::ClusterMetrics>>,
+    failing_publish: bool,
+) -> SocketAddr {
     // reqwest here is pylon's `rustls-no-provider` build: it panics unless the
     // process already has a rustls provider.
     pylon::transport::tls::install_crypto_provider();
@@ -66,7 +75,13 @@ async fn spawn_configured(apps_json: &str, with: impl FnOnce(&mut ServerConfig))
         Arc::new(Registry::new()),
         Arc::new(pylon::adapter::app_registry::AppRegistry::new()),
     ));
-    let adapter: Arc<dyn Adapter> = local.clone();
+    let adapter: Arc<dyn Adapter> = if failing_publish {
+        Arc::new(pylon::adapter::failing::FailingBroadcastAdapter::new(
+            local.clone(),
+        ))
+    } else {
+        local.clone()
+    };
     let conn_counts = Arc::new(Default::default());
     let webhooks = pylon::webhook::WebhookHandle::null();
 
@@ -96,7 +111,7 @@ async fn spawn_configured(apps_json: &str, with: impl FnOnce(&mut ServerConfig))
         webhooks: webhooks.clone(),
         saturated: Some(local.saturation_flag()),
         draining: Arc::new(AtomicBool::new(false)),
-        cluster_metrics: None,
+        cluster_metrics,
         invalidator: None,
     };
     tokio::spawn(pylon::transport::rest::serve(
@@ -141,6 +156,24 @@ async fn spawn_configured(apps_json: &str, with: impl FnOnce(&mut ServerConfig))
 /// Build the signed query string for a request, returning the full URL query.
 fn signed_query(method: &str, path: &str, body: &[u8], extra: &[(&str, &str)]) -> String {
     signed_query_as("app-key", SECRET, method, path, body, extra)
+}
+
+async fn post_app1(addr: SocketAddr, path: &str, body: &Value) -> reqwest::Response {
+    let body = body.to_string();
+    let full = format!("/apps/app1{path}");
+    let q = signed_query("POST", &full, body.as_bytes(), &[]);
+    reqwest::Client::new()
+        .post(format!("http://{addr}{full}?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn spawn_failing_publish() -> (SocketAddr, Arc<pylon::cluster::bridge::ClusterMetrics>) {
+    let metrics = Arc::new(pylon::cluster::bridge::ClusterMetrics::new());
+    let addr = spawn_configured_with(APPS, |_| {}, Some(metrics.clone()), true).await;
+    (addr, metrics)
 }
 
 /// [`signed_query`] for app2 (the subscription_count-enabled app).
@@ -243,6 +276,77 @@ async fn subscribe_public(ws: &mut Ws, channel: &str) {
     .await
     .unwrap();
     let _ = next_json(ws).await; // subscription_succeeded
+}
+
+#[tokio::test]
+async fn rest_events_returns_503_when_the_cluster_publish_fails() {
+    let (addr, metrics) = spawn_failing_publish().await;
+    let resp = post_app1(
+        addr,
+        "/events",
+        &json!({"name": "e", "channels": ["my-channel"], "data": "{}"}),
+    )
+    .await;
+    assert_eq!(resp.status(), 503, "a failed cluster publish must be a 503");
+    assert_eq!(resp.headers().get("retry-after").unwrap(), "1");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], 503);
+    assert_eq!(body["error"], "cluster publish failed");
+    assert_eq!(
+        metrics
+            .publish_failed
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
+
+#[tokio::test]
+async fn rest_batch_events_stops_at_the_first_failing_publish() {
+    let (addr, metrics) = spawn_failing_publish().await;
+    let resp = post_app1(
+        addr,
+        "/batch_events",
+        &json!({"batch": [
+            {"channel": "a", "name": "e", "data": "{}"},
+            {"channel": "b", "name": "e", "data": "{}"}
+        ]}),
+    )
+    .await;
+    assert_eq!(resp.status(), 503);
+    assert_eq!(
+        metrics
+            .publish_failed
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the batch must stop at the first failure, not attempt both"
+    );
+}
+
+#[tokio::test]
+async fn metrics_render_the_cluster_publish_failure_counter() {
+    let (addr, _metrics) = spawn_failing_publish().await;
+    let resp = post_app1(
+        addr,
+        "/events",
+        &json!({"name": "e", "channels": ["my-channel"], "data": "{}"}),
+    )
+    .await;
+    assert_eq!(resp.status(), 503);
+
+    let text = reqwest::get(format!("http://{addr}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        text.contains("# TYPE pylon_cluster_publish_failed_total counter"),
+        "{text}"
+    );
+    assert!(
+        text.contains("pylon_cluster_publish_failed_total 1\n"),
+        "{text}"
+    );
 }
 
 #[tokio::test]

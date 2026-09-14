@@ -237,6 +237,11 @@ pub fn encode(snapshot: &MetricsSnapshot) -> String {
         );
         out.push_str("# TYPE pylon_redis_connected gauge\n");
         let _ = writeln!(out, "pylon_redis_connected {connected}");
+
+        let publish_failed = cm.publish_failed.load(Ordering::Relaxed);
+        out.push_str("# HELP pylon_cluster_publish_failed_total Cross-node broadcast publishes that failed (bridge channel full/closed, or a Redis publish error)\n");
+        out.push_str("# TYPE pylon_cluster_publish_failed_total counter\n");
+        let _ = writeln!(out, "pylon_cluster_publish_failed_total {publish_failed}");
     }
 
     out
@@ -389,6 +394,21 @@ mod tests {
             webhook_queue_depth: None,
             cluster: None,
         }
+    }
+
+    #[test]
+    fn encode_renders_the_cluster_publish_failure_counter() {
+        let cm = Arc::new(ClusterMetrics::new());
+        cm.publish_failed
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+        let mut s = snapshot_with_one_app("app1", 0, 0, 0);
+        s.cluster = Some(cm);
+        let text = encode(&s);
+        assert!(text.contains("# TYPE pylon_cluster_publish_failed_total counter"));
+        assert!(
+            text.contains("pylon_cluster_publish_failed_total 3\n"),
+            "{text}"
+        );
     }
 
     #[test]

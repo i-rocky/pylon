@@ -105,7 +105,7 @@ Every error is returned as JSON in the shape `{"error": "<message>", "status": <
 | `403` | The app exists but is disabled |
 | `404` | Unknown app, or a gated endpoint whose token is not configured |
 | `413` | The event payload exceeds `PYLON_MAX_EVENT_PAYLOAD_BYTES` (default 10,000), or the request body exceeds the REST body cap |
-| **`503`** | **The node is over capacity.** The publish is rejected before any broadcast, and the response carries `Retry-After: 1` so a well-behaved publisher backs off. See below |
+| **`503`** | **The node is over capacity**, in which case the publish is rejected before any broadcast, **or the cross-node publish failed**, in which case the channels (or batch items) published before the failure were delivered — a retry re-delivers them, so delivery is at-least-once, and on a cache channel the event may already be stored and the retry overwrites it. Either way the response carries `Retry-After: 1` so a well-behaved publisher backs off. See below |
 
 !!! warning "`503` under load is new in practice"
     Admission control has always been described, but the node-wide saturation

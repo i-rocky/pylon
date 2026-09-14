@@ -33,6 +33,7 @@ use tokio::sync::mpsc;
 pub struct ClusterMetrics {
     /// Total `ClusterCmd`s dropped because the bridge channel was full or closed.
     pub cmd_dropped: AtomicU64,
+    pub publish_failed: AtomicU64,
     /// Whether the Redis connection is currently healthy. Set `true` by the
     /// node-heartbeat loop after a successful tick; `false` on error.
     /// Held as `Arc<AtomicBool>` so it can be cloned into the heartbeat loop.
@@ -43,6 +44,7 @@ impl ClusterMetrics {
     pub fn new() -> Self {
         Self {
             cmd_dropped: AtomicU64::new(0),
+            publish_failed: AtomicU64::new(0),
             redis_connected: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -231,8 +233,9 @@ pub enum ClusterCmd {
 pub struct ClusterHandle {
     tx: mpsc::Sender<ClusterCmd>,
     node_id: Arc<str>,
-    /// Shared bridge metrics. The handle only writes `cmd_dropped`; `redis_connected`
-    /// is written by the heartbeat loop that runs inside the bridge's runtime.
+    /// Shared bridge metrics. The handle writes `cmd_dropped` and `publish_failed`;
+    /// `redis_connected` is written by the heartbeat loop that runs inside the bridge's
+    /// runtime.
     metrics: Arc<ClusterMetrics>,
 }
 
@@ -247,8 +250,8 @@ impl ClusterHandle {
     /// so in-crate tests can drive a
     /// [`ClusterAdapter`](crate::cluster::adapter::ClusterAdapter) without a live
     /// bridge + Redis (the test drains the [`ClusterCmd`]s itself).
-    #[cfg(test)]
-    pub(crate) fn test_handle(tx: mpsc::Sender<ClusterCmd>) -> ClusterHandle {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_handle(tx: mpsc::Sender<ClusterCmd>) -> ClusterHandle {
         ClusterHandle {
             tx,
             node_id: Arc::from("test-node"),
@@ -256,17 +259,21 @@ impl ClusterHandle {
         }
     }
 
-    /// Fire a cross-node broadcast at the bridge. NON-BLOCKING: a `try_send` that drops the
-    /// command if the channel is full or closed — the worker must NEVER block on the bridge.
-    /// A full channel means the bridge is momentarily behind; a dropped publish is
-    /// at-most-once cross-node delivery, which is acceptable for this best-effort fan-out.
+    pub fn metrics(&self) -> Arc<ClusterMetrics> {
+        self.metrics.clone()
+    }
+
+    /// Fire a cross-node broadcast at the bridge. NON-BLOCKING: a `try_send` that never
+    /// waits — the worker must NEVER block on the bridge. A full or closed channel means
+    /// the frame reaches no other node, which is an `Err` the caller acts on: the
+    /// broadcast is refused whole rather than delivered on this node alone.
     pub fn publish(
         &self,
         app: Arc<str>,
         channel: Arc<str>,
         frame: String,
         except: Option<SocketId>,
-    ) {
+    ) -> Result<(), crate::adapter::BroadcastError> {
         let cmd = ClusterCmd::Publish {
             app,
             channel,
@@ -274,14 +281,22 @@ impl ClusterHandle {
             except,
         };
         match self.tx.try_send(cmd) {
-            Ok(()) => {}
+            Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
+                self.metrics.publish_failed.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("cluster bridge channel full; dropping cross-node publish");
+                Err(crate::adapter::BroadcastError::Publish(
+                    "cluster bridge channel full or closed".into(),
+                ))
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
+                self.metrics.publish_failed.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("cluster bridge gone; dropping cross-node publish");
+                Err(crate::adapter::BroadcastError::Publish(
+                    "cluster bridge channel full or closed".into(),
+                ))
             }
         }
     }
@@ -647,7 +662,8 @@ impl ClusterBridge {
         self.handle.clone()
     }
 
-    /// The shared cluster metrics (cmd_dropped counter + redis_connected gauge).
+    /// The shared cluster metrics (the `cmd_dropped` and `publish_failed` counters plus
+    /// the `redis_connected` gauge).
     pub fn metrics(&self) -> Arc<ClusterMetrics> {
         self.metrics.clone()
     }
@@ -731,6 +747,7 @@ pub fn start(
     let cfg = cfg.clone();
     let thread_shutdown = shutdown.clone();
     let thread_webhooks = webhooks.clone();
+    let thread_metrics = metrics.clone();
     // The cluster-wide presence member cap the drain loop enforces in
     // `ClusterCmd::PresenceSubscribe` (the inline node-local check in `ws::subscribe` is
     // guarded off in cluster mode). Captured as the single `usize` the loop needs.
@@ -823,6 +840,7 @@ pub fn start(
                                 &local_for_loop,
                                 &apps,
                                 &thread_webhooks,
+                                &thread_metrics,
                                 max_presence_members,
                                 cmd,
                             )
@@ -877,6 +895,7 @@ async fn handle_cmd(
     local: &Arc<LocalAdapter>,
     apps: &Arc<dyn AppManager>,
     webhooks: &OnceLock<WebhookHandle>,
+    metrics: &ClusterMetrics,
     max_presence_members: usize,
     cmd: ClusterCmd,
 ) {
@@ -887,11 +906,13 @@ async fn handle_cmd(
             frame,
             except,
         } => {
-            // ONLY the Redis publish — the worker already delivered locally. Self-dedup on
-            // the adapter's `node_id` stops the origin re-receiving its own frame.
-            adapter
+            if let Err(e) = adapter
                 .cluster_publish_broadcast(&app, &channel, frame, except.as_ref())
-                .await;
+                .await
+            {
+                metrics.publish_failed.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(app = %app, channel = %channel, error = %e, "cluster publish failed");
+            }
         }
         ClusterCmd::Subscribe {
             app,
@@ -925,7 +946,7 @@ async fn handle_cmd(
                 && a.subscription_count_enabled
                 && ChannelInfo::of(&channel).auth != AuthKind::Presence
             {
-                adapter
+                if let Err(e) = adapter
                     .broadcast(
                         &app,
                         &channel,
@@ -935,7 +956,11 @@ async fn handle_cmd(
                         },
                         None,
                     )
-                    .await;
+                    .await
+                {
+                    metrics.publish_failed.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(app = %app, channel = %channel, error = %e, "cluster publish failed");
+                }
                 // `subscription_count` WEBHOOK — emitted HERE (not in the worker's
                 // handler): this arm owns the cluster-authoritative count, exactly
                 // like the occupied webhook below. Verified against
@@ -1025,7 +1050,7 @@ async fn handle_cmd(
                 && a.subscription_count_enabled
                 && ChannelInfo::of(&channel).auth != AuthKind::Presence
             {
-                adapter
+                if let Err(e) = adapter
                     .broadcast(
                         &app,
                         &channel,
@@ -1035,7 +1060,11 @@ async fn handle_cmd(
                         },
                         None,
                     )
-                    .await;
+                    .await
+                {
+                    metrics.publish_failed.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(app = %app, channel = %channel, error = %e, "cluster publish failed");
+                }
                 // `subscription_count` WEBHOOK with the REMAINING cluster count —
                 // emitted by this arm (the count's owner), mirroring Subscribe.
                 // The 1→0 edge skips this whole block: `channel_vacated` below is
@@ -1155,7 +1184,7 @@ async fn handle_cmd(
             // this user (local-via-sink + cluster publish through `broadcast`, excluding
             // the joiner), plus the `member_added` webhook.
             if first_for_user {
-                adapter
+                if let Err(e) = adapter
                     .broadcast(
                         &app,
                         &channel,
@@ -1166,7 +1195,11 @@ async fn handle_cmd(
                         },
                         Some(socket_id),
                     )
-                    .await;
+                    .await
+                {
+                    metrics.publish_failed.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(app = %app, channel = %channel, error = %e, "cluster publish failed");
+                }
                 if a.has_member_added_webhooks {
                     if let Some(wh) = webhooks.get() {
                         wh.enqueue(WebhookEvent::MemberAdded {
@@ -1235,7 +1268,7 @@ async fn handle_cmd(
             // Single cluster-wide `member_removed` on the cluster-wide last connection for
             // this user, plus the `member_removed` webhook.
             if last_for_user {
-                adapter
+                if let Err(e) = adapter
                     .broadcast(
                         &app,
                         &channel,
@@ -1245,7 +1278,11 @@ async fn handle_cmd(
                         },
                         None,
                     )
-                    .await;
+                    .await
+                {
+                    metrics.publish_failed.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(app = %app, channel = %channel, error = %e, "cluster publish failed");
+                }
                 if a.has_member_removed_webhooks {
                     if let Some(wh) = webhooks.get() {
                         wh.enqueue(WebhookEvent::MemberRemoved {
@@ -1421,7 +1458,9 @@ mod tests {
         let (_pres_rx, pres_mailbox) = mailbox();
         let (_watch_rx, watch_mailbox) = mailbox();
         let (_ack_rx, ack_mailbox) = mailbox();
-        handle.publish(app.clone(), channel.clone(), "FRAME".to_string(), None);
+        handle
+            .publish(app.clone(), channel.clone(), "FRAME".to_string(), None)
+            .expect_err("an unavailable bridge must fail the publish");
         handle.subscribe(app.clone(), channel.clone(), sid, sub_mailbox, true);
         handle.unsubscribe(app.clone(), channel.clone(), sid, true);
         handle.presence_subscribe(
@@ -1458,12 +1497,14 @@ mod tests {
 
         // Precondition: occupy the channel's single slot so every send below is
         // genuinely rejected as Full rather than quietly succeeding.
-        handle.publish(
-            Arc::from("app1"),
-            Arc::from("public-c"),
-            "OCCUPANT".to_string(),
-            None,
-        );
+        handle
+            .publish(
+                Arc::from("app1"),
+                Arc::from("public-c"),
+                "OCCUPANT".to_string(),
+                None,
+            )
+            .expect("the first command fits in the channel");
         assert_eq!(
             handle.metrics.cmd_dropped.load(Ordering::Relaxed),
             0,

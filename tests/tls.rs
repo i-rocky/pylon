@@ -277,7 +277,8 @@ async fn wss_subscribe_and_receive_broadcast() {
             user_id: None,
         },
         None,
-    ));
+    ))
+    .unwrap();
 
     // 4. Receive the broadcast over the encrypted socket.
     let text = tokio::time::timeout(Duration::from_secs(5), async {

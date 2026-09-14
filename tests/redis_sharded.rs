@@ -237,7 +237,8 @@ async fn sharded_broadcast_cross_node_with_shardchannels_proof() {
                 },
                 None,
             )
-            .await;
+            .await
+            .unwrap();
 
         let got = with_timeout(async { rx_b.recv().await })
             .await
@@ -419,7 +420,8 @@ async fn flag_off_keeps_ordinary_pubsub() {
                 },
                 None,
             )
-            .await;
+            .await
+            .unwrap();
 
         let got = with_timeout(async { rx_b.recv().await })
             .await

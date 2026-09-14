@@ -1,4 +1,4 @@
-use super::Adapter;
+use super::{Adapter, BroadcastError};
 use crate::adapter::app_registry::AppRegistry;
 use crate::channel::cache::{CacheStore, CachedEvent};
 use crate::channel::outcome::{ChannelSummary, SubscribeOutcome, UnsubscribeOutcome};
@@ -151,7 +151,7 @@ impl Adapter for LocalAdapter {
         channel: &str,
         event: ServerEvent,
         except: Option<SocketId>,
-    ) {
+    ) -> Result<(), BroadcastError> {
         if let Some(sink) = self.broadcast_sink() {
             // Per-core active: encode + WS-frame ONCE per active protocol
             // version (U3 / 7.3: the sink message carries a `(version, frame)`
@@ -170,6 +170,7 @@ impl Adapter for LocalAdapter {
             self.registry
                 .broadcast(app, channel, &event, except.as_ref());
         }
+        Ok(())
     }
 
     async fn channels(&self, app: &str, prefix: Option<&str>) -> Vec<ChannelSummary> {
@@ -320,7 +321,10 @@ mod tests {
             )
             .await;
         assert_eq!(out.subscription_count, 1);
-        adapter.broadcast("app", "c", ServerEvent::Pong, None).await;
+        adapter
+            .broadcast("app", "c", ServerEvent::Pong, None)
+            .await
+            .unwrap();
         // `broadcast` now encodes once and fans out `Raw` frames; assert the wire
         // bytes match a freshly-encoded `Pong` rather than the structured variant.
         match rx.try_recv().map(|b| *b) {

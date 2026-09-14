@@ -521,7 +521,8 @@ async fn cross_node_broadcast_fans_out_with_dedup_and_exclusion() {
             },
             Some(sender_a_id),
         )
-        .await;
+        .await
+        .unwrap();
 
     // other_a receives EXACTLY ONE event via local delivery. `broadcast` now
     // encodes once and fans out pre-encoded `Raw` frames, so assert the local
@@ -2348,7 +2349,8 @@ async fn cluster_publish_broadcast_fans_out_only_remote() {
         );
         adapter_a
             .cluster_publish_broadcast(TEST_APP, "public-room", frame.clone(), None)
-            .await;
+            .await
+            .unwrap();
 
         let received = *tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
             .await
@@ -2431,7 +2433,8 @@ async fn cluster_envelope_compat_knob_shapes_the_wire_and_relay_still_works() {
                 ServerEvent::Raw(std::sync::Arc::from("ping")),
                 None,
             )
-            .await;
+            .await
+            .unwrap();
         let wire = next_probe_json(&mut probe_rx).await;
         assert!(
             wire.get("event").is_some() && wire.get("frame_b64").is_some(),
@@ -2508,7 +2511,8 @@ async fn cluster_envelope_compat_knob_shapes_the_wire_and_relay_still_works() {
                 ServerEvent::Raw(std::sync::Arc::from("ping")),
                 None,
             )
-            .await;
+            .await
+            .unwrap();
         let wire = next_probe_json(&mut probe_rx).await;
         assert_eq!(wire.get("kind").and_then(|v| v.as_str()), Some("Broadcast"));
         assert!(
@@ -3827,7 +3831,8 @@ async fn reconciler_resubscribes_pubsub_keys_after_a_dropped_bridge_command() {
                 },
                 None,
             )
-            .await;
+            .await
+            .unwrap();
         match with_timeout(async { rx.recv().await }).await.map(|b| *b) {
             Some(ServerEvent::Raw(frame)) => {
                 let v: serde_json::Value = serde_json::from_str(&frame).expect("raw frame is JSON");

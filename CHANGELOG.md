@@ -20,6 +20,16 @@ pre-1.0 and versions track `Cargo.toml`.
   binary, a CA bundle and a one-line `/etc/passwd` running as uid 65534. The
   image has no shell: probe `/health` and `/ready` over HTTP from outside the
   container, and the compose in-container `wget` healthchecks are removed.
+- **A cross-node publish failure is no longer silent.** `Adapter::broadcast`
+  returns a `Result`. A REST publish runs the cross-node publish FIRST and
+  delivers locally only once it succeeded, so `POST /apps/{id}/events` and
+  `/batch_events` answer `503` when it fails and no subscriber received that
+  channel's event (a batch stops at the first failing item; items published
+  before it were delivered). A WebSocket client event is handed to the cluster
+  bridge and delivered to this node's subscribers immediately; if the bridge's
+  cross-node publish then fails, the event is counted and warned, having
+  reached local subscribers only. New counter
+  `pylon_cluster_publish_failed_total`.
 
 ### Added
 - **Transport flood protection.** Every inbound WebSocket frame — data and

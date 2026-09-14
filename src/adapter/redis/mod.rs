@@ -14,7 +14,7 @@ pub mod pubsub;
 pub mod sweeper;
 pub mod user;
 
-use super::Adapter;
+use super::{Adapter, BroadcastError};
 use crate::adapter::local::LocalAdapter;
 use crate::channel::cache::CachedEvent;
 use crate::channel::outcome::{ChannelSummary, SubscribeOutcome, UnsubscribeOutcome};
@@ -1143,7 +1143,8 @@ impl RedisAdapter {
     /// `frame`) on the channel's `msg` pub/sub key so every other node delivers it. The
     /// local delivery is done separately by the caller. Always publishes — even with no
     /// local subscribers — because a REST trigger may land on a node where the channel is
-    /// only subscribed elsewhere. Best-effort: logs + returns on any Redis error.
+    /// only subscribed elsewhere. A Redis error is returned, never swallowed: the frame
+    /// reached no other node, so the caller refuses the broadcast whole.
     #[doc(hidden)]
     pub async fn cluster_publish_broadcast(
         &self,
@@ -1151,7 +1152,7 @@ impl RedisAdapter {
         channel: &str,
         frame: String,
         except: Option<&SocketId>,
-    ) {
+    ) -> Result<(), BroadcastError> {
         let env = envelope::Envelope {
             node_id: self.node_id.clone(),
             app: app.to_string(),
@@ -1172,7 +1173,7 @@ impl RedisAdapter {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, app, channel, "envelope was not valid UTF-8");
-                return;
+                return Err(BroadcastError::Publish(e.to_string()));
             }
         };
         let key = self.keys.msg(app, channel);
@@ -1181,7 +1182,9 @@ impl RedisAdapter {
                 .await
         {
             tracing::warn!(error = %e, app, channel, "redis publish failed");
+            return Err(BroadcastError::Publish(e.to_string()));
         }
+        Ok(())
     }
 }
 
@@ -1326,7 +1329,7 @@ impl Adapter for RedisAdapter {
         channel: &str,
         event: ServerEvent,
         except: Option<SocketId>,
-    ) {
+    ) -> Result<(), BroadcastError> {
         // F17 encode-once (the same shape `ClusterAdapter::broadcast` proved):
         // encode the frame ONCE (reusing the payload verbatim when the caller
         // already encoded it as `Raw`) and feed the SAME bytes to BOTH halves —
@@ -1348,17 +1351,19 @@ impl Adapter for RedisAdapter {
             ),
         };
 
-        // 1. Local delivery on THIS node — the shared frame, honouring `except`.
+        // 1. Fan out to the rest of the cluster FIRST. Publish the *pre-encoded* v7
+        //    frame so remote nodes deliver it verbatim (no re-encoding). Always
+        //    publish — even with no local subscribers — because a REST trigger may
+        //    land on a node where the channel is only subscribed elsewhere. A failed
+        //    publish short-circuits: delivering on this node alone would be a split
+        //    fan-out the caller reports as success.
+        self.cluster_publish_broadcast(app, channel, frame.to_string(), except.as_ref())
+            .await?;
+
+        // 2. Local delivery on THIS node — the shared frame, honouring `except`.
         self.local
             .broadcast(app, channel, ServerEvent::Raw(frame.clone()), except)
-            .await;
-
-        // 2. Fan out to the rest of the cluster. Publish the *pre-encoded* v7 frame
-        //    so remote nodes deliver it verbatim (no re-encoding). Always publish —
-        //    even with no local subscribers — because a REST trigger may land on a
-        //    node where the channel is only subscribed elsewhere.
-        self.cluster_publish_broadcast(app, channel, frame.to_string(), except.as_ref())
-            .await;
+            .await
     }
 
     async fn channels(&self, app: &str, prefix: Option<&str>) -> Vec<ChannelSummary> {

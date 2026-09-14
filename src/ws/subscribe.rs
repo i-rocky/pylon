@@ -331,18 +331,22 @@ impl ConnectionContext {
                         self.send_self(ServerEvent::Raw(join.roster_frame));
                         if join.first_for_user {
                             let uid = join.member.user_id.clone();
-                            self.adapter
-                                .broadcast(
-                                    &self.app.id,
-                                    &channel,
-                                    ServerEvent::MemberAdded {
-                                        channel: channel.clone(),
-                                        user_id: join.member.user_id,
-                                        user_info: join.member.user_info,
-                                    },
-                                    Some(self.socket_id),
-                                )
-                                .await;
+                            crate::ws::handler::note_broadcast_drop(
+                                self.adapter
+                                    .broadcast(
+                                        &self.app.id,
+                                        &channel,
+                                        ServerEvent::MemberAdded {
+                                            channel: channel.clone(),
+                                            user_id: join.member.user_id,
+                                            user_info: join.member.user_info,
+                                        },
+                                        Some(self.socket_id),
+                                    )
+                                    .await,
+                                &self.app.id,
+                                &channel,
+                            );
                             if self.app.has_member_added_webhooks {
                                 self.emit_webhook(
                                     crate::webhook::event::WebhookEvent::MemberAdded {
@@ -553,20 +557,24 @@ impl ConnectionContext {
         let user_id = self.presence_membership.get(&channel).cloned();
         let wh_event = event.clone();
         let wh_data = data.clone();
-        self.adapter
-            .broadcast(
-                &self.app.id,
-                &channel,
-                ServerEvent::ChannelEvent {
-                    channel: channel.clone(),
-                    event,
-                    data,
-                    // Presence members broadcast their `user_id`; private has none.
-                    user_id: user_id.clone(),
-                },
-                Some(self.socket_id),
-            )
-            .await;
+        crate::ws::handler::note_broadcast_drop(
+            self.adapter
+                .broadcast(
+                    &self.app.id,
+                    &channel,
+                    ServerEvent::ChannelEvent {
+                        channel: channel.clone(),
+                        event,
+                        data,
+                        // Presence members broadcast their `user_id`; private has none.
+                        user_id: user_id.clone(),
+                    },
+                    Some(self.socket_id),
+                )
+                .await,
+            &self.app.id,
+            &channel,
+        );
         if self.app.has_client_event_webhooks {
             self.emit_webhook(crate::webhook::event::WebhookEvent::ClientEvent {
                 app: self.app.id.clone(),
