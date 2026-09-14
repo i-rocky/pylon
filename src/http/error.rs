@@ -11,6 +11,7 @@ use axum::response::{IntoResponse, Response};
 pub struct RestError {
     pub status: StatusCode,
     pub message: String,
+    pub rate: Option<crate::http::rest::ratelimit::RateHeaders>,
 }
 
 /// Build the Pusher-style JSON error body: `{"error": "<message>", "status": <code>}`.
@@ -26,6 +27,7 @@ impl RestError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
+            rate: None,
         }
     }
     /// R10: a matched path with an unsupported method. Rendered by the
@@ -36,18 +38,21 @@ impl RestError {
         Self {
             status: StatusCode::METHOD_NOT_ALLOWED,
             message: message.into(),
+            rate: None,
         }
     }
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+            rate: None,
         }
     }
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: message.into(),
+            rate: None,
         }
     }
     /// R1: Pusher's HTTP API documents **403 Forbidden** for a disabled app —
@@ -56,12 +61,14 @@ impl RestError {
         Self {
             status: StatusCode::FORBIDDEN,
             message: message.into(),
+            rate: None,
         }
     }
     pub fn payload_too_large(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             message: message.into(),
+            rate: None,
         }
     }
     /// SP10 admission control: the publish pipeline is saturated, so reject the
@@ -71,6 +78,7 @@ impl RestError {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: message.into(),
+            rate: None,
         }
     }
 
@@ -81,6 +89,18 @@ impl RestError {
         Self {
             status,
             message: message.into(),
+            rate: None,
+        }
+    }
+
+    pub fn too_many_requests(
+        message: impl Into<String>,
+        rate: crate::http::rest::ratelimit::RateHeaders,
+    ) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.into(),
+            rate: Some(rate),
         }
     }
 }
@@ -98,6 +118,17 @@ impl IntoResponse for RestError {
         // A 503 (overload) carries `Retry-After: 1` so publishers back off.
         if self.status == StatusCode::SERVICE_UNAVAILABLE {
             headers.insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        if let Some(rate) = self.rate {
+            if let Ok(v) = HeaderValue::from_str(&rate.retry_after_secs.to_string()) {
+                headers.insert(header::RETRY_AFTER, v);
+            }
+            if let Ok(v) = HeaderValue::from_str(&rate.limit.to_string()) {
+                headers.insert("x-ratelimit-limit", v);
+            }
+            if let Ok(v) = HeaderValue::from_str(&rate.remaining.to_string()) {
+                headers.insert("x-ratelimit-remaining", v);
+            }
         }
         (self.status, headers, body).into_response()
     }
@@ -181,6 +212,28 @@ mod tests {
         let body = error_body("quote \" and \\ slash", 400);
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["error"], "quote \" and \\ slash");
+    }
+
+    #[tokio::test]
+    async fn too_many_requests_carries_the_rate_headers() {
+        let err = RestError::too_many_requests(
+            "Rate limit exceeded",
+            crate::http::rest::ratelimit::RateHeaders {
+                limit: 50,
+                remaining: 0,
+                retry_after_secs: 3,
+            },
+        );
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "3");
+        assert_eq!(resp.headers().get("x-ratelimit-limit").unwrap(), "50");
+        assert_eq!(resp.headers().get("x-ratelimit-remaining").unwrap(), "0");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], 429);
     }
 
     #[test]

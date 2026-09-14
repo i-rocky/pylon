@@ -6,6 +6,7 @@ pub mod channels;
 pub mod events;
 pub mod health;
 pub mod metrics;
+pub mod ratelimit;
 pub mod users;
 
 use crate::server::router::AppState;
