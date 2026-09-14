@@ -169,6 +169,18 @@ pub fn encode(snapshot: &MetricsSnapshot) -> String {
         for (i, &mb) in pc.mailbox_dropped.iter().enumerate() {
             let _ = writeln!(out, "pylon_mailbox_dropped_total{{worker=\"{i}\"}} {mb}");
         }
+
+        out.push_str("# HELP pylon_frame_limited_total Connections closed (4100) for exceeding the inbound frame rate limit, per worker (cumulative)\n");
+        out.push_str("# TYPE pylon_frame_limited_total counter\n");
+        for (i, &n) in pc.frame_limited.iter().enumerate() {
+            let _ = writeln!(out, "pylon_frame_limited_total{{worker=\"{i}\"}} {n}");
+        }
+
+        out.push_str("# HELP pylon_accept_limited_total Sockets closed immediately after accept for exceeding the accept rate limit, per worker (cumulative)\n");
+        out.push_str("# TYPE pylon_accept_limited_total counter\n");
+        for (i, &n) in pc.accept_limited.iter().enumerate() {
+            let _ = writeln!(out, "pylon_accept_limited_total{{worker=\"{i}\"}} {n}");
+        }
     }
 
     // Phase-2 B2: webhook pipeline metrics.
@@ -527,6 +539,8 @@ mod tests {
             codel_dropped: vec![1, 2],
             drophead_dropped: vec![0, 0],
             mailbox_dropped: vec![0, 0],
+            frame_limited: vec![0, 0],
+            accept_limited: vec![0, 0],
             inflight_total: 300,
             budget_factor: 0.9,
             worker_budget_bytes: 1024 * 1024 * 512,
@@ -623,6 +637,8 @@ mod tests {
             codel_dropped: vec![3, 0],
             drophead_dropped: vec![0, 0],
             mailbox_dropped: vec![0, 0],
+            frame_limited: vec![0, 0],
+            accept_limited: vec![0, 0],
             inflight_total: 0,
             budget_factor: 1.0,
             worker_budget_bytes: 1,
@@ -672,6 +688,8 @@ mod tests {
             codel_dropped: vec![0, 0],
             drophead_dropped: vec![7, 0],
             mailbox_dropped: vec![0, 0],
+            frame_limited: vec![0, 0],
+            accept_limited: vec![0, 0],
             inflight_total: 0,
             budget_factor: 1.0,
             worker_budget_bytes: 1,
@@ -706,6 +724,57 @@ mod tests {
         let type_pos = text.find("# TYPE pylon_drophead_dropped_total").unwrap();
         let series_pos = text.find("pylon_drophead_dropped_total{").unwrap();
         assert!(help_pos < type_pos && type_pos < series_pos);
+    }
+
+    #[test]
+    fn encode_percore_flood_limit_counters_present_when_some() {
+        use crate::transport::PercoreMetricsSnapshot;
+        let pc = PercoreMetricsSnapshot {
+            inflight: vec![0, 0],
+            dropped: vec![0, 0],
+            accepted: vec![0, 0],
+            codel_dropped: vec![0, 0],
+            drophead_dropped: vec![0, 0],
+            mailbox_dropped: vec![0, 0],
+            frame_limited: vec![2, 0],
+            accept_limited: vec![0, 7],
+            inflight_total: 0,
+            budget_factor: 1.0,
+            worker_budget_bytes: 1,
+        };
+        let s = MetricsSnapshot {
+            apps: HashMap::new(),
+            saturation: None,
+            percore: Some(pc),
+            webhook: None,
+            webhook_queue_depth: None,
+            cluster: None,
+        };
+        let text = encode(&s);
+        assert!(
+            text.contains("pylon_frame_limited_total{worker=\"0\"} 2\n"),
+            "frame_limited w0: {text}"
+        );
+        assert!(
+            text.contains("pylon_frame_limited_total{worker=\"1\"} 0\n"),
+            "frame_limited w1 must be present at 0: {text}"
+        );
+        assert!(
+            text.contains("pylon_accept_limited_total{worker=\"1\"} 7\n"),
+            "accept_limited w1: {text}"
+        );
+        assert!(
+            text.contains("pylon_accept_limited_total{worker=\"0\"} 0\n"),
+            "accept_limited w0 must be present at 0: {text}"
+        );
+        assert!(
+            text.contains("# TYPE pylon_frame_limited_total counter"),
+            "type counter frame_limited: {text}"
+        );
+        assert!(
+            text.contains("# TYPE pylon_accept_limited_total counter"),
+            "type counter accept_limited: {text}"
+        );
     }
 
     #[test]

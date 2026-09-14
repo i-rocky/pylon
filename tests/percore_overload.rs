@@ -1133,3 +1133,61 @@ where
     .await
     .expect("frame within 5s")
 }
+
+#[tokio::test]
+async fn a_frame_burst_above_the_limit_closes_the_connection_with_4100() {
+    let _guard = HARNESS_LOCK.lock().await;
+    let port = free_port();
+    let mut config = base_config(port);
+    config.workers = 1;
+    config.max_frames_per_second = 10;
+    config.max_frames_burst = 10;
+    let h = spawn_with(config).await;
+    let mut ws = connect(h.port).await;
+    for _ in 0..40 {
+        ws.send(Message::Ping(Vec::new().into())).await.unwrap();
+    }
+    let close = loop {
+        match ws.next().await {
+            Some(Ok(Message::Close(frame))) => break frame,
+            Some(Ok(_)) => continue,
+            other => panic!("expected a Close frame, got {other:?}"),
+        }
+    };
+    let code: u16 = close
+        .expect("the close frame must carry a code")
+        .code
+        .into();
+    assert_eq!(code, 4100, "a frame flood must close with 4100");
+}
+
+#[tokio::test]
+async fn an_accept_burst_above_the_limit_is_closed_before_the_handshake() {
+    let _guard = HARNESS_LOCK.lock().await;
+    let port = free_port();
+    let mut config = base_config(port);
+    config.workers = 1;
+    config.max_accepts_per_second = 1;
+    let h = spawn_with(config).await;
+    let _first = connect(h.port).await;
+    let second = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{}/app/app-key?protocol=7",
+        h.port
+    ))
+    .await;
+    assert!(
+        second.is_err(),
+        "the second accept inside the window must be closed before the handshake"
+    );
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let body = reqwest::get(format!("http://127.0.0.1:{}/metrics", h.port))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("pylon_accept_limited_total{worker=\"0\"} 1\n"),
+        "{body}"
+    );
+}

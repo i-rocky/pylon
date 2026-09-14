@@ -17,6 +17,7 @@ pub mod connection;
 pub mod http;
 pub mod presence;
 pub mod protocol;
+pub mod rate;
 pub mod server;
 // SP9 lean per-core transport. Self-contained RFC 6455 frame codec + the
 // readiness-driven worker event loop that drives the v7 protocol dispatch.

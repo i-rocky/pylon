@@ -84,6 +84,8 @@ disappearing, depends on the app manager backend:
 | `pylon_codel_dropped_total` | counter | `worker` | Frames discarded by the CoDel staleness check (stale frames removed from the queue before sending) |
 | `pylon_drophead_dropped_total` | counter | `worker` | Frames evicted by the per-connection drop-head queue: when a slow consumer's outbound queue is at its byte cap, the oldest queued frames are dropped to make room for newer ones (freshest-wins) |
 | `pylon_mailbox_dropped_total` | counter | `worker` | Frames dropped because a connection's inbound mailbox (the bounded direct-send channel for presence rosters, member events, user-targeted sends, watchlist notifications, cluster deliveries) was full when a producer tried to enqueue |
+| `pylon_frame_limited_total` | counter | `worker` | Connections closed with code 4100 for exceeding the per-connection inbound frame rate |
+| `pylon_accept_limited_total` | counter | `worker` | Sockets closed immediately after accept for exceeding the per-worker accept rate |
 | `pylon_inflight_bytes` | gauge | `worker` | Bytes currently queued in each worker's outbound buffer |
 | `pylon_inflight_bytes_sum` | gauge | — | Sum of `pylon_inflight_bytes` across all workers |
 | `pylon_worker_budget_bytes` | gauge | — | Per-worker memory budget in bytes |

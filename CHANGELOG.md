@@ -21,6 +21,17 @@ pre-1.0 and versions track `Cargo.toml`.
   image has no shell: probe `/health` and `/ready` over HTTP from outside the
   container, and the compose in-container `wget` healthchecks are removed.
 
+### Added
+- **Transport flood protection.** Every inbound WebSocket frame — data and
+  control — now counts against a per-connection token bucket
+  (`PYLON_MAX_FRAMES_PER_SECOND`, default 100; `PYLON_MAX_FRAMES_BURST`,
+  defaulting to `max(250, PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION + 50)` so a
+  client can still subscribe to its full channel allowance in one burst); a
+  connection over it is closed with code `4100`. A node-wide
+  accept cap (`PYLON_MAX_ACCEPTS_PER_SECOND`, default 0 = off) closes excess
+  sockets before TLS or the HTTP upgrade. New counters
+  `pylon_frame_limited_total{worker}` and `pylon_accept_limited_total{worker}`.
+
 ## [0.4.1] - 2026-09-14
 
 ### Fixed

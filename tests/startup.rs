@@ -324,6 +324,34 @@ fn a_malformed_numeric_env_var_exits_one_and_names_the_variable() {
     );
 }
 
+#[test]
+fn a_frames_burst_below_the_subscription_cap_refuses_to_boot() {
+    let (dir, apps_path) = apps_file();
+    let port = free_port();
+    let child = server_command(port, &apps_path)
+        .env("PYLON_MAX_FRAMES_BURST", "64")
+        .env("PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION", "500")
+        .spawn()
+        .expect("spawn pylon");
+    let mut server = Server {
+        child,
+        port,
+        _dir: dir,
+    };
+    let status = server.wait_exit(Duration::from_secs(30)).expect(
+        "a burst below the subscription cap must refuse to boot, not serve clients it will close",
+    );
+    assert_eq!(status.code(), Some(1), "the refusal must exit 1");
+    let logs = format!("{}{}", drain_stdout(&mut server), drain(&mut server));
+    assert!(
+        logs.contains("PYLON_MAX_FRAMES_BURST")
+            && logs.contains("PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION")
+            && logs.contains("64")
+            && logs.contains("500"),
+        "the refusal must name both knobs and both values: {logs}"
+    );
+}
+
 /// Half-configured TLS is a fatal misconfiguration, not a silent fall back to
 /// plain mode — a server the operator believes is encrypted must never boot
 /// unencrypted.
