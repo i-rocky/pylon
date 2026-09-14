@@ -41,6 +41,10 @@ pre-1.0 and versions track `Cargo.toml`.
   accept cap (`PYLON_MAX_ACCEPTS_PER_SECOND`, default 0 = off) closes excess
   sockets before TLS or the HTTP upgrade. New counters
   `pylon_frame_limited_total{worker}` and `pylon_accept_limited_total{worker}`.
+- **`cargo deny` gates every pull request.** A new root `deny.toml` denies
+  RUSTSEC vulnerability, unmaintained and yanked advisories, restricts
+  licences to an allowlist derived from the current tree, denies wildcard
+  version requirements, and permits crates.io as the only source.
 
 ### Fixed
 - Cleared three `cargo deny` advisories: `rustls` moved 0.23.40 → 0.23.45
