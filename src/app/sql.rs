@@ -43,7 +43,10 @@ impl Dialect {
 pub struct SqlAppManager {
     pub(crate) pool: AnyPool,
     dialect: Dialect,
+    rate_limit_columns: bool,
 }
+
+const RATE_LIMIT_COLUMNS: &str = "max_backend_events_per_second, max_read_requests_per_second";
 
 /// Typed column for app lookup to prevent SQL injection via caller-controlled column names.
 enum LookupCol {
@@ -59,14 +62,25 @@ impl SqlAppManager {
             .max_connections(8)
             .connect(dsn)
             .await?;
-        Ok(Self { pool, dialect })
+        let rate_limit_columns = probe_rate_limit_columns(&pool).await?;
+        Ok(Self {
+            pool,
+            dialect,
+            rate_limit_columns,
+        })
     }
 
     fn select_sql(&self) -> String {
+        let overrides = if self.rate_limit_columns {
+            format!(", {RATE_LIMIT_COLUMNS}")
+        } else {
+            String::new()
+        };
         format!(
             "SELECT id, {}, secret, name, capacity, client_messages_enabled, \
-                 subscription_count_enabled, enabled, webhooks FROM apps",
-            self.dialect.key_ident()
+                 subscription_count_enabled, enabled, webhooks{} FROM apps",
+            self.dialect.key_ident(),
+            overrides
         )
     }
 
@@ -95,7 +109,7 @@ impl SqlAppManager {
         match row {
             None => Ok(AppLookup::NotFound),
             Some(r) => {
-                let app = row_to_app(&r)?;
+                let app = row_to_app(&r, self.rate_limit_columns)?;
                 if app.enabled {
                     Ok(AppLookup::Found(Arc::new(app)))
                 } else {
@@ -103,6 +117,23 @@ impl SqlAppManager {
                 }
             }
         }
+    }
+}
+
+async fn probe_rate_limit_columns(pool: &AnyPool) -> anyhow::Result<bool> {
+    let probe = format!("SELECT {RATE_LIMIT_COLUMNS} FROM apps LIMIT 0");
+    match sqlx::query(AssertSqlSafe(probe)).fetch_optional(pool).await {
+        Ok(_) => Ok(true),
+        Err(sqlx::Error::Database(e)) => {
+            tracing::info!(
+                reason = %e,
+                "apps table exposes no {RATE_LIMIT_COLUMNS} columns; \
+                 per-app REST rate-limit overrides are disabled and every app \
+                 falls back to the server defaults"
+            );
+            Ok(false)
+        }
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -124,7 +155,22 @@ fn get_text(r: &AnyRow, col: &str) -> Result<String, AppLookupError> {
     String::from_utf8(bytes).map_err(|e| AppLookupError::Decode(format!("{col} utf8: {e}")))
 }
 
-fn row_to_app(r: &AnyRow) -> Result<App, AppLookupError> {
+fn get_opt_u32(r: &AnyRow, col: &str) -> Result<Option<u32>, AppLookupError> {
+    let stored: Option<i64> = r
+        .try_get(col)
+        .map_err(|e| AppLookupError::Decode(format!("{col}: {e}")))?;
+    match stored {
+        None => Ok(None),
+        Some(n) => u32::try_from(n).map(Some).map_err(|_| {
+            AppLookupError::Decode(format!(
+                "{col}: {n} is not a valid limit — use 0 for unlimited, \
+                 or leave the column NULL for the server default"
+            ))
+        }),
+    }
+}
+
+fn row_to_app(r: &AnyRow, rate_limit_columns: bool) -> Result<App, AppLookupError> {
     let webhooks_json = get_text(r, "webhooks")?;
     let webhooks: Vec<WebhookConfig> = serde_json::from_str(&webhooks_json)
         .map_err(|e| AppLookupError::Decode(format!("webhooks json: {e}")))?;
@@ -136,6 +182,16 @@ fn row_to_app(r: &AnyRow) -> Result<App, AppLookupError> {
         secret: r.try_get("secret").map_err(dec)?,
         client_messages_enabled: get_bool(r, "client_messages_enabled")?,
         capacity: r.try_get::<i64, _>("capacity").map_err(dec)? as u32,
+        max_backend_events_per_second: if rate_limit_columns {
+            get_opt_u32(r, "max_backend_events_per_second")?
+        } else {
+            None
+        },
+        max_read_requests_per_second: if rate_limit_columns {
+            get_opt_u32(r, "max_read_requests_per_second")?
+        } else {
+            None
+        },
         subscription_count_enabled: get_bool(r, "subscription_count_enabled")?,
         enabled: get_bool(r, "enabled")?,
         webhooks,
@@ -171,22 +227,23 @@ mod tests {
     async fn seed() -> (SqlAppManager, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
         let dsn = format!("sqlite://{}?mode=rwc", tmp.path().join("apps.db").display());
-        let m = SqlAppManager::connect(&dsn).await.unwrap();
+        let schema = SqlAppManager::connect(&dsn).await.unwrap();
         sqlx::query(include_str!("../../deploy/db/sqlite/001_apps.sql"))
-            .execute(&m.pool)
+            .execute(&schema.pool)
             .await
             .unwrap();
         sqlx::query(
             "INSERT INTO apps (id,key,secret,name,capacity,client_messages_enabled,\
-             subscription_count_enabled,enabled,webhooks) VALUES \
+             subscription_count_enabled,enabled,webhooks,max_backend_events_per_second,\
+             max_read_requests_per_second) VALUES \
              ('app-id','app-key','app-secret','Example',2,1,1,1,\
-              '[{\"url\":\"https://e.test\",\"event_types\":[\"channel_occupied\"]}]'),\
-             ('off-id','off-key','s','Disabled',0,0,0,0,'[]')",
+              '[{\"url\":\"https://e.test\",\"event_types\":[\"channel_occupied\"]}]',500,NULL),\
+             ('off-id','off-key','s','Disabled',0,0,0,0,'[]',NULL,NULL)",
         )
-        .execute(&m.pool)
+        .execute(&schema.pool)
         .await
         .unwrap();
-        (m, tmp)
+        (SqlAppManager::connect(&dsn).await.unwrap(), tmp)
     }
 
     #[tokio::test]
@@ -230,6 +287,67 @@ mod tests {
             m.by_key("off-key").await.unwrap(),
             AppLookup::Disabled
         ));
+    }
+
+    #[tokio::test]
+    async fn per_app_rate_overrides_load_from_the_new_columns() {
+        let (m, _tmp) = seed().await;
+        let AppLookup::Found(a) = m.by_id("app-id").await.unwrap() else {
+            panic!("expected Found");
+        };
+        assert_eq!(a.max_backend_events_per_second, Some(500));
+        assert_eq!(
+            a.max_read_requests_per_second, None,
+            "a NULL column is an absent override, not a zero one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_table_without_the_rate_columns_still_loads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dsn = format!("sqlite://{}?mode=rwc", tmp.path().join("apps.db").display());
+        let pre = SqlAppManager::connect(&dsn).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE apps (id TEXT PRIMARY KEY, key TEXT, secret TEXT, name TEXT, \
+             capacity INTEGER, client_messages_enabled INTEGER, \
+             subscription_count_enabled INTEGER, enabled INTEGER, webhooks TEXT)",
+        )
+        .execute(&pre.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO apps VALUES ('legacy','legacy-key','s','Legacy',0,0,0,1,'[]')")
+            .execute(&pre.pool)
+            .await
+            .unwrap();
+        let m = SqlAppManager::connect(&dsn).await.unwrap();
+        let AppLookup::Found(a) = m.by_id("legacy").await.unwrap() else {
+            panic!("a table without the rate columns must still resolve its apps");
+        };
+        assert_eq!(a.max_backend_events_per_second, None);
+        assert_eq!(a.max_read_requests_per_second, None);
+    }
+
+    #[tokio::test]
+    async fn a_negative_rate_override_is_a_decode_error_naming_the_column() {
+        let (m, _tmp) = seed().await;
+        sqlx::query(
+            "INSERT INTO apps (id,key,secret,name,capacity,client_messages_enabled,\
+             subscription_count_enabled,enabled,webhooks,max_backend_events_per_second,\
+             max_read_requests_per_second) VALUES \
+             ('neg-id','neg-key','s','Negative',0,0,0,1,'[]',-1,NULL)",
+        )
+        .execute(&m.pool)
+        .await
+        .unwrap();
+        match m.by_id("neg-id").await {
+            Err(AppLookupError::Decode(msg)) => assert!(
+                msg.contains("max_backend_events_per_second"),
+                "the decode error must name the offending column, got: {msg}"
+            ),
+            other => {
+                panic!("a negative limit is an invalid row, not silently unlimited, got: {other:?}")
+            }
+        }
     }
 
     #[tokio::test]

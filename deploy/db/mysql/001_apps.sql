@@ -9,6 +9,8 @@ CREATE TABLE IF NOT EXISTS apps (
     secret      VARCHAR(255) NOT NULL,
     name        VARCHAR(255) NOT NULL DEFAULT '',
     capacity    BIGINT NOT NULL DEFAULT 0,
+    max_backend_events_per_second  BIGINT NULL,
+    max_read_requests_per_second   BIGINT NULL,
     client_messages_enabled     BIGINT NOT NULL DEFAULT 0,
     subscription_count_enabled  BIGINT NOT NULL DEFAULT 0,
     enabled     BIGINT NOT NULL DEFAULT 1,

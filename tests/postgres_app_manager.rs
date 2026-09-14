@@ -1,6 +1,6 @@
 //! Postgres-backed SqlAppManager integration test. Fail-loud (assumes a Postgres at
 //! PYLON_TEST_POSTGRES_URL or 127.0.0.1:5433), per the repo's redis_cluster.rs convention.
-use pylon::app::{sql::SqlAppManager, AppLookup, AppManager};
+use pylon::app::{sql::SqlAppManager, AppLookup, AppLookupError, AppManager};
 use sqlx::any::AnyPoolOptions;
 
 fn url() -> String {
@@ -86,4 +86,113 @@ async fn postgres_resolves_by_id_and_key_and_filters_disabled() {
         m.by_key(&off_key).await.unwrap(),
         AppLookup::Disabled
     ));
+}
+
+const LEGACY_DDL: &str = "CREATE TABLE apps (\
+     id VARCHAR(255) NOT NULL PRIMARY KEY, key VARCHAR(255) NOT NULL UNIQUE, \
+     secret VARCHAR(255) NOT NULL, name VARCHAR(255) NOT NULL DEFAULT '', \
+     capacity BIGINT NOT NULL DEFAULT 0, client_messages_enabled BIGINT NOT NULL DEFAULT 0, \
+     subscription_count_enabled BIGINT NOT NULL DEFAULT 0, enabled BIGINT NOT NULL DEFAULT 1, \
+     webhooks TEXT NOT NULL DEFAULT '[]')";
+
+#[tokio::test]
+async fn postgres_loads_the_rate_overrides_and_tolerates_a_legacy_table() {
+    sqlx::any::install_default_drivers();
+    let setup = AnyPoolOptions::new()
+        .max_connections(2)
+        .connect(&url())
+        .await
+        .expect("connect Postgres (is pylon-test-postgres up?)");
+    let present = sqlx::query("SELECT 1 FROM pg_database WHERE datname = 'pylon_test_ratelimit'")
+        .fetch_optional(&setup)
+        .await
+        .expect("query pg_database")
+        .is_some();
+    if !present {
+        sqlx::query("CREATE DATABASE pylon_test_ratelimit")
+            .execute(&setup)
+            .await
+            .expect("create the isolated rate-limit database");
+    }
+    let dsn = swap_database(&url(), "pylon_test_ratelimit");
+    let db = AnyPoolOptions::new()
+        .max_connections(2)
+        .connect(&dsn)
+        .await
+        .expect("connect the isolated rate-limit database");
+
+    sqlx::query("DROP TABLE IF EXISTS apps")
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query(LEGACY_DDL).execute(&db).await.unwrap();
+    sqlx::query(
+        "INSERT INTO apps (id,key,secret,name,capacity,client_messages_enabled,\
+         subscription_count_enabled,enabled,webhooks) VALUES \
+         ('legacy','legacy-key','sec','Legacy',0,0,0,1,'[]')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    let m = SqlAppManager::connect(&dsn)
+        .await
+        .expect("a legacy apps table must still produce a manager");
+    let AppLookup::Found(a) = m.by_id("legacy").await.unwrap() else {
+        panic!("an apps table without the two override columns must still resolve its apps");
+    };
+    assert_eq!(a.max_backend_events_per_second, None);
+    assert_eq!(a.max_read_requests_per_second, None);
+
+    sqlx::query("DROP TABLE apps").execute(&db).await.unwrap();
+    sqlx::query(DDL).execute(&db).await.unwrap();
+    sqlx::query(
+        "INSERT INTO apps (id,key,secret,name,capacity,client_messages_enabled,\
+         subscription_count_enabled,enabled,webhooks,max_backend_events_per_second,\
+         max_read_requests_per_second) VALUES \
+         ('capped','capped-key','sec','Capped',0,0,0,1,'[]',500,NULL),\
+         ('free','free-key','sec','Free',0,0,0,1,'[]',0,0)",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    let m = SqlAppManager::connect(&dsn).await.unwrap();
+    let AppLookup::Found(capped) = m.by_id("capped").await.unwrap() else {
+        panic!("by_id hit");
+    };
+    assert_eq!(capped.max_backend_events_per_second, Some(500));
+    assert_eq!(
+        capped.max_read_requests_per_second, None,
+        "a NULL column is an absent override, not a zero one"
+    );
+    let AppLookup::Found(free) = m.by_id("free").await.unwrap() else {
+        panic!("by_id hit");
+    };
+    assert_eq!(free.max_backend_events_per_second, Some(0));
+    assert_eq!(free.max_read_requests_per_second, Some(0));
+
+    sqlx::query(
+        "INSERT INTO apps (id,key,secret,name,capacity,client_messages_enabled,\
+         subscription_count_enabled,enabled,webhooks,max_backend_events_per_second,\
+         max_read_requests_per_second) VALUES \
+         ('negative','negative-key','sec','Negative',0,0,0,1,'[]',-1,NULL)",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    match m.by_id("negative").await {
+        Err(AppLookupError::Decode(msg)) => assert!(
+            msg.contains("max_backend_events_per_second"),
+            "the decode error must name the offending column, got: {msg}"
+        ),
+        other => {
+            panic!("a negative limit is an invalid row, not silently unlimited, got: {other:?}")
+        }
+    }
+}
+
+fn swap_database(url: &str, name: &str) -> String {
+    let (prefix, _db) = url
+        .rsplit_once('/')
+        .expect("the test URL carries a database name to swap");
+    format!("{prefix}/{name}")
 }
