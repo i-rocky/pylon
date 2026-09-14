@@ -113,6 +113,7 @@ async fn spawn_configured_with(
         draining: Arc::new(AtomicBool::new(false)),
         cluster_metrics,
         invalidator: None,
+        rest_limits: Arc::new(pylon::http::rest::ratelimit::RestRateLimits::new(&config)),
     };
     tokio::spawn(pylon::transport::rest::serve(
         rest_rx,
@@ -2335,6 +2336,166 @@ async fn post_signed(addr: SocketAddr, path: &str, body: String) -> reqwest::Res
         .send()
         .await
         .unwrap()
+}
+
+async fn get_signed(addr: SocketAddr, path: &str) -> reqwest::Response {
+    let q = signed_query("GET", path, b"", &[]);
+    reqwest::Client::new()
+        .get(format!("http://{addr}{path}?{q}"))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn the_node_rest_cap_429s_the_second_request_and_spares_the_probes() {
+    let addr = spawn_configured(APPS, |c| c.max_rest_requests_per_second = 1).await;
+    let first = get_signed(addr, "/apps/app1/channels").await;
+    assert_eq!(first.status(), 200);
+    let second = get_signed(addr, "/apps/app1/channels").await;
+    assert_eq!(second.status(), 429);
+    assert_eq!(second.headers().get("retry-after").unwrap(), "1");
+    assert_eq!(second.headers().get("x-ratelimit-limit").unwrap(), "1");
+    assert_eq!(second.headers().get("x-ratelimit-remaining").unwrap(), "0");
+    let body: Value = second.json().await.unwrap();
+    assert_eq!(body["status"], 429);
+    assert_eq!(body["error"], "Rate limit exceeded");
+    for probe in ["/health", "/ready", "/metrics"] {
+        let r = reqwest::get(format!("http://{addr}{probe}")).await.unwrap();
+        assert_ne!(r.status(), 429, "{probe} must never be rate limited");
+    }
+}
+
+#[tokio::test]
+async fn the_node_rest_cap_rejects_an_unsigned_flood_before_it_reaches_auth() {
+    let addr = spawn_configured(APPS, |c| c.max_rest_requests_per_second = 1).await;
+    let first = reqwest::get(format!("http://{addr}/apps/app1/channels"))
+        .await
+        .unwrap();
+    assert_eq!(
+        first.status(),
+        401,
+        "the first unsigned request still reaches auth"
+    );
+    let second = reqwest::get(format!("http://{addr}/apps/app1/channels"))
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        429,
+        "the node cap is spent by an unsigned request too, so a flood costs no app-store lookup"
+    );
+}
+
+#[tokio::test]
+async fn the_node_rest_cap_429s_a_publish_before_its_handler_runs() {
+    let addr = spawn_configured(APPS, |c| c.max_rest_requests_per_second = 1).await;
+    let body = json!({"name": "e", "channels": ["a"], "data": "{}"}).to_string();
+    assert_eq!(
+        post_signed(addr, "/apps/app1/events", body.clone())
+            .await
+            .status(),
+        200,
+        "the first publish spends the node's only token"
+    );
+    let second = post_signed(addr, "/apps/app1/events", body).await;
+    assert_eq!(second.status(), 429);
+    assert_eq!(second.headers().get("retry-after").unwrap(), "1");
+    assert_eq!(second.headers().get("x-ratelimit-limit").unwrap(), "1");
+    let metrics = reqwest::get(format!("http://{addr}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("pylon_rest_rate_limited_total{scope=\"node\"} 1\n"),
+        "{metrics}"
+    );
+}
+
+#[tokio::test]
+async fn a_batch_costs_its_event_count_against_the_per_app_budget() {
+    let addr = spawn_configured(APPS, |c| c.max_backend_events_per_second = 3).await;
+    let batch = json!({
+        "batch": [
+            {"channel": "a", "name": "e", "data": "{}"},
+            {"channel": "b", "name": "e", "data": "{}"},
+            {"channel": "c", "name": "e", "data": "{}"}
+        ]
+    })
+    .to_string();
+    let first = post_signed(addr, "/apps/app1/batch_events", batch).await;
+    assert_eq!(first.status(), 200, "3 events exactly spend the budget");
+    let single = json!({"name": "e", "channels": ["a"], "data": "{}"}).to_string();
+    let second = post_signed(addr, "/apps/app1/events", single).await;
+    assert_eq!(second.status(), 429, "the budget is spent");
+    let body = reqwest::get(format!("http://{addr}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("pylon_rest_rate_limited_total{scope=\"app_events\"} 1\n"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_per_app_override_of_zero_is_unlimited() {
+    const UNLIMITED: &str = r#"[
+        {"name":"Test","id":"app1","key":"app-key","secret":"app-secret",
+         "max_backend_events_per_second":0}
+    ]"#;
+    let addr = spawn_configured(UNLIMITED, |c| c.max_backend_events_per_second = 1).await;
+    for i in 0..5 {
+        let body = json!({"name": "e", "channels": ["a"], "data": "{}"}).to_string();
+        let r = post_signed(addr, "/apps/app1/events", body).await;
+        assert_eq!(
+            r.status(),
+            200,
+            "publish {i}: an explicit 0 override means unlimited"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_absent_override_uses_the_server_default_for_reads() {
+    let addr = spawn_configured(APPS, |c| c.max_read_requests_per_second = 1).await;
+    assert_eq!(get_signed(addr, "/apps/app1/channels").await.status(), 200);
+    let second = get_signed(addr, "/apps/app1/channels").await;
+    assert_eq!(second.status(), 429);
+    assert_eq!(second.headers().get("x-ratelimit-limit").unwrap(), "1");
+    let body = reqwest::get(format!("http://{addr}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("pylon_rest_rate_limited_total{scope=\"app_reads\"} 1\n"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn the_rate_limit_counters_render_at_zero_while_every_limit_is_off() {
+    let addr = spawn().await;
+    let body = reqwest::get(format!("http://{addr}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    for scope in ["node", "app_events", "app_reads"] {
+        assert!(
+            body.contains(&format!(
+                "pylon_rest_rate_limited_total{{scope=\"{scope}\"}} 0\n"
+            )),
+            "scope {scope} must report 0 rather than vanish: {body}"
+        );
+    }
 }
 
 /// A trigger naming no destination at all is a 400 — not a silent 200 that

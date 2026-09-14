@@ -8,6 +8,8 @@ CREATE TABLE IF NOT EXISTS apps (
     secret      TEXT    NOT NULL,
     name        TEXT    NOT NULL DEFAULT '',
     capacity    INTEGER NOT NULL DEFAULT 0,
+    max_backend_events_per_second  INTEGER NULL,
+    max_read_requests_per_second   INTEGER NULL,
     client_messages_enabled     INTEGER NOT NULL DEFAULT 0,
     subscription_count_enabled  INTEGER NOT NULL DEFAULT 0,
     enabled     INTEGER NOT NULL DEFAULT 1,

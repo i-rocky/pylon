@@ -132,6 +132,9 @@ pub struct ServerConfig {
     pub max_frames_per_second: u32,
     pub max_frames_burst: u32,
     pub max_accepts_per_second: u32,
+    pub max_rest_requests_per_second: u32,
+    pub max_backend_events_per_second: u32,
+    pub max_read_requests_per_second: u32,
     pub max_presence_user_id_length: usize,
     pub max_presence_user_info_bytes: usize,
     pub max_subscriptions_per_connection: usize,
@@ -311,6 +314,9 @@ impl Default for ServerConfig {
             max_frames_per_second: 100,
             max_frames_burst: 250,
             max_accepts_per_second: 0,
+            max_rest_requests_per_second: 0,
+            max_backend_events_per_second: 0,
+            max_read_requests_per_second: 0,
             max_presence_user_id_length: 128,
             max_presence_user_info_bytes: 1024,
             max_subscriptions_per_connection: 200,
@@ -503,6 +509,18 @@ impl ServerConfig {
         env_parse(
             "PYLON_MAX_ACCEPTS_PER_SECOND",
             &mut c.max_accepts_per_second,
+        );
+        env_parse(
+            "PYLON_MAX_REST_REQUESTS_PER_SECOND",
+            &mut c.max_rest_requests_per_second,
+        );
+        env_parse(
+            "PYLON_MAX_BACKEND_EVENTS_PER_SECOND",
+            &mut c.max_backend_events_per_second,
+        );
+        env_parse(
+            "PYLON_MAX_READ_REQUESTS_PER_SECOND",
+            &mut c.max_read_requests_per_second,
         );
         env_parse(
             "PYLON_MAX_PRESENCE_USER_ID_LENGTH",
@@ -738,6 +756,9 @@ mod tests {
         assert_eq!(c.max_frames_per_second, 100);
         assert_eq!(c.max_frames_burst, 250);
         assert_eq!(c.max_accepts_per_second, 0);
+        assert_eq!(c.max_rest_requests_per_second, 0);
+        assert_eq!(c.max_backend_events_per_second, 0);
+        assert_eq!(c.max_read_requests_per_second, 0);
         assert_eq!(c.max_presence_user_id_length, 128);
         assert_eq!(c.max_presence_user_info_bytes, 1024);
         // webhook tunables (spec §6 + Pusher retry parity: exponential backoff

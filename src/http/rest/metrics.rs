@@ -1,6 +1,7 @@
 //! GET /metrics — Prometheus text exposition format v0.0.4.
 
 use crate::cluster::bridge::ClusterMetrics;
+use crate::http::rest::ratelimit::RestRateLimitedCounts;
 use crate::server::router::AppState;
 use crate::transport::percore_metrics_snapshot;
 use crate::webhook::WebhookMetrics;
@@ -45,6 +46,7 @@ pub struct MetricsSnapshot {
     pub webhook_queue_depth: Option<u64>,
     /// Phase-2 B3: cluster bridge counters (only present on the Redis path).
     pub cluster: Option<Arc<ClusterMetrics>>,
+    pub rest_rate_limited: RestRateLimitedCounts,
 }
 
 /// Pure encoder: given a snapshot, return the Prometheus text body.
@@ -64,6 +66,24 @@ pub fn encode(snapshot: &MetricsSnapshot) -> String {
         out.push_str("# TYPE pylon_saturation_flag gauge\n");
         let _ = writeln!(out, "pylon_saturation_flag {}", if sat { 1 } else { 0 });
     }
+
+    out.push_str("# HELP pylon_rest_rate_limited_total REST requests rejected with 429 by scope\n");
+    out.push_str("# TYPE pylon_rest_rate_limited_total counter\n");
+    let _ = writeln!(
+        out,
+        "pylon_rest_rate_limited_total{{scope=\"node\"}} {}",
+        snapshot.rest_rate_limited.node
+    );
+    let _ = writeln!(
+        out,
+        "pylon_rest_rate_limited_total{{scope=\"app_events\"}} {}",
+        snapshot.rest_rate_limited.app_events
+    );
+    let _ = writeln!(
+        out,
+        "pylon_rest_rate_limited_total{{scope=\"app_reads\"}} {}",
+        snapshot.rest_rate_limited.app_reads
+    );
 
     // Per-app metrics
     let mut app_ids: Vec<&String> = snapshot.apps.keys().collect();
@@ -357,6 +377,7 @@ pub async fn get_metrics(
         webhook,
         webhook_queue_depth,
         cluster,
+        rest_rate_limited: state.rest_limits.counts(),
     });
 
     let mut response = axum::response::Response::new(axum::body::Body::from(body));
@@ -393,6 +414,7 @@ mod tests {
             webhook: None,
             webhook_queue_depth: None,
             cluster: None,
+            rest_rate_limited: RestRateLimitedCounts::default(),
         }
     }
 
@@ -497,6 +519,7 @@ mod tests {
             webhook: None,
             webhook_queue_depth: None,
             cluster: None,
+            rest_rate_limited: RestRateLimitedCounts::default(),
         };
         let text = encode(&s);
         assert!(
@@ -511,6 +534,7 @@ mod tests {
             webhook: None,
             webhook_queue_depth: None,
             cluster: None,
+            rest_rate_limited: RestRateLimitedCounts::default(),
         };
         let text2 = encode(&s2);
         assert!(
@@ -528,6 +552,7 @@ mod tests {
             webhook: None,
             webhook_queue_depth: None,
             cluster: None,
+            rest_rate_limited: RestRateLimitedCounts::default(),
         };
         let text = encode(&s);
         assert!(
@@ -572,6 +597,7 @@ mod tests {
             webhook: None,
             webhook_queue_depth: None,
             cluster: None,
+            rest_rate_limited: RestRateLimitedCounts::default(),
         };
         let text = encode(&s);
         assert!(
@@ -624,6 +650,7 @@ mod tests {
             webhook: None,
             webhook_queue_depth: None,
             cluster: None,
+            rest_rate_limited: RestRateLimitedCounts::default(),
         };
         let text = encode(&s);
         assert!(
@@ -670,6 +697,7 @@ mod tests {
             webhook: None,
             webhook_queue_depth: None,
             cluster: None,
+            rest_rate_limited: RestRateLimitedCounts::default(),
         };
         let text = encode(&s);
         assert!(
@@ -721,6 +749,7 @@ mod tests {
             webhook: None,
             webhook_queue_depth: None,
             cluster: None,
+            rest_rate_limited: RestRateLimitedCounts::default(),
         };
         let text = encode(&s);
         assert!(
@@ -769,6 +798,7 @@ mod tests {
             webhook: None,
             webhook_queue_depth: None,
             cluster: None,
+            rest_rate_limited: RestRateLimitedCounts::default(),
         };
         let text = encode(&s);
         assert!(
@@ -813,6 +843,7 @@ mod tests {
             webhook: Some(wm),
             webhook_queue_depth: Some(3),
             cluster: None,
+            rest_rate_limited: RestRateLimitedCounts::default(),
         };
         let text = encode(&s);
         assert!(
@@ -854,6 +885,7 @@ mod tests {
             webhook: None,
             webhook_queue_depth: None,
             cluster: None,
+            rest_rate_limited: RestRateLimitedCounts::default(),
         };
         let text = encode(&s);
         assert!(
@@ -864,6 +896,42 @@ mod tests {
             !text.contains("pylon_webhook_queue_depth"),
             "queue_depth must be absent: {text}"
         );
+    }
+
+    #[test]
+    fn encode_rest_rate_limited_renders_every_scope_with_its_own_value() {
+        let mut s = snapshot_with_one_app("app1", 0, 0, 0);
+        s.rest_rate_limited = RestRateLimitedCounts {
+            node: 7,
+            app_events: 11,
+            app_reads: 13,
+        };
+        let text = encode(&s);
+        assert!(
+            text.contains("# TYPE pylon_rest_rate_limited_total counter\n"),
+            "missing TYPE: {text}"
+        );
+        for (scope, value) in [("node", 7), ("app_events", 11), ("app_reads", 13)] {
+            assert!(
+                text.contains(&format!(
+                    "pylon_rest_rate_limited_total{{scope=\"{scope}\"}} {value}\n"
+                )),
+                "scope {scope} must carry its own value: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_rest_rate_limited_reports_zero_rather_than_vanishing() {
+        let text = encode(&snapshot_with_one_app("app1", 0, 0, 0));
+        for scope in ["node", "app_events", "app_reads"] {
+            assert!(
+                text.contains(&format!(
+                    "pylon_rest_rate_limited_total{{scope=\"{scope}\"}} 0\n"
+                )),
+                "a counter that disappears when its limit is off is worse than one reading 0: {text}"
+            );
+        }
     }
 
     #[test]
@@ -880,6 +948,7 @@ mod tests {
             webhook: None,
             webhook_queue_depth: None,
             cluster: Some(cm),
+            rest_rate_limited: RestRateLimitedCounts::default(),
         };
         let text = encode(&s);
         assert!(
@@ -909,6 +978,7 @@ mod tests {
             webhook: None,
             webhook_queue_depth: None,
             cluster: None,
+            rest_rate_limited: RestRateLimitedCounts::default(),
         };
         let text = encode(&s);
         assert!(
@@ -931,6 +1001,7 @@ mod tests {
             ..crate::server::config::ServerConfig::default()
         };
         AppState {
+            rest_limits: Arc::new(crate::http::rest::ratelimit::RestRateLimits::new(&config)),
             config,
             apps: Arc::new(crate::app::static_file::StaticFileAppManager::from_json("[]").unwrap()),
             adapter: Arc::new(crate::adapter::local::LocalAdapter::new(

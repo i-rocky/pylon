@@ -229,6 +229,58 @@ capacity). See [Applications & Authentication](applications.md).
 
 ---
 
+## Flood protection and rate limits
+
+Every limit below defaults to off, because the right number is a property of
+your hardware, not of pylon. Measure it first with the capacity finder, which
+spawns a core-pinned pylon child and sweeps both axes to their real ceilings on
+the machine you will deploy on:
+
+```sh
+cargo run -p pylon-load --release --bin pylon-ceiling -- --phase both --json
+```
+
+Its **connection phase** reports the maximum sustainable connection count
+(`conn_ceiling.max_conns`), RSS at that count, bytes per connection and
+connections per GB. Its **throughput phase** ramps the publish rate until
+deliveries drop, p99 exceeds `--p99-budget-ms` (default 100 ms) or the CPU
+saturates, and reports the last rate that held (`tput_ceiling.best.rate`).
+Take those two numbers — call them `C` (max connections) and `R` (max publishes
+per second) — and set:
+
+| Variable | Suggested value | Why |
+|---|---|---|
+| `PYLON_MAX_ACCEPTS_PER_SECOND` | `C / 60` | Refills the node's full connection population in about a minute, so a fleet-wide reconnect storm is spread rather than absorbed in one spike. |
+| `PYLON_MAX_REST_REQUESTS_PER_SECOND` | `R × 1.5` | Above the measured publish ceiling, so the cap bites only on a genuine flood and never on healthy traffic. |
+| `PYLON_MAX_BACKEND_EVENTS_PER_SECOND` | `R / (expected apps)` | One tenant cannot spend the whole node's publish budget. Raise per app with `max_backend_events_per_second`. |
+| `PYLON_MAX_READ_REQUESTS_PER_SECOND` | `100` | `GET /channels` walks the channel registry; reads are far rarer than publishes in a healthy integration. |
+| `PYLON_MAX_FRAMES_PER_SECOND` | `100` (default) | Ten times the Pusher client-event ceiling, so control frames and subscribes have ample headroom while a Ping flood does not. |
+| `PYLON_MAX_FRAMES_BURST` | `250` (default) | Absorbs a client's opening subscribe storm. Auto-raised to `PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION + 50` unless you set it yourself — set it below that and pylon refuses to start. |
+
+The node cap runs **before** authentication, so an unsigned flood costs no
+app-store lookup; `/health`, `/ready`, `/metrics` and the admin API are never
+limited, because an operator has to reach them during exactly the flood this
+bounds. The per-app caps run after authentication and are overridable per app
+(see [Applications & Authentication](applications.md)); a `POST /batch_events`
+costs its event count, so keep `PYLON_MAX_BACKEND_EVENTS_PER_SECOND` at or
+above `PYLON_MAX_BATCH_EVENTS` or a full-size batch can never be afforded.
+
+Every one of these limits is enforced **per node**, with no cluster
+coordination — unlike an app's `capacity`, which the Redis adapter enforces
+cluster-wide. The numbers above are per-node numbers because the ceilings
+`pylon-ceiling` measures are per-node ceilings; a fleet of N nodes behind a
+load balancer therefore jointly allows `N ×` each value. If you need a
+cluster-wide ceiling, divide by your node count — and remember that a balancer
+spreading traffic unevenly will trip one node's cap before the fleet's share is
+used up.
+
+Watch `pylon_rest_rate_limited_total`, `pylon_frame_limited_total` and
+`pylon_accept_limited_total` after turning any of them on: a non-zero value in
+steady state means the limit is below your real traffic, not that you are under
+attack.
+
+---
+
 ## Graceful Restart
 
 Pylon supports bounded-drain restarts when used with a process manager:

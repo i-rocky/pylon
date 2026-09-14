@@ -65,6 +65,7 @@ async fn spawn_with_metrics_token(token: Option<&str>) -> SocketAddr {
         draining: Arc::new(AtomicBool::new(false)),
         cluster_metrics: None,
         invalidator: None,
+        rest_limits: Arc::new(pylon::http::rest::ratelimit::RestRateLimits::new(&config)),
     };
     tokio::spawn(pylon::transport::rest::serve(
         rest_rx,

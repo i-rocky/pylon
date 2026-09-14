@@ -3,6 +3,7 @@
 use crate::channel::kind::{AuthKind, ChannelInfo};
 use crate::http::error::RestError;
 use crate::http::rest::auth::authenticate;
+use crate::http::rest::ratelimit::RateDecision;
 use crate::server::router::AppState;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{OriginalUri, Path, Query, State};
@@ -34,6 +35,9 @@ pub async fn get_channels(
 ) -> Result<Json<Value>, RestError> {
     let params = query_params(query)?;
     let app = authenticate(&state, &app_id, "GET", uri.path(), &params, &[]).await?;
+    if let RateDecision::Limited(rate) = state.rest_limits.check_app_reads(&app) {
+        return Err(RestError::too_many_requests("Rate limit exceeded", rate));
+    }
     let prefix = params.get("filter_by_prefix").map(String::as_str);
     let want_user_count = wants(&params, "user_count");
     let want_subscription_count = wants(&params, "subscription_count");
@@ -82,6 +86,9 @@ pub async fn get_channel(
 ) -> Result<Json<Value>, RestError> {
     let params = query_params(query)?;
     let app = authenticate(&state, &app_id, "GET", uri.path(), &params, &[]).await?;
+    if let RateDecision::Limited(rate) = state.rest_limits.check_app_reads(&app) {
+        return Err(RestError::too_many_requests("Rate limit exceeded", rate));
+    }
     // R8: enforce the doc's info-attribute applicability BEFORE any lookup —
     // the table says `user_count` → "Presence", `subscription_count` → "All
     // (except Presence channels)", `cache` → "Cache", and "Requesting an

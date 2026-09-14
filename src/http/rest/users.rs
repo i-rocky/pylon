@@ -5,6 +5,7 @@ use crate::channel::kind::AuthKind;
 use crate::channel::kind::ChannelInfo;
 use crate::http::error::RestError;
 use crate::http::rest::auth::authenticate;
+use crate::http::rest::ratelimit::RateDecision;
 use crate::server::router::AppState;
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
@@ -31,6 +32,9 @@ pub async fn get_users(
 ) -> Result<Json<Value>, RestError> {
     let params = query_params(query)?;
     let app = authenticate(&state, &app_id, "GET", uri.path(), &params, &[]).await?;
+    if let RateDecision::Limited(rate) = state.rest_limits.check_app_reads(&app) {
+        return Err(RestError::too_many_requests("Rate limit exceeded", rate));
+    }
     // Pusher: "Only presence channels allow this functionality."
     if ChannelInfo::of(&channel).auth != AuthKind::Presence {
         return Err(RestError::bad_request(

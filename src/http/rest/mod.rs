@@ -6,6 +6,7 @@ pub mod channels;
 pub mod events;
 pub mod health;
 pub mod metrics;
+pub mod ratelimit;
 pub mod users;
 
 use crate::server::router::AppState;
@@ -18,7 +19,7 @@ use axum::Router;
 /// handlers run, so an unauthenticated caller cannot force a large buffer ahead
 /// of the signature check. Scoped to the REST routes only (the WS upgrade and
 /// root routes keep axum's defaults).
-pub fn merge(router: Router<AppState>, body_limit: usize) -> Router<AppState> {
+pub fn merge(router: Router<AppState>, body_limit: usize, state: AppState) -> Router<AppState> {
     let rest = Router::new()
         .route("/apps/{app_id}/events", post(events::post_events))
         .route("/apps/{app_id}/batch_events", post(events::post_batch))
@@ -35,7 +36,11 @@ pub fn merge(router: Router<AppState>, body_limit: usize) -> Router<AppState> {
             "/apps/{app_id}/users/{user_id}/terminate_connections",
             post(users::terminate_user_connections),
         )
-        .layer(DefaultBodyLimit::max(body_limit));
+        .layer(DefaultBodyLimit::max(body_limit))
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            ratelimit::node_rate_limit,
+        ));
     let probes = Router::new()
         .route("/metrics", get(metrics::get_metrics))
         .route("/health", get(health::get_health))

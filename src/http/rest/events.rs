@@ -4,6 +4,7 @@ use crate::channel::cache::CachedEvent;
 use crate::channel::kind::{validate_channel_name, AuthKind, ChannelInfo};
 use crate::http::error::RestError;
 use crate::http::rest::auth::authenticate;
+use crate::http::rest::ratelimit::RateDecision;
 use crate::protocol::event::ServerEvent;
 use crate::protocol::socket_id::SocketId;
 use crate::server::router::AppState;
@@ -262,6 +263,9 @@ pub async fn post_events(
     if state.is_saturated() {
         return Err(RestError::service_unavailable("Server overloaded"));
     }
+    if let RateDecision::Limited(rate) = state.rest_limits.check_app_events(&app, 1) {
+        return Err(RestError::too_many_requests("Rate limit exceeded", rate));
+    }
     let t: TriggerBody = merged_trigger_body(&body, &params)?;
     if t.data.len() > state.config.max_event_payload_bytes {
         return Err(RestError::payload_too_large("Event message over 10k"));
@@ -364,6 +368,12 @@ pub async fn post_batch(
         .map_err(|_| RestError::bad_request("invalid request body"))?;
     if b.batch.is_empty() || b.batch.len() > state.config.max_batch_events {
         return Err(RestError::bad_request("invalid batch size"));
+    }
+    if let RateDecision::Limited(rate) = state
+        .rest_limits
+        .check_app_events(&app, b.batch.len() as u32)
+    {
+        return Err(RestError::too_many_requests("Rate limit exceeded", rate));
     }
     for item in &b.batch {
         if item.data.len() > state.config.max_event_payload_bytes {
@@ -642,8 +652,10 @@ mod tests {
     }
 
     fn write_order_state(adapter: Arc<WriteOrderAdapter>) -> AppState {
+        let config = crate::server::config::ServerConfig::default();
         AppState {
-            config: crate::server::config::ServerConfig::default(),
+            rest_limits: Arc::new(crate::http::rest::ratelimit::RestRateLimits::new(&config)),
+            config,
             apps: Arc::new(crate::app::static_file::StaticFileAppManager::from_json("[]").unwrap()),
             adapter,
             conn_counts: Arc::new(dashmap::DashMap::new()),
@@ -791,9 +803,17 @@ mod tests {
 
     const SATURATION_APPS: &str = r#"[{"name":"T","id":"app1","key":"k","secret":"s"}]"#;
 
-    fn saturable_state(flag: crate::transport::fanout::SaturationFlag) -> AppState {
+    fn saturable_state(
+        flag: crate::transport::fanout::SaturationFlag,
+        max_backend_events_per_second: u32,
+    ) -> AppState {
+        let config = crate::server::config::ServerConfig {
+            max_backend_events_per_second,
+            ..crate::server::config::ServerConfig::default()
+        };
         AppState {
-            config: crate::server::config::ServerConfig::default(),
+            rest_limits: Arc::new(crate::http::rest::ratelimit::RestRateLimits::new(&config)),
+            config,
             apps: Arc::new(
                 crate::app::static_file::StaticFileAppManager::from_json(SATURATION_APPS).unwrap(),
             ),
@@ -807,6 +827,53 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_saturated_publish_is_not_billed_against_the_per_app_budget() {
+        let flag = crate::transport::fanout::SaturationFlag::default();
+        let state = saturable_state(flag.clone(), 2);
+        let path = "/apps/app1/events";
+        let body = br#"{"name":"ev","data":"1","channels":["room-a"]}"#;
+        let params = signed_params("s", "k", path, body);
+
+        let call = |state: AppState, params: HashMap<String, String>| async move {
+            post_events(
+                axum::extract::State(state),
+                Path("app1".to_string()),
+                OriginalUri(path.parse().unwrap()),
+                Ok(Query(params)),
+                Ok(Bytes::from_static(body)),
+            )
+            .await
+        };
+
+        let _ = call(state.clone(), params.clone())
+            .await
+            .expect("fixture precondition: the first publish is inside the budget of 2");
+
+        flag.set_inbox_full();
+        let err = call(state.clone(), params.clone())
+            .await
+            .expect_err("a saturated node must reject the publish");
+        assert_eq!(err.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+
+        flag.clear_inbox_full();
+        let _ = call(state.clone(), params.clone()).await.expect(
+            "the 503 published nothing, so it must not have spent the second unit of budget",
+        );
+
+        let spent = call(state, params)
+            .await
+            .expect_err("the budget of 2 is now genuinely spent");
+        assert_eq!(spent.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            spent
+                .rate
+                .expect("a 429 carries its rate headers")
+                .remaining,
+            0
+        );
+    }
+
     /// SP10 admission control on the BATCH endpoint: a saturated broadcast
     /// pipeline rejects the publish with 503 instead of piling more fan-out on a
     /// pipeline that is already behind. Driven at the handler because the flag is
@@ -815,7 +882,7 @@ mod tests {
     #[tokio::test]
     async fn a_saturated_node_rejects_batch_publishes_with_503() {
         let flag = crate::transport::fanout::SaturationFlag::default();
-        let state = saturable_state(flag.clone());
+        let state = saturable_state(flag.clone(), 0);
         let path = "/apps/app1/batch_events";
         let body = br#"{"batch":[{"name":"ev","data":"1","channel":"room-a"}]}"#;
         let params = signed_params("s", "k", path, body);

@@ -34,6 +34,7 @@ labels**.
 | Series | Type | Labels | Description |
 |---|---|---|---|
 | `pylon_up` | gauge | — | Always `1`; confirms the process is alive and the scrape succeeded |
+| `pylon_rest_rate_limited_total` | counter | `scope` | REST requests rejected with `429`; `scope="node"`, `"app_events"` or `"app_reads"`. Always emitted, reading `0` while the matching limit is off |
 
 #### Per-App
 

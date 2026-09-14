@@ -38,6 +38,9 @@ fn state() -> (AppState, Arc<AtomicBool>) {
     ));
     (
         AppState {
+            rest_limits: Arc::new(pylon::http::rest::ratelimit::RestRateLimits::new(
+                &ServerConfig::default(),
+            )),
             config: ServerConfig::default(),
             apps,
             adapter,

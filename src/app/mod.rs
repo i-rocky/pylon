@@ -48,6 +48,10 @@ pub struct App {
     #[serde(default)]
     pub capacity: u32,
     #[serde(default)]
+    pub max_backend_events_per_second: Option<u32>,
+    #[serde(default)]
+    pub max_read_requests_per_second: Option<u32>,
+    #[serde(default)]
     pub subscription_count_enabled: bool,
     #[serde(default)]
     pub webhooks: Vec<WebhookConfig>,
@@ -394,6 +398,39 @@ mod tests {
         assert!(back.client_messages_enabled);
         assert_eq!(back.webhooks.len(), 1);
         assert!(back.has_channel_occupied_webhooks);
+    }
+
+    #[test]
+    fn an_absent_rate_override_is_none_and_an_explicit_zero_is_some_zero() {
+        let absent = parse(serde_json::json!({
+            "name": "t", "id": "app", "key": "k", "secret": "s"
+        }));
+        assert_eq!(absent.max_backend_events_per_second, None);
+        assert_eq!(absent.max_read_requests_per_second, None);
+        let explicit = parse(serde_json::json!({
+            "name": "t", "id": "app", "key": "k", "secret": "s",
+            "max_backend_events_per_second": 0, "max_read_requests_per_second": 250
+        }));
+        assert_eq!(explicit.max_backend_events_per_second, Some(0));
+        assert_eq!(explicit.max_read_requests_per_second, Some(250));
+    }
+
+    #[test]
+    fn a_negative_rate_override_is_refused_rather_than_read_as_unlimited() {
+        for field in [
+            "max_backend_events_per_second",
+            "max_read_requests_per_second",
+        ] {
+            let err = serde_json::from_value::<App>(serde_json::json!({
+                "name": "t", "id": "app", "key": "k", "secret": "s",
+                field: -1
+            }))
+            .expect_err("a negative limit must not deserialize into an app");
+            assert!(
+                err.to_string().contains("expected u32"),
+                "{field}: the refusal must say what was expected, got: {err}"
+            );
+        }
     }
 
     #[test]
