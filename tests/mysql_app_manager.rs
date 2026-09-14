@@ -34,6 +34,10 @@ async fn mysql_resolves_by_id_and_key_and_filters_disabled() {
         .bind("[{\"url\":\"https://e.test\",\"event_types\":[\"channel_occupied\"]}]")
         .bind(&off_id).bind(&off_key).bind("s").bind("Off").bind(0_i64).bind(0_i64).bind(0_i64).bind(0_i64).bind("[]")
         .execute(&setup).await.unwrap();
+    sqlx::query("FLUSH PRIVILEGES")
+        .execute(&setup)
+        .await
+        .unwrap();
 
     let m = SqlAppManager::connect(&url()).await.unwrap();
     let AppLookup::Found(a) = m.by_id(&id).await.unwrap() else {
