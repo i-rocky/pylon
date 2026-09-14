@@ -264,3 +264,18 @@ jobs:
       - name: Clippy
         working-directory: conformance
         run: cargo clippy --all-targets --locked -- -D warnings
+
+  # Dependency audit: RUSTSEC advisories, the licence allowlist, banned
+  # wildcards and the crates.io-only source policy, all from deny.toml at the
+  # repo root. conformance/ is its own workspace and is not covered here, the
+  # same way it is not covered by the `check` job's fmt/clippy steps.
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2.1.1
+        with:
+          command: check
