@@ -4392,6 +4392,65 @@ async fn a_failing_vacate_script_claims_no_emission_right() {
     .expect("failing-vacate sweep test must not hang (Redis up?)");
 }
 
+#[tokio::test]
+async fn a_failing_vacate_leaves_the_channel_indexed_for_the_next_sweep() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let channel = "presence-revacate";
+        let (adapter, keys, clients) = orphaned_channel(channel).await;
+        let (webhooks, transport) = recording_webhooks();
+        let presusers = keys.presusers(TEST_APP, channel);
+
+        poison(&clients, &presusers).await;
+        let (acquired, reaped, vacated) = adapter.sweep_now(&webhooks, now_ms()).await;
+        assert!(acquired);
+        assert_eq!(reaped, 1, "the stale member is reaped before the vacate");
+        assert!(
+            vacated.is_empty(),
+            "a failed vacate must claim no emission right: {vacated:?}"
+        );
+        let still_indexed: bool = clients
+            .pool
+            .next()
+            .sismember(keys.chans(TEST_APP), channel)
+            .await
+            .expect("sismember chans");
+        assert!(
+            still_indexed,
+            "a vacate that errored must leave the channel in `chans`, the sweeper's only \
+             way of ever finding it again"
+        );
+
+        let _: i64 = clients
+            .pool
+            .next()
+            .del(&presusers)
+            .await
+            .expect("del poisoned presusers");
+        let _: i64 = clients
+            .pool
+            .next()
+            .hset(&presusers, ("u1", "1"))
+            .await
+            .expect("restore the roster");
+
+        let (_, _, vacated) = adapter.sweep_now(&webhooks, now_ms()).await;
+        assert!(
+            vacated.contains(&(TEST_APP.to_string(), channel.to_string())),
+            "the restored pass vacates the channel the poisoned pass could not: {vacated:?}"
+        );
+        assert_eq!(
+            await_recorded(&transport, 2, Duration::from_secs(3)).await,
+            vec![
+                ("member_removed".to_string(), Some("u1".to_string())),
+                ("channel_vacated".to_string(), None),
+            ],
+            "and pays the roster entry the poisoned pass owed, before the vacancy"
+        );
+    })
+    .await
+    .expect("re-vacate sweep test must not hang (Redis up?)");
+}
+
 /// A failure in the user-binding half or the dead-node half must not abort the
 /// pass: the channel half, which ran first, still did its work.
 #[tokio::test]

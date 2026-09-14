@@ -172,11 +172,11 @@ return {count, won}
 /// (the last-unsubscribe's [`UNSUBSCRIBE_LUA`]) already removed, yields `won == 0`.
 ///
 /// That same winner DRAINS the channel's presence side-tables in the same script,
-/// returning every user still on the roster — each owed one `member_removed`.
-/// `chans` is the only index without a TTL, so the SREM that de-indexes the channel
-/// is the last instant anything can still reach those hashes; doing both under one
-/// script is what stops them outliving the membership they describe, and keeps the
-/// drain on the single winner rather than every racing sweeper.
+/// returning every user still on the roster — each owed one `member_removed`. The
+/// roster is read BEFORE the de-index, since `chans` is the only index without a TTL
+/// and a channel out of it is unreachable. Doing both under one script is what stops
+/// the side-tables outliving the membership they describe, and keeps the drain on the
+/// single winner rather than every racing sweeper.
 ///
 /// `KEYS[1]` = occ hash, `KEYS[2]` = chans set, `KEYS[3]` = presusers,
 /// `KEYS[4]` = presinfo, `KEYS[5]` = presmembers, `KEYS[6]` = presseats.
@@ -184,9 +184,9 @@ return {count, won}
 /// Returns `{won, drained_user_ids}`; a non-presence channel drains empty.
 const VACATE_LUA: &str = r#"
 if redis.call('HLEN', KEYS[1]) ~= 0 then return {0, {}} end
+local roster = redis.call('HKEYS', KEYS[3])
 redis.call('DEL', KEYS[1])
 if redis.call('SREM', KEYS[2], ARGV[1]) == 0 then return {0, {}} end
-local roster = redis.call('HKEYS', KEYS[3])
 redis.call('DEL', KEYS[3], KEYS[4], KEYS[5], KEYS[6])
 return {1, roster}
 "#;

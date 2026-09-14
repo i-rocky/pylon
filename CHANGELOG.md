@@ -191,6 +191,18 @@ pre-1.0 and versions track `Cargo.toml`.
   to drop the arm.
 
 ### Fixed
+- **A sweeper vacate that faults part-way no longer loses the channel's
+  `channel_vacated` and every `member_removed` it still owed** (#101). `VACATE_LUA`
+  de-indexed the channel from `chans` before it read the presence roster with
+  `HKEYS`, and a Redis script serializes but does not roll back: a fault on that
+  read — a `WRONGTYPE`, an `OOM` write rejection, the server dying mid-script —
+  left the `SREM` applied while the sweeper took its error arm and emitted nothing.
+  `chans` is the sweeper's only discovery source, so the de-indexed channel was
+  never visited again: the vacancy went unannounced, the users whose node died
+  holding the roster were never removed, and the presence hashes stayed behind
+  unreachable. The roster is now read before any destructive command, so a fault
+  ahead of the de-index leaves the channel indexed for the next pass to reclaim,
+  and everything after it is a `DEL` of the channel's presence side-tables.
 - **The `client_event` webhook now sends `data` as a string, not as the raw JSON
   value.** `pusher-http-node` 5.3.4's `index.d.ts` declares the webhook event as
   `{name, channel, event, data: string, socket_id}`, and its `lib/webhook.js`
