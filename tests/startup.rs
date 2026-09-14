@@ -887,3 +887,44 @@ async fn mongo_app_store_boots_with_the_l1_cache_and_no_l2() {
 
     let _ = apps.delete_one(doc! { "id": &app_id }).await;
 }
+
+#[tokio::test]
+async fn rediss_app_cache_url_does_not_panic_on_missing_crypto_provider() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let dsn = format!("sqlite://{}?mode=rwc", dir.path().join("apps.db").display());
+    let port = free_port();
+
+    let mut cmd = Command::new(binary());
+    cmd.env("PYLON_BIND", "127.0.0.1")
+        .env("PYLON_PORT", port.to_string())
+        .env("PYLON_WORKERS", "1")
+        .env("PYLON_APP_MANAGER", "sqlite")
+        .env("PYLON_APP_DSN", &dsn)
+        .env("PYLON_APP_CACHE", "1")
+        .env("PYLON_APP_CACHE_REDIS_URL", "rediss://127.0.0.1:1/")
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut server = Server {
+        child: cmd.spawn().expect("spawn pylon"),
+        port,
+        _dir: dir,
+    };
+
+    let status = server.wait_exit(Duration::from_secs(10)).expect(
+        "pylon must exit (either the crypto-provider panic or the connection-refused \
+         error) within the budget",
+    );
+    let stderr = drain(&mut server);
+
+    assert!(
+        !stderr.contains("Could not automatically determine the process-level CryptoProvider"),
+        "fred must build against ring only, not both rustls crypto providers: {stderr}"
+    );
+    assert!(
+        stderr.contains("ConnectionRefused"),
+        "pylon must reach fred's real connect attempt (refused — nothing listens on \
+         127.0.0.1:1), not die before it: {stderr}"
+    );
+    assert!(!status.success(), "expected a non-zero exit: {status}");
+}
