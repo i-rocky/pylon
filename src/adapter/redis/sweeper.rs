@@ -175,8 +175,8 @@ pub(crate) async fn sweep_once(
             }
 
             // Vacate via the atomic VACATE_LUA CAS. The whole vacate DECISION+action is
-            // one script, so unlike the old HLEN→DEL→SREM round-trips it cannot straddle
-            // a concurrent last-unsubscribe's UNSUBSCRIBE_LUA and see a chans-indexed
+            // one script, so unlike the round-trips it replaced, it cannot straddle a
+            // concurrent last-unsubscribe's UNSUBSCRIBE_LUA and see a chans-indexed
             // channel whose occ is already gone (which double-fired channel_vacated).
             // The winner also gets the presence roster the script drained — every user
             // whose node died holding it, owed one member_removed BEFORE the vacate.
