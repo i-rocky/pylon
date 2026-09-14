@@ -196,6 +196,22 @@ pre-1.0 and versions track `Cargo.toml`.
   need `LocalAdapter::saturation_flag().is_saturated()`.
 
 ### Fixed
+- **The SQL app manager now negotiates TLS with MySQL and Postgres when the
+  server offers it, so `PYLON_APP_MANAGER=mysql` starts against a fresh MySQL 8
+  instead of failing at startup.** `sqlx` was built with no TLS backend, which
+  left MySQL 8's default `caching_sha2_password` plugin only its fast path — a
+  path the server offers only once some other client has fully authenticated
+  that account since the last restart. Against a freshly started server nothing
+  had, so the pool's `connect` failed with `RSA auth backend disabled` before
+  the listener ever bound, and a database restart or a replica promotion was
+  enough to stop an already-working deployment coming back up. Enabling sqlx's
+  `tls-rustls-ring` adds no new dependency — rustls and its `ring` provider were
+  already linked — and encrypts the session that carries every app `secret`.
+  `ssl-mode` still defaults to `PREFERRED`, so a server without TLS is still
+  reached in plaintext exactly as before. The MySQL suite now resets the
+  server's credential cache before the manager connects, so it exercises the
+  cold path a fresh deployment hits on every run rather than riding on whatever
+  client logged in first.
 - **A sweeper vacate that faults part-way no longer loses the channel's
   `channel_vacated` and every `member_removed` it still owed** (#101). `VACATE_LUA`
   de-indexed the channel from `chans` before it read the presence roster with
