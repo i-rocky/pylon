@@ -1989,6 +1989,75 @@ async fn client_event_oversize_name_returns_4301_and_does_not_broadcast() {
     );
 }
 
+#[tokio::test]
+async fn a_client_event_whose_broadcast_fails_is_dropped_without_erroring_the_sender() {
+    let registry = Arc::new(Registry::new());
+    let local: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(
+        registry,
+        Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+    ));
+    let adapter: Arc<dyn Adapter> =
+        Arc::new(crate::adapter::failing::FailingBroadcastAdapter::new(local));
+    let mk = || {
+        let (tx, rx) = mpsc::channel(1024);
+        let c = ConnectionContext {
+            app: std::sync::Arc::new(app_with_client_messages(true)),
+            socket_id: SocketId::generate(),
+            self_tx: tx,
+            adapter: adapter.clone(),
+            limits: crate::server::config::ServerConfig::default().limits(),
+            subscribed: HashSet::new(),
+            user: None,
+            webhooks: crate::webhook::WebhookHandle::null(),
+            presence_membership: std::collections::HashMap::new(),
+            saturated: None,
+            clustered: false,
+            mailbox_notify: None,
+            mailbox_dropped: None,
+            client_event_rate: crate::ws::rate::RateWindow::new(100),
+            capabilities: Capabilities::v7(),
+        };
+        (c, rx)
+    };
+    let (mut sender, mut rx_sender) = mk();
+    let (mut receiver, mut rx_receiver) = mk();
+
+    let channel = "private-cluster-fault";
+    for c in [&mut sender, &mut receiver] {
+        let sid = c.socket_id.as_str().to_string();
+        let sig = crate::auth::signature::channel_signature("s", &sid, channel, None);
+        c.dispatch(ClientCommand::Subscribe {
+            channel: channel.into(),
+            auth: Some(format!("k:{sig}")),
+            channel_data: None,
+        })
+        .await;
+    }
+    while rx_sender.try_recv().is_ok() {}
+    while rx_receiver.try_recv().is_ok() {}
+
+    sender
+        .dispatch(ClientCommand::ClientEvent {
+            event: "client-hello".into(),
+            channel: channel.into(),
+            data: serde_json::json!({ "hi": 1 }),
+        })
+        .await;
+
+    assert!(
+        rx_sender.try_recv().is_err(),
+        "a failed cross-node publish must not send the sender an error frame"
+    );
+    assert!(
+        sender.subscribed.contains(channel),
+        "the sender keeps its subscription: the fault is the server's, not the client's"
+    );
+    assert!(
+        rx_receiver.try_recv().is_err(),
+        "a broadcast that failed to reach the cluster delivers nowhere"
+    );
+}
+
 // Resource-hardening Task 1 — per-connection subscription cap
 
 /// Build a ConnectionContext with `limits.max_subscriptions_per_connection` set
