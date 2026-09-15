@@ -6,7 +6,8 @@ image:
   repository: ghcr.io/i-rocky/pylon
   # Empty defaults to the chart's own Chart.yaml appVersion, so a given chart
   # revision deploys a known, reproducible image. Set to "latest" (or any tag)
-  # to opt out of that pin explicitly.
+  # to opt out of that pin explicitly. Quote a purely numeric tag (e.g. "20240115")
+  # so YAML keeps it as the literal text you wrote.
   tag: ""
   pullPolicy: IfNotPresent
 

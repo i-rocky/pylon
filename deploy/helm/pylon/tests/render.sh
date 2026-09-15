@@ -5,6 +5,7 @@ HELM_IMAGE=alpine/helm:4.3.0
 helm_run() {
     docker run --rm -v "$PWD:/apps" -w /apps "$HELM_IMAGE" "$@"
 }
+trap 'rm -f .*-values.yaml.tmp' EXIT
 
 helm_run lint deploy/helm/pylon
 
@@ -25,7 +26,6 @@ printf '%s' "$nopdb" | grep -q '^kind: PodDisruptionBudget$' && { echo "FAIL: PD
 echo "OK: secret, pdb, existingSecret and no-configmap all render as specified"
 
 bignum_values=".bignum-values.yaml.tmp"
-trap 'rm -f "$bignum_values"' EXIT
 cat > "$bignum_values" <<'YAML'
 image:
   tag: 2147483648
@@ -58,3 +58,52 @@ pdbpercent=$(helm_run template pylon deploy/helm/pylon --set-string podDisruptio
 printf '%s' "$pdbpercent" | grep -q '^  minAvailable: 50%$' || { echo "FAIL: PDB minAvailable percentage override did not render exactly"; exit 1; }
 
 echo "OK: PDB minAvailable percentage override renders exactly"
+
+tag_values=".tagform-values.yaml.tmp"
+
+cat > "$tag_values" <<'YAML'
+image:
+  tag: 1.0
+YAML
+out=$(helm_run template pylon deploy/helm/pylon -f "$tag_values")
+printf '%s' "$out" | grep -q 'image: "ghcr.io/i-rocky/pylon:1"' || { echo "FAIL: integral numeric image.tag 1.0 did not render as 1"; exit 1; }
+
+cat > "$tag_values" <<'YAML'
+image:
+  tag: "20240115"
+YAML
+out=$(helm_run template pylon deploy/helm/pylon -f "$tag_values")
+printf '%s' "$out" | grep -q 'image: "ghcr.io/i-rocky/pylon:20240115"' || { echo "FAIL: quoted numeric image.tag did not render exactly"; exit 1; }
+
+cat > "$tag_values" <<'YAML'
+image:
+  tag: 1.10
+YAML
+out=$(helm_run template pylon deploy/helm/pylon -f "$tag_values")
+printf '%s' "$out" | grep -q 'image: "ghcr.io/i-rocky/pylon:1.1"' || { echo "FAIL: fractional image.tag 1.10 did not render as 1.1"; exit 1; }
+
+cat > "$tag_values" <<'YAML'
+image:
+  tag: 1.2.3
+YAML
+out=$(helm_run template pylon deploy/helm/pylon -f "$tag_values")
+printf '%s' "$out" | grep -q 'image: "ghcr.io/i-rocky/pylon:1.2.3"' || { echo "FAIL: semver image.tag did not render exactly"; exit 1; }
+
+cat > "$tag_values" <<'YAML'
+image:
+  tag: latest
+YAML
+out=$(helm_run template pylon deploy/helm/pylon -f "$tag_values")
+printf '%s' "$out" | grep -q 'image: "ghcr.io/i-rocky/pylon:latest"' || { echo "FAIL: string image.tag did not render exactly"; exit 1; }
+
+tag_default=$(helm_run template pylon deploy/helm/pylon)
+printf '%s' "$tag_default" | grep -q 'image: "ghcr.io/i-rocky/pylon:0.5.0"' || { echo "FAIL: unset image.tag did not fall through to Chart.AppVersion"; exit 1; }
+
+cat > "$tag_values" <<'YAML'
+config:
+  redisPrefix: 1.5
+YAML
+out=$(helm_run template pylon deploy/helm/pylon -f "$tag_values")
+printf '%s' "$out" | grep -A1 'name: PYLON_REDIS_PREFIX' | grep -q 'value: "1.5"' || { echo "FAIL: fractional redisPrefix did not render exactly"; exit 1; }
+
+echo "OK: every image.tag form and a fractional redisPrefix render their exact expected string"

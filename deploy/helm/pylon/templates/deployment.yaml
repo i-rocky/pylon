@@ -30,7 +30,7 @@ spec:
       containers:
         - name: pylon
           {{- $tag := .Values.image.tag | default .Chart.AppVersion }}
-          image: "{{ .Values.image.repository }}:{{ if kindIs "float64" $tag }}{{ $tag | int64 }}{{ else }}{{ $tag }}{{ end }}"
+          image: "{{ .Values.image.repository }}:{{ if and (kindIs "float64" $tag) (eq $tag (floor $tag)) }}{{ $tag | int64 }}{{ else }}{{ $tag }}{{ end }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
 
           ports:
@@ -54,7 +54,7 @@ spec:
             {{- end }}
             {{- if .Values.config.redisPrefix }}
             - name: PYLON_REDIS_PREFIX
-              value: {{ if kindIs "float64" .Values.config.redisPrefix }}{{ .Values.config.redisPrefix | int64 | quote }}{{ else }}{{ .Values.config.redisPrefix | quote }}{{ end }}
+              value: {{ if and (kindIs "float64" .Values.config.redisPrefix) (eq .Values.config.redisPrefix (floor .Values.config.redisPrefix)) }}{{ .Values.config.redisPrefix | int64 | quote }}{{ else }}{{ .Values.config.redisPrefix | quote }}{{ end }}
             {{- end }}
             - name: PYLON_WORKERS
               value: {{ .Values.config.workers | int64 | quote }}

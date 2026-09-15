@@ -21,8 +21,14 @@ pre-1.0 and versions track `Cargo.toml`.
   `int64` type-conversion function before being quoted or emitted, which
   renders the exact digit string for any integer a user can legitimately
   set; `image.tag` and `redisPrefix` can legitimately be non-numeric strings
-  (`latest`, `pylon`), so each branches on `kindIs "float64"` and only
-  applies `int64` when the value is actually a number.
+  (`latest`, `pylon`) or fractional numbers (`1.5`), and `int64` truncates a
+  fraction, so each branches on `kindIs "float64"` and only applies `int64`
+  when the value is both a number and integral (`eq $tag (floor $tag)`); a
+  fractional value renders exactly as it always did, decimal point and all,
+  unaffected by this fix, including the pre-existing YAML behaviour where an
+  unquoted `1.10` is already the float `1.1` before Helm ever sees it — quote
+  a numeric `image.tag` in your own values file if you need the literal text
+  preserved.
   `podDisruptionBudget.minAvailable` is a Kubernetes `IntOrString` and
   legitimately takes a percentage string (`"50%"`), so it is left uncoerced;
   its legitimate integer range is bounded by the replica count and can never
