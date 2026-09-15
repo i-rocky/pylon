@@ -298,10 +298,9 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
     margin, floored at 30s so it never allows less than that (override with
     `config.terminationGracePeriodSeconds`; the chart fails the render if your
     override is too small or not a usable non-negative integer), and uses a
-    rolling update strategy
-    with `maxUnavailable: 0` to keep the full replica count serving traffic
-    during a rollout. The readiness probe (`GET /ready`) removes a pod from
-    Service endpoints as soon as it enters the drain phase.
+    rolling update strategy with `maxUnavailable: 0` to keep the full replica
+    count serving traffic during a rollout. The readiness probe (`GET /ready`)
+    removes a pod from Service endpoints as soon as it enters the drain phase.
 
     ### TLS (Ingress)
 
