@@ -25,6 +25,28 @@ Switching to the `redis` adapter causes every node to:
   reconnect automatically; a brief Redis outage does not crash pylon, it only
   degrades cluster-state consistency until reconnection.
 
+### When a cross-node publish fails {#publish-failure}
+
+A publish reaches the rest of the cluster in two steps — the node hands the
+frame to its cluster bridge, and the bridge runs the Redis `PUBLISH` — and
+which of the two failed decides who received the event.
+`pylon_cluster_publish_failed_total` counts both.
+
+- **REST triggers** (`POST /apps/{id}/events`, `/batch_events`) publish
+  cross-node first and deliver locally only once that succeeded, so either
+  failure answers `503` with `Retry-After: 1` and no subscriber, local or
+  remote, received that channel's event.
+- **WebSocket client events** are handed to the bridge, which publishes on its
+  own runtime. A hand-off refused because the bridge channel is full or closed
+  drops the event before any delivery: nobody receives it, not even this node's
+  subscribers, and the sender is sent no error frame, since the fault is the
+  server's and the subscription is still good. Once the hand-off has succeeded
+  the event goes to this node's subscribers, so a `PUBLISH` that fails inside
+  the bridge after that point leaves it delivered on this node and on no other.
+
+Both are logged at `WARN`: the refused hand-off by `pylon::ws::handler`, the
+failed `PUBLISH` by `pylon::cluster::bridge`.
+
 ---
 
 ## Enabling the redis adapter

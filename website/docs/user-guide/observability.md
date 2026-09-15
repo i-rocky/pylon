@@ -124,7 +124,7 @@ disappearing, depends on the app manager backend:
 | Series | Type | Labels | Description |
 |---|---|---|---|
 | `pylon_cluster_cmd_dropped_total` | counter | — | `ClusterCmd` messages dropped on a full bridge channel |
-| `pylon_cluster_publish_failed_total` | counter | — | Cross-node broadcast publishes that failed: the bridge channel was full or closed, or Redis rejected the `PUBLISH`. A REST trigger publishes before it delivers locally, so one that hits this answers `503` and no subscriber received the event. A WebSocket client event is delivered to this node's subscribers first, so one that hits this reached local subscribers only, and is counted here and warned |
+| `pylon_cluster_publish_failed_total` | counter | — | Cross-node broadcast publishes that failed: the bridge channel was full or closed, or Redis rejected the `PUBLISH`. A REST trigger publishes cross-node before it delivers locally, so either failure answers `503` and no subscriber received the event. A WebSocket client event is handed to the cluster bridge first, so where the failure lands decides who received it: a hand-off refused by a full or closed bridge channel drops the event before any delivery — nobody receives it, not even this node's subscribers, and the sender is sent no error frame — while a Redis `PUBLISH` that fails inside the bridge after the hand-off succeeded leaves the event delivered to this node's subscribers and to no other node. Both cases are counted here and warned |
 | `pylon_redis_connected` | gauge | — | `1` = Redis connection healthy; `0` = error/disconnected |
 
 ---

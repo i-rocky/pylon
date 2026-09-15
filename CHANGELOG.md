@@ -19,6 +19,28 @@ pre-1.0 and versions track `Cargo.toml`.
   `PYLON_*` knob. Enables the `json` feature of `tracing-subscriber`, which
   pulls in its `tracing-serde` adapter as a transitive dependency; no new
   direct dependency.
+- **REST rate limits.** A node-wide pre-auth cap
+  (`PYLON_MAX_REST_REQUESTS_PER_SECOND`) plus per-app event and read caps
+  (`PYLON_MAX_BACKEND_EVENTS_PER_SECOND`,
+  `PYLON_MAX_READ_REQUESTS_PER_SECOND`), each overridable per app via the new
+  `max_backend_events_per_second` / `max_read_requests_per_second` fields
+  (absent = server default, `0` = unlimited). Over the limit: `429` with
+  `Retry-After`, `X-RateLimit-Limit` and `X-RateLimit-Remaining`. New counter
+  `pylon_rest_rate_limited_total{scope}`. Existing SQL `apps` tables without
+  the two new columns keep working unchanged.
+- **Transport flood protection.** Every inbound WebSocket frame — data and
+  control — now counts against a per-connection token bucket
+  (`PYLON_MAX_FRAMES_PER_SECOND`, default 100; `PYLON_MAX_FRAMES_BURST`,
+  defaulting to `max(250, PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION + 50)` so a
+  client can still subscribe to its full channel allowance in one burst); a
+  connection over it is closed with code `4100`. A node-wide
+  accept cap (`PYLON_MAX_ACCEPTS_PER_SECOND`, default 0 = off) closes excess
+  sockets before TLS or the HTTP upgrade. New counters
+  `pylon_frame_limited_total{worker}` and `pylon_accept_limited_total{worker}`.
+- **`cargo deny` gates every pull request.** A new root `deny.toml` denies
+  RUSTSEC vulnerability, unmaintained and yanked advisories, restricts
+  licences to an allowlist derived from the current tree, denies wildcard
+  version requirements, and permits crates.io as the only source.
 
 ### Changed
 - **The Helm chart no longer writes credentials to a ConfigMap.** `apps.json`
@@ -48,34 +70,12 @@ pre-1.0 and versions track `Cargo.toml`.
   `/batch_events` answer `503` when it fails and no subscriber received that
   channel's event (a batch stops at the first failing item; items published
   before it were delivered). A WebSocket client event is handed to the cluster
-  bridge and delivered to this node's subscribers immediately; if the bridge's
-  cross-node publish then fails, the event is counted and warned, having
-  reached local subscribers only. New counter
-  `pylon_cluster_publish_failed_total`.
-
-### Added
-- **REST rate limits.** A node-wide pre-auth cap
-  (`PYLON_MAX_REST_REQUESTS_PER_SECOND`) plus per-app event and read caps
-  (`PYLON_MAX_BACKEND_EVENTS_PER_SECOND`,
-  `PYLON_MAX_READ_REQUESTS_PER_SECOND`), each overridable per app via the new
-  `max_backend_events_per_second` / `max_read_requests_per_second` fields
-  (absent = server default, `0` = unlimited). Over the limit: `429` with
-  `Retry-After`, `X-RateLimit-Limit` and `X-RateLimit-Remaining`. New counter
-  `pylon_rest_rate_limited_total{scope}`. Existing SQL `apps` tables without
-  the two new columns keep working unchanged.
-- **Transport flood protection.** Every inbound WebSocket frame — data and
-  control — now counts against a per-connection token bucket
-  (`PYLON_MAX_FRAMES_PER_SECOND`, default 100; `PYLON_MAX_FRAMES_BURST`,
-  defaulting to `max(250, PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION + 50)` so a
-  client can still subscribe to its full channel allowance in one burst); a
-  connection over it is closed with code `4100`. A node-wide
-  accept cap (`PYLON_MAX_ACCEPTS_PER_SECOND`, default 0 = off) closes excess
-  sockets before TLS or the HTTP upgrade. New counters
-  `pylon_frame_limited_total{worker}` and `pylon_accept_limited_total{worker}`.
-- **`cargo deny` gates every pull request.** A new root `deny.toml` denies
-  RUSTSEC vulnerability, unmaintained and yanked advisories, restricts
-  licences to an allowlist derived from the current tree, denies wildcard
-  version requirements, and permits crates.io as the only source.
+  bridge before any local delivery, so a hand-off refused by a full or closed
+  bridge channel drops the event before it reaches anyone — not even this
+  node's subscribers — and the sender is sent no error frame, while a bridge
+  whose own Redis `PUBLISH` fails after accepting the hand-off leaves the event
+  delivered to this node's subscribers and to no other node. Both are counted
+  and warned. New counter `pylon_cluster_publish_failed_total`.
 
 ### Fixed
 - **A malformed `PYLON_*` value is reported once, not twice.** `env_parse` wrote
