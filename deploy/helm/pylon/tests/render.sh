@@ -38,8 +38,6 @@ autoscaling:
   minReplicas: 2147483648
   maxReplicas: 2147483648
   targetCPUUtilizationPercentage: 2147483648
-podDisruptionBudget:
-  minAvailable: 2147483648
 service:
   port: 2147483648
 YAML
@@ -49,3 +47,8 @@ printf '%s' "$bignum" | grep -A1 'name: PYLON_MEMORY_BUDGET_BYTES' | grep -q 'va
 printf '%s' "$bignum" | grep -q 'e+' && { echo "FAIL: rendered chart contains scientific notation"; exit 1; }
 
 echo "OK: large numeric overrides render as plain integers, no scientific notation"
+
+pdbpercent=$(helm_run template pylon deploy/helm/pylon --set-string podDisruptionBudget.minAvailable=50%)
+printf '%s' "$pdbpercent" | grep -q '^  minAvailable: 50%$' || { echo "FAIL: PDB minAvailable percentage override did not render exactly"; exit 1; }
+
+echo "OK: PDB minAvailable percentage override renders exactly"

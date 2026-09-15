@@ -8,17 +8,20 @@ pre-1.0 and versions track `Cargo.toml`.
 
 ### Fixed
 - **A large `config.memoryBudgetBytes` (or `workers`, `shutdownPredrainsMs`,
-  `shutdownGraceMs`, `replicaCount`, `service.port`, the autoscaling
-  replica/utilization fields, or `podDisruptionBudget.minAvailable`) no
-  longer crash-loops the pod.** Helm parses values YAML through
-  `sigs.k8s.io/yaml`, which decodes every number as `float64`; rendering one
-  of these straight into a template (`{{ .Values.x }}` or `{{ .Values.x |
-  quote }}`) let Go's default float formatting flip a large whole number into
-  scientific notation (`2.147483648e+09`), which pylon rejects and which is
-  not a valid Kubernetes integer field either. Each of these now goes through
-  Helm's `int64` type-conversion function before being quoted or emitted,
-  which renders the exact digit string for any integer a user can legitimately
-  set.
+  `shutdownGraceMs`, `replicaCount`, `service.port`, or the autoscaling
+  replica/utilization fields) no longer crash-loops the pod.** Helm parses
+  values YAML through `sigs.k8s.io/yaml`, which decodes every number as
+  `float64`; rendering one of these straight into a template (`{{
+  .Values.x }}` or `{{ .Values.x | quote }}`) let Go's default float
+  formatting flip a large whole number into scientific notation
+  (`2.147483648e+09`), which pylon rejects and which is not a valid
+  Kubernetes integer field either. Each of these now goes through Helm's
+  `int64` type-conversion function before being quoted or emitted, which
+  renders the exact digit string for any integer a user can legitimately
+  set. `podDisruptionBudget.minAvailable` is a Kubernetes `IntOrString` and
+  legitimately takes a percentage string (`"50%"`), so it is left uncoerced;
+  its legitimate integer range is bounded by the replica count and can never
+  reach the magnitude where this bug triggers.
 
 ## [0.5.0] - 2026-09-15
 

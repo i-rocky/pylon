@@ -6,7 +6,7 @@ metadata:
   labels:
     {{- include "pylon.labels" . | nindent 4 }}
 spec:
-  minAvailable: {{ .Values.podDisruptionBudget.minAvailable | int64 }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
   selector:
     matchLabels:
       {{- include "pylon.selectorLabels" . | nindent 6 }}
