@@ -5,7 +5,7 @@ metadata:
   labels:
     {{- include "pylon.labels" . | nindent 4 }}
 spec:
-  replicas: {{ .Values.replicaCount }}
+  replicas: {{ .Values.replicaCount | int64 }}
   selector:
     matchLabels:
       {{- include "pylon.selectorLabels" . | nindent 6 }}
@@ -56,16 +56,16 @@ spec:
               value: {{ .Values.config.redisPrefix | quote }}
             {{- end }}
             - name: PYLON_WORKERS
-              value: {{ .Values.config.workers | quote }}
+              value: {{ .Values.config.workers | int64 | quote }}
             - name: PYLON_APPS_PATH
               value: "/etc/pylon/apps.json"
             - name: PYLON_SHUTDOWN_PREDRAIN_MS
-              value: {{ .Values.config.shutdownPredrainsMs | quote }}
+              value: {{ .Values.config.shutdownPredrainsMs | int64 | quote }}
             - name: PYLON_SHUTDOWN_GRACE_MS
-              value: {{ .Values.config.shutdownGraceMs | quote }}
+              value: {{ .Values.config.shutdownGraceMs | int64 | quote }}
             {{- if .Values.config.memoryBudgetBytes }}
             - name: PYLON_MEMORY_BUDGET_BYTES
-              value: {{ .Values.config.memoryBudgetBytes | quote }}
+              value: {{ .Values.config.memoryBudgetBytes | int64 | quote }}
             {{- end }}
 
           volumeMounts:
