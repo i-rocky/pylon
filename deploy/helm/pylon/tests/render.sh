@@ -70,10 +70,10 @@ printf '%s' "$out" | grep -q 'image: "ghcr.io/i-rocky/pylon:20240115"' || { echo
 
 cat > "$tag_values" <<'YAML'
 image:
-  tag: "20240115"
+  tag: "007"
 YAML
 out=$(helm_run template pylon deploy/helm/pylon -f "$tag_values")
-printf '%s' "$out" | grep -q 'image: "ghcr.io/i-rocky/pylon:20240115"' || { echo "FAIL: quoted numeric image.tag did not render exactly"; exit 1; }
+printf '%s' "$out" | grep -q 'image: "ghcr.io/i-rocky/pylon:007"' || { echo "FAIL: quoted numeric image.tag did not render exactly"; exit 1; }
 
 cat > "$tag_values" <<'YAML'
 image:
