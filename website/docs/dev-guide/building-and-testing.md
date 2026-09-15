@@ -62,7 +62,9 @@ cargo build --release # optimised build → target/release/pylon
 
 ### Tests that need no infrastructure
 
-This is the primary, always-on gate CI runs, and needs nothing but the pinned
+This is the infrastructure-free subset of the primary, always-on gate CI
+runs — CI's own invocation carries no `--skip` because it always has a Redis
+service available for this step — and needs nothing but the pinned
 toolchain. Run it before opening a pull request if you don't have the
 services below available locally:
 
@@ -75,8 +77,30 @@ cargo test --locked --lib \
   --test percore_wiring \
   --test readiness_states \
   --test rest --test signin --test tls --test watchlist --test webhooks \
-  -- --test-threads=1
+  -- --test-threads=1 \
+  --skip app::cache::tests::l2_hit_avoids_driver \
+  --skip app::cache::tests::l2_disabled_marker_avoids_driver \
+  --skip app::cache::tests::driver_disabled_answer_is_written_to_l2 \
+  --skip app::l2::tests::put_then_get_by_id_and_key_round_trips \
+  --skip app::l2::tests::disabled_marker_round_trips_under_both_aliases \
+  --skip app::l2::tests::get_miss_is_ok_none \
+  --skip app::l2::tests::del_removes_both_keys \
+  --skip app::invalidation::tests::publish_on_one_node_evicts_another \
+  --skip app::invalidation::tests::remove_publish_force_closes_conn_clears_counter_and_evicts_cache_on_node_b \
+  --skip http::rest::admin::tests::handler_authed_with_invalidator_returns_202
 ```
+
+!!! note "Ten `--lib` tests are Redis-gated, not infrastructure-free"
+    The `--skip` list above excludes 10 unit tests colocated with the
+    Redis-backed L2 app cache and cross-node invalidation code
+    (`src/app/cache.rs`, `src/app/l2.rs`, `src/app/invalidation.rs`,
+    `src/http/rest/admin.rs`). They open a real Redis connection
+    (`PYLON_TEST_REDIS_URL`, default `redis://127.0.0.1:6390`) instead of
+    mocking it, and they only exist as `--lib` tests because they reach
+    private mock scaffolding with no business being public API — they can't
+    move into a `tests/*.rs` integration binary alongside the cluster/Redis
+    suites below. They fail loudly, not silently, without Redis. The full
+    suite (next section) runs them.
 
 ### Full suite (all services)
 
@@ -151,9 +175,10 @@ warnings that only appear in the default-features build (`cargo build --release`
 ## Load-Testing Crate
 
 The `load/` workspace crate contains scenario-based load tests and the
-`pylon-ceiling` capacity-finder binary. `pylon-ceiling` performs a binary
-search over connection counts to find the maximum sustainable concurrency on a
-given host, taking latency, CPU, and memory constraints as stop criteria.
+`pylon-ceiling` capacity-finder binary. `pylon-ceiling` ramps connections in
+fixed-size batches (`--conn-batch`) to find the maximum sustainable
+concurrency on a given host, taking latency, CPU, and memory constraints as
+stop criteria.
 
 See [`load/`](https://github.com/i-rocky/pylon/tree/master/load) for details
 on running load scenarios and the ceiling tool.

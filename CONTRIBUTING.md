@@ -42,8 +42,27 @@ cargo test --locked --lib \
   --test percore_wiring \
   --test readiness_states \
   --test rest --test signin --test tls --test watchlist --test webhooks \
-  -- --test-threads=1
+  -- --test-threads=1 \
+  --skip app::cache::tests::l2_hit_avoids_driver \
+  --skip app::cache::tests::l2_disabled_marker_avoids_driver \
+  --skip app::cache::tests::driver_disabled_answer_is_written_to_l2 \
+  --skip app::l2::tests::put_then_get_by_id_and_key_round_trips \
+  --skip app::l2::tests::disabled_marker_round_trips_under_both_aliases \
+  --skip app::l2::tests::get_miss_is_ok_none \
+  --skip app::l2::tests::del_removes_both_keys \
+  --skip app::invalidation::tests::publish_on_one_node_evicts_another \
+  --skip app::invalidation::tests::remove_publish_force_closes_conn_clears_counter_and_evicts_cache_on_node_b \
+  --skip http::rest::admin::tests::handler_authed_with_invalidator_returns_202
 ```
+
+The 10 skipped names are unit tests colocated with the Redis-backed L2 app
+cache and cross-node invalidation code (`src/app/cache.rs`, `src/app/l2.rs`,
+`src/app/invalidation.rs`, `src/http/rest/admin.rs`). They open a real Redis
+connection (`PYLON_TEST_REDIS_URL`, default `redis://127.0.0.1:6390`) rather
+than mocking it, and they only exist as `--lib` tests because they reach
+private mock scaffolding that has no business being public API — so they
+can't move into a `tests/*.rs` integration binary. They fail loudly, not
+silently, without Redis. The full suite (below) runs them.
 
 See the "Testing" section of the [dev guide](website/docs/dev-guide/building-and-testing.md) for
 the full-suite and per-service commands.
