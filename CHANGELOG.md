@@ -182,10 +182,12 @@ pre-1.0 and versions track `Cargo.toml`.
 - **The "no infrastructure" test command in `CONTRIBUTING.md` and
   `website/docs/dev-guide/building-and-testing.md` actually runs without
   Redis, MySQL, Postgres or Mongo.** Ten `--lib` unit tests — colocated with
-  the Redis-backed L2 app cache and cross-node invalidation code — open a
-  real Redis connection and failed on a machine with none running; the
-  documented command now `--skip`s them by name and explains why they can't
-  move into a `tests/*.rs` integration binary.
+  the Redis-backed L2 app cache and cross-node invalidation code — opened a
+  real Redis connection and failed on a machine with none running. They move
+  into the new `tests/redis_app_cache.rs` integration binary alongside the
+  other Redis-gated suites; the command and a new `check-no-infra` CI job
+  (no service containers at all) now both run from the single
+  `scripts/test-no-infra.sh`, so the claim and CI cannot drift apart again.
 
 ## [0.5.0] - 2026-09-15
 
