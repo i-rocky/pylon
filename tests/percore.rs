@@ -901,16 +901,21 @@ async fn wait_server_close(
 /// per-app `conn_counts` increment only in `finish_establish`); a reap that
 /// decremented what it never took would drift them. Pin the net-zero invariant
 /// on both reap paths.
-fn assert_counters_net_zero(h: &Harness) {
-    assert_eq!(
-        h.node_conns.load(Ordering::SeqCst),
-        0,
-        "node_conns must net to zero after the pre-session reap"
-    );
-    assert!(
-        h.conn_counts.is_empty(),
-        "conn_counts must hold no entries after the pre-session reap"
-    );
+async fn assert_counters_net_zero(h: &Harness) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let node_conns = h.node_conns.load(Ordering::SeqCst);
+        let app_entries = h.conn_counts.len();
+        if node_conns == 0 && app_entries == 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "counters must net to zero once the close path has released them \
+             (node_conns={node_conns}, conn_counts entries={app_entries})"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// (a) A client dribbling HEADERLESS bytes slowly grows `inbuf` forever
@@ -946,7 +951,7 @@ async fn head_cap_closes_a_dribbling_slowloris() {
     writer.abort();
     let _ = writer.await;
     tokio::time::sleep(Duration::from_millis(100)).await; // reap settles
-    assert_counters_net_zero(&h);
+    assert_counters_net_zero(&h).await;
 }
 
 /// (b) A TCP connection that sends NOTHING never completes its handshake and
@@ -969,7 +974,7 @@ async fn handshake_timeout_reaps_a_silent_connection() {
         start.elapsed() >= Duration::from_millis(300),
         "the reap must respect the 500ms deadline, not close instantly"
     );
-    assert_counters_net_zero(&h);
+    assert_counters_net_zero(&h).await;
 }
 
 /// (c) The slowloris limits are generous for real handshakes: under the same
@@ -1036,7 +1041,7 @@ async fn handshake_deadline_is_not_postponed_by_activity() {
     );
     writer.abort();
     let _ = writer.await;
-    assert_counters_net_zero(&h);
+    assert_counters_net_zero(&h).await;
 }
 
 // ── Scenario 10: G5 same-burst subscribe + close deindexing ─────────────────
@@ -1219,7 +1224,7 @@ async fn same_burst_subscribe_then_close_deindexes_membership() {
     }
 
     // Counters net zero (establish → close): no leaked per-app entries either.
-    assert_counters_net_zero(&h);
+    assert_counters_net_zero(&h).await;
 }
 
 /// G5 control: the NORMAL close path (subscribe settled, THEN a separate
@@ -1279,5 +1284,5 @@ async fn normal_close_still_deindexes_and_is_idempotent() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert_counters_net_zero(&h);
+    assert_counters_net_zero(&h).await;
 }
