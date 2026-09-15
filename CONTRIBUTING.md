@@ -81,6 +81,11 @@ schema, and isolates its rows with a UUID prefix, so it's safe to point at a sha
   `docker run --rm -v "$PWD:/repo" -w /repo rust:1.98.1-alpine3.24 sh -c 'apk add --no-cache build-base musl-dev perl git && cargo install cargo-deny --locked --version 0.20.2 && cargo deny check'`.
   A new dependency whose licence is not already on the allowlist fails this gate — add the
   identifier the failure names, and nothing else.
+- **Helm chart:** CI runs `deploy/helm/pylon/tests/render.sh` on every pull request — it lints the
+  chart and asserts that the default render carries the Secret and the PodDisruptionBudget, that
+  `existingSecret` replaces the chart-created Secret, and that no ConfigMap is rendered. Run it
+  yourself from the repo root; it drives a pinned `alpine/helm` image through docker and installs
+  nothing on the host.
 - Add or update tests for behavior you change. New behavior should come with a failing test first.
 - Keep changes focused; prefer small, well-scoped commits with clear messages.
 

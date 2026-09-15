@@ -279,3 +279,12 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2.1.1
         with:
           command: check
+
+  helm:
+    name: helm render
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Lint and render the chart
+        run: deploy/helm/pylon/tests/render.sh
