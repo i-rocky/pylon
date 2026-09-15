@@ -62,45 +62,20 @@ cargo build --release # optimised build → target/release/pylon
 
 ### Tests that need no infrastructure
 
-This is the infrastructure-free subset of the primary, always-on gate CI
-runs — CI's own invocation carries no `--skip` because it always has a Redis
-service available for this step — and needs nothing but the pinned
+This is the primary, always-on gate CI runs, and needs nothing but the pinned
 toolchain. Run it before opening a pull request if you don't have the
 services below available locally:
 
 ```bash
-cargo test --locked --lib \
-  --test admin --test health --test integration --test metrics \
-  --test percore --test percore_drain --test percore_liveness \
-  --test percore_multiworker --test percore_nonblocking_establish \
-  --test percore_overload --test percore_selective_drain \
-  --test percore_wiring \
-  --test readiness_states \
-  --test rest --test signin --test tls --test watchlist --test webhooks \
-  -- --test-threads=1 \
-  --skip app::cache::tests::l2_hit_avoids_driver \
-  --skip app::cache::tests::l2_disabled_marker_avoids_driver \
-  --skip app::cache::tests::driver_disabled_answer_is_written_to_l2 \
-  --skip app::l2::tests::put_then_get_by_id_and_key_round_trips \
-  --skip app::l2::tests::disabled_marker_round_trips_under_both_aliases \
-  --skip app::l2::tests::get_miss_is_ok_none \
-  --skip app::l2::tests::del_removes_both_keys \
-  --skip app::invalidation::tests::publish_on_one_node_evicts_another \
-  --skip app::invalidation::tests::remove_publish_force_closes_conn_clears_counter_and_evicts_cache_on_node_b \
-  --skip http::rest::admin::tests::handler_authed_with_invalidator_returns_202
+scripts/test-no-infra.sh
 ```
 
-!!! note "Ten `--lib` tests are Redis-gated, not infrastructure-free"
-    The `--skip` list above excludes 10 unit tests colocated with the
-    Redis-backed L2 app cache and cross-node invalidation code
-    (`src/app/cache.rs`, `src/app/l2.rs`, `src/app/invalidation.rs`,
-    `src/http/rest/admin.rs`). They open a real Redis connection
-    (`PYLON_TEST_REDIS_URL`, default `redis://127.0.0.1:6390`) instead of
-    mocking it, and they only exist as `--lib` tests because they reach
-    private mock scaffolding with no business being public API — they can't
-    move into a `tests/*.rs` integration binary alongside the cluster/Redis
-    suites below. They fail loudly, not silently, without Redis. The full
-    suite (next section) runs them.
+`scripts/test-no-infra.sh` is the single source for this command: CI's
+`check` job (services running) and its `check-no-infra` job (none at all)
+both run it verbatim, so this page and CI cannot drift apart — a future test
+that quietly needs a service (like one that used to sit here, see "Cluster /
+Redis tests" below) fails the `check-no-infra` job instead of only a
+contributor's local run.
 
 ### Full suite (all services)
 
@@ -133,13 +108,13 @@ cargo test --locked --no-fail-fast -- --test-threads=1
 
 ### Cluster / Redis tests
 
-Tests that exercise the clustered path or the Redis adapter require a local
-Redis instance. Point at it with the `PYLON_TEST_REDIS_URL` environment
-variable:
+Tests that exercise the clustered path, the Redis adapter, or the Redis-backed
+L2 app cache and cross-node invalidation require a local Redis instance.
+Point at it with the `PYLON_TEST_REDIS_URL` environment variable:
 
 ```bash
 PYLON_TEST_REDIS_URL=redis://127.0.0.1:6390 \
-  cargo test --test cluster_bridge --test redis_cluster -- --test-threads=1
+  cargo test --test cluster_bridge --test redis_app_cache --test redis_cluster -- --test-threads=1
 ```
 
 !!! warning "Never FLUSH a shared Redis"

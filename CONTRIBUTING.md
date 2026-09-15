@@ -34,43 +34,21 @@ that need no infrastructure at all. If you don't have all four services below ru
 the infrastructure-free subset instead:
 
 ```sh
-cargo test --locked --lib \
-  --test admin --test health --test integration --test metrics \
-  --test percore --test percore_drain --test percore_liveness \
-  --test percore_multiworker --test percore_nonblocking_establish \
-  --test percore_overload --test percore_selective_drain \
-  --test percore_wiring \
-  --test readiness_states \
-  --test rest --test signin --test tls --test watchlist --test webhooks \
-  -- --test-threads=1 \
-  --skip app::cache::tests::l2_hit_avoids_driver \
-  --skip app::cache::tests::l2_disabled_marker_avoids_driver \
-  --skip app::cache::tests::driver_disabled_answer_is_written_to_l2 \
-  --skip app::l2::tests::put_then_get_by_id_and_key_round_trips \
-  --skip app::l2::tests::disabled_marker_round_trips_under_both_aliases \
-  --skip app::l2::tests::get_miss_is_ok_none \
-  --skip app::l2::tests::del_removes_both_keys \
-  --skip app::invalidation::tests::publish_on_one_node_evicts_another \
-  --skip app::invalidation::tests::remove_publish_force_closes_conn_clears_counter_and_evicts_cache_on_node_b \
-  --skip http::rest::admin::tests::handler_authed_with_invalidator_returns_202
+scripts/test-no-infra.sh
 ```
 
-The 10 skipped names are unit tests colocated with the Redis-backed L2 app
-cache and cross-node invalidation code (`src/app/cache.rs`, `src/app/l2.rs`,
-`src/app/invalidation.rs`, `src/http/rest/admin.rs`). They open a real Redis
-connection (`PYLON_TEST_REDIS_URL`, default `redis://127.0.0.1:6390`) rather
-than mocking it, and they only exist as `--lib` tests because they reach
-private mock scaffolding that has no business being public API — so they
-can't move into a `tests/*.rs` integration binary. They fail loudly, not
-silently, without Redis. The full suite (below) runs them.
+The script is the single source for this command: CI's `check` job (services
+running) and its `check-no-infra` job (none at all) both run it verbatim, so
+this claim and CI cannot drift apart — see `.github/workflows/ci.yml`.
 
 See the "Testing" section of the [dev guide](website/docs/dev-guide/building-and-testing.md) for
 the full-suite and per-service commands.
 
-Cluster and Redis-backed tests (e.g. `cluster_bridge`, `redis_cluster`, `percore_cluster`) require a
-local Redis and **fail loudly without one** — they default to `redis://127.0.0.1:6390` (port 6390,
-not the 6379 production default, so a stray run never clobbers a real instance) and refuse to
-silently pass. Export `PYLON_TEST_REDIS_URL` to point them elsewhere. The one exception is
+Cluster and Redis-backed tests (e.g. `cluster_bridge`, `redis_app_cache`, `redis_cluster`,
+`percore_cluster`) require a local Redis and **fail loudly without one** — they default to
+`redis://127.0.0.1:6390` (port 6390, not the 6379 production default, so a stray run never
+clobbers a real instance) and refuse to silently pass. Export `PYLON_TEST_REDIS_URL` to point
+them elsewhere. The one exception is
 `redis_failover`, which is opt-in via `PYLON_TEST_REDIS_FAILOVER=1` because it bounces the Redis
 container and would disrupt parallel suites (CI runs it against a dedicated container). Tests use
 random key prefixes for isolation — never run them against a Redis that holds data you care about,
