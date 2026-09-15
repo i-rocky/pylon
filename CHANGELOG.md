@@ -6,6 +6,34 @@ pre-1.0 and versions track `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+- **A large `config.memoryBudgetBytes` (or `workers`, `shutdownPredrainsMs`,
+  `shutdownGraceMs`, `replicaCount`, `service.port`, the autoscaling
+  replica/utilization fields, a date-stamped numeric `image.tag`, or a
+  numeric `config.redisPrefix`) no longer crash-loops the pod or
+  ImagePullBackOffs it.** Helm parses values YAML through `sigs.k8s.io/yaml`,
+  which decodes every number as `float64`; rendering one of these straight
+  into a template (`{{ .Values.x }}` or `{{ .Values.x | quote }}`) let Go's
+  default float formatting flip a whole number into scientific notation
+  starting as low as 1,000,000 (`service.port: 1000000` alone rendered
+  `1e+06`), which pylon rejects and which is not a valid Kubernetes integer
+  field or image tag either. The plain-integer fields now go through Helm's
+  `int64` type-conversion function before being quoted or emitted, which
+  renders the exact digit string for any integer a user can legitimately
+  set; `image.tag` and `redisPrefix` can legitimately be non-numeric strings
+  (`latest`, `pylon`) or fractional numbers (`1.5`), and `int64` truncates a
+  fraction, so each branches on `kindIs "float64"` and only applies `int64`
+  when the value is both a number and integral (`eq $tag (floor $tag)`); a
+  fractional value renders exactly as it always did, decimal point and all,
+  unaffected by this fix, including the pre-existing YAML behaviour where an
+  unquoted `1.10` is already the float `1.1` before Helm ever sees it — quote
+  a numeric `image.tag` in your own values file if you need the literal text
+  preserved.
+  `podDisruptionBudget.minAvailable` is a Kubernetes `IntOrString` and
+  legitimately takes a percentage string (`"50%"`), so it is left uncoerced;
+  its legitimate integer range is bounded by the replica count and can never
+  reach 1,000,000, the magnitude where this bug triggers.
+
 ## [0.5.0] - 2026-09-15
 
 ### Added
