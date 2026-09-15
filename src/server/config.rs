@@ -408,8 +408,10 @@ where
     }
 }
 
-/// `try_env_parse`, but a parse failure is logged at `error` and exits the
-/// process with status `1` — the same exit code `main.rs` uses for a bad CLI
+/// `try_env_parse`, but a parse failure is reported once — at `error` through
+/// `tracing` once a subscriber is installed, on stderr when none is yet (the
+/// `PYLON_LOG_FORMAT` parse runs before `init_tracing` installs one) — and exits
+/// the process with status `1`, the same exit code `main.rs` uses for a bad CLI
 /// flag (`unknown_arg_text`'s path). A malformed `PYLON_*` value is a startup
 /// error either way, so the convention matches.
 pub(crate) fn env_parse<T>(name: &str, slot: &mut T)
@@ -418,8 +420,11 @@ where
     T::Err: std::fmt::Display,
 {
     if let Err(msg) = try_env_parse(name, slot) {
-        eprintln!("{msg}");
-        tracing::error!("{msg}");
+        if tracing::dispatcher::has_been_set() {
+            tracing::error!("{msg}");
+        } else {
+            eprintln!("{msg}");
+        }
         std::process::exit(1);
     }
 }
@@ -670,6 +675,18 @@ impl ServerConfig {
                  so a client subscribing to its full channel allowance would be closed with 4100",
                 c.max_frames_burst,
                 c.max_subscriptions_per_connection
+            );
+            std::process::exit(1);
+        }
+        if c.max_backend_events_per_second > 0
+            && u64::from(c.max_backend_events_per_second) < c.max_batch_events as u64
+        {
+            tracing::error!(
+                "invalid PYLON_MAX_BACKEND_EVENTS_PER_SECOND={}: below PYLON_MAX_BATCH_EVENTS={}, \
+                 so a full batch costs more than the cap ever holds and every \
+                 `POST /batch_events` is answered 429 with a `Retry-After` that can never succeed",
+                c.max_backend_events_per_second,
+                c.max_batch_events
             );
             std::process::exit(1);
         }

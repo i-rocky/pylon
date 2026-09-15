@@ -34,6 +34,14 @@ pre-1.0 and versions track `Cargo.toml`.
   binary, a CA bundle and a one-line `/etc/passwd` running as uid 65534. The
   image has no shell: probe `/health` and `/ready` over HTTP from outside the
   container, and the compose in-container `wget` healthchecks are removed.
+- **A `PYLON_MAX_BACKEND_EVENTS_PER_SECOND` below `PYLON_MAX_BATCH_EVENTS`
+  refuses to boot.** A `POST /batch_events` costs its event count, so a non-zero
+  server-wide cap under the batch cap admitted no full-size batch at all while
+  answering `429` with a `Retry-After` no retry could satisfy. Startup now logs
+  both values and exits `1`, as `PYLON_MAX_FRAMES_BURST` below
+  `PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION` already did. A per-app
+  `max_backend_events_per_second` override is not validated against the batch
+  cap.
 - **A cross-node publish failure is no longer silent.** `Adapter::broadcast`
   returns a `Result`. A REST publish runs the cross-node publish FIRST and
   delivers locally only once it succeeded, so `POST /apps/{id}/events` and
@@ -70,6 +78,13 @@ pre-1.0 and versions track `Cargo.toml`.
   version requirements, and permits crates.io as the only source.
 
 ### Fixed
+- **A malformed `PYLON_*` value is reported once, not twice.** `env_parse` wrote
+  the failure through `tracing` AND to stderr, so a `PYLON_LOG_FORMAT=json`
+  deployment got one structured line plus a plain-text duplicate its log
+  pipeline could not parse. It now reports through `tracing` when a subscriber
+  is installed and on stderr when none is yet — which is only the
+  `PYLON_LOG_FORMAT` parse itself, since that one runs before `init_tracing`
+  installs the subscriber.
 - Cleared three `cargo deny` advisories: `rustls` moved 0.23.40 → 0.23.45
   (RUSTSEC-2026-0285, TLS 1.3 handshake messages accepted across encryption
   level boundaries), `spin` moved 0.9.8 → 0.9.9 (yanked release), and

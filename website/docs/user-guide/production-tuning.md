@@ -262,8 +262,10 @@ app-store lookup; `/health`, `/ready`, `/metrics` and the admin API are never
 limited, because an operator has to reach them during exactly the flood this
 bounds. The per-app caps run after authentication and are overridable per app
 (see [Applications & Authentication](applications.md)); a `POST /batch_events`
-costs its event count, so keep `PYLON_MAX_BACKEND_EVENTS_PER_SECOND` at or
-above `PYLON_MAX_BATCH_EVENTS` or a full-size batch can never be afforded.
+costs its event count, so a non-zero `PYLON_MAX_BACKEND_EVENTS_PER_SECOND` below
+`PYLON_MAX_BATCH_EVENTS` is refused at startup — a full-size batch could never
+be afforded. A per-app `max_backend_events_per_second` is not validated against
+the batch cap, so check that one yourself.
 
 Every one of these limits is enforced **per node**, with no cluster
 coordination — unlike an app's `capacity`, which the Redis adapter enforces
