@@ -63,10 +63,10 @@ tag_values=".tagform-values.yaml.tmp"
 
 cat > "$tag_values" <<'YAML'
 image:
-  tag: 1.0
+  tag: 20240115
 YAML
 out=$(helm_run template pylon deploy/helm/pylon -f "$tag_values")
-printf '%s' "$out" | grep -q 'image: "ghcr.io/i-rocky/pylon:1"' || { echo "FAIL: integral numeric image.tag 1.0 did not render as 1"; exit 1; }
+printf '%s' "$out" | grep -q 'image: "ghcr.io/i-rocky/pylon:20240115"' || { echo "FAIL: integral numeric image.tag 20240115 did not render as a plain integer"; exit 1; }
 
 cat > "$tag_values" <<'YAML'
 image:
