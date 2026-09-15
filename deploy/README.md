@@ -36,9 +36,11 @@ SIGTERM
 Worst-case drain: ~12 s. The systemd unit and Docker Compose both allow **20 s**
 (`TimeoutStopSec=20`, `stop_grace_period: 20s`); the Helm chart derives
 `terminationGracePeriodSeconds` from `config.shutdownPredrainsMs` +
-`config.shutdownGraceMs` plus a safety margin, floored at **30 s** so it never
-allows less. All three comfortably exceed the worst case, and raising the
-drain timing in `values.yaml` grows the Helm chart's grace period to match.
+`config.shutdownGraceMs` plus a safety margin, floored at **30 s**. All three
+comfortably exceed the worst case, and raising the drain timing in
+`values.yaml` grows the derived grace period to match; an explicit
+`config.terminationGracePeriodSeconds` override is honoured as given, provided
+it's large enough to fit the drain, which the chart enforces at render time.
 
 ---
 

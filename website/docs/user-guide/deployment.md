@@ -295,12 +295,13 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
 
     The Deployment template derives `terminationGracePeriodSeconds` from
     `config.shutdownPredrainsMs` + `config.shutdownGraceMs` plus a safety
-    margin, floored at 30s so it never allows less than that (override with
-    `config.terminationGracePeriodSeconds`; the chart fails the render if your
-    override is too small or not a usable non-negative integer), and uses a
-    rolling update strategy with `maxUnavailable: 0` to keep the full replica
-    count serving traffic during a rollout. The readiness probe (`GET /ready`)
-    removes a pod from Service endpoints as soon as it enters the drain phase.
+    margin, floored at 30s. An explicit `config.terminationGracePeriodSeconds`
+    override is honoured as given, provided it's large enough to fit the
+    drain — the chart fails the render if it's too small or not a usable
+    non-negative integer. It also uses a rolling update strategy with
+    `maxUnavailable: 0` to keep the full replica count serving traffic during
+    a rollout. The readiness probe (`GET /ready`) removes a pod from Service
+    endpoints as soon as it enters the drain phase.
 
     ### TLS (Ingress)
 
