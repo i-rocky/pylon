@@ -278,6 +278,7 @@ pub struct WorkerConfig {
     pub mailbox_dropped_slot: Option<Arc<AtomicU64>>,
     pub frame_limited_slot: Option<Arc<AtomicU64>>,
     pub accept_limited_slot: Option<Arc<AtomicU64>>,
+    pub handshake_timeout_slot: Option<Arc<AtomicU64>>,
     pub max_frames_per_second: u32,
     pub max_frames_burst: u32,
     pub max_accepts_per_second: u32,
@@ -1142,12 +1143,15 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                     }
                     Due::HandshakeTimeout(key) => {
                         // G3 (slowloris) reap. No session exists, so there is
-                        // no protocol close to emit and no counter to unwind:
-                        // both `node_conns` and `conn_counts` are taken in
+                        // no protocol close to emit, and neither `node_conns`
+                        // nor `conn_counts` is decremented: both are taken in
                         // `finish_establish`, paired with `session = Some(..)`.
                         let pre_session =
                             conns.get(key).is_some_and(|entry| entry.session.is_none());
                         if pre_session {
+                            if let Some(slot) = &cfg.handshake_timeout_slot {
+                                slot.fetch_add(1, Ordering::Relaxed);
+                            }
                             remove(
                                 &poll,
                                 &mut conns,
@@ -3278,6 +3282,7 @@ mod tests {
             mailbox_dropped_slot: None,
             frame_limited_slot: None,
             accept_limited_slot: None,
+            handshake_timeout_slot: None,
             max_frames_per_second: 0,
             max_frames_burst: 0,
             max_accepts_per_second: 0,
@@ -3583,6 +3588,7 @@ mod tests {
             mailbox_dropped_slot: None,
             frame_limited_slot: None,
             accept_limited_slot: None,
+            handshake_timeout_slot: None,
             max_frames_per_second: 0,
             max_frames_burst: 0,
             max_accepts_per_second: 0,

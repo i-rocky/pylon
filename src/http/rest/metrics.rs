@@ -212,6 +212,12 @@ pub fn encode(snapshot: &MetricsSnapshot) -> String {
         for (i, &n) in pc.accept_limited.iter().enumerate() {
             let _ = writeln!(out, "pylon_accept_limited_total{{worker=\"{i}\"}} {n}");
         }
+
+        out.push_str("# HELP pylon_handshake_timeout_total Pre-session connections reaped for exceeding the handshake deadline, per worker (cumulative)\n");
+        out.push_str("# TYPE pylon_handshake_timeout_total counter\n");
+        for (i, &n) in pc.handshake_timeout.iter().enumerate() {
+            let _ = writeln!(out, "pylon_handshake_timeout_total{{worker=\"{i}\"}} {n}");
+        }
     }
 
     // Phase-2 B2: webhook pipeline metrics.
@@ -602,6 +608,7 @@ mod tests {
             mailbox_dropped: vec![0, 0],
             frame_limited: vec![0, 0],
             accept_limited: vec![0, 0],
+            handshake_timeout: vec![0, 0],
             inflight_total: 300,
             budget_factor: 0.9,
             worker_budget_bytes: 1024 * 1024 * 512,
@@ -704,6 +711,7 @@ mod tests {
             mailbox_dropped: vec![0, 0],
             frame_limited: vec![0, 0],
             accept_limited: vec![0, 0],
+            handshake_timeout: vec![0, 0],
             inflight_total: 0,
             budget_factor: 1.0,
             worker_budget_bytes: 1,
@@ -757,6 +765,7 @@ mod tests {
             mailbox_dropped: vec![0, 0],
             frame_limited: vec![0, 0],
             accept_limited: vec![0, 0],
+            handshake_timeout: vec![0, 0],
             inflight_total: 0,
             budget_factor: 1.0,
             worker_budget_bytes: 1,
@@ -807,6 +816,7 @@ mod tests {
             mailbox_dropped: vec![0, 0],
             frame_limited: vec![2, 0],
             accept_limited: vec![0, 7],
+            handshake_timeout: vec![0, 0],
             inflight_total: 0,
             budget_factor: 1.0,
             worker_budget_bytes: 1,
@@ -845,6 +855,52 @@ mod tests {
         assert!(
             text.contains("# TYPE pylon_accept_limited_total counter"),
             "type counter accept_limited: {text}"
+        );
+    }
+
+    #[test]
+    fn encode_percore_handshake_timeout_counter_present_when_some() {
+        use crate::transport::PercoreMetricsSnapshot;
+        let pc = PercoreMetricsSnapshot {
+            inflight: vec![0, 0],
+            dropped: vec![0, 0],
+            accepted: vec![0, 0],
+            codel_dropped: vec![0, 0],
+            drophead_dropped: vec![0, 0],
+            mailbox_dropped: vec![0, 0],
+            frame_limited: vec![0, 0],
+            accept_limited: vec![0, 0],
+            handshake_timeout: vec![3, 0],
+            inflight_total: 0,
+            budget_factor: 1.0,
+            worker_budget_bytes: 1,
+        };
+        let s = MetricsSnapshot {
+            apps: HashMap::new(),
+            saturation: None,
+            percore: Some(pc),
+            webhook: None,
+            webhook_queue_depth: None,
+            cluster: None,
+            rest_rate_limited: RestRateLimitedCounts::default(),
+            app_store_up: false,
+        };
+        let text = encode(&s);
+        assert!(
+            text.contains("# HELP pylon_handshake_timeout_total "),
+            "help handshake_timeout: {text}"
+        );
+        assert!(
+            text.contains("# TYPE pylon_handshake_timeout_total counter"),
+            "type counter handshake_timeout: {text}"
+        );
+        assert!(
+            text.contains("pylon_handshake_timeout_total{worker=\"0\"} 3\n"),
+            "handshake_timeout w0: {text}"
+        );
+        assert!(
+            text.contains("pylon_handshake_timeout_total{worker=\"1\"} 0\n"),
+            "handshake_timeout w1 must be present at 0: {text}"
         );
     }
 

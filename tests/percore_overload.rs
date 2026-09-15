@@ -1146,9 +1146,10 @@ async fn a_frame_burst_above_the_limit_closes_the_connection_with_4100() {
     config.max_frames_burst = 10;
     let h = spawn_with(config).await;
     let mut ws = connect(h.port).await;
-    for _ in 0..40 {
-        ws.send(Message::Ping(Vec::new().into())).await.unwrap();
+    for _ in 0..15 {
+        ws.feed(Message::Ping(Vec::new().into())).await.unwrap();
     }
+    ws.flush().await.unwrap();
     let close = loop {
         match ws.next().await {
             Some(Ok(Message::Close(frame))) => break frame,
@@ -1191,5 +1192,156 @@ async fn an_accept_burst_above_the_limit_is_closed_before_the_handshake() {
     assert!(
         body.contains("pylon_accept_limited_total{worker=\"0\"} 1\n"),
         "{body}"
+    );
+}
+
+async fn metrics_body(port: u16) -> String {
+    reqwest::get(format!("http://127.0.0.1:{port}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+}
+
+async fn await_metric_line(port: u16, line: &str, wall: Duration) -> String {
+    let deadline = Instant::now() + wall;
+    loop {
+        let body = metrics_body(port).await;
+        if body.contains(line) {
+            return body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "`{line}` absent after {wall:?}:\n{body}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_connection_that_blows_the_handshake_deadline_is_counted_once() {
+    let _guard = HARNESS_LOCK.lock().await;
+    let port = free_port();
+    let mut config = base_config(port);
+    config.workers = 1;
+    config.handshake_timeout_ms = 400;
+    let h = spawn_with(config).await;
+
+    let silent = tokio::net::TcpStream::connect(("127.0.0.1", h.port))
+        .await
+        .expect("raw tcp connect");
+
+    await_metric_line(
+        h.port,
+        "pylon_handshake_timeout_total{worker=\"0\"} 1\n",
+        Duration::from_secs(5),
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let body = metrics_body(h.port).await;
+    assert!(
+        body.contains("pylon_handshake_timeout_total{worker=\"0\"} 1\n"),
+        "the reaped connection must be counted exactly once: {body}"
+    );
+    drop(silent);
+}
+
+#[tokio::test]
+async fn a_handshake_completed_inside_the_deadline_is_not_counted() {
+    let _guard = HARNESS_LOCK.lock().await;
+    let port = free_port();
+    let mut config = base_config(port);
+    config.workers = 1;
+    config.handshake_timeout_ms = 400;
+    let h = spawn_with(config).await;
+
+    let mut ws = connect(h.port).await;
+    assert_eq!(
+        next_json(&mut ws).await["event"],
+        "pusher:connection_established"
+    );
+
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let body = metrics_body(h.port).await;
+    assert!(
+        body.contains("pylon_handshake_timeout_total{worker=\"0\"} 0\n"),
+        "an established session must never be counted: {body}"
+    );
+
+    ws.send(Message::text(
+        json!({ "event": "pusher:ping", "data": {} }).to_string(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(next_json(&mut ws).await["event"], "pusher:pong");
+}
+
+#[tokio::test]
+async fn a_disabled_handshake_deadline_is_never_counted() {
+    let _guard = HARNESS_LOCK.lock().await;
+    let port = free_port();
+    let mut config = base_config(port);
+    config.workers = 1;
+    config.handshake_timeout_ms = 0;
+    let h = spawn_with(config).await;
+
+    let mut silent = tokio::net::TcpStream::connect(("127.0.0.1", h.port))
+        .await
+        .expect("raw tcp connect");
+
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let body = metrics_body(h.port).await;
+    assert!(
+        body.contains("pylon_handshake_timeout_total{worker=\"0\"} 0\n"),
+        "a disabled deadline must arm nothing: {body}"
+    );
+
+    use tokio::io::AsyncWriteExt;
+    silent
+        .write_all(b"G")
+        .await
+        .expect("the silent connection must still be open");
+}
+
+#[tokio::test]
+async fn a_frame_limited_close_is_not_counted_as_a_handshake_timeout() {
+    let _guard = HARNESS_LOCK.lock().await;
+    let port = free_port();
+    let mut config = base_config(port);
+    config.workers = 1;
+    config.handshake_timeout_ms = 400;
+    config.max_frames_per_second = 10;
+    config.max_frames_burst = 10;
+    let h = spawn_with(config).await;
+
+    let mut ws = connect(h.port).await;
+    for _ in 0..15 {
+        ws.feed(Message::Ping(Vec::new().into())).await.unwrap();
+    }
+    ws.flush().await.unwrap();
+    let close = loop {
+        match ws.next().await {
+            Some(Ok(Message::Close(frame))) => break frame,
+            Some(Ok(_)) => continue,
+            other => panic!("expected a Close frame, got {other:?}"),
+        }
+    };
+    let code: u16 = close
+        .expect("the close frame must carry a code")
+        .code
+        .into();
+    assert_eq!(code, 4100);
+
+    let body = await_metric_line(
+        h.port,
+        "pylon_frame_limited_total{worker=\"0\"} 1\n",
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        body.contains("pylon_handshake_timeout_total{worker=\"0\"} 0\n"),
+        "a 4100 close must not be counted as a handshake timeout: {body}"
     );
 }

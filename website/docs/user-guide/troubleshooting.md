@@ -140,6 +140,14 @@ These are all validation failures that older builds accepted:
 4. **Firewall** — ensure port `PYLON_PORT` (default `7000`) is reachable from
    the client network.
 
+5. **Reaped before the upgrade** — a connection that does not finish its HTTP
+   head, TLS, WebSocket upgrade and session establish within
+   `PYLON_HANDSHAKE_TIMEOUT_MS` (default 10 s) is torn down with no protocol
+   close, which the client sees as a bare disconnect.
+   `pylon_handshake_timeout_total{worker}` counts every such reap — a rising
+   value points at a slow, proxied or stalled handshake rather than at the app
+   key or the firewall. See [Observability](observability.md).
+
 ---
 
 ### 401 from the REST API
