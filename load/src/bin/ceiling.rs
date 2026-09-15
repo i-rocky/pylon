@@ -14,7 +14,7 @@ use anyhow::Result;
 use clap::{Parser, ValueEnum};
 
 use pylon_load::ceiling::{
-    child::{default_pylon_bin, write_temp_apps, ChildOpts, PylonChild},
+    child::{default_pylon_bin, AppsFile, ChildOpts, PylonChild},
     conn_ramp::{self, ConnRampOpts},
     rate_ramp::{self, RateRampOpts},
     report::{human, json, recommend, Envelope},
@@ -161,10 +161,10 @@ async fn main() -> Result<()> {
     let cores_list = format!("0-{}", server_cores.saturating_sub(1));
 
     // 3. Resolve apps path.
-    let apps_path = if args.apps_path.is_empty() {
-        write_temp_apps()?
+    let apps_file = if args.apps_path.is_empty() {
+        AppsFile::create_temp()?
     } else {
-        args.apps_path.clone()
+        AppsFile::use_existing(&args.apps_path)?
     };
 
     // 4. Spawn pylon child.
@@ -173,16 +173,21 @@ async fn main() -> Result<()> {
         port: args.port,
         workers: args.workers,
         cores: cores_list,
-        apps_path,
+        apps_path: apps_file.path().to_owned(),
     };
     let child = PylonChild::spawn(&child_opts).await?;
 
     // 5. Build URLs.
-    let url = format!("ws://127.0.0.1:{}/app/app-key", args.port);
+    let url = format!(
+        "ws://127.0.0.1:{}/app/{}",
+        args.port,
+        apps_file.credentials().key
+    );
     let rest = format!("http://127.0.0.1:{}", args.port);
 
     // 6. Install Ctrl-C handler; kill the child's process group before exiting.
     let pgid = child.pid();
+    let temp_apps = apps_file.owned_path().map(str::to_owned);
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         eprintln!("interrupted — tearing down pylon child");
@@ -191,6 +196,9 @@ async fn main() -> Result<()> {
         let _ = std::process::Command::new("kill")
             .args(["-TERM", &format!("-{pgid}")])
             .status();
+        if let Some(path) = &temp_apps {
+            AppsFile::remove_temp(path);
+        }
         std::process::exit(130);
     });
 
@@ -202,8 +210,8 @@ async fn main() -> Result<()> {
     if args.phase == Phase::Conn || args.phase == Phase::Both {
         let opts = ConnRampOpts {
             url: url.clone(),
-            key: "app-key".into(),
-            secret: "app-secret".into(),
+            key: apps_file.credentials().key.clone(),
+            secret: apps_file.credentials().secret.clone(),
             conn_batch: args.conn_batch,
             max_conns: args.max_conns,
             mem_ceiling_pct: args.mem_ceiling_pct,
@@ -225,9 +233,10 @@ async fn main() -> Result<()> {
 
         let opts = RateRampOpts {
             url: url.clone(),
+            app_id: apps_file.app_id().to_owned(),
             rest: rest.clone(),
-            key: "app-key".into(),
-            secret: "app-secret".into(),
+            key: apps_file.credentials().key.clone(),
+            secret: apps_file.credentials().secret.clone(),
             tput_conns,
             channels: args.channels,
             rate_start: args.rate_start,

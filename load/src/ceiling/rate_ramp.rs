@@ -44,6 +44,7 @@ pub enum TputStop {
 /// Options for the throughput-ceiling rate ramp.
 pub struct RateRampOpts {
     pub url: String,
+    pub app_id: String,
     pub rest: String,
     pub key: String,
     pub secret: String,
@@ -102,7 +103,7 @@ pub async fn run(child: &PylonChild, opts: &RateRampOpts) -> TputCeiling {
         url: opts.url.clone(),
         url_b: None,
         rest: opts.rest.clone(),
-        app_id: "app".into(),
+        app_id: opts.app_id.clone(),
         key: opts.key.clone(),
         secret: opts.secret.clone(),
         scenario: crate::cli::Scenario::Channels,
@@ -151,7 +152,7 @@ pub async fn run(child: &PylonChild, opts: &RateRampOpts) -> TputCeiling {
             publish_openloop(
                 super::openloop::OpenLoopConfig {
                     rest: opts.rest.clone(),
-                    app_id: "app".into(),
+                    app_id: opts.app_id.clone(),
                     key: opts.key.clone(),
                     secret: opts.secret.clone(),
                     channels: channels_vec.clone(),

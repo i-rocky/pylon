@@ -145,6 +145,26 @@ pre-1.0 and versions track `Cargo.toml`.
   the daemon.json edit) now come first in both docs' Docker / Compose
   section, ahead of the published-image recipe, because the daemon's
   nofile default cannot be satisfied until `fs.nr_open` is raised.
+- **`pylon-ceiling` no longer carries an app key and secret in its source.**
+  Every run that has ever used the tool authenticated its pylon child with the
+  same published `app-key` / `app-secret` pair, and an operator sweeping
+  capacity had no way to change them. The child now gets a key and a secret
+  drawn per run from the OS-seeded CSPRNG — 16 and 32 random bytes,
+  hex-encoded — written to a temp apps file the process creates exclusively at
+  mode `0600` rather than the world-readable `0644` it used before. Neither
+  value is printed, the credentials type redacts itself in debug output, and
+  the human and JSON reports carry neither. Pointing `--apps-path` at your own
+  apps file now takes the app id and the credentials from that file's first
+  app — previously both were assumed to be the hardcoded pair — so an operator
+  supplying their own never puts a secret on the command line.
+- **`pylon-ceiling` no longer deletes the apps file it was handed.** Teardown
+  removed whatever path `--apps-path` named, destroying a caller's own file —
+  which cost a real capacity run. Removal is now tied to the file the tool
+  created itself: a caller-supplied path is read, never written, and never
+  removed, whether the run succeeds, fails partway, or unwinds from a panic. A
+  temp file the tool created is removed on a clean exit and on Ctrl-C, and
+  outlives the run only under a signal the process cannot catch, such as
+  `SIGKILL`.
 
 ## [0.5.0] - 2026-09-15
 

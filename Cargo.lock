@@ -2387,6 +2387,7 @@ dependencies = [
  "hmac 0.13.0",
  "md-5 0.11.0",
  "pylon",
+ "rand 0.10.2",
  "reqwest",
  "serde",
  "serde_json",
