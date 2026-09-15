@@ -281,7 +281,9 @@ an explicit **`0`** means unlimited for this app. Those are different states —
 is not the same as writing `0`.
 
 A `POST /batch_events` costs its event count against `max_backend_events_per_second`, so a value
-below `PYLON_MAX_BATCH_EVENTS` makes a full-size batch permanently unaffordable.
+below `PYLON_MAX_BATCH_EVENTS` makes a full-size batch permanently unaffordable. Pylon refuses to
+start when the server-wide `PYLON_MAX_BACKEND_EVENTS_PER_SECOND` is non-zero and below the batch
+cap; a per-app override is not validated against it, so that one is yours to keep above the cap.
 
 Every limit is enforced **per node**, with no cluster coordination: unlike `capacity`, which the
 Redis adapter enforces cluster-wide, N nodes behind a load balancer jointly allow

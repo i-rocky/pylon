@@ -374,6 +374,86 @@ fn a_frames_burst_below_the_subscription_cap_refuses_to_boot() {
 }
 
 #[test]
+fn an_invalid_numeric_env_var_is_reported_exactly_once_under_json_logging() {
+    const REPORT: &str = "invalid PYLON_MAX_FRAMES_PER_SECOND=";
+    let (_dir, apps_path) = apps_file();
+    let out = Command::new(binary())
+        .env("PYLON_BIND", "127.0.0.1")
+        .env("PYLON_PORT", free_port().to_string())
+        .env("PYLON_ADAPTER", "local")
+        .env("PYLON_APPS_PATH", &apps_path)
+        .env("PYLON_LOG_FORMAT", "json")
+        .env("PYLON_MAX_FRAMES_PER_SECOND", "abc")
+        .output()
+        .expect("run the pylon binary");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unparseable PYLON_* value must exit 1"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        format!("{stdout}{stderr}").matches(REPORT).count(),
+        1,
+        "the failure must be reported once: stdout {stdout:?}, stderr {stderr:?}"
+    );
+    let line = stdout.lines().find(|l| l.contains(REPORT)).unwrap_or_else(|| {
+        panic!("the report belongs in the configured json stream: stdout {stdout:?}, stderr {stderr:?}")
+    });
+    let v: Value = serde_json::from_str(line.trim())
+        .unwrap_or_else(|e| panic!("the report line must be JSON: {e}; line was {line:?}"));
+    assert_eq!(v["level"].as_str(), Some("ERROR"), "reported at error: {v}");
+    assert!(
+        v["fields"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains(REPORT) && m.contains("abc")),
+        "the message must name the variable and the offending value: {v}"
+    );
+}
+
+#[test]
+fn a_backend_event_cap_below_the_batch_cap_refuses_to_boot() {
+    let (dir, apps_path) = apps_file();
+    let port = free_port();
+    let child = server_command(port, &apps_path)
+        .env("PYLON_MAX_BACKEND_EVENTS_PER_SECOND", "5")
+        .spawn()
+        .expect("spawn pylon");
+    let mut server = Server {
+        child,
+        port,
+        _dir: dir,
+    };
+    let status = server.wait_exit(Duration::from_secs(30)).expect(
+        "a backend cap below the batch cap must refuse to boot, not serve batches it always rejects",
+    );
+    assert_eq!(status.code(), Some(1), "the refusal must exit 1");
+    let logs = format!("{}{}", drain_stdout(&mut server), drain(&mut server));
+    assert!(
+        logs.contains("PYLON_MAX_BACKEND_EVENTS_PER_SECOND=5")
+            && logs.contains("PYLON_MAX_BATCH_EVENTS=10"),
+        "the refusal must name both knobs and both values: {logs}"
+    );
+}
+
+#[tokio::test]
+async fn a_backend_event_cap_equal_to_the_batch_cap_boots() {
+    let (dir, apps_path) = apps_file();
+    let port = free_port();
+    let child = server_command(port, &apps_path)
+        .env("PYLON_MAX_BACKEND_EVENTS_PER_SECOND", "10")
+        .spawn()
+        .expect("spawn pylon");
+    let mut server = Server {
+        child,
+        port,
+        _dir: dir,
+    };
+    await_healthy(&mut server, Duration::from_secs(30)).await;
+}
+
+#[test]
 fn json_log_format_emits_parseable_lines() {
     let (dir, apps) = apps_file();
     let port = free_port();
