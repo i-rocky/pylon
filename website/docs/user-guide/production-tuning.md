@@ -234,14 +234,22 @@ capacity). See [Applications & Authentication](applications.md).
 Every limit below defaults to off, because the right number is a property of
 your hardware, not of pylon. Measure it first with the capacity finder, which
 spawns a core-pinned pylon child and sweeps both axes to their real ceilings on
-the machine you will deploy on. Pass `--tput-conns`, `--channels` and
-`--max-rate` explicitly — the defaults are sized for a quick smoke test, not
-for finding a production ceiling:
+the machine you will deploy on. Pass `--tput-conns` and `--channels`
+explicitly so you know the fan-out (see below), and raise `--max-rate` above
+its default of 5,000 — that default stops the ladder well short of a
+production rate:
 
 ```sh
 cargo run -p pylon-load --release --bin pylon-ceiling -- \
-  --phase both --tput-conns 20000 --channels 2000 --max-rate 20000 --json
+  --phase both --tput-conns 2000 --channels 200 --max-rate 20000 --json
 ```
+
+Raise `--tput-conns` (keeping it proportional to `--channels`) on a box with
+RAM to spare. Unlike the connection phase, which stops itself at
+`--mem-ceiling-pct` (default 80) of the box's memory, the throughput phase's
+subscriber pool has no memory guard of its own — at roughly 125 KB per
+connection loader-side, an unguarded `--tput-conns` can OOM the loader before
+the throughput phase produces a `tput_ceiling` at all.
 
 Its **connection phase** reports the maximum sustainable connection count
 (`conn_ceiling.max_conns`), RSS at that count, bytes per connection and
@@ -261,16 +269,17 @@ R = best.delivered_per_s ÷ (--tput-conns ÷ --channels)
 ```
 
 Neither `--tput-conns` nor `--channels` appears in `pylon-ceiling`'s own
-report — only `rate`, `delivered_per_s`, `drop_pct`, the latencies,
-`cpu_busy_pct` and `stop_reason` do. Pass both explicitly, as in the command
-above, so the fan-out is a number you chose. Reading a run that left
-`--tput-conns` at its default (`0`) instead: it resolved to
-`min(conn_ceiling.max_conns, 50000)` when the connection phase ran, or
-`10000` when it did not — read that from your own invocation, never by
-dividing by `conn_ceiling.max_conns` in the JSON. On a box where `max_conns`
-is 200,000, the auto-resolution still caps `--tput-conns` at 50,000, so
-dividing by `max_conns` instead gives a fan-out four times too large and an
-`R` four times too low.
+report — it emits `rate`, `delivered_per_s`, `drop_pct`, the latencies,
+`cpu_busy_pct`, `stop_reason` and, when `mpstat` is available, `per_core_busy`.
+Pass both explicitly, as in the command above, so the fan-out is a number you
+chose. Reading a run that left `--tput-conns` at its default (`0`) instead:
+it resolved to `min(conn_ceiling.max_conns, 50000)` when the connection phase
+ran, or `10000` when it did not. Dividing by `conn_ceiling.max_conns` from
+the JSON reproduces that only when `max_conns` was at or below 50,000 — the
+auto-resolution then returns `max_conns` itself. Above 50,000 the cap
+engages: on a box where `max_conns` is 200,000, `--tput-conns` still resolved
+to 50,000, so dividing by `max_conns` instead gives a fan-out four times too
+large and an `R` four times too low.
 
 `--tput-conns ÷ --channels` is the fan-out per published event — how many
 subscribers each publish reaches. Worked example, measured on a 2 vCPU arm64
