@@ -6,6 +6,8 @@ pre-1.0 and versions track `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-15
+
 ### Added
 - **`pylon_app_store_up` gauge** — a background task probes the app store
   (`SELECT 1` on SQL, `ping` on Mongo, a no-op for the static file) every
