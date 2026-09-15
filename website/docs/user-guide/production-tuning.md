@@ -234,19 +234,73 @@ capacity). See [Applications & Authentication](applications.md).
 Every limit below defaults to off, because the right number is a property of
 your hardware, not of pylon. Measure it first with the capacity finder, which
 spawns a core-pinned pylon child and sweeps both axes to their real ceilings on
-the machine you will deploy on:
+the machine you will deploy on. Pass `--tput-conns` and `--channels`
+explicitly so you know the fan-out (see below), and raise `--max-rate` above
+its default of 5,000 — that default stops the ladder well short of a
+production rate:
 
 ```sh
-cargo run -p pylon-load --release --bin pylon-ceiling -- --phase both --json
+cargo run -p pylon-load --release --bin pylon-ceiling -- \
+  --phase both --tput-conns 2000 --channels 200 --max-rate 20000 --json
 ```
+
+Raise `--tput-conns` (keeping it proportional to `--channels`) on a box with
+RAM to spare. Unlike the connection phase, which stops itself at
+`--mem-ceiling-pct` (default 80) of the box's memory, the throughput phase's
+subscriber pool has no memory guard of its own — at roughly 125 KB per
+connection loader-side, an unguarded `--tput-conns` can OOM the loader before
+the throughput phase produces a `tput_ceiling` at all.
 
 Its **connection phase** reports the maximum sustainable connection count
 (`conn_ceiling.max_conns`), RSS at that count, bytes per connection and
 connections per GB. Its **throughput phase** ramps the publish rate until
 deliveries drop, p99 exceeds `--p99-budget-ms` (default 100 ms) or the CPU
-saturates, and reports the last rate that held (`tput_ceiling.best.rate`).
-Take those two numbers — call them `C` (max connections) and `R` (max publishes
-per second) — and set:
+saturates, and stops at the last *clean* requested rate — `tput_ceiling.best.rate`.
+
+`best.rate` is not what the server delivered. The sweep's open-loop publisher
+sheds a tick whenever its `--max-inflight` window is full, and `drop_pct` is
+computed against *attempted* publishes, i.e. after shedding — so shedding
+never shows up as a drop, and the sweep keeps climbing while the achieved rate
+underneath it rises far more slowly than the requested rate. Derive `R` from
+what was delivered instead:
+
+```
+R = best.delivered_per_s ÷ (--tput-conns ÷ --channels)
+```
+
+Neither `--tput-conns` nor `--channels` appears in `pylon-ceiling`'s own
+report — it emits `rate`, `delivered_per_s`, `drop_pct`, the latencies,
+`cpu_busy_pct`, `stop_reason` and, when `mpstat` is available, `per_core_busy`.
+Pass both explicitly, as in the command above, so the fan-out is a number you
+chose. Reading a run that left `--tput-conns` at its default (`0`) instead:
+it resolved to `min(conn_ceiling.max_conns, 50000)` when the connection phase
+ran, or `10000` when it did not. Dividing by `conn_ceiling.max_conns` from
+the JSON reproduces that only when `max_conns` was at or below 50,000 — the
+auto-resolution then returns `max_conns` itself. Above 50,000 the cap
+engages: on a box where `max_conns` is 200,000, `--tput-conns` still resolved
+to 50,000, so dividing by `max_conns` instead gives a fan-out four times too
+large and an `R` four times too low.
+
+`--tput-conns ÷ --channels` is the fan-out per published event — how many
+subscribers each publish reaches. Worked example, measured on a 2 vCPU arm64
+box: a step requesting 5,000/s delivered 49,229/s; a later step requesting
+17,000/s delivered 63,281/s. Both ran with `--tput-conns` ten times
+`--channels`, so the achieved publish rate was 49,229 ÷ 10 = 4,923/s and
+63,281 ÷ 10 = 6,328/s — nowhere near the 5,000 and 17,000 the sweep reports as
+`best.rate`. Compute the same quotient from your own run's
+`best.delivered_per_s` and your own `--tput-conns ÷ --channels`; that is `R`.
+
+!!! warning "Quote `--max-inflight` and `--p99-budget-ms` with every throughput number"
+    `--max-inflight` is itself a throughput knob, not just a safety valve: at a
+    fixed requested rate of 12,000 on the box above, a window of 256 delivered
+    51,367/s at p99 99 ms, 1,024 delivered 60,125/s at p99 345 ms, and 4,096
+    delivered 77,304/s at p99 1,063 ms. A bare "R publishes/s" figure is
+    meaningless without the `--max-inflight` and `--p99-budget-ms` it was
+    measured at — including a later run of your own against a different
+    window.
+
+Take `C` (max connections, `conn_ceiling.max_conns`) and `R` (achieved
+publishes per second, derived above) and set:
 
 | Variable | Suggested value | Why |
 |---|---|---|
