@@ -202,3 +202,18 @@ printf '%s' "$second" | grep -q 'apps\[1\].secret' || { echo "FAIL: the second-a
 printf '%s' "$existing" | grep -q '^kind: Deployment$' || { echo "FAIL: existingSecret render without any apps value did not produce the Deployment"; exit 1; }
 
 echo "OK: the chart refuses an empty or CHANGE_ME app secret and renders only real ones or an existingSecret"
+
+printf '%s' "$default" | grep -q 'terminationGracePeriodSeconds: 18' || { echo "FAIL: default shutdownPredrainsMs+shutdownGraceMs (12s) should derive terminationGracePeriodSeconds 18"; exit 1; }
+
+raised=$(helm_run template pylon deploy/helm/pylon -f "$ci_values" --set config.shutdownGraceMs=30000)
+printf '%s' "$raised" | grep -q 'terminationGracePeriodSeconds: 38' || { echo "FAIL: shutdownPredrainsMs 2000 + shutdownGraceMs 30000 (32s, exceeds the old hardcoded 30s) should derive terminationGracePeriodSeconds 38"; exit 1; }
+
+override=$(helm_run template pylon deploy/helm/pylon -f "$ci_values" --set config.terminationGracePeriodSeconds=60)
+printf '%s' "$override" | grep -q 'terminationGracePeriodSeconds: 60' || { echo "FAIL: an explicit, sufficient config.terminationGracePeriodSeconds override should be honored"; exit 1; }
+
+if toosmall=$(helm_run template pylon deploy/helm/pylon -f "$ci_values" --set config.terminationGracePeriodSeconds=5 2>&1); then
+    echo "FAIL: config.terminationGracePeriodSeconds=5 (below the 13s minimum for the default shutdown timing) should fail the render"; exit 1
+fi
+printf '%s' "$toosmall" | grep -q 'too small' || { echo "FAIL: the too-small-override failure doesn't name the problem"; exit 1; }
+
+echo "OK: secret, pdb, existingSecret, no-configmap and terminationGracePeriodSeconds derivation/override/failure all render as specified"

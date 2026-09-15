@@ -77,6 +77,13 @@ pre-1.0 and versions track `Cargo.toml`.
   --channels`), with a worked example from that box, and calls out that
   `--max-inflight` is itself a throughput knob so no figure is quoted
   without it and `--p99-budget-ms`.
+- **The Helm chart's `terminationGracePeriodSeconds` now honours the drain
+  timing it documents, instead of a hardcoded `30` that could silently
+  truncate a raised `config.shutdownGraceMs`.** The Deployment template
+  derives it from `config.shutdownPredrainsMs` + `config.shutdownGraceMs`
+  plus a safety margin; `config.terminationGracePeriodSeconds` overrides the
+  derived value, and the chart now fails the render (instead of deploying a
+  pod that SIGKILLs mid-drain) when that override is too small.
 
 ## [0.5.0] - 2026-09-15
 
