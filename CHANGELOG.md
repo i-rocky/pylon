@@ -33,6 +33,17 @@ pre-1.0 and versions track `Cargo.toml`.
   legitimately takes a percentage string (`"50%"`), so it is left uncoerced;
   its legitimate integer range is bounded by the replica count and can never
   reach 1,000,000, the magnitude where this bug triggers.
+- **Production Tuning no longer derives `R` from `tput_ceiling.best.rate`.**
+  `pylon-ceiling`'s open-loop publisher sheds a tick whenever `--max-inflight`
+  is full, and `drop_pct` is computed against attempted (post-shed)
+  publishes, so shedding is invisible to the sweep's stop predicate and
+  `best.rate` is the last requested rate, not the delivered one — following
+  the old guidance set `PYLON_MAX_REST_REQUESTS_PER_SECOND` roughly 2.8×
+  too high on a measured 2 vCPU arm64 box. The doc now derives `R` from
+  `best.delivered_per_s` divided by the fan-out (`--tput-conns ÷
+  --channels`), with a worked example from that box, and calls out that
+  `--max-inflight` is itself a throughput knob so no figure is quoted
+  without it and `--p99-budget-ms`.
 
 ## [0.5.0] - 2026-09-15
 

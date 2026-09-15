@@ -244,9 +244,39 @@ Its **connection phase** reports the maximum sustainable connection count
 (`conn_ceiling.max_conns`), RSS at that count, bytes per connection and
 connections per GB. Its **throughput phase** ramps the publish rate until
 deliveries drop, p99 exceeds `--p99-budget-ms` (default 100 ms) or the CPU
-saturates, and reports the last rate that held (`tput_ceiling.best.rate`).
-Take those two numbers — call them `C` (max connections) and `R` (max publishes
-per second) — and set:
+saturates, and stops at the last rate it *requested* — `tput_ceiling.best.rate`.
+
+`best.rate` is not what the server delivered. The sweep's open-loop publisher
+sheds a tick whenever its `--max-inflight` window is full, and `drop_pct` is
+computed against *attempted* publishes, i.e. after shedding — so shedding
+never shows up as a drop, and the sweep keeps climbing while the server is
+actually serving a flat rate underneath it. Derive `R` from what was
+delivered instead:
+
+```
+R = best.delivered_per_s ÷ (--tput-conns ÷ --channels)
+```
+
+`--tput-conns ÷ --channels` is the fan-out per published event — how many
+subscribers each publish reaches. Worked example, measured on a 2 vCPU arm64
+box: a step requesting 5,000/s delivered 49,229/s; a later step requesting
+17,000/s delivered 63,281/s. Both ran with `--tput-conns` ten times
+`--channels`, so the achieved publish rate was 49,229 ÷ 10 = 4,923/s and
+63,281 ÷ 10 = 6,328/s — nowhere near the 5,000 and 17,000 the sweep reports as
+`best.rate`. Compute the same quotient from your own run's
+`best.delivered_per_s` and your own `--tput-conns ÷ --channels`; that is `R`.
+
+!!! warning "Quote `--max-inflight` and `--p99-budget-ms` with every throughput number"
+    `--max-inflight` is itself a throughput knob, not just a safety valve: at a
+    fixed requested rate of 12,000 on the box above, a window of 256 delivered
+    51,367/s at p99 99 ms, 1,024 delivered 60,125/s at p99 345 ms, and 4,096
+    delivered 77,304/s at p99 1,063 ms. A bare "R publishes/s" figure is
+    meaningless without the `--max-inflight` and `--p99-budget-ms` it was
+    measured at — including a later run of your own against a different
+    window.
+
+Take `C` (max connections, `conn_ceiling.max_conns`) and `R` (achieved
+publishes per second, derived above) and set:
 
 | Variable | Suggested value | Why |
 |---|---|---|
