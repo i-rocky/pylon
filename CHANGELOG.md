@@ -37,9 +37,10 @@ pre-1.0 and versions track `Cargo.toml`.
   `pylon-ceiling`'s open-loop publisher sheds a tick whenever `--max-inflight`
   is full, and `drop_pct` is computed against attempted (post-shed)
   publishes, so shedding is invisible to the sweep's stop predicate and
-  `best.rate` is the last requested rate, not the delivered one — following
-  the old guidance set `PYLON_MAX_REST_REQUESTS_PER_SECOND` roughly 2.8×
-  too high on a measured 2 vCPU arm64 box. The doc now derives `R` from
+  `best.rate` is the last clean requested rate, not the delivered one —
+  following the old guidance set `PYLON_MAX_REST_REQUESTS_PER_SECOND` roughly
+  2.7× too high on a measured 2 vCPU arm64 box (17,000 ÷ 6,328 in the doc's
+  worked example). The doc now derives `R` from
   `best.delivered_per_s` divided by the fan-out (`--tput-conns ÷
   --channels`), with a worked example from that box, and calls out that
   `--max-inflight` is itself a throughput knob so no figure is quoted
