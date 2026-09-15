@@ -6,6 +6,16 @@ pre-1.0 and versions track `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+- **`pylon_handshake_timeout_total{worker}`** counts the connections reaped by
+  the slowloris handshake deadline (`PYLON_HANDSHAKE_TIMEOUT_MS`, default
+  10000). The reap closes the connection and reclaims its slot without a
+  protocol close or a log line, so a node shedding thousands of connections
+  between accept and the WebSocket upgrade showed nothing at all on the server
+  side — every other drop and limit counter stayed at zero. Only the
+  pre-session reap increments it: the accept and inbound-frame rate limiters,
+  the idle/pong `4201` and max-lifetime `4202` closes, TLS failures and normal
+  closes are unaffected and keep their own counters.
 ### Fixed
 - **A large `config.memoryBudgetBytes` (or `workers`, `shutdownPredrainsMs`,
   `shutdownGraceMs`, `replicaCount`, `service.port`, the autoscaling

@@ -148,6 +148,7 @@ async fn spawn_slow(delay: Duration) -> Harness {
                 mailbox_dropped_slot: None,
                 frame_limited_slot: None,
                 accept_limited_slot: None,
+                handshake_timeout_slot: None,
                 max_frames_per_second: 0,
                 max_frames_burst: 0,
                 max_accepts_per_second: 0,

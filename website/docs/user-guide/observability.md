@@ -88,6 +88,7 @@ disappearing, depends on the app manager backend:
 | `pylon_mailbox_dropped_total` | counter | `worker` | Frames dropped because a connection's inbound mailbox (the bounded direct-send channel for presence rosters, member events, user-targeted sends, watchlist notifications, cluster deliveries) was full when a producer tried to enqueue |
 | `pylon_frame_limited_total` | counter | `worker` | Connections closed with code 4100 for exceeding the per-connection inbound frame rate |
 | `pylon_accept_limited_total` | counter | `worker` | Sockets closed immediately after accept for exceeding the per-worker accept rate |
+| `pylon_handshake_timeout_total` | counter | `worker` | Pre-session connections reaped for exceeding `PYLON_HANDSHAKE_TIMEOUT_MS`, the absolute deadline from TCP accept within which a connection must finish its HTTP head, TLS, WebSocket upgrade and session establish. The reap sends no protocol close, so this counter is the only server-side signal that it happened |
 | `pylon_inflight_bytes` | gauge | `worker` | Bytes currently queued in each worker's outbound buffer |
 | `pylon_inflight_bytes_sum` | gauge | — | Sum of `pylon_inflight_bytes` across all workers |
 | `pylon_worker_budget_bytes` | gauge | — | Per-worker memory budget in bytes |

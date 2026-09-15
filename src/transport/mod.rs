@@ -56,6 +56,7 @@ struct PercoreRegistry {
     mailbox_dropped_slots: Vec<Arc<AtomicU64>>,
     frame_limited_slots: Vec<Arc<AtomicU64>>,
     accept_limited_slots: Vec<Arc<AtomicU64>>,
+    handshake_timeout_slots: Vec<Arc<AtomicU64>>,
     budget_factor: Arc<AtomicU32>,
     worker_budget_bytes: u64,
 }
@@ -78,6 +79,7 @@ pub struct PercoreMetricsSnapshot {
     pub mailbox_dropped: Vec<u64>,
     pub frame_limited: Vec<u64>,
     pub accept_limited: Vec<u64>,
+    pub handshake_timeout: Vec<u64>,
     /// Sum of all workers' inflight bytes.
     pub inflight_total: u64,
     /// Budget factor as a fraction (×1000 fixed-point → 0.0–1.0).
@@ -136,6 +138,11 @@ pub fn percore_metrics_snapshot() -> Option<PercoreMetricsSnapshot> {
         .iter()
         .map(|s| s.load(Ordering::Relaxed))
         .collect();
+    let handshake_timeout: Vec<u64> = guard
+        .handshake_timeout_slots
+        .iter()
+        .map(|s| s.load(Ordering::Relaxed))
+        .collect();
     let inflight_total = inflight.iter().sum();
     let budget_factor = guard.budget_factor.load(Ordering::Relaxed) as f64 / 1000.0;
     let worker_budget_bytes = guard.worker_budget_bytes;
@@ -148,6 +155,7 @@ pub fn percore_metrics_snapshot() -> Option<PercoreMetricsSnapshot> {
         mailbox_dropped,
         frame_limited,
         accept_limited,
+        handshake_timeout,
         inflight_total,
         budget_factor,
         worker_budget_bytes,
@@ -182,6 +190,7 @@ fn lock_percore_registry_for_write() -> std::sync::MutexGuard<'static, PercoreRe
                 mailbox_dropped_slots: Vec::new(),
                 frame_limited_slots: Vec::new(),
                 accept_limited_slots: Vec::new(),
+                handshake_timeout_slots: Vec::new(),
                 budget_factor: Arc::new(AtomicU32::new(1000)),
                 worker_budget_bytes: 0,
             })
@@ -385,6 +394,9 @@ pub fn run_percore(
     let accept_limited_slots: Vec<Arc<AtomicU64>> = (0..worker_count)
         .map(|_| Arc::new(AtomicU64::new(0)))
         .collect();
+    let handshake_timeout_slots: Vec<Arc<AtomicU64>> = (0..worker_count)
+        .map(|_| Arc::new(AtomicU64::new(0)))
+        .collect();
 
     // Build the per-core sharded broadcast plumbing: one `(Sender, Receiver)`
     // pair + `WorkerSlot` per worker. The `Sender`s live in the sink (installed
@@ -508,6 +520,9 @@ pub fn run_percore(
         g.accept_limited_slots.clear();
         g.accept_limited_slots
             .extend(accept_limited_slots.iter().cloned());
+        g.handshake_timeout_slots.clear();
+        g.handshake_timeout_slots
+            .extend(handshake_timeout_slots.iter().cloned());
         g.budget_factor = budget_factor.clone();
         g.worker_budget_bytes = per_worker_budget;
     }
@@ -536,6 +551,7 @@ pub fn run_percore(
             mailbox_dropped_slot: Some(mailbox_dropped_slots[i].clone()),
             frame_limited_slot: Some(frame_limited_slots[i].clone()),
             accept_limited_slot: Some(accept_limited_slots[i].clone()),
+            handshake_timeout_slot: Some(handshake_timeout_slots[i].clone()),
             max_frames_per_second: config.max_frames_per_second,
             max_frames_burst: config.max_frames_burst,
             max_accepts_per_second: if config.max_accepts_per_second == 0 {
