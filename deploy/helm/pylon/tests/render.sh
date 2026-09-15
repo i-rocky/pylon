@@ -24,26 +24,32 @@ printf '%s' "$nopdb" | grep -q '^kind: PodDisruptionBudget$' && { echo "FAIL: PD
 
 echo "OK: secret, pdb, existingSecret and no-configmap all render as specified"
 
-bignum_values="deploy/helm/pylon/tests/bignum-values.yaml.tmp"
+bignum_values=".bignum-values.yaml.tmp"
 trap 'rm -f "$bignum_values"' EXIT
 cat > "$bignum_values" <<'YAML'
+image:
+  tag: 2147483648
 config:
   workers: 2147483648
   memoryBudgetBytes: 2147483648
   shutdownPredrainsMs: 2147483648
   shutdownGraceMs: 2147483648
+  redisPrefix: 2147483648
 replicaCount: 2147483648
 autoscaling:
   enabled: true
   minReplicas: 2147483648
   maxReplicas: 2147483648
   targetCPUUtilizationPercentage: 2147483648
+  targetMemoryUtilizationPercentage: 2147483648
 service:
   port: 2147483648
 YAML
 
 bignum=$(helm_run template pylon deploy/helm/pylon -f "$bignum_values")
 printf '%s' "$bignum" | grep -A1 'name: PYLON_MEMORY_BUDGET_BYTES' | grep -q 'value: "2147483648"' || { echo "FAIL: memoryBudgetBytes did not render as a plain integer"; exit 1; }
+printf '%s' "$bignum" | grep -q 'image: "ghcr.io/i-rocky/pylon:2147483648"' || { echo "FAIL: image.tag did not render as a plain integer"; exit 1; }
+printf '%s' "$bignum" | grep -A1 'name: PYLON_REDIS_PREFIX' | grep -q 'value: "2147483648"' || { echo "FAIL: redisPrefix did not render as a plain integer"; exit 1; }
 printf '%s' "$bignum" | grep -q 'e+' && { echo "FAIL: rendered chart contains scientific notation"; exit 1; }
 
 echo "OK: large numeric overrides render as plain integers, no scientific notation"

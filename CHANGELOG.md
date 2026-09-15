@@ -8,20 +8,25 @@ pre-1.0 and versions track `Cargo.toml`.
 
 ### Fixed
 - **A large `config.memoryBudgetBytes` (or `workers`, `shutdownPredrainsMs`,
-  `shutdownGraceMs`, `replicaCount`, `service.port`, or the autoscaling
-  replica/utilization fields) no longer crash-loops the pod.** Helm parses
-  values YAML through `sigs.k8s.io/yaml`, which decodes every number as
-  `float64`; rendering one of these straight into a template (`{{
-  .Values.x }}` or `{{ .Values.x | quote }}`) let Go's default float
-  formatting flip a large whole number into scientific notation
-  (`2.147483648e+09`), which pylon rejects and which is not a valid
-  Kubernetes integer field either. Each of these now goes through Helm's
+  `shutdownGraceMs`, `replicaCount`, `service.port`, the autoscaling
+  replica/utilization fields, a date-stamped numeric `image.tag`, or a
+  numeric `config.redisPrefix`) no longer crash-loops the pod or
+  ImagePullBackOffs it.** Helm parses values YAML through `sigs.k8s.io/yaml`,
+  which decodes every number as `float64`; rendering one of these straight
+  into a template (`{{ .Values.x }}` or `{{ .Values.x | quote }}`) let Go's
+  default float formatting flip a whole number into scientific notation
+  starting as low as 1,000,000 (`service.port: 1000000` alone rendered
+  `1e+06`), which pylon rejects and which is not a valid Kubernetes integer
+  field or image tag either. The plain-integer fields now go through Helm's
   `int64` type-conversion function before being quoted or emitted, which
   renders the exact digit string for any integer a user can legitimately
-  set. `podDisruptionBudget.minAvailable` is a Kubernetes `IntOrString` and
+  set; `image.tag` and `redisPrefix` can legitimately be non-numeric strings
+  (`latest`, `pylon`), so each branches on `kindIs "float64"` and only
+  applies `int64` when the value is actually a number.
+  `podDisruptionBudget.minAvailable` is a Kubernetes `IntOrString` and
   legitimately takes a percentage string (`"50%"`), so it is left uncoerced;
   its legitimate integer range is bounded by the replica count and can never
-  reach the magnitude where this bug triggers.
+  reach 1,000,000, the magnitude where this bug triggers.
 
 ## [0.5.0] - 2026-09-15
 
