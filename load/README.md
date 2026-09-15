@@ -14,7 +14,10 @@ cargo run -p pylon-load --release --bin pylon-ceiling -- --help
 ## `pylon-load` — scenarios
 
 All scenarios point at a running server via `--url` (WebSocket) and `--rest`,
-authenticating REST triggers with `--app-id` / `--key` / `--secret`. Key flags:
+authenticating REST triggers with `--app-id` / `--key` / `--secret`. All four of
+`--url`, `--app-id`, `--key` and `--secret` are required and have no default:
+they identify one app on one server, so no built-in value could work against
+yours. Key flags:
 `--conns` (default 1000), `--rate` (events/sec, default 10), `--secs`
 (measured duration, default 10), `--ramp-per-sec` (connection ramp; default
 2000), `--publishers` (fanout only), `--channels` (channels only), `--private`
@@ -33,9 +36,9 @@ Example — 50k connections, one hot channel, 4 publishers × 100 msg/s for 30 s
 
 ```sh
 cargo run -p pylon-load --release --bin pylon-load -- \
-  --url ws://127.0.0.1:7000/app/app-key \
+  --url ws://127.0.0.1:7000/app/<app-key> \
   --rest http://127.0.0.1:7000 \
-  --app-id app --key app-key --secret app-secret \
+  --app-id <app-id> --key <app-key> --secret <app-secret> \
   --scenario fanout --conns 50000 --publishers 4 --rate 100 --secs 30
 ```
 

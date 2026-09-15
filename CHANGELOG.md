@@ -165,6 +165,16 @@ pre-1.0 and versions track `Cargo.toml`.
   temp file the tool created is removed on a clean exit and on Ctrl-C, and
   outlives the run only under a signal the process cannot catch, such as
   `SIGKILL`.
+- **`pylon-load` no longer defaults its app identity to credential-shaped
+  literals.** `--url`, `--app-id`, `--key` and `--secret` defaulted to
+  `ws://127.0.0.1:7000/app/app-key`, `app`, `app-key` and `app-secret`, so the
+  harness started happily against any server and then failed authentication —
+  and since the `fanout`, `channels` and `cluster` scenarios count a successful
+  publish rather than raising a rejected one, the run completed and reported
+  zero instead of erroring. All four now have no default and are required, so
+  clap names whichever is missing before anything connects. `Cli` and
+  `ConnRampOpts` also lose their derived `Debug`, which rendered the secret in
+  plain text and which nothing used.
 
 ## [0.5.0] - 2026-09-15
 
