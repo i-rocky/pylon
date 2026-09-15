@@ -81,9 +81,12 @@ pre-1.0 and versions track `Cargo.toml`.
   timing it documents, instead of a hardcoded `30` that could silently
   truncate a raised `config.shutdownGraceMs`.** The Deployment template
   derives it from `config.shutdownPredrainsMs` + `config.shutdownGraceMs`
-  plus a safety margin; `config.terminationGracePeriodSeconds` overrides the
-  derived value, and the chart now fails the render (instead of deploying a
-  pod that SIGKILLs mid-drain) when that override is too small.
+  plus a safety margin, floored at `30` so the derivation only ever grows the
+  grace period, never shrinks it below what every pod already gets today;
+  `config.terminationGracePeriodSeconds` overrides the derived value, and the
+  chart now fails the render (instead of deploying a pod that SIGKILLs
+  mid-drain) when that override is too small, negative, or not a usable
+  integer.
 
 ## [0.5.0] - 2026-09-15
 

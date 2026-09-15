@@ -46,10 +46,12 @@ config:
   shutdownGraceMs: 10000
 
   # Pod terminationGracePeriodSeconds. 0 (default) = derive it from
-  # shutdownPredrainsMs + shutdownGraceMs plus a safety margin, so it always
-  # fits and there's one fewer thing to keep in sync by hand. Set a positive
-  # number to override; the chart fails the render if your override is too
-  # small to fit shutdownPredrainsMs + shutdownGraceMs.
+  # shutdownPredrainsMs + shutdownGraceMs plus a safety margin, floored at 30
+  # (never less than that, so raising the drain timing only ever grows this),
+  # so it always fits and there's one fewer thing to keep in sync by hand.
+  # Set a positive number to override; the chart fails the render if your
+  # override is too small to fit shutdownPredrainsMs + shutdownGraceMs, or
+  # isn't a usable non-negative integer.
   terminationGracePeriodSeconds: 0
 
 # ── Apps configuration (apps.json) ──────────────────────────────────────────

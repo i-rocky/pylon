@@ -27,14 +27,19 @@ spec:
       {{- $graceMs := .Values.config.shutdownGraceMs | int64 }}
       {{- $sumMs := add $predrainMs $graceMs }}
       {{- $minSeconds := add (div $sumMs 1000) 1 }}
-      {{- $override := int .Values.config.terminationGracePeriodSeconds }}
+      {{- $overrideRaw := .Values.config.terminationGracePeriodSeconds }}
+      {{- $overrideStr := toString $overrideRaw }}
+      {{- if not (regexMatch "^[0-9]+$" $overrideStr) }}
+      {{- fail (printf "config.terminationGracePeriodSeconds=%q is not a usable value: it must be a non-negative integer (0 means \"derive from shutdownPredrainsMs + shutdownGraceMs\")" $overrideStr) }}
+      {{- end }}
+      {{- $override := int $overrideRaw }}
       {{- if gt $override 0 }}
       {{- if lt $override $minSeconds }}
       {{- fail (printf "config.terminationGracePeriodSeconds=%d is too small: config.shutdownPredrainsMs (%dms) + config.shutdownGraceMs (%dms) = %dms needs terminationGracePeriodSeconds >= %ds, or SIGKILL truncates the drain" $override $predrainMs $graceMs $sumMs $minSeconds) }}
       {{- end }}
       terminationGracePeriodSeconds: {{ $override }}
       {{- else }}
-      terminationGracePeriodSeconds: {{ add $minSeconds 5 }}
+      terminationGracePeriodSeconds: {{ max (add $minSeconds 5) 30 }}
       {{- end }}
 
       securityContext:

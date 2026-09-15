@@ -263,7 +263,7 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
     | `config.memoryBudgetBytes` | `0` | Memory cap in bytes. `0` = auto. |
     | `config.shutdownPredrainsMs` | `2000` | LB drain window after SIGTERM, before closing connections. |
     | `config.shutdownGraceMs` | `10000` | Max time to flush in-flight connections. |
-    | `config.terminationGracePeriodSeconds` | `0` | Pod grace period. `0` = derive from the two settings above plus a safety margin. |
+    | `config.terminationGracePeriodSeconds` | `0` | Pod grace period. `0` = derive from the two settings above plus a safety margin, floored at 30s. |
     | `autoscaling.enabled` | `false` | Enable the HPA. |
     | `autoscaling.minReplicas` | `2` | Minimum replicas when HPA is active. |
     | `autoscaling.maxReplicas` | `10` | Maximum replicas when HPA is active. |
@@ -294,9 +294,11 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
     ### Graceful rollout
 
     The Deployment template derives `terminationGracePeriodSeconds` from
-    `config.shutdownPredrainsMs` + `config.shutdownGraceMs` plus a safety margin
-    (override with `config.terminationGracePeriodSeconds`; the chart fails the
-    render if your override is too small), and uses a rolling update strategy
+    `config.shutdownPredrainsMs` + `config.shutdownGraceMs` plus a safety
+    margin, floored at 30s so it never allows less than that (override with
+    `config.terminationGracePeriodSeconds`; the chart fails the render if your
+    override is too small or not a usable non-negative integer), and uses a
+    rolling update strategy
     with `maxUnavailable: 0` to keep the full replica count serving traffic
     during a rollout. The readiness probe (`GET /ready`) removes a pod from
     Service endpoints as soon as it enters the drain phase.

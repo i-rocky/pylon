@@ -34,8 +34,11 @@ SIGTERM
 ```
 
 Worst-case drain: ~12 s. The systemd unit and Docker Compose both allow **20 s**
-(`TimeoutStopSec=20`, `stop_grace_period: 20s`); the Helm chart allows **30 s**
-(`terminationGracePeriodSeconds: 30`). All three comfortably exceed the worst case.
+(`TimeoutStopSec=20`, `stop_grace_period: 20s`); the Helm chart derives
+`terminationGracePeriodSeconds` from `config.shutdownPredrainsMs` +
+`config.shutdownGraceMs` plus a safety margin, floored at **30 s** so it never
+allows less. All three comfortably exceed the worst case, and raising the
+drain timing in `values.yaml` grows the Helm chart's grace period to match.
 
 ---
 
@@ -259,8 +262,11 @@ any app's `secret` is empty or the placeholder `CHANGE_ME`, so set one
 
 ### Graceful rollout
 
-`terminationGracePeriodSeconds: 30` (in the Deployment template) gives pylon
-30 s to complete its drain (predrain 2 s + grace 10 s + slack). The rolling
+The Deployment template derives `terminationGracePeriodSeconds` from
+`config.shutdownPredrainsMs` + `config.shutdownGraceMs` plus a safety margin,
+floored at 30 s (defaults to 30 s; only grows if you raise the drain timing).
+Override it with `config.terminationGracePeriodSeconds` — the chart fails the
+render if your override is too small. The rolling
 update strategy (`maxUnavailable: 0`) keeps the full replica count serving
 traffic throughout a rollout.
 
