@@ -37,11 +37,20 @@ config:
   # non-zero budget instead of the reserve consuming the whole limit).
   memoryBudgetBytes: 0
 
-  # Graceful shutdown timing (must sum to less than terminationGracePeriodSeconds).
+  # Graceful shutdown timing. The chart derives the pod's
+  # terminationGracePeriodSeconds from this pair, so the two always fit —
+  # see config.terminationGracePeriodSeconds below.
   # Pre-drain: wait after SIGTERM before closing connections (LB drain window).
   shutdownPredrainsMs: 2000
   # Grace: max time to flush in-flight connections.
   shutdownGraceMs: 10000
+
+  # Pod terminationGracePeriodSeconds. 0 (default) = derive it from
+  # shutdownPredrainsMs + shutdownGraceMs plus a safety margin, so it always
+  # fits and there's one fewer thing to keep in sync by hand. Set a positive
+  # number to override; the chart fails the render if your override is too
+  # small to fit shutdownPredrainsMs + shutdownGraceMs.
+  terminationGracePeriodSeconds: 0
 
 # ── Apps configuration (apps.json) ──────────────────────────────────────────
 # The apps list is rendered into a Kubernetes Secret (never a ConfigMap) and

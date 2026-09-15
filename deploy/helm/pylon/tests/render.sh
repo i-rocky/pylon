@@ -107,3 +107,17 @@ out=$(helm_run template pylon deploy/helm/pylon -f "$tag_values")
 printf '%s' "$out" | grep -A1 'name: PYLON_REDIS_PREFIX' | grep -q 'value: "1.5"' || { echo "FAIL: fractional redisPrefix did not render exactly"; exit 1; }
 
 echo "OK: every image.tag form and a fractional redisPrefix render their exact expected string"
+printf '%s' "$default" | grep -q 'terminationGracePeriodSeconds: 18' || { echo "FAIL: default shutdownPredrainsMs+shutdownGraceMs (12s) should derive terminationGracePeriodSeconds 18"; exit 1; }
+
+raised=$(helm_run template pylon deploy/helm/pylon --set config.shutdownGraceMs=30000)
+printf '%s' "$raised" | grep -q 'terminationGracePeriodSeconds: 38' || { echo "FAIL: shutdownPredrainsMs 2000 + shutdownGraceMs 30000 (32s, exceeds the old hardcoded 30s) should derive terminationGracePeriodSeconds 38"; exit 1; }
+
+override=$(helm_run template pylon deploy/helm/pylon --set config.terminationGracePeriodSeconds=60)
+printf '%s' "$override" | grep -q 'terminationGracePeriodSeconds: 60' || { echo "FAIL: an explicit, sufficient config.terminationGracePeriodSeconds override should be honored"; exit 1; }
+
+if toosmall=$(helm_run template pylon deploy/helm/pylon --set config.terminationGracePeriodSeconds=5 2>&1); then
+    echo "FAIL: config.terminationGracePeriodSeconds=5 (below the 13s minimum for the default shutdown timing) should fail the render"; exit 1
+fi
+printf '%s' "$toosmall" | grep -q 'too small' || { echo "FAIL: the too-small-override failure doesn't name the problem"; exit 1; }
+
+echo "OK: secret, pdb, existingSecret, no-configmap and terminationGracePeriodSeconds derivation/override/failure all render as specified"
