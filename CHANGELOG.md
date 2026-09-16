@@ -175,6 +175,19 @@ pre-1.0 and versions track `Cargo.toml`.
   clap names whichever is missing before anything connects. `Cli` and
   `ConnRampOpts` also lose their derived `Debug`, which rendered the secret in
   plain text and which nothing used.
+- **`pylon-ceiling` docs no longer claim a binary search.** The
+  capacity-finder's connection phase ramps in fixed-size `--conn-batch`
+  batches, not a binary search over connection counts;
+  `website/docs/dev-guide/building-and-testing.md` now says so.
+- **The "no infrastructure" test command in `CONTRIBUTING.md` and
+  `website/docs/dev-guide/building-and-testing.md` actually runs without
+  Redis, MySQL, Postgres or Mongo.** Ten `--lib` unit tests — colocated with
+  the Redis-backed L2 app cache and cross-node invalidation code — opened a
+  real Redis connection and failed on a machine with none running. They move
+  into the new `tests/redis_app_cache.rs` integration binary alongside the
+  other Redis-gated suites; the command and a new `check-no-infra` CI job
+  (no service containers at all) now both run from the single
+  `scripts/test-no-infra.sh`, so the claim and CI cannot drift apart again.
 
 ## [0.5.0] - 2026-09-15
 

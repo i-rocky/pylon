@@ -34,24 +34,21 @@ that need no infrastructure at all. If you don't have all four services below ru
 the infrastructure-free subset instead:
 
 ```sh
-cargo test --locked --lib \
-  --test admin --test health --test integration --test metrics \
-  --test percore --test percore_drain --test percore_liveness \
-  --test percore_multiworker --test percore_nonblocking_establish \
-  --test percore_overload --test percore_selective_drain \
-  --test percore_wiring \
-  --test readiness_states \
-  --test rest --test signin --test tls --test watchlist --test webhooks \
-  -- --test-threads=1
+scripts/test-no-infra.sh
 ```
+
+The script is the single source for this command: CI's `check` job (services
+running) and its `check-no-infra` job (none at all) both run it verbatim, so
+this claim and CI cannot drift apart — see `.github/workflows/ci.yml`.
 
 See the "Testing" section of the [dev guide](website/docs/dev-guide/building-and-testing.md) for
 the full-suite and per-service commands.
 
-Cluster and Redis-backed tests (e.g. `cluster_bridge`, `redis_cluster`, `percore_cluster`) require a
-local Redis and **fail loudly without one** — they default to `redis://127.0.0.1:6390` (port 6390,
-not the 6379 production default, so a stray run never clobbers a real instance) and refuse to
-silently pass. Export `PYLON_TEST_REDIS_URL` to point them elsewhere. The one exception is
+Cluster and Redis-backed tests (e.g. `cluster_bridge`, `redis_app_cache`, `redis_cluster`,
+`percore_cluster`) require a local Redis and **fail loudly without one** — they default to
+`redis://127.0.0.1:6390` (port 6390, not the 6379 production default, so a stray run never
+clobbers a real instance) and refuse to silently pass. Export `PYLON_TEST_REDIS_URL` to point
+them elsewhere. The one exception is
 `redis_failover`, which is opt-in via `PYLON_TEST_REDIS_FAILOVER=1` because it bounces the Redis
 container and would disrupt parallel suites (CI runs it against a dedicated container). Tests use
 random key prefixes for isolation — never run them against a Redis that holds data you care about,

@@ -67,16 +67,15 @@ toolchain. Run it before opening a pull request if you don't have the
 services below available locally:
 
 ```bash
-cargo test --locked --lib \
-  --test admin --test health --test integration --test metrics \
-  --test percore --test percore_drain --test percore_liveness \
-  --test percore_multiworker --test percore_nonblocking_establish \
-  --test percore_overload --test percore_selective_drain \
-  --test percore_wiring \
-  --test readiness_states \
-  --test rest --test signin --test tls --test watchlist --test webhooks \
-  -- --test-threads=1
+scripts/test-no-infra.sh
 ```
+
+`scripts/test-no-infra.sh` is the single source for this command: CI's
+`check` job (services running) and its `check-no-infra` job (none at all)
+both run it verbatim, so this page and CI cannot drift apart — a future test
+that quietly needs a service (like one that used to sit here, see "Cluster /
+Redis tests" below) fails the `check-no-infra` job instead of only a
+contributor's local run.
 
 ### Full suite (all services)
 
@@ -109,13 +108,13 @@ cargo test --locked --no-fail-fast -- --test-threads=1
 
 ### Cluster / Redis tests
 
-Tests that exercise the clustered path or the Redis adapter require a local
-Redis instance. Point at it with the `PYLON_TEST_REDIS_URL` environment
-variable:
+Tests that exercise the clustered path, the Redis adapter, or the Redis-backed
+L2 app cache and cross-node invalidation require a local Redis instance.
+Point at it with the `PYLON_TEST_REDIS_URL` environment variable:
 
 ```bash
 PYLON_TEST_REDIS_URL=redis://127.0.0.1:6390 \
-  cargo test --test cluster_bridge --test redis_cluster -- --test-threads=1
+  cargo test --test cluster_bridge --test redis_app_cache --test redis_cluster -- --test-threads=1
 ```
 
 !!! warning "Never FLUSH a shared Redis"
@@ -151,9 +150,10 @@ warnings that only appear in the default-features build (`cargo build --release`
 ## Load-Testing Crate
 
 The `load/` workspace crate contains scenario-based load tests and the
-`pylon-ceiling` capacity-finder binary. `pylon-ceiling` performs a binary
-search over connection counts to find the maximum sustainable concurrency on a
-given host, taking latency, CPU, and memory constraints as stop criteria.
+`pylon-ceiling` capacity-finder binary. `pylon-ceiling` ramps connections in
+fixed-size batches (`--conn-batch`) to find the maximum sustainable
+concurrency on a given host, taking latency, CPU, and memory constraints as
+stop criteria.
 
 See [`load/`](https://github.com/i-rocky/pylon/tree/master/load) for details
 on running load scenarios and the ceiling tool.

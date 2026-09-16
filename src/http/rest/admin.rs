@@ -264,47 +264,4 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
     }
-
-    /// Redis-gated: the authenticated success path publishes to Redis pub/sub and
-    /// returns 202 Accepted.
-    #[tokio::test]
-    async fn handler_authed_with_invalidator_returns_202() {
-        use crate::app::cache::{CacheConfig, CachingAppManager};
-        let url = std::env::var("PYLON_TEST_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6390".into());
-        let apps: Arc<dyn crate::app::AppManager> =
-            Arc::new(crate::app::static_file::StaticFileAppManager::from_json("[]").unwrap());
-        let cache = Arc::new(CachingAppManager::new(
-            apps,
-            CacheConfig {
-                max_capacity: 16,
-                ttl_secs: 60,
-                neg_max: 16,
-                neg_ttl_secs: 60,
-            },
-            None,
-        ));
-        let adapter: Arc<dyn crate::adapter::Adapter> =
-            Arc::new(crate::adapter::local::LocalAdapter::new(
-                Arc::new(crate::channel::registry::Registry::new()),
-                Arc::new(crate::adapter::app_registry::AppRegistry::new()),
-            ));
-        let purger = Arc::new(crate::app::purger::AppPurger::new(
-            adapter,
-            Arc::new(dashmap::DashMap::new()),
-            cache,
-        ));
-        let inv = crate::app::invalidation::AppInvalidator::spawn(&url, purger)
-            .await
-            .expect("invalidator must connect to the test Redis");
-        let status = post_invalidate(
-            State(test_state(Some("secret"), Some(inv))),
-            Path("app1".into()),
-            bearer("secret"),
-            Ok(Bytes::from(r#"{"key":"k","action":"refresh"}"#)),
-        )
-        .await
-        .expect("authed valid request must return 202");
-        assert_eq!(status, StatusCode::ACCEPTED);
-    }
 }

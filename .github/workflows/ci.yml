@@ -79,6 +79,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check
 
       - name: Format
         run: cargo fmt --all --check
@@ -94,18 +96,12 @@ jobs:
         run: cargo clippy --workspace --locked --lib --bins -- -D warnings
 
       # Unit tests + non-cluster integration tests — the reliable gate. Serial
-      # (`--test-threads=1`) for deterministic, resource-isolated runs.
+      # (`--test-threads=1`) for deterministic, resource-isolated runs. Same
+      # script as the `check-no-infra` job below, which runs it with no
+      # service containers at all to prove CONTRIBUTING.md's "no
+      # infrastructure" claim rather than just assert it.
       - name: Test (unit + integration)
-        run: |
-          cargo test --locked --lib \
-            --test admin --test health --test integration --test metrics \
-            --test percore --test percore_drain --test percore_liveness \
-            --test percore_multiworker --test percore_nonblocking_establish \
-            --test percore_overload --test percore_selective_drain \
-            --test percore_wiring \
-            --test readiness_states \
-            --test rest --test signin --test tls --test watchlist --test webhooks \
-            -- --test-threads=1
+        run: scripts/test-no-infra.sh
 
       # Cross-node cluster / Redis tests (real Redis service container, random
       # key prefixes per run). The former flake sources are fixed: the vacate-CAS
@@ -119,7 +115,7 @@ jobs:
             --test cluster_bridge --test cluster_capacity --test cluster_subscribe \
             --test percore_cluster --test percore_cluster_cache \
             --test percore_cluster_presence --test percore_cluster_user \
-            --test redis_cluster --test redis_sharded \
+            --test redis_app_cache --test redis_cluster --test redis_sharded \
             --test startup \
             -- --test-threads=1
 
@@ -133,6 +129,31 @@ jobs:
           cargo test --locked --no-fail-fast \
             --test mongo_app_manager --test mysql_app_manager --test postgres_app_manager \
             -- --test-threads=1
+
+  # Proves CONTRIBUTING.md's and the dev guide's "needs no infrastructure"
+  # claim rather than asserting it: no `services:` block at all, so a test
+  # that quietly grows a Redis/MySQL/Postgres/Mongo dependency without moving
+  # into one of the `check` job's gated steps fails here, not just in a
+  # contributor's terminal that happens to be missing a service. Runs
+  # `scripts/test-no-infra.sh` — the same script the `check` job's "Test
+  # (unit + integration)" step runs — so the two jobs and the docs cannot
+  # disagree about what the command is.
+  check-no-infra:
+    name: test (no infrastructure)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check
+
+      - name: Test (no infrastructure)
+        run: scripts/test-no-infra.sh
 
   # Redis failover/self-heal regression: proves cross-node delivery (A → Redis →
   # B) RESUMES after `docker restart` of the Redis container (Fred reconnects +
