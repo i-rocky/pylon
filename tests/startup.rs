@@ -686,6 +686,35 @@ async fn boots_from_env_serves_ws_and_rest_then_drains_on_sigterm() {
     );
 }
 
+#[tokio::test]
+async fn startup_logs_the_resolved_shutdown_timings() {
+    let (dir, apps_path) = apps_file();
+    let port = free_port();
+    let child = server_command(port, &apps_path)
+        .env("PYLON_SHUTDOWN_PREDRAIN_MS", "250")
+        .env("PYLON_SHUTDOWN_GRACE_MS", "750")
+        .env("PYLON_LOG_FORMAT", "json")
+        .spawn()
+        .expect("spawn pylon");
+    let mut server = Server {
+        child,
+        port,
+        _dir: dir,
+    };
+
+    await_healthy(&mut server, Duration::from_secs(30)).await;
+    server.sigterm();
+    server
+        .wait_exit(Duration::from_secs(20))
+        .expect("pylon must exit after SIGTERM");
+
+    let logs = format!("{}{}", drain_stdout(&mut server), drain(&mut server));
+    assert!(
+        logs.contains("\"predrain_ms\":250") && logs.contains("\"grace_ms\":750"),
+        "the resolved shutdown timings must be logged at startup: {logs}"
+    );
+}
+
 /// SIGINT (Ctrl-C) is the other arm of `shutdown_signal`'s select and must
 /// drain exactly like SIGTERM. `RUST_LOG` is unset here so the same run also
 /// exercises `init_tracing`'s default-filter fallback.

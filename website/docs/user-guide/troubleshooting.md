@@ -235,6 +235,9 @@ accepting new connections, returns `503` from `/ready` so the load balancer
 removes it from rotation, then closes existing connections with Pusher code
 **4200** ("server restarting — reconnect immediately"). The Pusher.js client
 reconnects automatically. See [Production Tuning — Graceful Restart](production-tuning.md#graceful-restart).
+Pylon logs the resolved `predrain_ms` and `grace_ms` at startup, so a `0` or
+unexpected drain window is visible before the first `SIGTERM` rather than
+discovered during one.
 
 ---
 
