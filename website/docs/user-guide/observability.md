@@ -274,8 +274,10 @@ Also available at `/readyz`.
 Verbosity comes from `RUST_LOG` (default `info`); the format comes from
 `PYLON_LOG_FORMAT`.
 
-`text` (the default) is the human-readable formatter. `json` emits one JSON
-object per line, which is what a log pipeline wants:
+`text` (the default) is the human-readable formatter; it colours its output
+only when stdout is a terminal, so journald, Docker and Kubernetes logs carry
+no ANSI escape sequences. `json` emits one JSON object per line, which is what
+a log pipeline wants:
 
 ```json
 {"timestamp":"2026-09-14T09:12:04.118273Z","level":"WARN","fields":{"message":"cluster publish failed; broadcast dropped","app":"app1","channel":"presence-room","error":"cluster publish failed: cluster bridge channel full or closed"},"target":"pylon::ws::handler"}

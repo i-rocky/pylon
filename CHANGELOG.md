@@ -117,6 +117,14 @@ pre-1.0 and versions track `Cargo.toml`.
   `src/server/config.rs` to discover TLS is configurable at all.
 - **An apps file that cannot be read or parsed is now reported with its path
   and `PYLON_APPS_PATH`** instead of a bare OS error.
+- **The `text` log format no longer writes ANSI colour into journald, Docker
+  and Kubernetes log streams.** `tracing_subscriber::fmt()` enables colour by
+  default regardless of whether the output is a terminal, so every `text`
+  deployment carried `\x1b[2m…\x1b[0m` escape sequences into its log store —
+  found when a startup test could not match `predrain_ms=250` as contiguous
+  text. `init_tracing` now gates colour on `stdout().is_terminal()` — the
+  stream `fmt()` actually writes to — so a terminal session still gets colour
+  and every redirected, piped or non-interactive run gets plain text.
 
 ## [0.5.0] - 2026-09-15
 

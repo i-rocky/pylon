@@ -483,6 +483,38 @@ fn json_log_format_emits_parseable_lines() {
     );
 }
 
+#[tokio::test]
+async fn text_logs_carry_no_ansi_escapes_when_stdout_is_not_a_terminal() {
+    let (dir, apps_path) = apps_file();
+    let port = free_port();
+    let child = server_command(port, &apps_path)
+        .env("RUST_LOG", "info")
+        .spawn()
+        .expect("spawn pylon");
+    let mut server = Server {
+        child,
+        port,
+        _dir: dir,
+    };
+
+    await_healthy(&mut server, Duration::from_secs(30)).await;
+    server.sigterm();
+    let status = server
+        .wait_exit(Duration::from_secs(20))
+        .expect("pylon must exit after SIGTERM");
+    assert!(status.success(), "expected a clean exit, got {status}");
+
+    let logs = format!("{}{}", drain_stdout(&mut server), drain(&mut server));
+    assert!(
+        logs.contains("INFO"),
+        "expected at least one INFO line: {logs}"
+    );
+    assert!(
+        !logs.contains('\u{1b}'),
+        "text logs must carry no ANSI escapes when stdout is not a terminal: {logs:?}"
+    );
+}
+
 #[test]
 fn an_invalid_log_format_exits_one() {
     let (dir, apps) = apps_file();
