@@ -16,6 +16,15 @@ pre-1.0 and versions track `Cargo.toml`.
   pre-session reap increments it: the accept and inbound-frame rate limiters,
   the idle/pong `4201` and max-lifetime `4202` closes, TLS failures and normal
   closes are unaffected and keep their own counters.
+
+### Changed
+- **The Helm chart now defaults to one replica.** Two or more replicas, or
+  autoscaling, now require `config.adapter=redis` at render time, because
+  local-adapter pods behind one Service cannot see each other's channels and
+  a default install would silently lose events. The `PodDisruptionBudget` is
+  rendered only when more than one pod can exist, since `minAvailable: 1`
+  over a single pod blocks every voluntary eviction.
+
 ### Fixed
 - **A large `config.memoryBudgetBytes` (or `workers`, `shutdownPredrainsMs`,
   `shutdownGraceMs`, `replicaCount`, `service.port`, the autoscaling

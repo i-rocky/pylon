@@ -241,7 +241,7 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
 
     | Value | Default | Purpose |
     |---|---|---|
-    | `replicaCount` | `2` | Number of pylon pods. |
+    | `replicaCount` | `1` | Number of pylon pods. |
     | `config.adapter` | `local` | `local` or `redis`. Must be `redis` for `replicaCount > 1`. |
     | `config.redisUrl` | `""` | Redis connection URL (required when `adapter=redis`). |
     | `config.redisPrefix` | `pylon` | Redis key prefix. |
@@ -257,6 +257,8 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
     | `podDisruptionBudget.minAvailable` | `1` | Minimum pods that must stay up during a voluntary disruption. |
 
     Byte and millisecond values are plain integers (`memoryBudgetBytes: 2147483648`, `shutdownGraceMs: 10000`); pylon has no unit suffixes, and the chart passes whatever is written through unchanged, so `2Gi` or `10s` fails at pod start with `invalid PYLON_MEMORY_BUDGET_BYTES="2Gi"` rather than being altered.
+
+    The chart refuses to render more than one replica, or autoscaling, on the local adapter, and renders the PodDisruptionBudget only when more than one pod can exist.
 
     ### Autoscaling
 

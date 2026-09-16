@@ -229,6 +229,8 @@ helm install pylon ./deploy/helm/pylon \
 
 Byte and millisecond values are plain integers (`memoryBudgetBytes: 2147483648`, `shutdownGraceMs: 10000`); pylon has no unit suffixes, and the chart passes whatever is written through unchanged, so `2Gi` or `10s` fails at pod start with `invalid PYLON_MEMORY_BUDGET_BYTES="2Gi"` rather than being altered.
 
+The chart refuses to render more than one replica, or autoscaling, on the local adapter, and renders the PodDisruptionBudget only when more than one pod can exist.
+
 **Important:** the `apps` list in `values.yaml` is rendered into a ConfigMap
 in plain text. For production, use a Kubernetes Secret or an external secret
 manager and mount apps.json as a file. Change the `secret` field from
