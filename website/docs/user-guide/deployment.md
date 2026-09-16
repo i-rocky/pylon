@@ -18,6 +18,9 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
 
     ### Install steps
 
+    The commands below give the `deploy/systemd/` paths for a source checkout;
+    from a release tarball, the same files ship under `systemd/` instead.
+
     **1. Apply kernel tuning (once per host, as root):**
 
     ```bash

@@ -67,6 +67,8 @@ jobs:
           mkdir -p "${dist}"
           cp "target/${TARGET}/release/pylon" "${dist}/"
           cp LICENSE README.md apps.example.json "${dist}/"
+          mkdir -p "${dist}/systemd"
+          cp deploy/systemd/pylon.service deploy/systemd/pylon.env.example deploy/systemd/99-pylon.sysctl.conf "${dist}/systemd/"
           tar -C dist -czf "${name}.tar.gz" "${name}"
           sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
           # Stage the raw binary (under its docker arch) for the image job.

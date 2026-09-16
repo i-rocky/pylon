@@ -56,7 +56,8 @@
     tar xzf "${ASSET}.tar.gz"
 
     # The tarball unpacks into a directory containing the binary plus
-    # LICENSE, README.md and apps.example.json.
+    # LICENSE, README.md, apps.example.json, and a systemd/ directory with
+    # pylon.service, pylon.env.example and 99-pylon.sysctl.conf.
     "./${ASSET}/pylon" --version
     ```
 
