@@ -6,6 +6,8 @@ pre-1.0 and versions track `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-16
+
 ### Added
 - **Pylon logs `graceful shutdown timings predrain_ms=… grace_ms=…` at
   startup.** `PYLON_SHUTDOWN_PREDRAIN_MS=0` and `PYLON_SHUTDOWN_GRACE_MS=0`
