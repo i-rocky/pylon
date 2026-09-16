@@ -226,12 +226,26 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
 
     ### Install
 
+    The chart refuses to render until every app has a real secret, so the values
+    file is written first with one generated in place:
+
     ```bash
     # Single-node (local adapter, default):
-    helm install pylon ./deploy/helm/pylon
+    cat > my-values.yaml <<EOF
+    apps:
+      - name: my-app
+        id: app
+        key: app-key
+        secret: $(openssl rand -hex 32)
+        capacity: 1000000
+        client_messages_enabled: false
+        enabled: true
+        webhooks: []
+    EOF
+    helm install pylon ./deploy/helm/pylon -f my-values.yaml
 
     # Multi-node cluster (redis adapter):
-    helm install pylon ./deploy/helm/pylon \
+    helm install pylon ./deploy/helm/pylon -f my-values.yaml \
       --set config.adapter=redis \
       --set config.redisUrl=redis://my-redis:6379 \
       --set replicaCount=3
@@ -291,9 +305,11 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
 
     App secrets and the Redis URL are rendered into a Kubernetes `Secret`, never a
     ConfigMap, and reach the pod as a mounted file (`/etc/pylon/apps.json`) and a
-    `secretKeyRef` (`PYLON_REDIS_URL`). **Change the `secret` field from
-    `CHANGE_ME` before deploying** — it is the HMAC key behind every REST
-    signature, channel-auth token and `pusher:signin` for that app.
+    `secretKeyRef` (`PYLON_REDIS_URL`). **The chart refuses to render while any
+    app's `secret` is empty or the placeholder `CHANGE_ME`** — it is the HMAC
+    key behind every REST signature, channel-auth token and `pusher:signin` for
+    that app, so set a real one (`openssl rand -hex 32`) or point
+    `existingSecret` at a Secret you manage.
 
     If you manage secrets outside Helm — an external secret manager,
     sealed-secrets, or a CI-created Secret — set `existingSecret` to its name and
