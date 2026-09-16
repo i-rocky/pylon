@@ -137,31 +137,10 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
 
 === "Docker / Compose"
 
-    ### Published image
-
-    A multi-arch image (`linux/amd64` + `linux/arm64`) is published on each release:
-
-    ```
-    ghcr.io/i-rocky/pylon:latest
-    ghcr.io/i-rocky/pylon:X.Y.Z   # pinned release
-    ghcr.io/i-rocky/pylon:X.Y     # floating minor
-    ```
-
-    ### Single-node quick start
-
-    ```bash
-    docker run -d --name pylon -p 7000:7000 \
-      -v "$PWD/apps.json:/etc/pylon/apps.json:ro" \
-      -e PYLON_APPS_PATH=/etc/pylon/apps.json \
-      --ulimit nofile=1048576:1048576 \
-      ghcr.io/i-rocky/pylon:latest
-    ```
-
-    Volume-mount your `apps.json` at `/etc/pylon/apps.json` and pass the path
-    via `PYLON_APPS_PATH`. The `--ulimit` flag raises the file-descriptor limit
-    for the container.
-
     ### Host prerequisites
+
+    Apply these before starting any container: the daemon-level nofile default cannot be
+    satisfied until `fs.nr_open` is raised.
 
     Apply the kernel tuning drop-in on the Docker host before starting containers:
 
@@ -183,6 +162,43 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
 
     Restart the Docker daemon after editing this file.
 
+    ### Published image
+
+    A multi-arch image (`linux/amd64` + `linux/arm64`) is published on each release:
+
+    ```
+    ghcr.io/i-rocky/pylon:latest
+    ghcr.io/i-rocky/pylon:X.Y.Z   # pinned release
+    ghcr.io/i-rocky/pylon:X.Y     # floating minor
+    ```
+
+    ### Single-node quick start
+
+    ```bash
+    cp apps.example.json apps.json      # from the release tarball or the repo root
+    # edit apps.json: set id, key and secret
+    chown 65534:65534 apps.json && chmod 0600 apps.json
+    ```
+
+    The image runs as UID 65534 (`nobody`) with no shell, so a file it cannot read makes the
+    container exit with `Permission denied`; owning it to 65534 with mode 0600 keeps the secret
+    private and readable.
+
+    ```bash
+    docker run -d --name pylon -p 7000:7000 \
+      -v "$PWD/apps.json:/etc/pylon/apps.json:ro" \
+      -e PYLON_APPS_PATH=/etc/pylon/apps.json \
+      --ulimit nofile=1048576:1048576 \
+      --stop-timeout 20 \
+      ghcr.io/i-rocky/pylon:latest
+    ```
+
+    Volume-mount your `apps.json` at `/etc/pylon/apps.json` and pass the path
+    via `PYLON_APPS_PATH`. The `--ulimit` flag raises the file-descriptor limit
+    for the container. The default 10 s stop timeout is below the 12 s drain
+    worst case (2 s pre-drain plus 10 s grace); `--stop-timeout 20` makes
+    `docker stop` use 20 s.
+
     ### Two-node Compose cluster
 
     `deploy/docker/docker-compose.yml` starts Redis 7, `pylon-1` (host port 7000),
@@ -192,6 +208,7 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
     ```bash
     # Copy and edit the apps config — change the secret!
     cp apps.example.json deploy/docker/apps.json
+    chown 65534:65534 deploy/docker/apps.json && chmod 0600 deploy/docker/apps.json
 
     # Build and start.
     cd deploy/docker
