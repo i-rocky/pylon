@@ -1,0 +1,87 @@
+# Pylon
+
+> Pusher-protocol-compatible WebSocket server in Rust, a single static binary, drop-in for Pusher Channels, soketi or Laravel Reverb behind unchanged Pusher SDKs.
+
+Pylon's recommended production deployment is a Linux host under systemd: install the single static binary at `/usr/local/bin/pylon`, run it as a dedicated `pylon` system user, and configure it with one environment file (`/etc/pylon/pylon.env`) and one apps file (`/etc/pylon/apps.json`). Apply the `systemd/99-pylon.sysctl.conf` kernel-tuning drop-in shipped in the release tarball once per host. TLS terminates either natively in pylon (`PYLON_TLS_CERT` / `PYLON_TLS_KEY`) or behind a reverse proxy such as nginx or Caddy. Pylon listens on port 7000 by default and exposes a liveness probe at `/health` and a readiness probe at `/ready`. Docker and Kubernetes are alternatives, covered below under Optional.
+
+Minimal install on a systemd host:
+
+```bash
+# Replace X.Y.Z and ARCH (x86_64 or aarch64) as appropriate.
+# Note the asset name carries the leading "v" of the tag.
+ASSET=pylon-vX.Y.Z-ARCH-unknown-linux-musl
+
+curl -LO "https://github.com/i-rocky/pylon/releases/download/vX.Y.Z/${ASSET}.tar.gz"
+curl -LO "https://github.com/i-rocky/pylon/releases/download/vX.Y.Z/${ASSET}.tar.gz.sha256"
+
+sha256sum -c "${ASSET}.tar.gz.sha256"
+tar xzf "${ASSET}.tar.gz"
+
+# The tarball unpacks into a directory containing the binary plus
+# LICENSE, README.md, apps.example.json, and a systemd/ directory with
+# pylon.service, pylon.env.example and 99-pylon.sysctl.conf.
+"./${ASSET}/pylon" --version
+
+cp "./${ASSET}/systemd/99-pylon.sysctl.conf" /etc/sysctl.d/
+sysctl --system
+
+# Create the system user.
+useradd --system --no-create-home --shell /sbin/nologin pylon
+
+# Install the binary.
+install -m 0755 "./${ASSET}/pylon" /usr/local/bin/pylon
+
+# Create the config directory (owned root, readable by pylon group).
+install -d -m 0750 -o root -g pylon /etc/pylon
+
+# Install and edit the environment file.
+install -m 0640 -o root -g pylon \
+    "./${ASSET}/systemd/pylon.env.example" /etc/pylon/pylon.env
+# Edit /etc/pylon/pylon.env — set adapter, Redis URL, etc.
+
+# Install the apps config.
+install -m 0640 -o root -g pylon \
+    "./${ASSET}/apps.example.json" /etc/pylon/apps.json
+# IMPORTANT: change the "secret" field in apps.json.
+
+# Install the systemd unit.
+cp "./${ASSET}/systemd/pylon.service" /etc/systemd/system/
+systemctl daemon-reload
+
+systemctl enable --now pylon
+
+# Health check
+curl -s http://localhost:7000/health
+curl -s http://localhost:7000/ready
+```
+
+## Install and run
+
+- [Installation](https://i-rocky.github.io/pylon/user-guide/installation/): OS requirements (Linux amd64/arm64, statically linked musl binaries) and installing via Docker, a prebuilt binary, or building from source.
+- [Quick Start](https://i-rocky.github.io/pylon/user-guide/quick-start/): Gets Pylon running locally and verifies it works end-to-end using a Pusher client SDK and a Pusher server SDK.
+- [Deployment](https://i-rocky.github.io/pylon/user-guide/deployment/): Deploy artifacts for three targets — bare metal/systemd, Docker/Compose, and Kubernetes/Helm.
+- [Configuration](https://i-rocky.github.io/pylon/user-guide/configuration/): The two configuration layers — the application store (`apps.json` or a database) and `PYLON_*` environment variables.
+- [TLS / SSL](https://i-rocky.github.io/pylon/user-guide/tls/): Two approaches for adding TLS — a reverse proxy (nginx or Caddy) or pylon's native TLS.
+- [Production Tuning](https://i-rocky.github.io/pylon/user-guide/production-tuning/): OS-level and pylon-specific settings to maximise connection density and reliability in production.
+- [Applications & Authentication](https://i-rocky.github.io/pylon/user-guide/applications/): The application registry — multiple applications per server, each with its own key/secret pair, defined in `apps.json`.
+
+## Use it
+
+- [Connecting Clients](https://i-rocky.github.io/pylon/user-guide/clients/): Pylon speaks the Pusher Channels v7 WebSocket protocol, so any Pusher-compatible client SDK works against it unchanged.
+- [Triggering Events](https://i-rocky.github.io/pylon/user-guide/triggering-events/): Server-side code triggers events by calling the Pusher HTTP API, via an official server SDK or raw signed HTTP requests.
+- [Channels](https://i-rocky.github.io/pylon/user-guide/channels/): All Pusher Channels v7 channel types — the channel name prefix determines its type and required authentication.
+- [Webhooks](https://i-rocky.github.io/pylon/user-guide/webhooks/): Signed HTTP POST webhooks fired to your server on channel events, configured per-app in `apps.json`, retried for up to five minutes.
+
+## Operate
+
+- [Observability](https://i-rocky.github.io/pylon/user-guide/observability/): Prometheus metrics, a liveness probe, and a readiness probe on the same HTTP port as the REST API (default 7000).
+- [Troubleshooting & FAQ](https://i-rocky.github.io/pylon/user-guide/troubleshooting/): The numeric close codes pylon sends before closing a WebSocket connection, plus other troubleshooting and FAQ topics.
+
+## Optional
+
+- [Clustering & Scaling](https://i-rocky.github.io/pylon/user-guide/clustering/): Pylon scales horizontally by connecting multiple nodes through a shared Redis instance; each node is stateless from a routing perspective.
+- [Architecture](https://i-rocky.github.io/pylon/dev-guide/architecture/): Pylon is a single Rust binary built around a lock-free, per-core transport; describes the major subsystems and how data flows through them.
+- [Pusher Protocol Reference](https://i-rocky.github.io/pylon/dev-guide/protocol/): The Pusher Channels protocol v7 wire details pylon enforces, for contributors and integration authors.
+- [Building & Testing](https://i-rocky.github.io/pylon/dev-guide/building-and-testing/): The Rust toolchain is pinned in `rust-toolchain.toml`; rustup reads it automatically on a fresh checkout.
+- [Contributing](https://i-rocky.github.io/pylon/dev-guide/contributing/): A summary of the key contribution expectations; full guidelines are in `CONTRIBUTING.md` at the repository root.
+- [Release Process](https://i-rocky.github.io/pylon/dev-guide/release-process/): Releases are tag-driven — pushing a `vX.Y.Z` tag triggers the GitHub Actions release workflow that builds native binaries and a multi-arch container image.
