@@ -24,6 +24,11 @@ pre-1.0 and versions track `Cargo.toml`.
   a default install would silently lose events. The `PodDisruptionBudget` is
   rendered only when more than one pod can exist, since `minAvailable: 1`
   over a single pod blocks every voluntary eviction.
+- **The Helm chart now refuses to render an empty or `CHANGE_ME` app secret.**
+  `values.yaml` ships `secret: "CHANGE_ME"` and every render used to accept
+  it, so a forgotten placeholder became the HMAC key behind every REST
+  signature, channel-auth token and `pusher:signin` for a production app; set
+  a real secret (`openssl rand -hex 32`) or use `existingSecret` instead.
 
 ### Fixed
 - **A large `config.memoryBudgetBytes` (or `workers`, `shutdownPredrainsMs`,

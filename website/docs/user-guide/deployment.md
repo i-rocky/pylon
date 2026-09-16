@@ -291,9 +291,11 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
 
     App secrets and the Redis URL are rendered into a Kubernetes `Secret`, never a
     ConfigMap, and reach the pod as a mounted file (`/etc/pylon/apps.json`) and a
-    `secretKeyRef` (`PYLON_REDIS_URL`). **Change the `secret` field from
-    `CHANGE_ME` before deploying** — it is the HMAC key behind every REST
-    signature, channel-auth token and `pusher:signin` for that app.
+    `secretKeyRef` (`PYLON_REDIS_URL`). **The chart refuses to render while any
+    app's `secret` is empty or the placeholder `CHANGE_ME`** — it is the HMAC
+    key behind every REST signature, channel-auth token and `pusher:signin` for
+    that app, so set a real one (`openssl rand -hex 32`) or point
+    `existingSecret` at a Secret you manage.
 
     If you manage secrets outside Helm — an external secret manager,
     sealed-secrets, or a CI-created Secret — set `existingSecret` to its name and

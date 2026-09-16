@@ -231,10 +231,11 @@ Byte and millisecond values are plain integers (`memoryBudgetBytes: 2147483648`,
 
 The chart refuses to render more than one replica, or autoscaling, on the local adapter, and renders the PodDisruptionBudget only when more than one pod can exist.
 
-**Important:** the `apps` list in `values.yaml` is rendered into a ConfigMap
-in plain text. For production, use a Kubernetes Secret or an external secret
-manager and mount apps.json as a file. Change the `secret` field from
-`CHANGE_ME` before deploying.
+The `apps` list and `config.redisUrl` are rendered into a Kubernetes Secret
+(`templates/secret.yaml`), mounted at `/etc/pylon/apps.json` and injected as
+`PYLON_REDIS_URL` through a `secretKeyRef`. The chart refuses to render while
+any app's `secret` is empty or the placeholder `CHANGE_ME`, so set one
+(`openssl rand -hex 32`) or use `existingSecret`.
 
 ### Probes (configured in values.yaml)
 
@@ -401,10 +402,11 @@ deploy/
 │       ├── values.yaml
 │       └── templates/
 │           ├── _helpers.tpl
-│           ├── configmap.yaml       apps.json ConfigMap
+│           ├── secret.yaml          apps.json + redisUrl Secret
 │           ├── deployment.yaml      Deployment with probes + grace period
 │           ├── service.yaml
-│           └── hpa.yaml             HorizontalPodAutoscaler (gated by values)
+│           ├── hpa.yaml             HorizontalPodAutoscaler (gated by values)
+│           └── pdb.yaml             PodDisruptionBudget (rendered when more than one pod can exist)
 └── tls/
     ├── Caddyfile.example            Caddy v2 auto-HTTPS reverse proxy
     └── nginx.conf.example           nginx TLS termination with WS proxy
