@@ -202,3 +202,34 @@ printf '%s' "$second" | grep -q 'apps\[1\].secret' || { echo "FAIL: the second-a
 printf '%s' "$existing" | grep -q '^kind: Deployment$' || { echo "FAIL: existingSecret render without any apps value did not produce the Deployment"; exit 1; }
 
 echo "OK: the chart refuses an empty or CHANGE_ME app secret and renders only real ones or an existingSecret"
+
+printf '%s' "$default" | grep -q 'terminationGracePeriodSeconds: 30' || { echo "FAIL: default shutdownPredrainsMs+shutdownGraceMs (12s, derived 18s) should floor terminationGracePeriodSeconds at 30"; exit 1; }
+
+raised=$(helm_run template pylon deploy/helm/pylon -f "$ci_values" --set config.shutdownGraceMs=30000)
+printf '%s' "$raised" | grep -q 'terminationGracePeriodSeconds: 38' || { echo "FAIL: shutdownPredrainsMs 2000 + shutdownGraceMs 30000 (32s, exceeds the 30s floor) should derive terminationGracePeriodSeconds 38"; exit 1; }
+
+zero=$(helm_run template pylon deploy/helm/pylon -f "$ci_values" --set config.terminationGracePeriodSeconds=0)
+printf '%s' "$zero" | grep -q 'terminationGracePeriodSeconds: 30' || { echo "FAIL: an explicit config.terminationGracePeriodSeconds=0 should derive (30s), same as unset"; exit 1; }
+
+override=$(helm_run template pylon deploy/helm/pylon -f "$ci_values" --set config.terminationGracePeriodSeconds=60)
+printf '%s' "$override" | grep -q 'terminationGracePeriodSeconds: 60' || { echo "FAIL: an explicit, sufficient config.terminationGracePeriodSeconds override should be honored"; exit 1; }
+
+atmin=$(helm_run template pylon deploy/helm/pylon -f "$ci_values" --set config.terminationGracePeriodSeconds=13)
+printf '%s' "$atmin" | grep -q 'terminationGracePeriodSeconds: 13' || { echo "FAIL: config.terminationGracePeriodSeconds=13 (exactly the minimum for the default 12s drain) should be honored, not rejected"; exit 1; }
+
+if belowmin=$(helm_run template pylon deploy/helm/pylon -f "$ci_values" --set config.terminationGracePeriodSeconds=12 2>&1); then
+    echo "FAIL: config.terminationGracePeriodSeconds=12 (exactly one below the 13s minimum) should fail the render"; exit 1
+fi
+printf '%s' "$belowmin" | grep -q 'too small' || { echo "FAIL: the below-minimum failure doesn't name the problem"; exit 1; }
+
+if negative=$(helm_run template pylon deploy/helm/pylon -f "$ci_values" --set config.terminationGracePeriodSeconds=-5 2>&1); then
+    echo "FAIL: config.terminationGracePeriodSeconds=-5 should fail the render, not silently derive"; exit 1
+fi
+printf '%s' "$negative" | grep -q -- '-5' || { echo "FAIL: the negative-override failure doesn't name the value"; exit 1; }
+
+if unparseable=$(helm_run template pylon deploy/helm/pylon -f "$ci_values" --set-string config.terminationGracePeriodSeconds=60s 2>&1); then
+    echo "FAIL: config.terminationGracePeriodSeconds=60s should fail the render, not silently derive"; exit 1
+fi
+printf '%s' "$unparseable" | grep -q '60s' || { echo "FAIL: the unparseable-override failure doesn't name the value"; exit 1; }
+
+echo "OK: terminationGracePeriodSeconds derivation, floor, override, boundary and failure cells render as specified"
