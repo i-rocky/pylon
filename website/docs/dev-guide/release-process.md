@@ -55,8 +55,10 @@ The release workflow (`.github/workflows/release.yml`) runs three jobs:
 | `aarch64-unknown-linux-musl` | `ubuntu-22.04-arm` |
 
 Each binary is statically linked against musl and stripped by `[profile.release]`,
-then packaged into a `.tar.gz` archive alongside the `LICENSE`, `README.md`, and
-`apps.example.json`, and a `.sha256` checksum is produced.
+then packaged into a `.tar.gz` archive alongside the `LICENSE`, `README.md`,
+`apps.example.json`, and a `systemd/` directory with `pylon.service`,
+`pylon.env.example` and `99-pylon.sysctl.conf`, and a `.sha256` checksum is
+produced.
 
 **`image`** — Assembles a multi-arch container image from the prebuilt binaries
 using Docker Buildx and pushes it to:

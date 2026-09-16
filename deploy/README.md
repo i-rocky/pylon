@@ -46,6 +46,9 @@ it's large enough to fit the drain, which the chart enforces at render time.
 
 ## 1. Bare metal / systemd (quick-start)
 
+The commands below give the `deploy/systemd/` paths for a source checkout;
+from a release tarball, the same files ship under `systemd/` instead.
+
 ### Prerequisites
 
 **Kernel tuning** (run once per host, as root):

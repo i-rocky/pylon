@@ -16,6 +16,12 @@ pre-1.0 and versions track `Cargo.toml`.
   pre-session reap increments it: the accept and inbound-frame rate limiters,
   the idle/pong `4201` and max-lifetime `4202` closes, TLS failures and normal
   closes are unaffected and keep their own counters.
+- **The release tarball now ships the systemd unit, env example and sysctl
+  drop-in.** The tarball previously held only `pylon`, `LICENSE`, `README.md`
+  and `apps.example.json`, while the docs told a tarball user to `cp
+  deploy/systemd/pylon.service`, a path that only exists in a source
+  checkout. The archive now also contains a `systemd/` directory with
+  `pylon.service`, `pylon.env.example` and `99-pylon.sysctl.conf`.
 
 ### Changed
 - **The Helm chart now defaults to one replica.** Two or more replicas, or
