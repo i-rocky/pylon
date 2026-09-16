@@ -108,6 +108,9 @@ pre-1.0 and versions track `Cargo.toml`.
   own placeholders and its own unresolvable webhook target) is gone, and
   every recipe — tarball, Docker image, CI, quick start, README,
   CONTRIBUTING — points at the one root `apps.example.json`.
+- **`pylon.env.example` now lists `PYLON_TLS_CERT`, `PYLON_TLS_KEY` and
+  `PYLON_TLS_CA`**, so an operator copying the file no longer has to read
+  `src/server/config.rs` to discover TLS is configurable at all.
 
 ## [0.5.0] - 2026-09-15
 
