@@ -88,7 +88,7 @@ install -m 0640 -o root -g pylon \
 
 # 5. Install the apps config.
 install -m 0640 -o root -g pylon \
-    deploy/systemd/apps.example.json /etc/pylon/apps.json
+    apps.example.json /etc/pylon/apps.json
 # IMPORTANT: change the "secret" field in apps.json.
 
 # 6. Install the systemd unit.
@@ -184,7 +184,7 @@ Ensure the Docker daemon allows high nofile limits:
 
 ```bash
 # Copy and edit the apps config — change the secret!
-cp deploy/systemd/apps.example.json deploy/docker/apps.json
+cp apps.example.json deploy/docker/apps.json
 
 # Build the image and start services.
 cd deploy/docker
@@ -415,8 +415,7 @@ deploy/
 ├── systemd/
 │   ├── pylon.service                systemd unit (primary deploy target)
 │   ├── pylon.env.example            Environment variables with comments
-│   ├── 99-pylon.sysctl.conf         Kernel tuning drop-in (/etc/sysctl.d/)
-│   └── apps.example.json            Sample apps.json (change the secret!)
+│   └── 99-pylon.sysctl.conf         Kernel tuning drop-in (/etc/sysctl.d/)
 ├── docker/
 │   ├── Dockerfile                   Multi-stage build (rust:alpine musl builder → scratch)
 │   ├── Dockerfile.release           Runtime-only image over a prebuilt binary (CI)

@@ -15,7 +15,6 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
     | `deploy/systemd/pylon.service` | systemd unit — runs pylon as the `pylon` system user, sets `LimitNOFILE=2000000`, handles graceful shutdown via `SIGTERM`. |
     | `deploy/systemd/99-pylon.sysctl.conf` | Kernel tuning drop-in — TCP buffer sizes, `somaxconn`, `fs.file-max`, `fs.nr_open`, and `tcp_migrate_req` for millions of idle WebSocket connections. |
     | `deploy/systemd/pylon.env.example` | Template environment file — all variables documented inline; copy to `/etc/pylon/pylon.env` and edit. |
-    | `deploy/systemd/apps.example.json` | Sample apps.json — change the `secret` field before use. |
 
     ### Install steps
 
@@ -56,7 +55,7 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
 
     # Install the apps config.
     install -m 0640 -o root -g pylon \
-        deploy/systemd/apps.example.json /etc/pylon/apps.json
+        apps.example.json /etc/pylon/apps.json
     # IMPORTANT: change the "secret" field in apps.json.
 
     # Install the systemd unit.
@@ -189,7 +188,7 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
 
     ```bash
     # Copy and edit the apps config — change the secret!
-    cp deploy/systemd/apps.example.json deploy/docker/apps.json
+    cp apps.example.json deploy/docker/apps.json
 
     # Build and start.
     cd deploy/docker

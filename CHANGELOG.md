@@ -95,6 +95,13 @@ pre-1.0 and versions track `Cargo.toml`.
   `systemctl is-active` never reporting `failed` and nothing paging.
   `StartLimitIntervalSec=60` / `StartLimitBurst=5` in `[Unit]` bound the
   crash loop to the failed state so it surfaces.
+- **The shipped `apps.example.json` no longer carries a webhook at an
+  unresolvable host**, so a stock deployment no longer logs
+  `webhook target refused by SSRF guard` warnings on every channel event.
+  The duplicate `deploy/systemd/apps.example.json` (a second example with its
+  own placeholders and its own unresolvable webhook target) is gone, and
+  every recipe — tarball, Docker image, CI, quick start, README,
+  CONTRIBUTING — points at the one root `apps.example.json`.
 
 ## [0.5.0] - 2026-09-15
 
