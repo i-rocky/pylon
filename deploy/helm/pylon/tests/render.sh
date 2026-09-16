@@ -232,4 +232,4 @@ if unparseable=$(helm_run template pylon deploy/helm/pylon -f "$ci_values" --set
 fi
 printf '%s' "$unparseable" | grep -q '60s' || { echo "FAIL: the unparseable-override failure doesn't name the value"; exit 1; }
 
-echo "OK: secret, pdb, existingSecret, no-configmap and terminationGracePeriodSeconds derivation/floor/override/boundary/failure all render as specified"
+echo "OK: terminationGracePeriodSeconds derivation, floor, override, boundary and failure cells render as specified"
