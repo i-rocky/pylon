@@ -251,10 +251,13 @@ traffic throughout a rollout.
 
 ### Autoscaling
 
-Enable the HPA:
+Autoscaling needs the redis adapter, and `helm upgrade` without `--reuse-values`
+re-reads the chart defaults, so pass the adapter again:
 
 ```bash
 helm upgrade pylon ./deploy/helm/pylon \
+  --set config.adapter=redis \
+  --set config.redisUrl=redis://my-redis:6379 \
   --set autoscaling.enabled=true \
   --set autoscaling.minReplicas=2 \
   --set autoscaling.maxReplicas=10

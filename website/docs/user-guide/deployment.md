@@ -253,7 +253,7 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
     | `resources.requests.memory` | `512Mi` | Pod memory request. |
     | `resources.limits.memory` | `8Gi` | Pod memory limit. |
     | `existingSecret` | `""` | Name of a Secret you manage yourself (keys `apps.json`, `redisUrl`). When set, the chart creates no Secret. |
-    | `podDisruptionBudget.enabled` | `true` | Render a `PodDisruptionBudget`. |
+    | `podDisruptionBudget.enabled` | `true` | Render a PodDisruptionBudget; rendered only when `replicaCount` is above 1 or autoscaling is enabled. |
     | `podDisruptionBudget.minAvailable` | `1` | Minimum pods that must stay up during a voluntary disruption. |
 
     Byte and millisecond values are plain integers (`memoryBudgetBytes: 2147483648`, `shutdownGraceMs: 10000`); pylon has no unit suffixes, and the chart passes whatever is written through unchanged, so `2Gi` or `10s` fails at pod start with `invalid PYLON_MEMORY_BUDGET_BYTES="2Gi"` rather than being altered.
@@ -262,8 +262,13 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
 
     ### Autoscaling
 
+    Autoscaling needs the redis adapter, and `helm upgrade` without `--reuse-values`
+    re-reads the chart defaults, so pass the adapter again:
+
     ```bash
     helm upgrade pylon ./deploy/helm/pylon \
+      --set config.adapter=redis \
+      --set config.redisUrl=redis://my-redis:6379 \
       --set autoscaling.enabled=true \
       --set autoscaling.minReplicas=2 \
       --set autoscaling.maxReplicas=10
