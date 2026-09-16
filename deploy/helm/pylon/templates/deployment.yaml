@@ -1,3 +1,6 @@
+{{- if and (ne .Values.config.adapter "redis") (or (gt (int .Values.replicaCount) 1) .Values.autoscaling.enabled) }}
+{{- fail (printf "replicaCount=%v autoscaling.enabled=%v need config.adapter=redis: pods on the local adapter cannot see each other's channels" .Values.replicaCount .Values.autoscaling.enabled) }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:

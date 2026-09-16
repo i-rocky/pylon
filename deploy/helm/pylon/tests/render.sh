@@ -12,24 +12,47 @@ helm_run lint deploy/helm/pylon
 default=$(helm_run template pylon deploy/helm/pylon)
 printf '%s' "$default" | grep -q '^kind: Secret$' || { echo "FAIL: default render has no Secret"; exit 1; }
 printf '%s' "$default" | grep -q 'apps.json:' || { echo "FAIL: the Secret carries no apps.json"; exit 1; }
-printf '%s' "$default" | grep -q '^kind: PodDisruptionBudget$' || { echo "FAIL: default render has no PDB"; exit 1; }
-printf '%s' "$default" | grep -q 'minAvailable: 1' || { echo "FAIL: PDB minAvailable is not 1"; exit 1; }
 printf '%s' "$default" | grep -q '^kind: ConfigMap$' && { echo "FAIL: a ConfigMap is still rendered"; exit 1; }
 
 existing=$(helm_run template pylon deploy/helm/pylon --set existingSecret=my-secret)
 printf '%s' "$existing" | grep -q '^kind: Secret$' && { echo "FAIL: existingSecret must not create a Secret"; exit 1; }
 printf '%s' "$existing" | grep -q 'name: my-secret' || { echo "FAIL: existingSecret is not mounted"; exit 1; }
 
-nopdb=$(helm_run template pylon deploy/helm/pylon --set podDisruptionBudget.enabled=false)
+echo "OK: secret, existingSecret and no-configmap all render as specified"
+
+printf '%s' "$default" | grep -q '^  replicas: 1$' || { echo "FAIL: default replicaCount is not 1"; exit 1; }
+printf '%s' "$default" | grep -q '^kind: PodDisruptionBudget$' && { echo "FAIL: a PDB rendered for a single replica, which would block every eviction"; exit 1; }
+
+if two=$(helm_run template pylon deploy/helm/pylon --set replicaCount=2 2>&1); then
+    echo "FAIL: replicaCount=2 on the local adapter should fail the render"; exit 1
+fi
+printf '%s' "$two" | grep -q 'config.adapter=redis' || { echo "FAIL: the multi-replica failure does not name config.adapter=redis"; exit 1; }
+
+if hpa_local=$(helm_run template pylon deploy/helm/pylon --set autoscaling.enabled=true 2>&1); then
+    echo "FAIL: autoscaling on the local adapter should fail the render"; exit 1
+fi
+printf '%s' "$hpa_local" | grep -q 'config.adapter=redis' || { echo "FAIL: the autoscaling failure does not name config.adapter=redis"; exit 1; }
+
+multi=$(helm_run template pylon deploy/helm/pylon --set replicaCount=2 --set config.adapter=redis)
+printf '%s' "$multi" | grep -q '^  replicas: 2$' || { echo "FAIL: replicaCount=2 with the redis adapter did not render"; exit 1; }
+printf '%s' "$multi" | grep -q '^kind: PodDisruptionBudget$' || { echo "FAIL: no PDB rendered for two replicas"; exit 1; }
+printf '%s' "$multi" | grep -q 'minAvailable: 1' || { echo "FAIL: PDB minAvailable is not 1"; exit 1; }
+
+hpa=$(helm_run template pylon deploy/helm/pylon --set autoscaling.enabled=true --set config.adapter=redis)
+printf '%s' "$hpa" | grep -q '^kind: HorizontalPodAutoscaler$' || { echo "FAIL: no HPA rendered with autoscaling on the redis adapter"; exit 1; }
+printf '%s' "$hpa" | grep -q '^kind: PodDisruptionBudget$' || { echo "FAIL: no PDB rendered with autoscaling on the redis adapter"; exit 1; }
+
+nopdb=$(helm_run template pylon deploy/helm/pylon --set replicaCount=2 --set config.adapter=redis --set podDisruptionBudget.enabled=false)
 printf '%s' "$nopdb" | grep -q '^kind: PodDisruptionBudget$' && { echo "FAIL: PDB rendered while disabled"; exit 1; }
 
-echo "OK: secret, pdb, existingSecret and no-configmap all render as specified"
+echo "OK: one replica by default, multi-replica and autoscaling need the redis adapter, the PDB exists only when more than one pod can"
 
 bignum_values=".bignum-values.yaml.tmp"
 cat > "$bignum_values" <<'YAML'
 image:
   tag: 2147483648
 config:
+  adapter: redis
   workers: 2147483648
   memoryBudgetBytes: 2147483648
   shutdownPredrainsMs: 2147483648
@@ -54,7 +77,7 @@ printf '%s' "$bignum" | grep -q 'e+' && { echo "FAIL: rendered chart contains sc
 
 echo "OK: large numeric overrides render as plain integers, no scientific notation"
 
-pdbpercent=$(helm_run template pylon deploy/helm/pylon --set-string podDisruptionBudget.minAvailable=50%)
+pdbpercent=$(helm_run template pylon deploy/helm/pylon --set replicaCount=2 --set config.adapter=redis --set-string podDisruptionBudget.minAvailable=50%)
 printf '%s' "$pdbpercent" | grep -q '^  minAvailable: 50%$' || { echo "FAIL: PDB minAvailable percentage override did not render exactly"; exit 1; }
 
 echo "OK: PDB minAvailable percentage override renders exactly"
@@ -112,6 +135,7 @@ strings_values=".strings-values.yaml.tmp"
 cat > "$strings_values" <<'YAML'
 replicaCount: two
 config:
+  adapter: redis
   workers: four
   memoryBudgetBytes: 2Gi
   shutdownPredrainsMs: 2s
@@ -141,6 +165,8 @@ printf '%s' "$strings" | grep -q 'value: "0"' && { echo "FAIL: an unparseable va
 fraction_values=".fraction-values.yaml.tmp"
 cat > "$fraction_values" <<'YAML'
 replicaCount: 2.5
+config:
+  adapter: redis
 YAML
 fraction=$(helm_run template pylon deploy/helm/pylon -f "$fraction_values")
 printf '%s' "$fraction" | grep -q '^  replicas: 2.5$' || { echo "FAIL: replicaCount 2.5 was truncated or altered instead of passed through"; exit 1; }
