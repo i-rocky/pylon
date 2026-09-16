@@ -26,6 +26,11 @@ pre-1.0 and versions track `Cargo.toml`.
   deploy/systemd/pylon.service`, a path that only exists in a source
   checkout. The archive now also contains a `systemd/` directory with
   `pylon.service`, `pylon.env.example` and `99-pylon.sysctl.conf`.
+- **The docs site now serves `llms.txt`**, a machine-readable index that
+  points language models at the systemd install path first. A model asked to
+  set up pylon on a server previously had to infer the production path from
+  the full docs nav; the file orders systemd ahead of Docker and Kubernetes
+  and copies its install commands verbatim from the Deployment page.
 
 ### Changed
 - **The Helm chart now defaults to one replica.** Two or more replicas, or
