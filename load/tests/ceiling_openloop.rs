@@ -1,4 +1,4 @@
-use pylon_load::ceiling::child::{default_pylon_bin, write_temp_apps, ChildOpts, PylonChild};
+use pylon_load::ceiling::child::{default_pylon_bin, AppsFile, ChildOpts, PylonChild};
 use pylon_load::ceiling::openloop::{publish_openloop, OpenLoopConfig};
 use pylon_load::metrics::Counters;
 use std::sync::Arc;
@@ -6,13 +6,13 @@ use std::sync::Arc;
 #[tokio::test]
 async fn openloop_reaches_target_rate() {
     // 1. Spawn a real pylon child.
-    let apps_path = write_temp_apps().unwrap();
+    let apps = AppsFile::create_temp().unwrap();
     let opts = ChildOpts {
         pylon_bin: default_pylon_bin(),
         port: 7702,
         workers: 2,
         cores: "0-1".into(),
-        apps_path,
+        apps_path: apps.path().to_owned(),
     };
     let child = PylonChild::spawn(&opts).await.expect("spawn pylon child");
 
@@ -22,8 +22,8 @@ async fn openloop_reaches_target_rate() {
         OpenLoopConfig {
             rest: "http://127.0.0.1:7702".into(),
             app_id: "app".into(),
-            key: "app-key".into(),
-            secret: "app-secret".into(),
+            key: apps.credentials().key.clone(),
+            secret: apps.credentials().secret.clone(),
             channels: vec![
                 "c0".into(),
                 "c1".into(),

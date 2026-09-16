@@ -1,14 +1,15 @@
-use pylon_load::ceiling::child::{default_pylon_bin, write_temp_apps, ChildOpts, PylonChild};
+use pylon_load::ceiling::child::{default_pylon_bin, AppsFile, ChildOpts, PylonChild};
 
 #[tokio::test]
 async fn spawns_pins_reads_and_tears_down() {
-    let apps = write_temp_apps().unwrap();
+    let apps = AppsFile::create_temp().unwrap();
+    let apps_path = apps.path().to_owned();
     let opts = ChildOpts {
         pylon_bin: default_pylon_bin(),
         port: 7700,
         workers: 2,
         cores: "0-1".into(),
-        apps_path: apps.clone(),
+        apps_path: apps_path.clone(),
     };
     let child = PylonChild::spawn(&opts).await.expect("spawn");
     let pid = child.pid();
@@ -25,7 +26,12 @@ async fn spawns_pins_reads_and_tears_down() {
         "child not reaped"
     );
     assert!(
-        !std::path::Path::new(&apps).exists(),
+        std::path::Path::new(&apps_path).exists(),
+        "the child must not remove the apps file"
+    );
+    drop(apps);
+    assert!(
+        !std::path::Path::new(&apps_path).exists(),
         "temp apps not cleaned"
     );
 }

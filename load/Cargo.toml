@@ -31,6 +31,7 @@ hmac = "0.13"
 sha2 = "0.11"
 md-5 = "0.11"
 hex = "0.4"
+rand = "0.10"
 hdrhistogram = "7"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"

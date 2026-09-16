@@ -27,7 +27,7 @@ pub struct ConnCeiling {
     pub stop_reason: StopReason,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConnRampOpts {
     pub url: String,
     pub key: String,

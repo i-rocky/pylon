@@ -285,4 +285,60 @@ mod tests {
         let r = recommend(&conn, &tput, 1, 17_179_869_184, 1_000_000, 1_000_000);
         assert_eq!(r.binding, "cpu");
     }
+
+    #[test]
+    fn neither_report_carries_the_run_credentials() {
+        let creds = crate::ceiling::child::AppCredentials::generate();
+        let conn = ConnCeiling {
+            max_conns: 1_000_000,
+            rss_bytes_at_max: 6_144_000_000,
+            bytes_per_conn: 6144,
+            conns_per_gb: 174762,
+            stop_reason: StopReason::MemCeiling,
+        };
+        let best = TputStep {
+            rate: 1000,
+            delivered_per_s: 500_000,
+            drop_pct: 0.0,
+            p50_ms: 5,
+            p99_ms: 40,
+            cpu_busy_pct: 90.0,
+            per_core_busy: vec![12.5, 87.5],
+        };
+        let tput = TputCeiling {
+            best: best.clone(),
+            steps: vec![best],
+            stop_reason: TputStop::CpuSaturated,
+        };
+        let rec = recommend(&conn, &tput, 4, 17_179_869_184, 1_000_000, 300_000);
+        let env = Envelope {
+            logical_cores: 8,
+            physical_cores: 4,
+            total_ram_bytes: 17_179_869_184,
+            kernel: "6.8.0-generic".into(),
+            conn: Some(conn),
+            tput: Some(tput),
+        };
+
+        let human_out = human(&env, Some(&rec));
+        let json_out = json(&env, Some(&rec));
+        assert!(
+            human_out.contains("Connections:"),
+            "the human report rendered"
+        );
+        assert!(
+            json_out.contains("conn_ceiling"),
+            "the JSON report rendered"
+        );
+        for out in [&human_out, &json_out] {
+            assert!(
+                !out.contains(&creds.key),
+                "a report must not carry the app key"
+            );
+            assert!(
+                !out.contains(&creds.secret),
+                "a report must not carry the app secret"
+            );
+        }
+    }
 }
