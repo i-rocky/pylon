@@ -10,8 +10,8 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: {{ include "pylon.fullname" . }}
-  minReplicas: {{ .Values.autoscaling.minReplicas | int64 }}
-  maxReplicas: {{ .Values.autoscaling.maxReplicas | int64 }}
+  minReplicas: {{ include "pylon.plainNumber" .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ include "pylon.plainNumber" .Values.autoscaling.maxReplicas }}
   metrics:
     {{- if .Values.autoscaling.targetCPUUtilizationPercentage }}
     - type: Resource
@@ -19,7 +19,7 @@ spec:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage | int64 }}
+          averageUtilization: {{ include "pylon.plainNumber" .Values.autoscaling.targetCPUUtilizationPercentage }}
     {{- end }}
     {{- if .Values.autoscaling.targetMemoryUtilizationPercentage }}
     - type: Resource
@@ -27,6 +27,6 @@ spec:
         name: memory
         target:
           type: Utilization
-          averageUtilization: {{ .Values.autoscaling.targetMemoryUtilizationPercentage | int64 }}
+          averageUtilization: {{ include "pylon.plainNumber" .Values.autoscaling.targetMemoryUtilizationPercentage }}
     {{- end }}
 {{- end }}

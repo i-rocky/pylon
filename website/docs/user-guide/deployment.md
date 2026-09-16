@@ -256,6 +256,8 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
     | `podDisruptionBudget.enabled` | `true` | Render a `PodDisruptionBudget`. |
     | `podDisruptionBudget.minAvailable` | `1` | Minimum pods that must stay up during a voluntary disruption. |
 
+    Byte and millisecond values are plain integers (`memoryBudgetBytes: 2147483648`, `shutdownGraceMs: 10000`); pylon has no unit suffixes, and the chart passes whatever is written through unchanged, so `2Gi` or `10s` fails at pod start with `invalid PYLON_MEMORY_BUDGET_BYTES="2Gi"` rather than being altered.
+
     ### Autoscaling
 
     ```bash
