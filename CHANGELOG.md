@@ -7,6 +7,10 @@ pre-1.0 and versions track `Cargo.toml`.
 ## [Unreleased]
 
 ### Added
+- **Pylon logs `graceful shutdown timings predrain_ms=… grace_ms=…` at
+  startup.** `PYLON_SHUTDOWN_PREDRAIN_MS=0` and `PYLON_SHUTDOWN_GRACE_MS=0`
+  were accepted silently, so an operator had no way to see a zero or
+  unexpected drain window before the first `SIGTERM`.
 - **`pylon_handshake_timeout_total{worker}`** counts the connections reaped by
   the slowloris handshake deadline (`PYLON_HANDSHAKE_TIMEOUT_MS`, default
   10000). The reap closes the connection and reclaims its slot without a

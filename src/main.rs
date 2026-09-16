@@ -150,6 +150,11 @@ async fn main() -> anyhow::Result<()> {
     let _dhat = dhat::Profiler::new_heap();
     pylon::init_tracing();
     let config = ServerConfig::from_env();
+    tracing::info!(
+        predrain_ms = config.shutdown_predrain_ms,
+        grace_ms = config.shutdown_grace_ms,
+        "graceful shutdown timings"
+    );
     let apps: Arc<dyn AppManager> = match config.app_manager {
         AppManagerKind::StaticFile => Arc::new(StaticFileAppManager::from_file(&config.apps_path)?),
         AppManagerKind::Sqlite | AppManagerKind::Mysql | AppManagerKind::Postgres => {
