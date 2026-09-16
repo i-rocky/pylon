@@ -226,12 +226,26 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
 
     ### Install
 
+    The chart refuses to render until every app has a real secret, so the values
+    file is written first with one generated in place:
+
     ```bash
     # Single-node (local adapter, default):
-    helm install pylon ./deploy/helm/pylon
+    cat > my-values.yaml <<EOF
+    apps:
+      - name: my-app
+        id: app
+        key: app-key
+        secret: $(openssl rand -hex 32)
+        capacity: 1000000
+        client_messages_enabled: false
+        enabled: true
+        webhooks: []
+    EOF
+    helm install pylon ./deploy/helm/pylon -f my-values.yaml
 
     # Multi-node cluster (redis adapter):
-    helm install pylon ./deploy/helm/pylon \
+    helm install pylon ./deploy/helm/pylon -f my-values.yaml \
       --set config.adapter=redis \
       --set config.redisUrl=redis://my-redis:6379 \
       --set replicaCount=3
