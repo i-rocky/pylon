@@ -5,7 +5,7 @@ metadata:
   labels:
     {{- include "pylon.labels" . | nindent 4 }}
 spec:
-  replicas: {{ .Values.replicaCount | int64 }}
+  replicas: {{ include "pylon.plainNumber" .Values.replicaCount }}
   selector:
     matchLabels:
       {{- include "pylon.selectorLabels" . | nindent 6 }}
@@ -30,7 +30,7 @@ spec:
       containers:
         - name: pylon
           {{- $tag := .Values.image.tag | default .Chart.AppVersion }}
-          image: "{{ .Values.image.repository }}:{{ if and (kindIs "float64" $tag) (eq $tag (floor $tag)) }}{{ $tag | int64 }}{{ else }}{{ $tag }}{{ end }}"
+          image: "{{ .Values.image.repository }}:{{ include "pylon.plainNumber" $tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
 
           ports:
@@ -54,19 +54,19 @@ spec:
             {{- end }}
             {{- if .Values.config.redisPrefix }}
             - name: PYLON_REDIS_PREFIX
-              value: {{ if and (kindIs "float64" .Values.config.redisPrefix) (eq .Values.config.redisPrefix (floor .Values.config.redisPrefix)) }}{{ .Values.config.redisPrefix | int64 | quote }}{{ else }}{{ .Values.config.redisPrefix | quote }}{{ end }}
+              value: {{ include "pylon.plainNumber" .Values.config.redisPrefix | quote }}
             {{- end }}
             - name: PYLON_WORKERS
-              value: {{ .Values.config.workers | int64 | quote }}
+              value: {{ include "pylon.plainNumber" .Values.config.workers | quote }}
             - name: PYLON_APPS_PATH
               value: "/etc/pylon/apps.json"
             - name: PYLON_SHUTDOWN_PREDRAIN_MS
-              value: {{ .Values.config.shutdownPredrainsMs | int64 | quote }}
+              value: {{ include "pylon.plainNumber" .Values.config.shutdownPredrainsMs | quote }}
             - name: PYLON_SHUTDOWN_GRACE_MS
-              value: {{ .Values.config.shutdownGraceMs | int64 | quote }}
+              value: {{ include "pylon.plainNumber" .Values.config.shutdownGraceMs | quote }}
             {{- if .Values.config.memoryBudgetBytes }}
             - name: PYLON_MEMORY_BUDGET_BYTES
-              value: {{ .Values.config.memoryBudgetBytes | int64 | quote }}
+              value: {{ include "pylon.plainNumber" .Values.config.memoryBudgetBytes | quote }}
             {{- end }}
 
           volumeMounts:

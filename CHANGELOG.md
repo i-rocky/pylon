@@ -43,6 +43,14 @@ pre-1.0 and versions track `Cargo.toml`.
   legitimately takes a percentage string (`"50%"`), so it is left uncoerced;
   its legitimate integer range is bounded by the replica count and can never
   reach 1,000,000, the magnitude where this bug triggers.
+- **An unparseable numeric chart value is no longer rendered as `0`.** The
+  fix above piped every integral field through sprig `int64`, which maps any
+  unparseable string to `0` (`memoryBudgetBytes: 2Gi`, `shutdownGraceMs: 10s`,
+  `replicaCount: two`), so pylon started silently with the auto budget or a
+  zero grace instead of failing, and the API server accepted a `0` replica
+  count or utilization target. The value now reaches pylon or the API server
+  verbatim and is rejected there instead; a fractional `replicaCount` is no
+  longer truncated either.
 - **Production Tuning no longer derives `R` from `tput_ceiling.best.rate`.**
   `pylon-ceiling`'s open-loop publisher sheds a tick whenever `--max-inflight`
   is full, and `drop_pct` is computed against attempted (post-shed)

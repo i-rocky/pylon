@@ -7,7 +7,7 @@ metadata:
 spec:
   type: {{ .Values.service.type }}
   ports:
-    - port: {{ .Values.service.port | int64 }}
+    - port: {{ include "pylon.plainNumber" .Values.service.port }}
       targetPort: ws
       protocol: TCP
       name: ws

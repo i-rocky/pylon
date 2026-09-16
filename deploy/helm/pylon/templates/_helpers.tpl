@@ -56,3 +56,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- printf "%s-apps" (include "pylon.fullname" .) }}
 {{- end }}
 {{- end }}
+
+{{- define "pylon.plainNumber" -}}
+{{- if and (kindIs "float64" .) (eq . (floor .)) }}{{ int64 . }}{{ else }}{{ . }}{{ end }}
+{{- end }}
