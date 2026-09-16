@@ -87,6 +87,14 @@ pre-1.0 and versions track `Cargo.toml`.
   chart now fails the render (instead of deploying a pod that SIGKILLs
   mid-drain) when that override is too small, negative, or not a usable
   integer.
+- **The systemd unit now stops retrying after five failed starts in a
+  minute and reports `failed`**, instead of looping in
+  `activating (auto-restart)` forever on a fatal config value. `pylon.service`
+  had `Restart=on-failure` and no start limit, so a bad `PYLON_*` value or an
+  unreadable `apps.json` kept the unit auto-restarting indefinitely with
+  `systemctl is-active` never reporting `failed` and nothing paging.
+  `StartLimitIntervalSec=60` / `StartLimitBurst=5` in `[Unit]` bound the
+  crash loop to the failed state so it surfaces.
 
 ## [0.5.0] - 2026-09-15
 

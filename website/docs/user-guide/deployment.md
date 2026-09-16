@@ -78,9 +78,19 @@ Pylon ships deploy artifacts for three targets. Choose the tab that matches your
 
     # Graceful restart (SIGTERM → drain → restart)
     systemctl restart pylon
+    ```
 
+    `Type=exec` makes `systemctl restart` return as soon as the binary executes, so check `systemctl is-active pylon` after a restart.
+
+    ```bash
     # Tail logs
     journalctl -u pylon -f
+
+    # A start that keeps failing (bad config value, unreadable apps.json) stops
+    # retrying after five attempts within a minute and the unit reports failed.
+    systemctl is-active pylon        # failed
+    journalctl -u pylon -n 20        # the last attempt's error, e.g. invalid PYLON_SHUTDOWN_GRACE_MS="10s"
+    systemctl reset-failed pylon && systemctl start pylon   # after fixing the config
 
     # Health check
     curl -s http://localhost:7000/health
