@@ -145,25 +145,10 @@ on the same host.
 
 ## 2. Docker / Compose
 
-### Published image
-
-A ready-to-use multi-arch image (`linux/amd64` + `linux/arm64`) is published to GHCR on each
-release: `ghcr.io/i-rocky/pylon:latest` (also tagged `X.Y.Z` and `X.Y`). Pull it instead of
-building from source:
-
-```bash
-docker run -d --name pylon -p 7000:7000 \
-  -v "$PWD/apps.json:/etc/pylon/apps.json:ro" \
-  -e PYLON_APPS_PATH=/etc/pylon/apps.json \
-  --ulimit nofile=1048576:1048576 \
-  ghcr.io/i-rocky/pylon:latest
-```
-
-The published image is built by `.github/workflows/release.yml`, which packages the prebuilt
-per-arch binaries into [`Dockerfile.release`](docker/Dockerfile.release). The `Dockerfile` in this
-directory builds the same runtime image from source instead.
-
 ### Prerequisites (host)
+
+Apply these before starting any container: the daemon-level nofile default cannot be
+satisfied until `fs.nr_open` is raised.
 
 Apply the sysctl drop-in on the Docker host before starting containers:
 
@@ -172,10 +157,10 @@ cp deploy/systemd/99-pylon.sysctl.conf /etc/sysctl.d/
 sysctl --system
 ```
 
-Ensure the Docker daemon allows high nofile limits:
+Ensure the Docker daemon allows high nofile limits by adding to
+`/etc/docker/daemon.json`:
 
 ```json
-// /etc/docker/daemon.json
 {
   "default-ulimits": {
     "nofile": {"Name": "nofile", "Hard": 2000000, "Soft": 2000000}
@@ -183,11 +168,46 @@ Ensure the Docker daemon allows high nofile limits:
 }
 ```
 
+Restart the Docker daemon after editing this file.
+
+### Published image
+
+A ready-to-use multi-arch image (`linux/amd64` + `linux/arm64`) is published to GHCR on each
+release: `ghcr.io/i-rocky/pylon:latest` (also tagged `X.Y.Z` and `X.Y`). Pull it instead of
+building from source:
+
+```bash
+cp apps.example.json apps.json      # from the release tarball or the repo root
+# edit apps.json: set id, key and secret
+chown 65534:65534 apps.json && chmod 0600 apps.json
+```
+
+The image runs as UID 65534 (`nobody`) with no shell, so a file it cannot read makes the
+container exit with `Permission denied`; owning it to 65534 with mode 0600 keeps the secret
+private and readable.
+
+```bash
+docker run -d --name pylon -p 7000:7000 \
+  -v "$PWD/apps.json:/etc/pylon/apps.json:ro" \
+  -e PYLON_APPS_PATH=/etc/pylon/apps.json \
+  --ulimit nofile=1048576:1048576 \
+  --stop-timeout 20 \
+  ghcr.io/i-rocky/pylon:latest
+```
+
+The default 10 s stop timeout is below the 12 s drain worst case (2 s pre-drain plus 10 s
+grace); `--stop-timeout 20` makes `docker stop` use 20 s.
+
+The published image is built by `.github/workflows/release.yml`, which packages the prebuilt
+per-arch binaries into [`Dockerfile.release`](docker/Dockerfile.release). The `Dockerfile` in this
+directory builds the same runtime image from source instead.
+
 ### Start a 2-node cluster
 
 ```bash
 # Copy and edit the apps config — change the secret!
 cp apps.example.json deploy/docker/apps.json
+chown 65534:65534 deploy/docker/apps.json && chmod 0600 deploy/docker/apps.json
 
 # Build the image and start services.
 cd deploy/docker

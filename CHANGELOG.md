@@ -125,6 +125,21 @@ pre-1.0 and versions track `Cargo.toml`.
   text. `init_tracing` now gates colour on `stdout().is_terminal()` — the
   stream `fmt()` actually writes to — so a terminal session still gets colour
   and every redirected, piped or non-interactive run gets plain text.
+- **The Docker recipe now works when followed literally.** The
+  `/etc/docker/daemon.json` fence in `deploy/README.md` started with a `//`
+  comment line; dockerd rejects that as invalid JSON and systemd rate-limits
+  the resulting restart loop. Neither the README nor the docs site said
+  `apps.json` must be owned by the image's UID 65534 — a correctly
+  locked-down `0600 root:root` file makes the `FROM scratch`, shell-less
+  container exit 1 with `Permission denied`. The published-image `docker
+  run` also left `docker stop` at its 10 s default, below the 12 s drain
+  worst case (2 s pre-drain plus 10 s grace). Both docs now create and
+  `chown 65534:65534`/`chmod 0600` the apps file before running the
+  container, pass `--stop-timeout 20`, and drop the invalid comment line
+  from the daemon.json fence. Host prerequisites (the sysctl drop-in and
+  the daemon.json edit) now come first in both docs' Docker / Compose
+  section, ahead of the published-image recipe, because the daemon's
+  nofile default cannot be satisfied until `fs.nr_open` is raised.
 
 ## [0.5.0] - 2026-09-15
 
