@@ -2,7 +2,7 @@
 #
 # Usage:
 #   # Copy and edit the apps config first:
-#   cp ../systemd/apps.example.json ./apps.json
+#   cp ../../apps.example.json ./apps.json
 #   # Edit apps.json — change the secret!
 #
 #   docker compose up -d

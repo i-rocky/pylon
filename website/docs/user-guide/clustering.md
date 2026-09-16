@@ -197,7 +197,7 @@ cp deploy/systemd/99-pylon.sysctl.conf /etc/sysctl.d/
 sysctl --system
 
 # 2. Create and edit the apps config — change the secret!
-cp deploy/systemd/apps.example.json deploy/docker/apps.json
+cp apps.example.json deploy/docker/apps.json
 
 # 3. Build the image and start the cluster.
 cd deploy/docker
