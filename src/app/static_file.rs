@@ -1,4 +1,5 @@
 use super::{App, AppLookup, AppLookupError, AppManager};
+use anyhow::Context;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -32,7 +33,10 @@ impl StaticFileAppManager {
         Ok(Self { apps })
     }
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
-        Self::from_json(&std::fs::read_to_string(path)?)
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("PYLON_APPS_PATH: cannot read apps file '{path}'"))?;
+        Self::from_json(&raw)
+            .with_context(|| format!("PYLON_APPS_PATH: invalid apps file '{path}'"))
     }
 
     /// Resolve by predicate, distinguishing a found-but-disabled app (`Disabled`,
@@ -95,11 +99,32 @@ mod tests {
         };
         assert_eq!(app.id, "app-id");
 
+        let missing_path = dir.path().join("missing.json");
+        let err = StaticFileAppManager::from_file(missing_path.to_str().unwrap())
+            .expect_err("a missing apps file must fail loudly, not load zero apps");
+        let rendered = format!("{err:#}");
         assert!(
-            StaticFileAppManager::from_file(dir.path().join("missing.json").to_str().unwrap())
-                .is_err(),
-            "a missing apps file must fail loudly, not load zero apps"
+            rendered.contains(missing_path.to_str().unwrap()),
+            "got: {rendered}"
         );
+        assert!(rendered.contains("PYLON_APPS_PATH"), "got: {rendered}");
+        assert!(
+            rendered.contains("No such file or directory"),
+            "got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn from_file_names_the_path_on_invalid_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("apps.json");
+        std::fs::write(&path, "not json").expect("write apps.json");
+
+        let err = StaticFileAppManager::from_file(path.to_str().unwrap())
+            .expect_err("invalid JSON must fail loudly");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains(path.to_str().unwrap()), "got: {rendered}");
+        assert!(rendered.contains("PYLON_APPS_PATH"), "got: {rendered}");
     }
 
     #[tokio::test]
