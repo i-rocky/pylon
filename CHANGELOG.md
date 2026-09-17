@@ -13,6 +13,10 @@ pre-1.0 and versions track `Cargo.toml`.
   fan-out, fixed-load latency and graceful stop, with the method and its caveats.
   The README's Performance section quotes the headline figures.
 
+### Changed
+- **The docs site, README and `llms.txt` name ThriveDesk as the team behind
+  Pylon**, with a link to `thrivedesk.com` in the site footer and home page.
+
 ### Fixed
 - **`pylon-load`'s `channels` scenario no longer cross-counts another concurrent
   `pylon-load` process's deliveries.** Every process named its channels
