@@ -60,6 +60,7 @@ plugins:
 
 nav:
   - Home: index.md
+  - Benchmarks: benchmarks.md
   - User Guide:
       - Introduction: user-guide/introduction.md
       - Installation: user-guide/installation.md

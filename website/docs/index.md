@@ -23,4 +23,5 @@ work unchanged — point them at your own server and you're done.
 ## Get started
 
 [Quick Start](user-guide/quick-start.md){ .md-button .md-button--primary }
+[Benchmarks](benchmarks.md){ .md-button }
 [:fontawesome-brands-github: View on GitHub](https://github.com/i-rocky/pylon){ .md-button }

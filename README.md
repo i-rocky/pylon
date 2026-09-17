@@ -156,8 +156,14 @@ an encode-once, sharded fan-out path and adaptive overload control. At roughly a
 few KB per idle connection it is designed to hold millions of concurrent
 connections per node within its memory budget.
 
-Rather than quoting benchmark numbers from someone else's machine, measure on
-yours:
+Measured against soketi (Aloware fork v2.0.0) and Laravel Reverb v1.11.1 on the same
+2 vCPU / 4 GB arm64 host under identical load (2026-09-17): Pylon seated 80,000 connections at
+3.6 KB each (soketi topped out at 20,000; Reverb seated 80,000 at 21 KB each), delivered
+79,630 fan-out messages/s within a 99% delivery / 100 ms p99 budget (soketi 23,204; Reverb
+11,001), and held a p99 of 4.4 ms at fixed load (soketi 6.0 ms; Reverb 10.4 ms). Method,
+tables and caveats: [Benchmarks](https://i-rocky.github.io/pylon/benchmarks/).
+
+To measure on your own hardware:
 
 - **Micro-benchmarks** — criterion benches in [`benches/`](benches/)
   (`fanout`, `fanout_sink`, `mailbox`, `app_lookup`): `cargo bench`.
