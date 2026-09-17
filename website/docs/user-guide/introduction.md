@@ -51,6 +51,8 @@ queues, CoDel, graduated shedding, memory budget), and clean graceful shutdown a
 | Overload control | Yes (adaptive) | No | No |
 | License | Apache 2.0 | MIT | MIT |
 
+Measured on the same hardware under the same load: see [Benchmarks](../benchmarks.md).
+
 !!! note "Trademark notice"
     "Pusher" is a trademark of its respective owner. Pylon is an independent, clean-room
     implementation and is not affiliated with or endorsed by Pusher.

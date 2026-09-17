@@ -6,6 +6,13 @@ pre-1.0 and versions track `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+- **The docs site carries a benchmarks page** comparing Pylon v0.5.1 with soketi
+  (Aloware fork v2.0.0) and Laravel Reverb v1.11.1 on identical hardware and load:
+  memory per connection, connection ceiling, fan-out throughput, hot-channel
+  fan-out, fixed-load latency and graceful stop, with the method and its caveats.
+  The README's Performance section quotes the headline figures.
+
 ### Fixed
 - **`pylon-load`'s `channels` scenario no longer cross-counts another concurrent
   `pylon-load` process's deliveries.** Every process named its channels
