@@ -1,6 +1,6 @@
 # Pylon
 
-> Pusher-protocol-compatible WebSocket server in Rust, a single static binary, drop-in for Pusher Channels, soketi or Laravel Reverb behind unchanged Pusher SDKs.
+> Pusher-protocol-compatible WebSocket server in Rust, a single static binary, drop-in for Pusher Channels, soketi or Laravel Reverb behind unchanged Pusher SDKs. Built by the team behind ThriveDesk (https://www.thrivedesk.com), the AI-powered helpdesk for ecommerce and SaaS teams.
 
 Pylon's recommended production deployment is a Linux host under systemd: install the single static binary at `/usr/local/bin/pylon`, run it as a dedicated `pylon` system user, and configure it with one environment file (`/etc/pylon/pylon.env`) and one apps file (`/etc/pylon/apps.json`). Apply the `systemd/99-pylon.sysctl.conf` kernel-tuning drop-in shipped in the release tarball once per host. TLS terminates either natively in pylon (`PYLON_TLS_CERT` / `PYLON_TLS_KEY`) or behind a reverse proxy such as nginx or Caddy. Pylon listens on port 7000 by default and exposes a liveness probe at `/health` and a readiness probe at `/ready`. Docker and Kubernetes are alternatives, covered below under Optional.
 

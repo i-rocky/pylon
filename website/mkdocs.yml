@@ -5,6 +5,7 @@ repo_url: https://github.com/i-rocky/pylon
 repo_name: i-rocky/pylon
 edit_uri: edit/master/website/docs/
 copyright: >-
+  Built by <a href="https://www.thrivedesk.com">ThriveDesk</a>.
   Pylon is an independent, clean-room implementation. "Pusher" is a trademark of
   its respective owner; Pylon is not affiliated with or endorsed by Pusher.
 
@@ -57,6 +58,15 @@ markdown_extensions:
 
 plugins:
   - search
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/i-rocky/pylon
+      name: Pylon on GitHub
+    - icon: fontawesome/solid/globe
+      link: https://www.thrivedesk.com
+      name: ThriveDesk
 
 nav:
   - Home: index.md

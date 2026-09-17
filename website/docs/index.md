@@ -25,3 +25,14 @@ work unchanged — point them at your own server and you're done.
 [Quick Start](user-guide/quick-start.md){ .md-button .md-button--primary }
 [Benchmarks](benchmarks.md){ .md-button }
 [:fontawesome-brands-github: View on GitHub](https://github.com/i-rocky/pylon){ .md-button }
+
+## Built by ThriveDesk
+
+Pylon is built and maintained by the team behind [ThriveDesk](https://www.thrivedesk.com),
+the agentic helpdesk that unifies email, live chat and a knowledge base into one AI-powered
+inbox for ecommerce and SaaS teams. Pylon is the realtime layer built for ThriveDesk's live chat,
+which is why it is designed for high connection counts, low latency and a small memory
+footprint on ordinary hardware.
+
+Looking for a helpdesk rather than a WebSocket server?
+[Meet ThriveDesk](https://www.thrivedesk.com){ .md-button .md-button--primary }
