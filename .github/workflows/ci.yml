@@ -309,3 +309,12 @@ jobs:
 
       - name: Lint and render the chart
         run: deploy/helm/pylon/tests/render.sh
+
+  systemd-env-example:
+    name: systemd env example
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check the env example against the reference and the parser
+        run: deploy/systemd/tests/env-example.sh
