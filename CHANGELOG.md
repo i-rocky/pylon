@@ -14,6 +14,10 @@ pre-1.0 and versions track `Cargo.toml`.
   The README's Performance section quotes the headline figures.
 
 ### Changed
+- **`deploy/systemd/pylon.env.example` documents every `PYLON_*` variable** from
+  the configuration reference, in the reference's order, with each default and a
+  one-line purpose; `deploy/systemd/tests/env-example.sh` asserts in CI that the
+  example and the reference stay in step.
 - **The docs site, README and `llms.txt` name ThriveDesk as the team behind
   Pylon**, with a link to `thrivedesk.com` in the site footer and home page.
 
