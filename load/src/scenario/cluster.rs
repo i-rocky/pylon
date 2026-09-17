@@ -35,7 +35,7 @@ pub async fn run(cli: &Cli) -> anyhow::Result<()> {
     let mut seq = 0u64;
     while Instant::now() < end {
         ticker.tick().await;
-        let payload = stamp_payload(seq, epoch.elapsed().as_nanos());
+        let payload = stamp_payload(seq, epoch.elapsed().as_nanos(), &h.run_id);
         if pubr
             .publish(&channel, "bench", &payload, crate::pusher::unix_now())
             .await

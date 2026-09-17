@@ -12,6 +12,7 @@ pub mod fanout;
 
 pub struct Harness {
     pub epoch: Instant,
+    pub run_id: String,
     pub lat: Arc<Latency>,
     pub counters: Arc<Counters>,
     pub shutdown: Arc<tokio::sync::Notify>,
@@ -22,6 +23,7 @@ impl Harness {
     pub fn new(epoch: Instant) -> Self {
         Self {
             epoch,
+            run_id: crate::pusher::run_id(),
             lat: Arc::new(Latency::default()),
             counters: Arc::new(Counters::default()),
             shutdown: Arc::new(tokio::sync::Notify::new()),
@@ -68,6 +70,7 @@ impl Harness {
                 channel: channel_of(i),
                 private: cli.private,
                 src_ip,
+                own_run_id: self.run_id.clone(),
             };
             let (e, l, c, s) = (
                 self.epoch,

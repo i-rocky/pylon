@@ -22,6 +22,7 @@ pub struct OpenLoopConfig {
     pub target_rate: u64,
     pub max_inflight: usize,
     pub secs: u64,
+    pub run_id: String,
 }
 
 pub async fn publish_openloop(
@@ -42,6 +43,7 @@ pub async fn publish_openloop(
         target_rate,
         max_inflight,
         secs,
+        run_id,
     } = cfg;
     let pubr = Arc::new(Publisher::new(rest, app_id, key, secret));
     let sem = Arc::new(Semaphore::new(max_inflight));
@@ -67,7 +69,7 @@ pub async fn publish_openloop(
             pubr.clone(),
             channels[(seq as usize) % channels.len()].clone(),
         );
-        let payload = stamp_payload(seq, epoch.elapsed().as_nanos());
+        let payload = stamp_payload(seq, epoch.elapsed().as_nanos(), &run_id);
         let (att, ok, c) = (attempted.clone(), succeeded.clone(), counters.clone());
         tokio::spawn(async move {
             let _permit = permit;

@@ -29,8 +29,18 @@ aliases for ephemeral-port headroom).
 |---|---|
 | `connect` | Ramp N mostly-idle subscribers onto one channel, hold, then fire **one** broadcast — reports time-to-subscribed, the single-shot fan-out latency, and peak server RSS / bytes-per-connection. The connection-density check. |
 | `fanout` | N subscribers on one channel; `--publishers` concurrent publishers each push at `--rate`/sec for `--secs` — sustained throughput, delivery latency percentiles, and drop counts under continuous fan-out. |
-| `channels` | N connections spread across `--channels` channels; a publisher round-robins events at `--rate`/sec — the many-channels shape (registry lookups instead of one hot channel). |
+| `channels` | N connections spread across `--channels` channels; a publisher round-robins events at `--rate`/sec — the many-channels shape (registry lookups instead of one hot channel). Each `pylon-load` process draws its own run id at startup and names its channels `bench-<run-id>-0`..`bench-<run-id>-<channels-1>`, so two processes run concurrently against the same app never share a channel. |
 | `cluster` | Two nodes (`--url` and required `--url-b`) on the Redis adapter; half the clients subscribe to each node, publishing happens on node A only — measures cross-node delivery latency (the Redis pub/sub hop). |
+
+Every published event carries its publisher's run id. A subscriber only measures
+latency for, and counts into `received`, deliveries stamped with its own process's
+run id; a delivery from another concurrently-running process is counted into
+`received_foreign` instead and never enters the latency histogram. `fanout` and
+`cluster` still fan a single hot channel (`bench-fanout`, `bench-cluster`) out to
+every subscriber regardless of which process published, so `received_foreign` is
+expected to be non-zero there whenever more than one `pylon-load` process targets
+the same channel; `channels` isolates its channels per process, so a correctly
+isolated run reports `received_foreign=0`.
 
 Example — 50k connections, one hot channel, 4 publishers × 100 msg/s for 30 s:
 

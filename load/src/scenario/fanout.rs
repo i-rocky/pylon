@@ -41,13 +41,14 @@ pub async fn run(cli: &Cli) -> anyhow::Result<()> {
         );
         let channel = channel.clone();
         let counters: Arc<crate::metrics::Counters> = h.counters.clone();
+        let run_id = h.run_id.clone();
         pub_tasks.push(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             let end = Instant::now() + Duration::from_secs(secs);
             let mut seq = 0u64;
             while Instant::now() < end {
                 ticker.tick().await;
-                let payload = stamp_payload(seq, epoch.elapsed().as_nanos());
+                let payload = stamp_payload(seq, epoch.elapsed().as_nanos(), &run_id);
                 if pub_
                     .publish(&channel, "bench", &payload, crate::pusher::unix_now())
                     .await
@@ -91,12 +92,13 @@ pub fn report(
     let (count, p50, p99, p999, max) = h.lat.summary_us();
     println!("=== scenario: {name} ===");
     println!(
-        "conns={} subscribed={} sent={} received={} (expected≈{})",
+        "conns={} subscribed={} sent={} received={} (expected≈{}) received_foreign={}",
         cli.conns,
         c.subscribed.load(Ordering::Relaxed),
         sent,
         recv,
-        sent * recipients_per_event
+        sent * recipients_per_event,
+        c.received_foreign.load(Ordering::Relaxed)
     );
     println!("latency µs: count={count} p50={p50} p99={p99} p99.9={p999} max={max}");
     if let Some((rss_mb, cpu)) = proc {

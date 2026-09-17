@@ -27,6 +27,8 @@ async fn fanout_smoke_delivers_to_all() {
     let counters = Arc::new(Counters::default());
     let shutdown = Arc::new(tokio::sync::Notify::new());
 
+    let run_id = pylon_load::pusher::run_id();
+
     const K: usize = 20;
     let mut tasks = Vec::new();
     for _ in 0..K {
@@ -37,6 +39,7 @@ async fn fanout_smoke_delivers_to_all() {
             channel: "bench".into(),
             private: false,
             src_ip: None,
+            own_run_id: run_id.clone(),
         };
         let (l, c, s) = (lat.clone(), counters.clone(), shutdown.clone());
         tasks.push(tokio::spawn(async move {
@@ -62,7 +65,7 @@ async fn fanout_smoke_delivers_to_all() {
     );
     const P: u64 = 5;
     for seq in 0..P {
-        let payload = stamp_payload(seq, epoch.elapsed().as_nanos());
+        let payload = stamp_payload(seq, epoch.elapsed().as_nanos(), &run_id);
         pubr.publish("bench", "ev", &payload, pylon_load::pusher::unix_now())
             .await
             .unwrap();

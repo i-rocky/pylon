@@ -159,6 +159,7 @@ pub async fn run(child: &PylonChild, opts: &RateRampOpts) -> TputCeiling {
                     target_rate: rate,
                     max_inflight: opts.max_inflight,
                     secs: opts.step_secs,
+                    run_id: h.run_id.clone(),
                 },
                 h.counters.clone(),
                 epoch, // SHARED epoch (same one the clients measure latency against)
