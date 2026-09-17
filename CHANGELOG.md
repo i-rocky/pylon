@@ -6,6 +6,19 @@ pre-1.0 and versions track `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+- **`pylon-load`'s `channels` scenario no longer cross-counts another concurrent
+  `pylon-load` process's deliveries.** Every process named its channels
+  `bench-0`..`bench-<m-1>` regardless of which process started it, so two
+  processes pointed at the same app delivered into each other's subscribers — a
+  16-process run recorded `received=160310` against an expected `≈10010` per
+  process. Each process now draws its own run id at startup and prefixes its
+  channel names with it (`bench-<run-id>-<n>`), and every published event
+  carries the publisher's run id so a subscriber only measures latency for, and
+  counts into `received`, its own process's deliveries; a delivery from another
+  process is counted into the new `received_foreign` instead of polluting the
+  latency histogram with readings from an unrelated process's clock.
+
 ## [0.5.1] - 2026-09-16
 
 ### Added

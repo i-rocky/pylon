@@ -34,6 +34,7 @@ async fn openloop_reaches_target_rate() {
             target_rate: 500,
             max_inflight: 128,
             secs: 3,
+            run_id: pylon_load::pusher::run_id(),
         },
         counters,
         std::time::Instant::now(), // epoch (this test asserts rate, not latency)

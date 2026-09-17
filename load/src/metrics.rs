@@ -45,6 +45,7 @@ pub struct Counters {
     pub subscribed: AtomicU64,
     pub sent: AtomicU64,
     pub received: AtomicU64,
+    pub received_foreign: AtomicU64,
 }
 
 impl Counters {

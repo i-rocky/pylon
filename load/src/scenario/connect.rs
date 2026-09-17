@@ -33,7 +33,7 @@ pub async fn run(cli: &Cli) -> anyhow::Result<()> {
         cli.key.clone(),
         cli.secret.clone(),
     );
-    let payload = stamp_payload(0, epoch.elapsed().as_nanos());
+    let payload = stamp_payload(0, epoch.elapsed().as_nanos(), &h.run_id);
     pubr.publish(&channel, "bench", &payload, crate::pusher::unix_now())
         .await?;
     tokio::time::sleep(Duration::from_secs(2)).await; // let the fan-out land

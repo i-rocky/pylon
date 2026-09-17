@@ -1,5 +1,6 @@
 use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest, Md5};
+use rand::RngExt;
 use serde_json::{json, Value};
 use sha2::Sha256;
 
@@ -126,15 +127,29 @@ pub fn pong_frame() -> String {
     json!({ "event": "pusher:pong", "data": {} }).to_string()
 }
 
-/// Embed publish-nanos into an event payload object so subscribers can compute latency.
-pub fn stamp_payload(seq: u64, publish_nanos: u128) -> String {
-    json!({ "seq": seq, "t": publish_nanos.to_string() }).to_string()
+pub fn stamp_payload(seq: u64, publish_nanos: u128, run_id: &str) -> String {
+    json!({ "seq": seq, "t": publish_nanos.to_string(), "p": run_id }).to_string()
 }
 
-/// Extract publish-nanos from a received data payload (string-encoded JSON object).
-pub fn extract_nanos(data: &str) -> Option<u128> {
+pub struct Delivery {
+    pub seq: u64,
+    pub t: u128,
+    pub p: String,
+}
+
+pub fn parse_delivery(data: &str) -> Option<Delivery> {
     let v: Value = serde_json::from_str(data).ok()?;
-    v.get("t")?.as_str()?.parse().ok()
+    Some(Delivery {
+        seq: v.get("seq")?.as_u64()?,
+        t: v.get("t")?.as_str()?.parse().ok()?,
+        p: v.get("p")?.as_str()?.to_string(),
+    })
+}
+
+pub fn run_id() -> String {
+    let mut buf = [0u8; 4];
+    rand::rng().fill(&mut buf[..]);
+    hex::encode(buf)
 }
 
 #[cfg(test)]
@@ -162,9 +177,59 @@ mod frame_tests {
     }
 
     #[test]
-    fn stamp_and_extract_roundtrip() {
-        let p = stamp_payload(7, 123_456_789);
-        assert_eq!(extract_nanos(&p), Some(123_456_789));
+    fn stamp_and_parse_roundtrip() {
+        let payload = stamp_payload(7, 123_456_789, "ab12cd34");
+        let delivery = parse_delivery(&payload).unwrap();
+        assert_eq!(delivery.seq, 7);
+        assert_eq!(delivery.t, 123_456_789);
+        assert_eq!(delivery.p, "ab12cd34");
+    }
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+    use crate::metrics::{Counters, Latency};
+    use std::time::Instant;
+
+    #[test]
+    fn own_delivery_is_counted_and_measured() {
+        let lat = Latency::default();
+        let counters = Counters::default();
+        let epoch = Instant::now();
+        let payload = stamp_payload(1, epoch.elapsed().as_nanos(), "own-id");
+        record_delivery(&payload, "own-id", epoch, &lat, &counters);
+        assert_eq!(
+            counters.received.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            counters
+                .received_foreign
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(lat.summary_us().0, 1);
+    }
+
+    #[test]
+    fn foreign_delivery_is_counted_and_not_measured() {
+        let lat = Latency::default();
+        let counters = Counters::default();
+        let epoch = Instant::now();
+        let payload = stamp_payload(1, epoch.elapsed().as_nanos(), "other-id");
+        record_delivery(&payload, "own-id", epoch, &lat, &counters);
+        assert_eq!(
+            counters.received.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters
+                .received_foreign
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(lat.summary_us().0, 0);
     }
 }
 
@@ -217,6 +282,27 @@ pub struct ClientConfig {
     pub private: bool, // sign the subscribe
     /// Source IP to bind the TCP socket to (None = OS default).
     pub src_ip: Option<IpAddr>,
+    pub own_run_id: String,
+}
+
+fn record_delivery(
+    data: &str,
+    own_run_id: &str,
+    epoch: Instant,
+    lat: &Latency,
+    counters: &Counters,
+) {
+    let Some(delivery) = parse_delivery(data) else {
+        return;
+    };
+    if delivery.p == own_run_id {
+        let now = epoch.elapsed().as_nanos();
+        let d = now.saturating_sub(delivery.t);
+        lat.record_nanos(d.min(u64::MAX as u128) as u64);
+        Counters::inc(&counters.received);
+    } else {
+        Counters::inc(&counters.received_foreign);
+    }
 }
 
 /// Connect, handshake, subscribe, then receive until `shutdown` notifies. Records latency
@@ -288,12 +374,7 @@ pub async fn run_client(
                             }
                             _ => {
                                 if let Some(data) = f.data.as_deref() {
-                                    if let Some(t_ns) = extract_nanos(data) {
-                                        let now = epoch.elapsed().as_nanos();
-                                        let d = now.saturating_sub(t_ns);
-                                        lat.record_nanos(d.min(u64::MAX as u128) as u64);
-                                        Counters::inc(&counters.received);
-                                    }
+                                    record_delivery(data, &cfg.own_run_id, epoch, &lat, &counters);
                                 }
                             }
                         }
