@@ -22,6 +22,16 @@ pre-1.0 and versions track `Cargo.toml`.
   Pylon**, with a link to `thrivedesk.com` in the site footer and home page.
 
 ### Fixed
+- **A panicking per-core worker thread now makes Pylon exit non-zero.** A worker
+  that panicked died alone: the fleet joined its workers one after another, and
+  `main` looked at the fleet only after a shutdown signal, so the process stayed
+  up with `/health` at 200 while that worker's listener and connections were
+  gone, and systemd's `Restart=on-failure` never restarted it. A worker panic now
+  sets the fleet's shutdown flag, so the other workers drain their connections
+  with the 4200 close, and the server exits non-zero as soon as the fleet stops,
+  without waiting for a signal. A panic inside a tokio task (a REST request, a
+  webhook delivery, an offloaded app lookup) stays contained to that task, as
+  before.
 - **`pylon-load`'s `channels` scenario no longer cross-counts another concurrent
   `pylon-load` process's deliveries.** Every process named its channels
   `bench-0`..`bench-<m-1>` regardless of which process started it, so two

@@ -10,11 +10,11 @@ use pylon::cluster::adapter::ClusterAdapter;
 use pylon::server::config::AppManagerKind;
 use pylon::server::config::ServerConfig;
 use pylon::server::router::{build_router, AppState};
-use pylon::server::shutdown::shutdown_signal;
+use pylon::server::shutdown::{shutdown_signal, supervise_fleet};
 use pylon::webhook::dispatcher::SystemClock;
 use pylon::webhook::transport::{HttpTransport, WebhookTransport};
 use pylon::webhook::{OccupancySource, WebhookHandle};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -359,19 +359,14 @@ async fn main() -> anyhow::Result<()> {
         )
     });
 
-    // C2a two-phase graceful shutdown:
-    //   1. Set draining=true  → /ready returns 503; LBs stop sending new traffic.
-    //   2. Sleep predrain_ms  → allow LBs to observe the 503.
-    //   3. Set shutdown=true  → workers deregister listeners, queue a
-    //      `pusher:error` 4200 + Close(4200),
-    //      flush in-flight bytes, run on_close cleanup, then exit.
-    //   4. Join the worker.
-    shutdown_signal().await;
-    draining_for_shutdown.store(true, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(config.shutdown_predrain_ms)).await;
-    shutdown.store(true, Ordering::SeqCst);
-    worker.await??;
-    Ok(())
+    supervise_fleet(
+        worker,
+        shutdown_signal(),
+        &draining_for_shutdown,
+        &shutdown,
+        Duration::from_millis(config.shutdown_predrain_ms),
+    )
+    .await
 }
 
 /// The CLUSTERED production path: Redis adapter + percore transport. Mirrors the test
@@ -570,20 +565,16 @@ async fn run_redis_percore(
         )
     });
 
-    // C2a two-phase graceful shutdown (same sequence as main()):
-    //   1. Set draining=true  → /ready returns 503; LBs stop sending new traffic.
-    //   2. Sleep predrain_ms  → allow LBs to observe the 503.
-    //   3. Set shutdown=true  → workers drain + close connections, then exit.
-    //   4. Join the worker. `bridge` stays in scope until AFTER the join so its
-    //      Drop (which tears down the dedicated Redis runtime) runs only once the
-    //      worker has stopped firing commands at it.
-    shutdown_signal().await;
-    draining_for_shutdown.store(true, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(config.shutdown_predrain_ms)).await;
-    shutdown.store(true, Ordering::SeqCst);
-    worker.await??;
+    let outcome = supervise_fleet(
+        worker,
+        shutdown_signal(),
+        &draining_for_shutdown,
+        &shutdown,
+        Duration::from_millis(config.shutdown_predrain_ms),
+    )
+    .await;
     drop(bridge);
-    Ok(())
+    outcome
 }
 
 #[cfg(test)]
