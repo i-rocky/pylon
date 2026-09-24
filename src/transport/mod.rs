@@ -199,6 +199,16 @@ fn lock_percore_registry_for_write() -> std::sync::MutexGuard<'static, PercoreRe
         .unwrap_or_else(|p| p.into_inner())
 }
 
+struct StopFleetOnPanic(Arc<AtomicBool>);
+
+impl Drop for StopFleetOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 /// Run the per-core transport as the actual server.
 ///
 /// Takes the already-built shared pieces (the same ones `main`/`AppState`
@@ -569,6 +579,7 @@ pub fn run_percore(
         let handle = std::thread::Builder::new()
             .name(format!("pylon-worker-{i}"))
             .spawn(move || {
+                let _stop_fleet_on_panic = StopFleetOnPanic(shutdown.clone());
                 if let Some(core) = core {
                     if core_affinity::set_for_current(core) {
                         tracing::debug!(worker = i, core = ?core, "pinned percore worker to core");
