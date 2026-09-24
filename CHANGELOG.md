@@ -6,6 +6,8 @@ pre-1.0 and versions track `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-09-24
+
 ### Added
 - **The docs site carries a benchmarks page** comparing Pylon v0.5.1 with soketi
   (Aloware fork v2.0.0) and Laravel Reverb v1.11.1 on identical hardware and load:

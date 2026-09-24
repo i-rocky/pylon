@@ -133,7 +133,7 @@ out=$(helm_run template pylon deploy/helm/pylon -f "$tag_values" -f "$ci_values"
 printf '%s' "$out" | grep -q 'image: "ghcr.io/i-rocky/pylon:latest"' || { echo "FAIL: string image.tag did not render exactly"; exit 1; }
 
 tag_default=$(helm_run template pylon deploy/helm/pylon -f "$ci_values")
-printf '%s' "$tag_default" | grep -q 'image: "ghcr.io/i-rocky/pylon:0.5.1"' || { echo "FAIL: unset image.tag did not fall through to Chart.AppVersion"; exit 1; }
+printf '%s' "$tag_default" | grep -q 'image: "ghcr.io/i-rocky/pylon:0.5.2"' || { echo "FAIL: unset image.tag did not fall through to Chart.AppVersion"; exit 1; }
 
 cat > "$tag_values" <<'YAML'
 config:

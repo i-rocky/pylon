@@ -3,7 +3,7 @@ name: pylon
 description: High-performance Pusher-compatible WebSocket server
 type: application
 version: 0.2.0
-appVersion: "0.5.1"
+appVersion: "0.5.2"
 keywords:
   - websocket
   - pusher
